@@ -75,6 +75,7 @@ all = [
 ]
 dev = ["watchfiles>=0.20"]
 test = [
+    "build>=1.0",
     "pytest>=7.0",
     "numpy",
     "pytest-benchmark>=4.0",
