@@ -324,7 +324,19 @@ class TestPluginScoringDIThreadingSeam:
 
     def test_reject_scoring_plugin_failure_does_not_corrupt_registry(self):
         """Reject path: plugin scoring registration failure leaves registry
-        usable for subsequent valid registrations."""
+        usable for subsequent valid registrations.
+
+        Atlas review-1 (recall#824) Blocker 2: previous version of this test
+        used RecencyScoring as the recovery strategy. RecencyScoring.name ==
+        "recency" matches the default fallback strategy returned by
+        get_active_strategy() when no strategy is activated. Asserting
+        `get_active_strategy().name == "recency"` therefore passed whether
+        recovery activation succeeded OR fallback intermediated — false-positive.
+
+        Fix: use a custom recovery strategy with a unique name AND assert
+        get_active_strategy() returns the specific instance registered (identity
+        check), so the test fails closed if activation did not actually occur.
+        """
         from synapt.recall import scoring as canonical_scoring
         canonical_scoring.reset_registry()
         try:
@@ -339,11 +351,31 @@ class TestPluginScoringDIThreadingSeam:
             registered = register_plugins(mcp, [plugin])
             assert len(registered) == 0
 
-            # Registry is still usable for subsequent valid registrations
+            # Recovery uses a custom strategy with a unique name so the
+            # assertion below distinguishes "recovery activation succeeded"
+            # from "fallback to default RecencyScoring intermediated".
+            class _RecoveryStrategy:
+                name = "recovery-distinct-strategy"
+                window = 8
+
+                def score(self, inputs):
+                    return [
+                        canonical_scoring.ScoredChunk(
+                            input=i, score=0.5, strategy_name=self.name
+                        )
+                        for i in inputs
+                    ]
+
+            recovery_instance = _RecoveryStrategy()
             canonical_scoring.register_scoring_strategy(
-                "recovery", canonical_scoring.RecencyScoring(window=4)
+                "recovery", recovery_instance
             )
             canonical_scoring.activate_scoring_strategy("recovery")
-            assert canonical_scoring.get_active_strategy().name == "recency"
+            active = canonical_scoring.get_active_strategy()
+            # Identity check + distinct-name check both required so the test
+            # fails closed if the activation path was bypassed.
+            assert active is recovery_instance
+            assert active.name == "recovery-distinct-strategy"
+            assert active.name != "recency"  # not the default fallback
         finally:
             canonical_scoring.reset_registry()

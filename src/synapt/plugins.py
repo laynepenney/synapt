@@ -44,8 +44,12 @@ class LoadedPlugin:
 def discover_plugins() -> list[LoadedPlugin]:
     """Discover and load all plugins registered under the 'synapt.plugins' group.
 
+    Per the AT-LEAST-ONE plugin contract (PR4f-B per config#339 Q3): each
+    plugin module must export at least one of ``register_tools(mcp)`` or
+    ``register_scoring(scoring_module)``. Plugins that fail to import OR that
+    export neither callable are logged and skipped.
+
     Returns a list of LoadedPlugin for each successfully loaded plugin.
-    Plugins that fail to import or lack register_tools are logged and skipped.
     """
     plugins: list[LoadedPlugin] = []
     eps = importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
