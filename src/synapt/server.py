@@ -77,9 +77,10 @@ def _find_watch_paths() -> list[str]:
 
     paths: list[str] = []
 
-    # Main package source
-    pkg_dir = os.path.dirname(os.path.abspath(synapt.__file__))
-    paths.append(pkg_dir)
+    # Main package source(s) — synapt is a PEP 420 namespace package, so iterate __path__
+    # to watch every distribution contributing to the synapt namespace (recall, runner, etc.)
+    for ns_dir in synapt.__path__:
+        paths.append(os.path.abspath(ns_dir))
 
     # Also watch plugin packages (e.g., synapt_private) if installed editable
     try:

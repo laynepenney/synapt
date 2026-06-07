@@ -111,8 +111,8 @@ def _get_provenance() -> dict:
     }
     # Synapt version + code ref
     try:
-        import synapt
-        prov["synapt_version"] = synapt.__version__
+        import synapt.recall
+        prov["synapt_version"] = synapt.recall.__version__
     except ImportError:
         prov["synapt_version"] = "not installed"
     # Git ref from synapt repo
