@@ -51,7 +51,7 @@ def main():
         return
 
     if subcmd == "--version":
-        from synapt import __version__
+        from synapt.recall import __version__
 
         print(f"synapt {__version__}")
         return

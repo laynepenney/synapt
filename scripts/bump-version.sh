@@ -13,7 +13,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PYPROJECT="$REPO_ROOT/pyproject.toml"
-INIT_PY="$REPO_ROOT/src/synapt/__init__.py"
+INIT_PY="$REPO_ROOT/src/synapt/recall/__init__.py"
 
 # --- Read current version ---
 CURRENT=$(grep '^version = ' "$PYPROJECT" | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -61,9 +61,9 @@ echo ""
 sed -i '' "s/^version = \"$CURRENT\"/version = \"$NEW\"/" "$PYPROJECT"
 echo "  ✓ pyproject.toml"
 
-# src/synapt/__init__.py
+# src/synapt/recall/__init__.py
 sed -i '' "s/__version__ = \"$CURRENT\"/__version__ = \"$NEW\"/" "$INIT_PY"
-echo "  ✓ src/synapt/__init__.py"
+echo "  ✓ src/synapt/recall/__init__.py"
 
 # --- Verify ---
 VERIFY_PYPROJECT=$(grep '^version = ' "$PYPROJECT" | head -1 | sed 's/version = "\(.*\)"/\1/')
@@ -81,7 +81,7 @@ echo ""
 echo "Version bumped to $NEW"
 echo ""
 echo "Next steps:"
-echo "  gr add pyproject.toml src/synapt/__init__.py"
+echo "  gr add pyproject.toml src/synapt/recall/__init__.py"
 echo "  gr commit -m \"chore: bump version to $NEW\""
 echo "  git tag v$NEW"
 echo "  gr push -u && git push --tags"

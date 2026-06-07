@@ -123,7 +123,7 @@ def _archive_manifest(
     include_channels: bool,
 ) -> dict:
     """Build manifest metadata for a portable recall archive."""
-    from synapt import __version__ as synapt_version
+    from synapt.recall import __version__ as synapt_version
     from synapt.recall.sharded_db import ShardedRecallDB
 
     data_dir = _data_dir(project_dir)

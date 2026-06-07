@@ -31,7 +31,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import synapt as _synapt_pkg
+import synapt.recall as _synapt_pkg
 from synapt.recall.config import load_config
 
 # Capture version at server startup for stale-process detection

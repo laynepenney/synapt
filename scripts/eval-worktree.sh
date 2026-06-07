@@ -72,7 +72,7 @@ pip install --quiet "$WORKTREE"
 # Verify
 echo
 echo "=== Verification ==="
-INSTALLED_VERSION=$(python -c "import synapt; print(synapt.__version__)")
+INSTALLED_VERSION=$(python -c "import synapt.recall; print(synapt.recall.__version__)")
 CODE_REF=$(git -C "$WORKTREE" rev-parse --short HEAD)
 CODE_DIRTY=$(git -C "$WORKTREE" diff --quiet && echo "clean" || echo "DIRTY")
 
