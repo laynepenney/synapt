@@ -1322,6 +1322,51 @@ def _apply_consolidation_result(
     return result
 
 
+def score_cluster_chunks(cluster: list[JournalEntry]):
+    """Score a cluster of journal entries via the active scoring strategy.
+
+    Per config#332 consolidation-primary locus + config#339 Pattern 4 ratification:
+    consolidation is where vorn-scored synthesis happens. This helper exposes the
+    `ChunkScoringStrategy` seam at the canonical consolidation scoring point.
+
+    OSS default (RecencyScoring): scores by temporal position (older → newer);
+    premium VornScoring (when registered + activated via plugin) substitutes
+    vorn-attention-based scoring without OSS naming the premium strategy.
+
+    Backward-compat: with no plugin activated, returned scores reflect linear
+    recency ramp; existing consolidation logic that uses `entry.timestamp`
+    ordering produces equivalent ordering. This helper is the integration seam
+    for premium overlay, not a replacement for existing temporal-sort logic.
+
+    Args:
+        cluster: journal entries to score (any order).
+
+    Returns:
+        List of ScoredChunks in cluster-by-timestamp order (oldest → newest).
+    """
+    from synapt.recall.scoring import ScoringInput, get_active_strategy
+
+    if not cluster:
+        return []
+
+    ordered = sorted(cluster, key=lambda e: e.timestamp or "")
+    inputs = [
+        ScoringInput(
+            content=entry.focus or "",
+            position=i,
+            metadata={
+                "timestamp": entry.timestamp,
+                "session_id": entry.session_id,
+                "done": list(entry.done),
+                "decisions": list(entry.decisions),
+                "next_steps": list(entry.next_steps),
+            },
+        )
+        for i, entry in enumerate(ordered)
+    ]
+    return get_active_strategy().score(inputs)
+
+
 def consolidate(
     project_dir: Path | None = None,
     model: str = DEFAULT_MODEL,
