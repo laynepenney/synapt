@@ -423,17 +423,22 @@ synapt init</code></pre>
 
     <h2 id="plugins">5. Plugins</h2>
 
-    <p>Synapt has a plugin system based on Python entry points. Plugins can register additional MCP tools.</p>
+    <p>Synapt has a plugin system based on Python entry points. Plugins can register additional MCP tools and/or chunk scoring strategies for consolidation and enrichment.</p>
 
     <h3>Built-in: X/Twitter</h3>
     <p>Install with <code>pip install synapt[x]</code>. Adds 8 tools: <code>x_post</code>, <code>x_reply</code>, <code>x_thread</code>, <code>x_delete</code>, <code>x_timeline</code>, <code>x_mentions</code>, <code>x_get_tweet</code>, <code>x_search</code>.</p>
     <p>Requires environment variables: <code>X_API_KEY</code>, <code>X_API_SECRET</code>, <code>X_ACCESS_TOKEN</code>, <code>X_ACCESS_TOKEN_SECRET</code>.</p>
 
     <h3>External Plugins</h3>
-    <p>Any Python package can register tools by adding an entry point in its <code>pyproject.toml</code>:</p>
+    <p>Any Python package can register with synapt by adding an entry point in its <code>pyproject.toml</code>:</p>
     <pre><code>[project.entry-points."synapt.plugins"]
 my_plugin = "my_package.server"</code></pre>
-    <p>The module must export a <code>register_tools(mcp)</code> function that adds tools to the FastMCP server instance.</p>
+    <p>The plugin module must export <strong>at least one</strong> of the following callables:</p>
+    <ul>
+      <li><code>register_tools(mcp)</code> — register additional MCP tools on the FastMCP server instance.</li>
+      <li><code>register_scoring(scoring_module)</code> — register and/or activate chunk scoring strategies via the <code>synapt.recall.scoring</code> registry. Use <code>scoring_module.register_scoring_strategy(name, strategy)</code> to register, and <code>scoring_module.activate_scoring_strategy(name)</code> to make a strategy active.</li>
+    </ul>
+    <p>A plugin may export both callables. Plugins that export neither are logged and skipped at discovery.</p>
 
     <h2 id="config">6. Configuration Files</h2>
 
