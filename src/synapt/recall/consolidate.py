@@ -1344,7 +1344,11 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
     Returns:
         List of ScoredChunks in cluster-by-timestamp order (oldest → newest).
     """
-    from synapt.recall.scoring import ScoringInput, get_active_strategy
+    from synapt.recall.scoring import (
+        ScoringInput,
+        get_active_strategy,
+        score_with_validation,
+    )
 
     if not cluster:
         return []
@@ -1364,7 +1368,7 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
         )
         for i, entry in enumerate(ordered)
     ]
-    return get_active_strategy().score(inputs)
+    return score_with_validation(get_active_strategy(), inputs)
 
 
 def consolidate(

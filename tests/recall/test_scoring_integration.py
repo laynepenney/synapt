@@ -235,3 +235,70 @@ class TestPhase2EndToEndThreadingSeam:
         result = score_cluster_chunks([_entry("a", "2026-01-01T00:00:00Z")])
         assert result[0].strategy_name == "recency"
         assert recorder.score_called_with == []
+
+
+# === Phase 2 + validator integration (recall#823 review-1 Blocker 1 closure) ===
+
+
+class _SilentlyCorruptStrategy:
+    """Strategy that silently corrupts: structurally valid Protocol, returns
+    non-ScoredChunk garbage. Exists only to drive integration-helper reject
+    tests post-validator-introduction."""
+
+    name = "silently-corrupt"
+    window = 16
+
+    def score(self, inputs):
+        return ["not-a-scored-chunk" for _ in inputs]
+
+
+class TestPhase2ValidatorAtIntegrationBoundary:
+    """Sentinel review on recall#823 96b26b5: 'The runtime Protocol check
+    accepts a strategy that has name, window, and score, but it does not
+    validate the return contract. Both integration helpers pass the strategy
+    result through unchanged.'
+
+    These tests verify the post-fix behavior: integration helpers consume the
+    score_with_validation seam, so bad-strategy returns are rejected at the
+    boundary rather than silently corrupting consolidate/enrich callers.
+    """
+
+    def test_consolidate_rejects_silently_corrupt_strategy(self):
+        from synapt.recall.scoring import ScoreContractViolation
+
+        register_scoring_strategy("corrupt", _SilentlyCorruptStrategy())
+        activate_scoring_strategy("corrupt")
+
+        with pytest.raises(ScoreContractViolation, match="expected ScoredChunk"):
+            score_cluster_chunks([_entry("a", "2026-01-01T00:00:00Z")])
+
+    def test_enrich_rejects_silently_corrupt_strategy(self):
+        from synapt.recall.scoring import ScoreContractViolation
+
+        register_scoring_strategy("corrupt", _SilentlyCorruptStrategy())
+        activate_scoring_strategy("corrupt")
+
+        with pytest.raises(ScoreContractViolation, match="expected ScoredChunk"):
+            score_transcript_windows(["w0", "w1"])
+
+    def test_consolidate_accepts_well_behaved_strategy(self):
+        """Accept-path mirror: well-behaved strategy threads through unchanged
+        post-validator (no regression from Phase 2 baseline)."""
+        recorder = _RecordingStrategy()
+        register_scoring_strategy("recording", recorder)
+        activate_scoring_strategy("recording")
+
+        cluster = [_entry(f"c{i}", f"2026-0{i+1}-01T00:00:00Z") for i in range(3)]
+        scored = score_cluster_chunks(cluster)
+        assert len(scored) == 3
+        assert all(s.strategy_name == recorder.name for s in scored)
+
+    def test_enrich_accepts_well_behaved_strategy(self):
+        recorder = _RecordingStrategy()
+        register_scoring_strategy("recording", recorder)
+        activate_scoring_strategy("recording")
+
+        windows = ["w0", "w1", "w2"]
+        scored = score_transcript_windows(windows)
+        assert len(scored) == 3
+        assert all(s.strategy_name == recorder.name for s in scored)

@@ -6,8 +6,11 @@ Per config#339 Pattern 4 ratification:
 - Module-level registry: register_scoring_strategy + activate_scoring_strategy
 - DI-threading-seam reject/accept E2E pairs (per
   feedback_xfail_removal_doc_sweep.md DI-threading-seam rule)
-- window=16 default per Layne directive 2026-06-07 (keep empirical anchor until
-  window=8 directly tested; Atlas research#7 tested 4/16/32/64/128 — no inflection)
+- window=16 default per Layne directive 2026-06-07 (keep empirical anchor;
+  Atlas research#7 tested 4/8/16/32/64/128 with no inflection on the current
+  fixture — window=8 empirically equivalent to window=16)
+- ScoreContractViolation runtime validator (recall#823 review-1 Blocker 1):
+  bad-strategy returns rejected at the integration boundary
 
 Phase 2 (consolidate.py + enrich.py integration via get_active_strategy) covered
 by integration tests in a follow-on commit.
@@ -21,12 +24,14 @@ from synapt.recall.scoring import (
     DEFAULT_RECENT_TOKEN_WINDOW,
     ChunkScoringStrategy,
     RecencyScoring,
+    ScoreContractViolation,
     ScoredChunk,
     ScoringInput,
     activate_scoring_strategy,
     get_active_strategy,
     register_scoring_strategy,
     reset_registry,
+    score_with_validation,
 )
 
 
@@ -252,3 +257,137 @@ class TestDIThreadingSeamRejectAccept:
             activate_scoring_strategy("recency")
         active = get_active_strategy()
         assert isinstance(active, RecencyScoring)
+
+
+# === ScoreContractViolation runtime validator (recall#823 review-1 Blocker 1) ===
+
+
+class _BadReturnStrategy:
+    """Configurable strategy that returns various contract-violating shapes.
+
+    Used to drive validator reject-path tests. The class only honors the static
+    Protocol shape (name, window, score callable); behavior of score() is
+    controlled by the `violation` constructor argument.
+    """
+
+    name = "bad-return"
+    window = 16
+
+    def __init__(self, violation: str = "ok"):
+        self.violation = violation
+
+    def score(self, inputs):
+        if self.violation == "not-list":
+            return "not-a-list"
+        if self.violation == "wrong-length":
+            return [
+                ScoredChunk(input=inputs[0], score=1.0, strategy_name=self.name)
+            ]
+        if self.violation == "bad-item-type":
+            return ["not-a-scored-chunk" for _ in inputs]
+        if self.violation == "bad-score-string":
+            return [
+                ScoredChunk(input=i, score="not-a-number", strategy_name=self.name)
+                for i in inputs
+            ]
+        if self.violation == "bad-score-bool":
+            return [
+                ScoredChunk(input=i, score=True, strategy_name=self.name)
+                for i in inputs
+            ]
+        if self.violation == "bad-input-identity":
+            wrong = ScoringInput(content="not-original", position=0)
+            return [
+                ScoredChunk(input=wrong, score=1.0, strategy_name=self.name)
+                for _ in inputs
+            ]
+        if self.violation == "bad-strategy-name":
+            return [
+                ScoredChunk(input=i, score=1.0, strategy_name="wrong-name")
+                for i in inputs
+            ]
+        # "ok"
+        return [
+            ScoredChunk(input=i, score=float(i.position), strategy_name=self.name)
+            for i in inputs
+        ]
+
+
+class TestScoreContractViolation:
+    """Validator reject paths — each contract violation raises with diagnostic."""
+
+    def _inputs(self, n: int = 3):
+        return [ScoringInput(content=f"c{i}", position=i) for i in range(n)]
+
+    def test_not_a_list_rejected(self):
+        strategy = _BadReturnStrategy(violation="not-list")
+        with pytest.raises(ScoreContractViolation, match="expected list"):
+            score_with_validation(strategy, self._inputs())
+
+    def test_wrong_length_rejected(self):
+        strategy = _BadReturnStrategy(violation="wrong-length")
+        with pytest.raises(ScoreContractViolation, match="length must match"):
+            score_with_validation(strategy, self._inputs())
+
+    def test_bad_item_type_rejected(self):
+        strategy = _BadReturnStrategy(violation="bad-item-type")
+        with pytest.raises(ScoreContractViolation, match="expected ScoredChunk"):
+            score_with_validation(strategy, self._inputs())
+
+    def test_bad_score_string_rejected(self):
+        strategy = _BadReturnStrategy(violation="bad-score-string")
+        with pytest.raises(ScoreContractViolation, match="expected numeric"):
+            score_with_validation(strategy, self._inputs())
+
+    def test_bad_score_bool_rejected(self):
+        """bool is a subclass of int in Python; validator rejects explicitly so
+        a strategy returning True/False as score does not silently pass."""
+        strategy = _BadReturnStrategy(violation="bad-score-bool")
+        with pytest.raises(ScoreContractViolation, match="expected numeric"):
+            score_with_validation(strategy, self._inputs())
+
+    def test_bad_input_identity_rejected(self):
+        strategy = _BadReturnStrategy(violation="bad-input-identity")
+        with pytest.raises(ScoreContractViolation, match="input identity"):
+            score_with_validation(strategy, self._inputs())
+
+    def test_bad_strategy_name_rejected(self):
+        strategy = _BadReturnStrategy(violation="bad-strategy-name")
+        with pytest.raises(
+            ScoreContractViolation, match="must equal strategy.name"
+        ):
+            score_with_validation(strategy, self._inputs())
+
+    def test_well_behaved_strategy_passes_through(self):
+        """Accept path: well-behaved strategy returns clean result."""
+        strategy = _BadReturnStrategy(violation="ok")
+        result = score_with_validation(strategy, self._inputs())
+        assert len(result) == 3
+        assert all(isinstance(r, ScoredChunk) for r in result)
+        assert all(r.strategy_name == "bad-return" for r in result)
+
+    def test_empty_inputs_short_circuit(self):
+        """Empty inputs return empty list without invoking strategy.score()."""
+
+        class _ExplodingStrategy:
+            name = "explode"
+            window = 16
+
+            def score(self, inputs):
+                raise AssertionError("score must not be called on empty inputs")
+
+        result = score_with_validation(_ExplodingStrategy(), [])
+        assert result == []
+
+    def test_recency_default_passes_validator(self):
+        """Default RecencyScoring is contract-compliant by construction."""
+        result = score_with_validation(RecencyScoring(), self._inputs(5))
+        assert len(result) == 5
+        assert all(r.strategy_name == "recency" for r in result)
+
+
+class TestScoreContractViolationInheritance:
+    """ScoreContractViolation is a TypeError subclass for ergonomic except clauses."""
+
+    def test_is_type_error_subclass(self):
+        assert issubclass(ScoreContractViolation, TypeError)

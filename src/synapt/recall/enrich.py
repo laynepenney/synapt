@@ -422,7 +422,11 @@ def score_transcript_windows(windows: list[str]):
     Returns:
         List of ScoredChunks in input order.
     """
-    from synapt.recall.scoring import ScoringInput, get_active_strategy
+    from synapt.recall.scoring import (
+        ScoringInput,
+        get_active_strategy,
+        score_with_validation,
+    )
 
     if not windows:
         return []
@@ -431,7 +435,7 @@ def score_transcript_windows(windows: list[str]):
         ScoringInput(content=w, position=i, metadata={})
         for i, w in enumerate(windows)
     ]
-    return get_active_strategy().score(inputs)
+    return score_with_validation(get_active_strategy(), inputs)
 
 
 def enrich_entry(

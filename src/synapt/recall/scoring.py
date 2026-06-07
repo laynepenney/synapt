@@ -16,16 +16,17 @@ locus:
 - **Single-active-strategy by construction** (Pattern 4 caveat; revisit Pattern 3
   hooks if multi-strategy composition becomes a need).
 - **window=16 default** per Layne directive 2026-06-07: keep the
-  empirically-anchored choice (RC4 calibration smoke anchor) until window=8 is
-  directly tested. Atlas research#7 (2026-06-07) AXIS 3 sweep tested windows
-  4/16/32/64/128 and found NO inflection — identical SEMU selections across all
-  windows on this fixture (vorn-dilution thesis prediction did NOT replicate).
-  config#339 originally recommended window=8 on theoretical
-  "conservative-dilution-resilient zone" rationale; Layne corrected: don't move
-  off the empirical anchor without empirical reason. window=16 stays as the
-  locked default; window=8 would require direct empirical test (~$0.06 single
-  Modal cell) before adoption. Selector-sensitive fixture lane (Atlas surfaced)
-  is the bigger lever for any future window-sensitivity work.
+  empirically-anchored choice (RC4 calibration smoke baseline). Atlas
+  research#7 (2026-06-07) AXIS 3 sweep tested windows 4/8/16/32/64/128 and
+  found NO inflection — identical SEMU selections across all windows on this
+  fixture (vorn-dilution thesis prediction did NOT replicate). config#339
+  originally recommended window=8 on theoretical "conservative-dilution-
+  resilient zone" rationale; with window=8 now empirically equivalent to
+  window=16 on the current fixture, the empirical anchor (window=16) stays
+  the locked default — no differentiated reason to move. Selector-sensitive
+  fixture lane (Atlas surfaced) is the bigger lever for any future
+  window-sensitivity work; until such a fixture surfaces inflection, the
+  anchor holds.
 
 Move 2 contract redesign: this module IS the redesigned contract for
 config#330's rejected compression-as-search-param-with-strategy-enum frame.
@@ -39,11 +40,14 @@ from typing import Protocol, runtime_checkable
 
 
 # Default recent-token window for recency-based scoring.
-# Anchored at the existing RC4 calibration smoke baseline (window=16).
-# Atlas research#7 (2026-06-07) AXIS 3 sweep found no inflection across
-# windows 4/16/32/64/128 on the calibration fixture. Per Layne directive
-# 2026-06-07 ("keep 16 until we test 8"), don't move off the empirical
-# anchor without direct empirical reason. See module docstring.
+# Anchored at the RC4 calibration smoke baseline (window=16). Atlas
+# research#7 (2026-06-07) AXIS 3 sweep tested windows 4/8/16/32/64/128
+# and found no inflection on the calibration fixture (vorn-dilution
+# thesis prediction did not replicate). Window=8 was directly tested
+# and is empirically equivalent to window=16 on this fixture; Layne
+# directive 2026-06-07 keeps window=16 as the locked default because
+# window=8 produced no differentiated reason to move. See module
+# docstring.
 DEFAULT_RECENT_TOKEN_WINDOW = 16
 
 
@@ -222,6 +226,98 @@ def get_active_strategy() -> ChunkScoringStrategy:
     if _active_strategy_name is not None:
         return _registered_strategies[_active_strategy_name]
     return RecencyScoring()
+
+
+class ScoreContractViolation(TypeError):
+    """Raised when a strategy's `score()` return value violates the contract.
+
+    The Protocol provides static shape; this runtime check makes the plugin
+    seam fail closed. Premium plugins that violate the contract surface the
+    failure at the integration boundary (consolidate + enrich helpers) rather
+    than silently corrupting downstream callers.
+
+    Per Sentinel review on PR4f-A (recall#823 review-1): the registry-side
+    Protocol check accepts strategies with the right shape (name, window,
+    score callable) but doesn't validate return contract. This class is the
+    substrate-fix.
+    """
+
+
+def _validate_score_result(
+    inputs: list[ScoringInput],
+    result: object,
+    strategy_name: str,
+) -> list[ScoredChunk]:
+    """Validate a strategy's score() return value against the runtime contract.
+
+    The contract:
+    - Return value is a list
+    - Length equals the input length
+    - Each item is a ScoredChunk
+    - Each item.input is the corresponding inputs[i] (identity preserved)
+    - Each item.score is numeric (int or float; not bool)
+    - Each item.strategy_name equals the strategy's self-reported name
+
+    Raises:
+        ScoreContractViolation: any of the above conditions fail. The error
+            includes which item / which check failed for diagnostic clarity.
+    """
+    if not isinstance(result, list):
+        raise ScoreContractViolation(
+            f"strategy {strategy_name!r} returned "
+            f"{type(result).__name__}, expected list"
+        )
+    if len(result) != len(inputs):
+        raise ScoreContractViolation(
+            f"strategy {strategy_name!r} returned {len(result)} items, "
+            f"expected {len(inputs)} (length must match inputs)"
+        )
+    for i, (item, expected_input) in enumerate(zip(result, inputs)):
+        if not isinstance(item, ScoredChunk):
+            raise ScoreContractViolation(
+                f"strategy {strategy_name!r} item[{i}] is "
+                f"{type(item).__name__}, expected ScoredChunk"
+            )
+        # bool is a subclass of int in Python; reject explicitly so a
+        # strategy returning True/False as score does not silently pass.
+        if isinstance(item.score, bool) or not isinstance(item.score, (int, float)):
+            raise ScoreContractViolation(
+                f"strategy {strategy_name!r} item[{i}].score is "
+                f"{type(item.score).__name__}, expected numeric (int or float)"
+            )
+        if item.input is not expected_input:
+            raise ScoreContractViolation(
+                f"strategy {strategy_name!r} item[{i}].input does not preserve "
+                f"input identity (must be the corresponding inputs[i])"
+            )
+        if item.strategy_name != strategy_name:
+            raise ScoreContractViolation(
+                f"strategy {strategy_name!r} item[{i}].strategy_name="
+                f"{item.strategy_name!r}; must equal strategy.name="
+                f"{strategy_name!r}"
+            )
+    return result
+
+
+def score_with_validation(
+    strategy: ChunkScoringStrategy,
+    inputs: list[ScoringInput],
+) -> list[ScoredChunk]:
+    """Score `inputs` via `strategy` and validate the return contract.
+
+    This is the canonical integration boundary for both `consolidate` and
+    `enrich` to invoke scoring. Empty inputs short-circuit to an empty
+    result without invoking the strategy (consistent with the strategies'
+    own empty-input handling).
+
+    Raises:
+        ScoreContractViolation: strategy return value violates the contract;
+            see `_validate_score_result` for the specific check that failed.
+    """
+    if not inputs:
+        return []
+    result = strategy.score(inputs)
+    return _validate_score_result(inputs, result, strategy.name)
 
 
 def reset_registry() -> None:
