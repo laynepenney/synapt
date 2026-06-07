@@ -102,7 +102,7 @@ def _print_help(extra_commands: dict | None = None):
     ]
     if extra_commands:
         for name in sorted(extra_commands):
-            lines.append(f"  {name:<9} (from synapt-private)")
+            lines.append(f"  {name:<9} (from synapt-premium)")
     lines.append("")
     lines.append("Run 'synapt <command> --help' for details on each command.")
     lines.append("")
