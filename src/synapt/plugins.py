@@ -1,12 +1,18 @@
 """synapt.plugins — entry-point plugin discovery and loading.
 
 Plugins register via ``[project.entry-points."synapt.plugins"]`` in their
-pyproject.toml.  Each entry point must reference a module with a
-``register_tools(mcp: FastMCP) -> None`` callable.
+pyproject.toml.  Each entry point module must provide at least ONE of:
+
+- ``register_tools(mcp: FastMCP) -> None`` — register MCP tools on the server
+- ``register_scoring(scoring_module) -> None`` — register/activate chunk
+  scoring strategies via the ``synapt.recall.scoring`` registry (PR4f-B
+  plugin-time activation per config#339 Q3 ratification)
+
+A plugin may provide both. Plugins with neither callable are logged and skipped.
 
 Two-phase design: ``discover_plugins()`` loads modules and validates them,
-``register_plugins()`` calls ``register_tools()`` on each.  The separation
-creates a clean seam for future license checks.
+``register_plugins()`` invokes the appropriate registration callables.  The
+separation creates a clean seam for future license checks.
 """
 
 from __future__ import annotations
@@ -51,9 +57,13 @@ def discover_plugins() -> list[LoadedPlugin]:
             logger.warning("Plugin %r failed to import", ep.name, exc_info=True)
             continue
 
-        if not callable(getattr(module, "register_tools", None)):
+        has_tools = callable(getattr(module, "register_tools", None))
+        has_scoring = callable(getattr(module, "register_scoring", None))
+        if not has_tools and not has_scoring:
             logger.warning(
-                "Plugin %r has no register_tools() callable, skipping", ep.name
+                "Plugin %r has neither register_tools nor register_scoring "
+                "callable, skipping",
+                ep.name,
             )
             continue
 
@@ -68,23 +78,50 @@ def discover_plugins() -> list[LoadedPlugin]:
 def register_plugins(
     mcp: Any, plugins: list[LoadedPlugin] | None = None
 ) -> list[LoadedPlugin]:
-    """Discover plugins (if not provided) and register their tools on the MCP server.
+    """Discover plugins (if not provided) and register their tools + scoring.
 
-    Returns the list of successfully registered plugins.
-    Plugins whose register_tools() raises are logged and skipped.
+    For each plugin, invokes whichever of `register_tools(mcp)` and
+    `register_scoring(scoring_module)` the plugin provides. Failures in one
+    callable do not block the other; failures across both result in the plugin
+    being skipped from the registered list.
+
+    Returns the list of plugins where at least one registration callable
+    succeeded.
     """
     if plugins is None:
         plugins = discover_plugins()
 
     registered: list[LoadedPlugin] = []
     for plugin in plugins:
-        try:
-            plugin.module.register_tools(mcp)
+        succeeded_any = False
+
+        if callable(getattr(plugin.module, "register_tools", None)):
+            try:
+                plugin.module.register_tools(mcp)
+                succeeded_any = True
+                logger.debug("Registered tools for plugin: %s", plugin.name)
+            except Exception:
+                logger.warning(
+                    "Plugin %r register_tools() failed",
+                    plugin.name,
+                    exc_info=True,
+                )
+
+        if callable(getattr(plugin.module, "register_scoring", None)):
+            try:
+                from synapt.recall import scoring
+
+                plugin.module.register_scoring(scoring)
+                succeeded_any = True
+                logger.debug("Registered scoring for plugin: %s", plugin.name)
+            except Exception:
+                logger.warning(
+                    "Plugin %r register_scoring() failed",
+                    plugin.name,
+                    exc_info=True,
+                )
+
+        if succeeded_any:
             registered.append(plugin)
-            logger.debug("Registered plugin: %s", plugin.name)
-        except Exception:
-            logger.warning(
-                "Plugin %r register_tools() failed", plugin.name, exc_info=True
-            )
 
     return registered
