@@ -1326,17 +1326,19 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
     """Score a cluster of journal entries via the active scoring strategy.
 
     Per config#332 consolidation-primary locus + config#339 Pattern 4 ratification:
-    consolidation is where vorn-scored synthesis happens. This helper exposes the
-    `ChunkScoringStrategy` seam at the canonical consolidation scoring point.
+    consolidation is the primary site for substrate-reshape scoring. This helper
+    exposes the `ChunkScoringStrategy` seam at the canonical consolidation
+    scoring point.
 
-    OSS default (RecencyScoring): scores by temporal position (older → newer);
-    premium VornScoring (when registered + activated via plugin) substitutes
-    vorn-attention-based scoring without OSS naming the premium strategy.
+    OSS default (RecencyScoring): scores by temporal position (older → newer).
+    Premium plugins may register alternative strategies via the registry seam;
+    OSS does not name premium-side implementations.
 
     Backward-compat: with no plugin activated, returned scores reflect linear
     recency ramp; existing consolidation logic that uses `entry.timestamp`
     ordering produces equivalent ordering. This helper is the integration seam
-    for premium overlay, not a replacement for existing temporal-sort logic.
+    for plugin-registered strategies, not a replacement for existing
+    temporal-sort logic.
 
     Args:
         cluster: journal entries to score (any order).

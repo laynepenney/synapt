@@ -7,8 +7,9 @@ locus:
   `ChunkScoringStrategy` Protocol; OSS Reference vs Premium Implementation rule
   applies (OSS knows Protocol shape + provides default; premium implements
   differentiated strategies without OSS naming them).
-- **Default RecencyScoring in OSS**; premium VornScoring via registry (Q1
-  Pattern 4 strategy-resolver).
+- **Default RecencyScoring in OSS**; alternative strategies provided by
+  premium plugins via the registry (Q1 Pattern 4 strategy-resolver). OSS
+  does not name premium-side strategy implementations.
 - **Plugin-time activation** (Q3 ratified): premium plugin module-level code
   calls `register_scoring_strategy` + `activate_scoring_strategy` at import; no
   per-call override (would re-introduce search-side API surface rejected per
@@ -18,15 +19,14 @@ locus:
 - **window=16 default** per Layne directive 2026-06-07: keep the
   empirically-anchored choice (RC4 calibration smoke baseline). Atlas
   research#7 (2026-06-07) AXIS 3 sweep tested windows 4/8/16/32/64/128 and
-  found NO inflection — identical SEMU selections across all windows on this
-  fixture (vorn-dilution thesis prediction did NOT replicate). config#339
-  originally recommended window=8 on theoretical "conservative-dilution-
-  resilient zone" rationale; with window=8 now empirically equivalent to
-  window=16 on the current fixture, the empirical anchor (window=16) stays
-  the locked default — no differentiated reason to move. Selector-sensitive
-  fixture lane (Atlas surfaced) is the bigger lever for any future
-  window-sensitivity work; until such a fixture surfaces inflection, the
-  anchor holds.
+  found NO inflection — identical selections across all windows on this
+  fixture. config#339 originally recommended window=8 on theoretical
+  "conservative-dilution-resilient zone" rationale; with window=8 now
+  empirically equivalent to window=16 on the current fixture, the
+  empirical anchor (window=16) stays the locked default — no differentiated
+  reason to move. Selector-sensitive fixture lane (Atlas surfaced) is the
+  bigger lever for any future window-sensitivity work; until such a fixture
+  surfaces inflection, the anchor holds.
 
 Move 2 contract redesign: this module IS the redesigned contract for
 config#330's rejected compression-as-search-param-with-strategy-enum frame.
@@ -42,12 +42,11 @@ from typing import Protocol, runtime_checkable
 # Default recent-token window for recency-based scoring.
 # Anchored at the RC4 calibration smoke baseline (window=16). Atlas
 # research#7 (2026-06-07) AXIS 3 sweep tested windows 4/8/16/32/64/128
-# and found no inflection on the calibration fixture (vorn-dilution
-# thesis prediction did not replicate). Window=8 was directly tested
-# and is empirically equivalent to window=16 on this fixture; Layne
-# directive 2026-06-07 keeps window=16 as the locked default because
-# window=8 produced no differentiated reason to move. See module
-# docstring.
+# and found no inflection on the calibration fixture. Window=8 was
+# directly tested and is empirically equivalent to window=16 on this
+# fixture; Layne directive 2026-06-07 keeps window=16 as the locked
+# default because window=8 produced no differentiated reason to move.
+# See module docstring.
 DEFAULT_RECENT_TOKEN_WINDOW = 16
 
 
@@ -61,7 +60,8 @@ class ScoringInput:
 
     `position` is the temporal index within the input list (0 = oldest,
     N-1 = newest). `metadata` is the extension point for strategy-specific
-    context (e.g. vorn-attention requires per-chunk attention weights).
+    context (alternative strategies may require per-chunk metadata such
+    as attention weights or precomputed scores).
     """
 
     content: str
@@ -82,10 +82,11 @@ class ScoredChunk:
 class ChunkScoringStrategy(Protocol):
     """Pluggable scoring strategy for chunks during consolidation + enrichment.
 
-    Implementations:
-    - OSS: `RecencyScoring` (default; temporal-position only)
-    - Premium: `VornScoring` (vorn-attention-based; registered via plugin)
-    - Premium: `AutoScoring` (adaptive selection; gated on AXIS 3 fixture lane)
+    OSS provides `RecencyScoring` as the default (temporal-position only).
+    Premium plugins may register alternative strategies via the registry
+    seam (`register_scoring_strategy` + `activate_scoring_strategy`). OSS
+    does not name premium-side strategy implementations — the Protocol
+    contract is the public seam.
 
     Per Pattern 4 single-active-strategy constraint: only ONE strategy is active
     at any time. Multi-strategy composition (Pattern 3 hooks) is a future
@@ -122,7 +123,8 @@ class RecencyScoring:
 
     This is the substrate-coherent OSS default per the OSS Reference vs Premium
     Implementation rule (2026-05-04): OSS owns the Protocol + a real, usable
-    default; premium provides the differentiated implementation (VornScoring).
+    default; premium plugins provide differentiated implementations via the
+    registry seam without OSS naming them.
     """
 
     name = "recency"

@@ -406,14 +406,13 @@ def score_transcript_windows(windows: list[str]):
     the `ChunkScoringStrategy` seam at the canonical enrichment scoring point.
 
     OSS default (RecencyScoring): scores by position in input order (older →
-    newer); premium VornScoring (when registered + activated via plugin)
-    substitutes vorn-attention-based scoring without OSS naming the premium
-    strategy.
+    newer). Premium plugins may register alternative strategies via the
+    registry seam; OSS does not name premium-side implementations.
 
     Backward-compat: with no plugin activated, returned scores reflect linear
-    recency ramp. This helper is the integration seam for premium overlay,
-    not a replacement for existing window-splitting + multi-window enrichment
-    logic.
+    recency ramp. This helper is the integration seam for plugin-registered
+    strategies, not a replacement for existing window-splitting + multi-window
+    enrichment logic.
 
     Args:
         windows: transcript windows as strings (e.g. output of `_split_windows`),
