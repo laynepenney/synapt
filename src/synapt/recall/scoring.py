@@ -95,7 +95,9 @@ class ChunkScoringStrategy(Protocol):
 
     @property
     def name(self) -> str:
-        """Unique strategy identifier (e.g., 'recency', 'vorn', 'auto')."""
+        """Unique strategy identifier. OSS provides 'recency' as the default;
+        premium plugins may register additional named strategies via the
+        registry seam without OSS naming them here."""
         ...
 
     @property
