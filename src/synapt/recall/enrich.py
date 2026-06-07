@@ -397,6 +397,46 @@ def _merge_enrichment_results(results: list[dict]) -> dict:
     return merged
 
 
+def score_transcript_windows(windows: list[str]):
+    """Score transcript windows via the active scoring strategy.
+
+    Per config#332 consolidation-primary locus + config#339 Pattern 4 ratification:
+    enrichment-time scoring is a cheap precompute layer (scores stored on chunks
+    at ingest) that the consolidation primary site consumes. This helper exposes
+    the `ChunkScoringStrategy` seam at the canonical enrichment scoring point.
+
+    OSS default (RecencyScoring): scores by position in input order (older →
+    newer). Premium plugins may register alternative strategies via the
+    registry seam; OSS does not name premium-side implementations.
+
+    Backward-compat: with no plugin activated, returned scores reflect linear
+    recency ramp. This helper is the integration seam for plugin-registered
+    strategies, not a replacement for existing window-splitting + multi-window
+    enrichment logic.
+
+    Args:
+        windows: transcript windows as strings (e.g. output of `_split_windows`),
+            in temporal order (oldest → newest).
+
+    Returns:
+        List of ScoredChunks in input order.
+    """
+    from synapt.recall.scoring import (
+        ScoringInput,
+        get_active_strategy,
+        score_with_validation,
+    )
+
+    if not windows:
+        return []
+
+    inputs = [
+        ScoringInput(content=w, position=i, metadata={})
+        for i, w in enumerate(windows)
+    ]
+    return score_with_validation(get_active_strategy(), inputs)
+
+
 def enrich_entry(
     entry: JournalEntry,
     project_dir: Path,
