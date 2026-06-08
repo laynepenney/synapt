@@ -117,3 +117,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "synapt.resources" = ["skills/dev-loop/SKILL.md"]
+"synapt.dashboard" = ["template.html"]
