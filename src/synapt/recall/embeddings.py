@@ -24,6 +24,30 @@ import urllib.request
 from typing import List, Optional
 
 
+def _detect_device() -> str:
+    """Pick the safest available torch device for embedding inference.
+
+    Apple Silicon CPU path hits a Accelerate BLAS alignment fault (SIGBUS) on
+    sentence-transformers matmul; prefer MPS when available. Linux and other
+    CPU-only environments fall back to "cpu" cleanly.
+
+    Env override: SYNAPT_EMBED_DEVICE=cpu|mps|cuda
+    """
+    import os
+    override = os.environ.get("SYNAPT_EMBED_DEVICE", "").strip().lower()
+    if override in ("cpu", "mps", "cuda"):
+        return override
+    try:
+        import torch
+        if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 class EmbeddingProvider:
     """Base class for embedding backends."""
 
@@ -50,9 +74,9 @@ class LocalEmbeddings(EmbeddingProvider):
     """
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2",
-                 device: str = "cpu"):
+                 device: str | None = None):
         self._model_name = model_name
-        self._device = device
+        self._device = device if device is not None else _detect_device()
         self._model = None
         self._dim_cached: int | None = None
 
