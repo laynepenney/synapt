@@ -134,7 +134,12 @@ def test_miss_or_unavailable_recall_is_silent_noop() -> None:
 
 def test_timeout_never_blocks_the_original_grep_result() -> None:
     mod = _grep_intercept()
-    config = mod.GrepInterceptConfig(enabled=True, timeout_ms=25)
+    # Small 5ms internal budget, far under the 150ms product ceiling. slow_recall
+    # always exceeds it, so the bounded join always times out to a no-op; the
+    # small budget maximizes headroom for CI scheduling jitter (a 25ms budget ran
+    # 0.153s on a loaded macOS 3.10 runner) so the wall-clock stays comfortably
+    # under the <150ms product assertion the contract requires.
+    config = mod.GrepInterceptConfig(enabled=True, timeout_ms=5)
     tool_result = "src/app.py:10: needle"
 
     def slow_recall(_query: str) -> str:
