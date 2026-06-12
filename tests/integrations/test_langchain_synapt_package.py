@@ -13,6 +13,12 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = REPO_ROOT / "langchain-synapt"
 
 
+def _venv_python(venv_dir: Path) -> Path:
+    if sys.platform == "win32":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
 def _run(cmd: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         cmd,
@@ -53,7 +59,7 @@ def test_langchain_synapt_installs_and_exports_history_class(tmp_path: Path) -> 
 
     venv_dir = tmp_path / "venv"
     venv.create(venv_dir, with_pip=True)
-    python = venv_dir / "bin" / "python"
+    python = _venv_python(venv_dir)
     pip = [str(python), "-m", "pip"]
 
     _run(pip + ["install", "langchain-core>=0.2"])
