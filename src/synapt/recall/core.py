@@ -213,6 +213,14 @@ class TranscriptChunk:
 
 
 @dataclass
+class NearMiss:
+    """A sub-threshold candidate surfaced by recall#837 informative misses."""
+
+    topic: str
+    score: float
+
+
+@dataclass
 class SearchDiagnostics:
     """Diagnostic info collected when a search returns no results."""
 
@@ -224,6 +232,15 @@ class SearchDiagnostics:
     date_filter_active: bool = False
     embeddings_available: bool = True  # False when search ran without embeddings
     reason: str = ""                 # empty_index, empty_query, no_matches
+    # recall#837 informative-miss coverage. Consumed by recall_quick via
+    # _format_informative_miss (which maps empty_index -> empty_corpus and
+    # no_matches -> below_threshold). recall_search keeps using format_message,
+    # so these fields are additive and do not change recall_search behavior.
+    chunks_scanned: int = 0
+    best_score: float | None = None
+    threshold: float = 0.0
+    oldest_session_started_at: str | None = None
+    near_misses: list = field(default_factory=list)
 
     def format_message(self) -> str:
         """Format diagnostic information as a user-facing message."""
@@ -1680,6 +1697,11 @@ class TranscriptIndex:
         freshness = math.exp(-decay_rate * age_days)
         return 1.0 + (1.5 * freshness)
 
+    def _oldest_indexed_date(self) -> str | None:
+        """recall#837: oldest indexed chunk date (YYYY-MM-DD) for miss coverage."""
+        stamps = [c.timestamp for c in self.chunks if c.timestamp]
+        return min(stamps)[:10] if stamps else None
+
     def _apply_threshold_with_diagnostics(
         self,
         candidates: list[tuple[int, float]],
@@ -1705,9 +1727,15 @@ class TranscriptIndex:
                 candidates_found=0,
                 search_mode=search_mode,
                 date_filter_active=date_filter_active,
-                sessions_searched=sessions_searched,
+                sessions_searched=sessions_searched or len(self.sessions),
                 embeddings_available=embeddings_available,
                 reason="no_matches",
+                # recall#837: coverage stats so recall_quick can render a
+                # confident verified-absence instead of an empty result.
+                chunks_scanned=len(self.chunks),
+                best_score=0.0,
+                threshold=threshold_ratio,
+                oldest_session_started_at=self._oldest_indexed_date(),
             )
             return []
 
@@ -1795,7 +1823,12 @@ class TranscriptIndex:
         # (cold-start: recall_save was called but no conversations ingested)
         has_knowledge = self._db and self._db.knowledge_count() > 0
         if not self.chunks and not has_knowledge:
-            self._last_diagnostics = SearchDiagnostics(reason="empty_index")
+            self._last_diagnostics = SearchDiagnostics(
+                reason="empty_index",
+                chunks_scanned=0,
+                best_score=0.0,
+                threshold=threshold_ratio,
+            )
             return ""
 
         # Check query cache — skip if max_tokens=0 (diagnostics-only mode)
@@ -1997,7 +2030,7 @@ class TranscriptIndex:
         if depth == "concise":
             return self._concise_lookup(
                 query, max_chunks, max_tokens, knowledge_results,
-                include_archived,
+                include_archived, threshold_ratio=threshold_ratio,
             )
 
         fts_results = self._db.fts_search(query, limit=max_chunks * 10)
@@ -2257,6 +2290,7 @@ class TranscriptIndex:
         max_tokens: int,
         knowledge_results: list[dict] | None = None,
         include_archived: bool = False,
+        threshold_ratio: float = 0.2,
     ) -> str:
         """Search clusters directly and return only summaries.
 
@@ -2273,6 +2307,21 @@ class TranscriptIndex:
                 query, limit=max_chunks * 3, include_archived=include_archived,
             )
         if not cluster_hits and not knowledge_results:
+            # recall#837: concise mode mirrors the full/summary no_matches path
+            # so recall_quick can render an informative verified-absence instead
+            # of an empty result.
+            self._last_diagnostics = SearchDiagnostics(
+                total_chunks=len(self.chunks),
+                total_sessions=len(self.sessions),
+                candidates_found=0,
+                search_mode="concise",
+                sessions_searched=len(self.sessions),
+                reason="no_matches",
+                chunks_scanned=len(self.chunks),
+                best_score=0.0,
+                threshold=threshold_ratio,
+                oldest_session_started_at=self._oldest_indexed_date(),
+            )
             return ""
 
         wm = self._working_memory
@@ -2372,9 +2421,12 @@ class TranscriptIndex:
         agent_id: str | None = None,
     ) -> str:
         """Global lookup using in-memory BM25 (legacy fallback)."""
-        # BM25 path has no cluster FTS — concise mode requires FTS5
+        # BM25 path has no cluster FTS, so concise mode (cluster summaries) is
+        # unsupported. Fall back to summary depth rather than returning ""
+        # silently, so recall#837 informative misses still fire on a no-match
+        # (the no_matches diagnostics get set via _apply_threshold_with_diagnostics).
         if depth == "concise":
-            return ""
+            depth = "summary"
 
         scores = self._bm25.score(query_tokens)
 

@@ -369,6 +369,69 @@ def recall_search(
         return f"Search failed: {exc}"
 
 
+def _top_near_misses(diag, limit: int = 2) -> list:
+    """recall#837: the highest-scored candidates strictly below threshold, capped.
+
+    recall_quick owns this ordering rather than trusting producer input order:
+    keep scores strictly below threshold, sort by score descending, cap at limit.
+    """
+    near = getattr(diag, "near_misses", None) or []
+    threshold = getattr(diag, "threshold", 0.0)
+    below = [nm for nm in near if nm.score < threshold]
+    below.sort(key=lambda nm: nm.score, reverse=True)
+    return below[:limit]
+
+
+def _format_informative_miss(query: str, diag) -> str:
+    """recall#837: render a recall_quick miss as a confident, coverage-stated
+    negative instead of an empty result, so a verified absence reads as a real
+    answer rather than tool failure. Reason-keyed. The exact strings are the
+    contract (tests/recall/test_quick_informative_misses.py).
+    """
+    reason = getattr(diag, "reason", "")
+    # Map legacy producer reasons (emitted by the real index.lookup path) onto
+    # the recall#837 informative-miss vocabulary used by the recall#843 spec
+    # stubs, so real misses render the same output as the mocked tests.
+    reason = {
+        "empty_index": "empty_corpus",
+        "no_matches": "below_threshold",
+    }.get(reason, reason)
+
+    if reason == "empty_corpus":
+        # Nothing was indexed, so an absence cannot be verified.
+        return (
+            f"No indexed recall corpus available for '{query}' "
+            f"({diag.sessions_searched} sessions, {diag.chunks_scanned} chunks scanned). "
+            f"Verified absence unavailable. The index is empty."
+        )
+
+    if reason == "threshold_boundary":
+        # Best match sits at the threshold: a borderline hit, not an absence.
+        # Defer to the hit path rather than claim a verified absence.
+        return (
+            f"Borderline match for '{query}' at the score threshold. "
+            f"Not a verified absence. Try recall_search for the full result."
+        )
+
+    if reason == "below_threshold":
+        lines = [
+            f"No prior discussion found for '{query}' "
+            f"(searched {diag.sessions_searched} sessions back to "
+            f"{diag.oldest_session_started_at}, {diag.chunks_scanned} chunks scanned, "
+            f"best score {diag.best_score:.2f} below threshold {diag.threshold:.2f})."
+        ]
+        near = _top_near_misses(diag)
+        if near:
+            lines.append("Closest near misses:")
+            for near_miss in near:
+                lines.append(f'- "{near_miss.topic}" at {near_miss.score:.2f}')
+        lines.append("Proceeding fresh is safe.")
+        return "\n".join(lines)
+
+    # Unknown or legacy reason: safe, non-absence fallback.
+    return "No results found."
+
+
 def recall_quick(query: str) -> str:
     """Quick, low-cost memory check. Use this speculatively — when you're
     not sure if past context exists but want to check.
@@ -416,8 +479,8 @@ def recall_quick(query: str) -> str:
         if result:
             return result
         diag = index._last_diagnostics
-        if diag:
-            return diag.format_message()
+        if diag is not None:
+            return _format_informative_miss(query, diag)
         return "No results found."
     except Exception as exc:
         return f"Search failed: {exc}"
