@@ -51,9 +51,12 @@ def test_annotation_format_for_positive_recall_hit() -> None:
         assert query == "memory leak"
         return "\n".join([
             "Past session context:",
-            "Session: alpha",
-            "Session: beta",
-            "Session: gamma",
+            "--- [cluster: memory leak triage] 2026-06-01, 4 chunks (clust-alpha) ---",
+            "Memory leak investigation context.",
+            "--- [knowledge #42] debugging (high, today) ---",
+            "Memory leak root cause was retained callbacks.",
+            "--- [2026-06-02 session beta1234] assistant turn ---",
+            "Patch landed in src/app.py.",
         ])
 
     annotated = mod.annotate_tool_result(
@@ -67,6 +70,41 @@ def test_annotation_format_for_positive_recall_hit() -> None:
         'recall: 3 related conversations (recall_search "memory leak" for detail)\n'
     )
     assert annotated.endswith(tool_result)
+
+
+def test_hit_discriminator_uses_real_recall_quick_block_shape() -> None:
+    mod = _grep_intercept()
+    recall_hit = "\n".join([
+        "Past session context:",
+        "--- [cluster: memory leak triage] 2026-06-01, 4 chunks (clust-alpha) ---",
+        "Cluster summary.",
+        "--- [knowledge #42] debugging (high, today) ---",
+        "Knowledge content.",
+        "--- [2026-06-02 session beta1234] assistant turn ---",
+        "Raw chunk content.",
+    ])
+
+    assert mod.count_related_conversations(recall_hit) == 3
+
+
+def test_hit_discriminator_treats_informative_absences_as_zero() -> None:
+    mod = _grep_intercept()
+
+    assert (
+        mod.count_related_conversations(
+            "No prior discussion found for 'licenses proceeding'. Proceeding fresh is safe."
+        )
+        == 0
+    )
+    assert (
+        mod.count_related_conversations(
+            "No indexed recall corpus available for 'anything' "
+            "(0 sessions, 0 chunks scanned). Verified absence unavailable. "
+            "The index is empty."
+        )
+        == 0
+    )
+    assert mod.count_related_conversations("No results found.") == 0
 
 
 def test_miss_or_unavailable_recall_is_silent_noop() -> None:
@@ -114,6 +152,27 @@ def test_timeout_never_blocks_the_original_grep_result() -> None:
 
     assert annotated == tool_result
     assert elapsed < 0.150
+
+
+def test_pretooluse_context_is_advisory_and_does_not_require_tool_result() -> None:
+    mod = _grep_intercept()
+    config = mod.GrepInterceptConfig(enabled=True, timeout_ms=150)
+
+    def recall_quick(query: str) -> str:
+        assert query == "memory leak"
+        return "\n".join([
+            "Past session context:",
+            "--- [cluster: memory leak triage] 2026-06-01, 4 chunks (clust-alpha) ---",
+            "Memory leak investigation context.",
+        ])
+
+    context = mod.build_pretooluse_context(
+        _bash('rg "memory leak" src'),
+        config=config,
+        recall_quick=recall_quick,
+    )
+
+    assert context == 'recall: 1 related conversations (recall_search "memory leak" for detail)'
 
 
 def test_opt_in_config_disabled_never_calls_recall_quick() -> None:
