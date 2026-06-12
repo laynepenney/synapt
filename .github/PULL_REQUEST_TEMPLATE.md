@@ -15,8 +15,8 @@
 ### Boundary Checklist
 
 - [ ] **Boundary declaration** present above (one-line: what repo, OSS or premium, why)
-- [ ] **Identity test**: does this PR answer "who is this agent?" or "what workspace is this?" If yes, it must go in `synapt-private`.
-- [ ] **Plugin seam**: if this extends OSS for a premium feature, is the extension seam built in OSS first, with the implementation in `synapt-private`?
+- [ ] **Identity test**: does this PR answer "who is this agent?" or "what workspace is this?" If yes, it must go in premium (`synapt-dev/premium`; local worktree `synapt-private/`).
+- [ ] **Plugin seam**: if this extends OSS for a premium feature, is the extension seam built in OSS first, with the implementation in premium (`synapt-dev/premium`; local worktree `synapt-private/`)?
 - [ ] **Boundary-adjacent check**: does this PR do any of the following? If yes to any, it requires premium migration or explicit justification.
   - Parse `workspace.toml`, `agent.toml`, or `repo.toml`
   - Derive agent identity from filesystem layout
