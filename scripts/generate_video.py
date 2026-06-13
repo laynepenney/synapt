@@ -46,19 +46,42 @@ VALID_DURATIONS = ["4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "
 
 
 def get_fal_key() -> str:
-    """Get FAL_KEY from environment or ~/.zshrc."""
-    key = os.environ.get("FAL_KEY")
-    if key:
-        return key
-    zshrc = Path.home() / ".zshrc"
-    if zshrc.exists():
-        for line in zshrc.read_text().splitlines():
-            m = re.match(r"""^(?:export\s+)?FAL_KEY\s*=\s*["']?([^"'\s]+)""", line)
-            if m:
-                os.environ["FAL_KEY"] = m.group(1)
-                return m.group(1)
-    print("Error: FAL_KEY not found in environment or ~/.zshrc")
-    sys.exit(1)
+    """Resolve FAL_KEY.
+
+    Env value handling (printenv stays non-secret):
+      - `$(op read ...)` literal — bash eval expands the command substitution into the secret
+      - direct value — passes through unchanged
+
+    Fallback if env empty: `op read op://<vault>/FAL_KEY/credential` (OP_ACCOUNT, OP_VAULT).
+    """
+    raw = (os.environ.get("FAL_KEY") or "").strip()
+    if raw:
+        result = subprocess.run(
+            ["bash", "-c", 'eval echo "$FAL_KEY"'],
+            env={**os.environ, "FAL_KEY": raw},
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        print(f"Error: FAL_KEY eval failed: {result.stderr.strip() or 'empty result'}", file=sys.stderr)
+        sys.exit(1)
+    cmd = ["op", "read"]
+    if op_account := os.environ.get("OP_ACCOUNT"):
+        cmd.append(f"--account={op_account}")
+    vault = os.environ.get("OP_VAULT", "Private")
+    cmd.append(f"op://{vault}/FAL_KEY/credential")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        print("Error: FAL_KEY not in env and `op` CLI not installed.", file=sys.stderr)
+        sys.exit(1)
+    if result.returncode != 0:
+        print(f"Error: `op read op://{vault}/FAL_KEY/credential` failed: {result.stderr.strip()}", file=sys.stderr)
+        print("Ensure 1Password is unlocked and CLI integration is enabled.", file=sys.stderr)
+        if not os.environ.get("OP_ACCOUNT"):
+            print("For multi-account setups, set OP_ACCOUNT (e.g. export OP_ACCOUNT=mysub.1password.com).", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout.strip()
 
 
 def find_hero_raw(slug: str) -> Path:
