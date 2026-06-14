@@ -69,22 +69,42 @@ FALLBACK_LOGO = Path(__file__).resolve().parent.parent / "assets" / "logo.png"
 
 
 def _get_fal_key() -> str:
-    key = os.environ.get("FAL_KEY", "")
-    if key:
-        return key
-    # Try sourcing from zshrc
-    try:
+    """Resolve FAL_KEY.
+
+    Env value handling (printenv stays non-secret):
+      - `$(op read ...)` literal — bash eval expands the command substitution into the secret
+      - direct value — passes through unchanged
+
+    Fallback if env empty: `op read op://<vault>/FAL_KEY/credential` (OP_ACCOUNT, OP_VAULT).
+    """
+    raw = (os.environ.get("FAL_KEY") or "").strip()
+    if raw:
         result = subprocess.run(
-            ["zsh", "-c", "source ~/.zshrc 2>/dev/null && echo $FAL_KEY"],
-            capture_output=True, text=True, timeout=5,
+            ["bash", "-c", 'eval echo "$FAL_KEY"'],
+            env={**os.environ, "FAL_KEY": raw},
+            capture_output=True, text=True, timeout=10,
         )
-        key = result.stdout.strip()
-    except Exception:
-        pass
-    if not key:
-        print("Error: FAL_KEY not found. Set it in environment or ~/.zshrc")
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+        print(f"Error: FAL_KEY eval failed: {result.stderr.strip() or 'empty result'}", file=sys.stderr)
         sys.exit(1)
-    return key
+    cmd = ["op", "read"]
+    if op_account := os.environ.get("OP_ACCOUNT"):
+        cmd.append(f"--account={op_account}")
+    vault = os.environ.get("OP_VAULT", "Private")
+    cmd.append(f"op://{vault}/FAL_KEY/credential")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        print("Error: FAL_KEY not in env and `op` CLI not installed.", file=sys.stderr)
+        sys.exit(1)
+    if result.returncode != 0:
+        print(f"Error: `op read op://{vault}/FAL_KEY/credential` failed: {result.stderr.strip()}", file=sys.stderr)
+        print("Ensure 1Password is unlocked and CLI integration is enabled.", file=sys.stderr)
+        if not os.environ.get("OP_ACCOUNT"):
+            print("For multi-account setups, set OP_ACCOUNT (e.g. export OP_ACCOUNT=mysub.1password.com).", file=sys.stderr)
+        sys.exit(1)
+    return result.stdout.strip()
 
 
 def _find_logo() -> Path:
