@@ -16,12 +16,15 @@ Hook registration for premium:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import subprocess
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 MAX_BODY_SIZE = 65536  # 64KB default cap
 
@@ -413,6 +416,186 @@ def message_history(
 
 
 # ---------------------------------------------------------------------------
+# tmux delivery (recall#852) -- OSS transport
+#
+# The inbox write is durable but passive: the recipient has to poll it. This
+# layer ALSO delivers the message into the recipient's live tmux pane via
+# load-buffer + paste-buffer + send-keys, the mechanism that actually lands.
+# Boundary: the tmux MECHANICS are OSS transport. The agent->pane map is
+# operator-supplied data read from a neutral env/config seam (SYNAPT_AGENT_PANES),
+# NOT identity topology hardcoded into OSS -- resolving "who is at which pane" is
+# operator config, the same shape as an /etc/hosts routing table.
+# ---------------------------------------------------------------------------
+
+# Pastes at/above this size tend to collapse in the recipient TUI ("paste again
+# to expand"); we send one extra guarded Enter to expand before the submit Enter.
+LARGE_PASTE_THRESHOLD = 1200
+
+# Runtime -> Enter count. Claude needs paste-expand + submit; Codex folds large
+# pastes so it needs an extra fold-expand first.
+_ENTER_COUNT = {"claude": 2, "codex": 3}
+
+_TMUX_BUFFER = "synapt_speak_to_agent"
+
+# A short pause between key sends so the TUI registers each Enter separately
+# rather than coalescing expand and submit into one keystroke.
+_SEND_KEY_PAUSE_SECONDS = 0.15
+
+
+@dataclass(frozen=True)
+class PaneTarget:
+    """Where (and how) to deliver to an agent's live session."""
+
+    target: str
+    runtime: str
+
+
+@dataclass
+class TmuxDelivery:
+    """Result of a best-effort tmux delivery."""
+
+    delivered: bool
+    target: str | None
+    enters: int
+    detail: str
+
+
+def enter_count(runtime: str | None) -> int:
+    """Enter keystrokes needed to submit a paste for this runtime.
+
+    Claude=2 (paste-expand + submit), Codex=3 (fold-expand + paste-expand +
+    submit). Unknown runtimes default to the Claude count.
+    """
+    return _ENTER_COUNT.get((runtime or "").strip().lower(), 2)
+
+
+def load_pane_map() -> dict[str, Any]:
+    """Operator-supplied agent->pane map (neutral routing table, not identity).
+
+    Source order: the ``SYNAPT_AGENT_PANES`` env var as a JSON object, else the
+    JSON file at ``SYNAPT_AGENT_PANES_FILE``. Defaults to an empty map (which
+    makes delivery a no-op so the send falls back to inbox-only). OSS never
+    hardcodes the workspace's agent topology -- that is operator config.
+
+    Format (operator-supplied)::
+
+        {"<agent>": {"target": "<tmux-session>:<window>", "runtime": "claude|codex"}}
+    """
+    raw = os.environ.get("SYNAPT_AGENT_PANES")
+    if raw:
+        try:
+            return json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
+    if path and Path(path).exists():
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {}
+    return {}
+
+
+def _normalize_agent_key(to_agent: str) -> str:
+    # Recipients may arrive bare ("apollo"), org-prefixed ("synapt:apollo"), or
+    # cased; the pane map is keyed by the bare lower-case agent name.
+    key = to_agent.strip().lower()
+    if ":" in key:
+        key = key.split(":", 1)[1]
+    return key
+
+
+def resolve_pane(to_agent: str, pane_map: dict[str, Any]) -> PaneTarget | None:
+    """Resolve a recipient to its PaneTarget via the operator map, or None."""
+    if not to_agent or not pane_map:
+        return None
+    entry = pane_map.get(to_agent) or pane_map.get(_normalize_agent_key(to_agent))
+    if not isinstance(entry, dict) or not entry.get("target"):
+        return None
+    return PaneTarget(target=str(entry["target"]), runtime=str(entry.get("runtime", "claude")))
+
+
+def build_tmux_commands(
+    target: str,
+    runtime: str | None,
+    body: str,
+    *,
+    buffer_name: str = _TMUX_BUFFER,
+    large_threshold: int = LARGE_PASTE_THRESHOLD,
+) -> tuple[list[list[str]], int]:
+    """Build the tmux command sequence + the Enter count it will send.
+
+    load-buffer (body via stdin, never shell-escaped) -> paste-buffer into the
+    target pane (-d deletes the buffer after) -> N send-keys Enter, where N is the
+    runtime Enter count plus one guarded Enter when the paste is collapse-large.
+    """
+    enters = enter_count(runtime)
+    if len(body) >= large_threshold:
+        enters += 1
+    cmds: list[list[str]] = [
+        ["tmux", "load-buffer", "-b", buffer_name, "-"],
+        ["tmux", "paste-buffer", "-t", target, "-b", buffer_name, "-d"],
+    ]
+    cmds += [["tmux", "send-keys", "-t", target, "Enter"] for _ in range(enters)]
+    return cmds, enters
+
+
+def _run_tmux(cmd: list[str], *, input: str | None = None) -> Any:
+    """Default tmux runner (injectable for tests)."""
+    return subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=10)
+
+
+def deliver_via_tmux(
+    target: str,
+    runtime: str | None,
+    body: str,
+    *,
+    run: Callable[..., Any] | None = None,
+    sleep: Callable[[float], Any] | None = None,
+    buffer_name: str = _TMUX_BUFFER,
+    large_threshold: int = LARGE_PASTE_THRESHOLD,
+) -> TmuxDelivery:
+    """Best-effort delivery into a live tmux pane. Never raises.
+
+    On any failure (missing pane, no tmux binary, error) ``delivered`` is False
+    and ``detail`` carries the reason, so the caller can fall back to the durable
+    inbox without an exception escaping. ``run``/``sleep`` resolve to the module
+    defaults at call time (not bound as parameter defaults) so tests can
+    monkeypatch ``_run_tmux``.
+    """
+    run = run or _run_tmux
+    sleep = sleep or time.sleep
+    cmds, enters = build_tmux_commands(target, runtime, body, buffer_name=buffer_name, large_threshold=large_threshold)
+    try:
+        for cmd in cmds:
+            is_load = cmd[:2] == ["tmux", "load-buffer"]
+            is_send = cmd[:2] == ["tmux", "send-keys"]
+            if is_send:
+                # Pause before each Enter: the first lets the paste register
+                # before expand; later ones keep expand and submit distinct.
+                sleep(_SEND_KEY_PAUSE_SECONDS)
+            result = run(cmd, input=body if is_load else None)
+            returncode = getattr(result, "returncode", 0)
+            if returncode != 0:
+                detail = getattr(result, "stderr", "") or f"tmux exited {returncode}"
+                return TmuxDelivery(delivered=False, target=target, enters=enters, detail=f"{cmd[1]} failed for {target}: {detail}".strip())
+    except FileNotFoundError:
+        return TmuxDelivery(delivered=False, target=target, enters=enters, detail="tmux not available")
+    except Exception as exc:  # never let delivery break the send
+        return TmuxDelivery(delivered=False, target=target, enters=enters, detail=f"tmux delivery error: {exc}")
+    return TmuxDelivery(delivered=True, target=target, enters=enters, detail=f"pasted to {target} ({enters} Enter(s))")
+
+
+def _attempt_tmux_delivery(to_agent: str, body: str) -> TmuxDelivery | None:
+    """Resolve the recipient's pane from the operator map and deliver, or None
+    when no pane is configured (caller then reports inbox-only)."""
+    pane = resolve_pane(to_agent, load_pane_map())
+    if pane is None:
+        return None
+    return deliver_via_tmux(pane.target, pane.runtime, body)
+
+
+# ---------------------------------------------------------------------------
 # MCP tool function
 # ---------------------------------------------------------------------------
 
@@ -465,10 +648,17 @@ def speak_to_agent(
                 reply_to=reply_to,
                 priority=priority,
             )
-            return (
-                f"Sent to {to}: {msg.message_id}\n"
-                f"Status: delivered (written to {to}'s inbox)"
-            )
+            # The inbox write above is the durable record. Now also push the
+            # message into the recipient's live tmux pane so it actually lands
+            # (recall#852) -- best-effort, never breaks the send.
+            delivery = _attempt_tmux_delivery(to, message)
+            if delivery is None:
+                status = f"Status: written to {to}'s inbox (no tmux pane configured; inbox-only)"
+            elif delivery.delivered:
+                status = f"Status: written to {to}'s inbox AND delivered to live pane {delivery.target} via tmux"
+            else:
+                status = f"Status: written to {to}'s inbox; tmux delivery did not land ({delivery.detail})"
+            return f"Sent to {to}: {msg.message_id}\n{status}"
 
         elif action == "read":
             messages = read_inbox(agent_id=agent_id, limit=limit)
