@@ -12,3 +12,6 @@ build/
 .synapt/
 .claude/
 history.db*
+
+# Generated docs/blog HTML is built from markdown.
+docs/blog/*.html
