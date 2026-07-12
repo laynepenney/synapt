@@ -1498,7 +1498,7 @@ def _build_extraction_packet(
     model: str,
     *,
     adapter_path: str = "",
-    max_tokens: int = MIN_RESPONSE_TOKENS,
+    max_tokens: int | None = None,
 ) -> dict | None:
     """Run extract Stage 1 (via *client*, synchronously) → finalize →
     validate.
@@ -1509,15 +1509,35 @@ def _build_extraction_packet(
     MLX/router client for inference, and finalize_extraction() directly,
     all synchronously.
 
+    max_tokens defaults to None, which scales the response budget to the
+    built extraction prompt via _estimate_response_budget() — the same
+    dynamic sizing the legacy path uses (CONTEXT_BUDGET=8000, floor
+    MIN_RESPONSE_TOKENS). A flat low budget silently truncates dense
+    clusters mid-JSON, which fails parsing/validation and skips the
+    cluster exactly where extraction has the most to offer (Opus review,
+    m_13ae8e8a, blocker 2). Pass an explicit value to override.
+
     Returns the finalized, validated SynaptExtraction packet (dict), or
     None if the LLM response is unparseable or fails schema validation
     (fail-closed — mirrors _process_cluster's unparseable-response handling
     on the legacy path; no fallback to the legacy path mid-flag-on).
+
+    Returning None here propagates to _process_cluster returning False,
+    which triggers consolidate()'s existing retry-by-halving on the
+    cluster — the same behavior the legacy path has always had on any
+    inference/parse failure (deterministic or not). Splitting the cluster
+    also halves its prompt, so it can still help on residual budget
+    pressure at the floor; it won't help on genuine model schema
+    noncompliance, but that's an existing, shared cost, not a new one
+    introduced by the extract path (Opus review, m_13ae8e8a, medium 4).
     """
     built = create_extraction_builder(
         text=text,
         capabilities=list(EXTRACTION_CAPABILITIES),
     ).build()
+    response_budget = (
+        max_tokens if max_tokens is not None else _estimate_response_budget(built["prompt"])
+    )
 
     try:
         response = client.chat(
@@ -1525,7 +1545,7 @@ def _build_extraction_packet(
             messages=[Message(role="user", content=built["prompt"])],
             temperature=0.1,
             adapter_path=adapter_path or None,
-            max_tokens=max_tokens,
+            max_tokens=response_budget,
         )
     except Exception as exc:
         logger.warning("Extraction Stage-1 inference failed: %s", exc)
@@ -1723,6 +1743,16 @@ def consolidate(
                 client = MLXClient(MLXOptions(max_tokens=MIN_RESPONSE_TOKENS))
 
         if use_extract:
+            # recall#865 medium 3 (Opus review m_13ae8e8a): crash/re-run
+            # idempotency, matching legacy's response_cache pattern -- a
+            # distinct ":extract" key namespace keeps this from colliding
+            # with the legacy path's cache entries for the same cluster
+            # (see the "not use_extract" guard above).
+            extract_cache_key = f"{cache_key}:extract"
+            if extract_cache_key in response_cache:
+                logger.debug("Extract cache hit for cluster %s — skipping", extract_cache_key)
+                return True
+
             cluster_text = _format_journal_cluster(cluster)
             packet = _build_extraction_packet(
                 cluster_text, client, model, adapter_path=adapter_path,
@@ -1735,6 +1765,15 @@ def consolidate(
                 append_node(node, kn_path)
                 existing_nodes.append(node)
             result.nodes_created += len(new_nodes)
+
+            # Side effects (append_node) are on disk once this line runs --
+            # a subsequent run must not redo them.  Cache the finalized
+            # packet (more useful for debugging than a placeholder) rather
+            # than the raw Stage-1 text, since that's what actually got
+            # applied.
+            packet_json = json.dumps(packet)
+            _save_cached_response(cache_path, extract_cache_key, packet_json, cluster_text)
+            response_cache[extract_cache_key] = {"response": packet_json, "prompt": cluster_text}
             return True
 
         prompt = _build_consolidation_prompt(

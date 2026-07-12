@@ -13,6 +13,7 @@ from synapt.recall.consolidate import (
     CONTEXT_BUDGET,
     CONSOLIDATION_PROMPT_MINIMAL,
     ConsolidationResult,
+    EXTRACTION_CAPABILITIES,
     MIN_RESPONSE_TOKENS,
     _DEFAULT_GOOD_EXAMPLES,
     _apply_consolidation_result,
@@ -41,6 +42,7 @@ from synapt.recall.consolidate import (
     _split_large_cluster,
     _temporal_window_clusters,
     cluster_journal_entries,
+    consolidate,
 )
 
 
@@ -1890,14 +1892,18 @@ def test_resolve_source_offsets_omits_f_when_empty(tmp_path, monkeypatch):
 
 
 class TestSynaptExtractDependencyImports(unittest.TestCase):
-    """The new dependency must import cleanly (spec acceptance criterion)."""
+    """The new dependency must import cleanly (spec acceptance criterion).
+
+    Imports exactly what consolidate.py imports -- validate_extraction is
+    called internally by finalize_extraction, not directly by the impl, so
+    it's deliberately left out here (Opus review m_13ae8e8a, nit)."""
 
     def test_synapt_extract_imports_cleanly(self):
         import synapt_extract  # noqa: F401
         from synapt_extract import (  # noqa: F401
             create_extraction_builder,
             finalize_extraction,
-            validate_extraction,
+            FinalizeContext,
         )
 
 
@@ -2158,6 +2164,150 @@ class TestBuildExtractionPacket(unittest.TestCase):
         self.assertEqual(packet["entities"], [])
         self.assertEqual(packet["goals"], [])
         self.assertEqual(packet["themes"], [])
+
+    def test_default_budget_scales_with_prompt_not_flat(self):
+        # Opus review (m_13ae8e8a, blocker 2): a flat low budget silently
+        # truncates dense clusters mid-JSON. Default (no max_tokens passed)
+        # must scale like legacy's _estimate_response_budget(), not sit at
+        # a fixed MIN_RESPONSE_TOKENS regardless of prompt size.
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        sent_prompt = client.calls[0]["prompt"]
+        self.assertEqual(client.calls[0]["max_tokens"], _estimate_response_budget(sent_prompt))
+
+    def test_default_budget_shrinks_for_longer_prompt(self):
+        # Same shape as TestEstimateResponseBudget -- proves the extraction
+        # call site actually varies the budget with input size, not just
+        # matching _estimate_response_budget's return value coincidentally
+        # at one fixed input length.
+        short_client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        _build_extraction_packet("short cluster text", short_client, model="mlx-community/test-model")
+
+        long_client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        _build_extraction_packet("dense cluster text " * 200, long_client, model="mlx-community/test-model")
+
+        self.assertLess(long_client.calls[0]["max_tokens"], short_client.calls[0]["max_tokens"])
+
+    def test_explicit_max_tokens_still_overrides_default(self):
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        _build_extraction_packet(
+            "dense cluster text " * 200, client, model="mlx-community/test-model",
+            max_tokens=42,
+        )
+        self.assertEqual(client.calls[0]["max_tokens"], 42)
+
+    def test_requests_exactly_the_pinned_capabilities(self):
+        # Nit (Opus review m_13ae8e8a): pin what's actually requested from
+        # extract so capability creep (accidentally widening the Stage-1
+        # prompt surface for the fragile 3B model) shows up as a failing
+        # test, not a silent diff.
+        self.assertEqual(list(EXTRACTION_CAPABILITIES), ["facts", "decisions", "temporal_refs"])
+
+    def test_client_exception_returns_none(self):
+        class _RaisingClient:
+            def chat(self, *args, **kwargs):
+                raise RuntimeError("inference backend unavailable")
+
+        packet = _build_extraction_packet("some cluster text", _RaisingClient(), model="mlx-community/test-model")
+        self.assertIsNone(packet)
+
+
+class TestKnowledgeNodesFromExtractionGuards(unittest.TestCase):
+    """Per-item guards (Opus review m_13ae8e8a, nit): malformed items within
+    facts/decisions must be skipped, not crash the whole packet mapping."""
+
+    def test_non_dict_fact_item_skipped(self):
+        packet = {
+            "facts": [None, "not a dict", {"text": "a real fact"}],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].content, "a real fact")
+
+    def test_non_dict_decision_item_skipped(self):
+        packet = {
+            "facts": [],
+            "decisions": [None, 42, {"text": "a real decision"}],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0].content, "a real decision")
+
+    def test_fact_with_empty_text_skipped(self):
+        packet = {
+            "facts": [{"text": ""}, {"text": "a real fact"}],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 1)
+
+    def test_decision_with_missing_text_skipped(self):
+        packet = {
+            "facts": [],
+            "decisions": [{"category": "architecture"}, {"text": "a real decision"}],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 1)
+
+
+class TestConsolidateLegacyPathUnchangedWhenFlagOff(unittest.TestCase):
+    """Opus review (m_13ae8e8a, medium 5): "legacy byte-identical when flag
+    off" was a named acceptance bullet with zero executed test -- nothing
+    called consolidate()/_process_cluster anywhere in the suite. This drives
+    the real consolidate() entrypoint and proves the extract-path function
+    is never invoked when SYNAPT_USE_EXTRACT is unset."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.project_dir = Path(self.tmpdir)
+        journal_dir = self.project_dir / ".synapt" / "recall"
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {
+                "timestamp": "2026-07-12T09:00:00", "session_id": "guard-s1",
+                "focus": "Legacy-path guard test session one",
+                "done": ["Did something specific in src/synapt/recall/consolidate.py"],
+                "decisions": [], "next_steps": [], "files_modified": ["src/synapt/recall/consolidate.py"],
+                "enriched": True,
+            },
+            {
+                "timestamp": "2026-07-12T09:30:00", "session_id": "guard-s2",
+                "focus": "Legacy-path guard test session two",
+                "done": ["Did something else specific in src/synapt/recall/consolidate.py"],
+                "decisions": [], "next_steps": [], "files_modified": ["src/synapt/recall/consolidate.py"],
+                "enriched": True,
+            },
+        ]
+        with open(journal_dir / "journal.jsonl", "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def test_flag_off_never_calls_build_extraction_packet(self):
+        with patch("synapt.recall.consolidate._build_extraction_packet") as mock_extract, \
+             patch("synapt.recall._model_router.get_client", return_value=_FakeExtractionClient(
+                 json.dumps({"nodes": []})
+             )), \
+             patch.dict("os.environ", {"SYNAPT_USE_EXTRACT": ""}):
+            consolidate(project_dir=self.project_dir, model="fake-model", min_entries=2)
+        mock_extract.assert_not_called()
+
+    def test_flag_unset_never_calls_build_extraction_packet(self):
+        # Same as above but SYNAPT_USE_EXTRACT absent entirely, not just
+        # empty-string -- both must resolve to "off" per _env_flag.
+        import os
+        env_without_flag = {k: v for k, v in os.environ.items() if k != "SYNAPT_USE_EXTRACT"}
+        with patch("synapt.recall.consolidate._build_extraction_packet") as mock_extract, \
+             patch("synapt.recall._model_router.get_client", return_value=_FakeExtractionClient(
+                 json.dumps({"nodes": []})
+             )), \
+             patch.dict("os.environ", env_without_flag, clear=True):
+            consolidate(project_dir=self.project_dir, model="fake-model", min_entries=2)
+        mock_extract.assert_not_called()
 
 
 if __name__ == "__main__":
