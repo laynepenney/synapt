@@ -2727,6 +2727,15 @@ class TestExtractionSynthesisPrompt(unittest.TestCase):
         self.assertIn("exit code", p)
         self.assertTrue("already happened" in p or "transient event" in p)
 
+    def test_prompt_constant_forbids_confabulation_from_thin_input(self):
+        # Node-read finding (2026-07-12): on contentless clusters (repeated
+        # /clear markers) the 3B invented a fictional command semantics — 7
+        # confabulated nodes the counter reported as clean. The prompt must
+        # steer to EMPTY on thin input and forbid inventing behavior.
+        p = EXTRACTION_SYNTHESIS_PROMPT.lower()
+        self.assertTrue("invent" in p)
+        self.assertTrue("command marker" in p or "session boundar" in p or "thin input" in p)
+
     def test_build_synthesis_prompt_embeds_source_text(self):
         prompt = _build_extraction_prompt_synthesis("the loom weaves context here")
         self.assertIn("the loom weaves context here", prompt)

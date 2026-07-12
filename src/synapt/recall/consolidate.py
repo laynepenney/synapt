@@ -1442,8 +1442,15 @@ Output ONLY valid JSON (no markdown fences, no prose) with this exact shape:
   "decisions": [{{"text": "an explicit choice made between alternatives"}}],
   "temporal_refs": [{{"raw": "<phrase>", "resolved": "<ISO date or null>"}}]}}
 
+## Do NOT invent knowledge from thin input
+If the sessions contain only command markers, session boundaries, repeated
+control commands (like /clear, /exit), or no substantive content, output
+EMPTY. Do not invent behavior, semantics, or rules for a command or marker
+you merely saw executed — you do not know what it does. Extract only what the
+sessions actually state.
+
 If nothing durable emerges, output {{"extracted_at": "<ISO timestamp>", "facts": [], "decisions": [], "temporal_refs": []}}.
-Empty is better than noise.
+Empty is better than noise, and far better than invented.
 """
 
 
