@@ -14,11 +14,13 @@ from synapt.recall.consolidate import (
     CONSOLIDATION_PROMPT_MINIMAL,
     ConsolidationResult,
     EXTRACTION_CAPABILITIES,
+    EXTRACTION_SYNTHESIS_PROMPT,
     MIN_RESPONSE_TOKENS,
     _DEFAULT_GOOD_EXAMPLES,
     _apply_consolidation_result,
     _build_consolidation_prompt,
     _build_extraction_packet,
+    _build_extraction_prompt_synthesis,
     _build_few_shot_examples,
     _cluster_cache_key,
     _dedup_decisions_path,
@@ -31,9 +33,11 @@ from synapt.recall.consolidate import (
     _get_project_context,
     _is_garbled_content,
     _is_generic_node,
+    _is_metadata_noise,
     _knowledge_nodes_from_extraction,
     _lacks_specificity,
     _load_response_cache,
+    _sanitize_stage1_output,
     _save_cached_response,
     _jaccard,
     _log_dedup_decision,
@@ -2416,6 +2420,241 @@ class TestConsolidateFlagOnMalformedMlxOutputDoesNotCrash(unittest.TestCase):
             "facts": [], "decisions": [], "temporal_refs": ["tomorrow"],
         }))
         self.assertEqual(result.nodes_created, 0)
+
+
+# ---------------------------------------------------------------------------
+# recall#869 + #868 — port legacy's quality craft onto the extract path.
+#
+# Dispatch (Layne via Opus, 2026-07-12): local 3B is the moat; legacy already
+# gets 43 good nodes from the SAME model, so the gap is dropped scaffolding
+# (tuned prompt + garbage heuristics), not model weights. Schema-valid !=
+# quality. Three levers, each re-measured against legacy on the isolated
+# proof harness:
+#   Lever 1 (#869): strip invented entity_refs pre-finalize -> kill the 61%
+#                   fail-closed rate (12/14 were entity_refs-undeclared).
+#   Lever 2       : synthesis-tuned Stage-1 prompt porting legacy's guidance
+#                   + explicit forbid-list + few-shot.
+#   Lever 3       : quality post-filter (metadata-noise + legacy garbage
+#                   heuristics) + intra-batch dedup before node creation.
+# These tests are the committed quality bar (synthetic fixtures, CI); the
+# isolated harness proves the outcome on real data + real 3B.
+# ---------------------------------------------------------------------------
+
+
+class TestSanitizeStage1Output(unittest.TestCase):
+    """Lever 1 (recall#869): the local 3B keeps emitting entity_refs on
+    decisions (an optional extract field) with invented entity IDs; since we
+    don't request the `entities` capability there's nothing to reference, so
+    extract's referential-integrity validator rejects the whole packet. In
+    the dogfood proof this was 12/14 fail-closes. Strip these invented
+    cross-references before finalize so they can never fail-close."""
+
+    def test_strips_entity_refs_from_decisions(self):
+        parsed = {"decisions": [{"text": "a decision", "entity_refs": ["Fitbit Inspire HR"]}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertNotIn("entity_refs", out["decisions"][0])
+        self.assertEqual(out["decisions"][0]["text"], "a decision")
+
+    def test_strips_entity_refs_from_facts_defensively(self):
+        parsed = {"facts": [{"text": "a fact", "entity_refs": ["Foo"]}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertNotIn("entity_refs", out["facts"][0])
+
+    def test_strips_entity_refs_from_actions_and_goals(self):
+        parsed = {
+            "actions": [{"text": "an action", "entity_refs": ["Bar"]}],
+            "goals": [{"text": "a goal", "entity_refs": ["Baz"]}],
+        }
+        out = _sanitize_stage1_output(parsed)
+        self.assertNotIn("entity_refs", out["actions"][0])
+        self.assertNotIn("entity_refs", out["goals"][0])
+
+    def test_leaves_non_dict_members_untouched(self):
+        # sanitize runs before finalize's own guard; must not crash on the
+        # malformed-member shapes Sentinel found (facts:[null] etc.).
+        parsed = {"facts": [None, 42], "decisions": [{"text": "ok"}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertEqual(out["facts"], [None, 42])
+        self.assertEqual(out["decisions"][0]["text"], "ok")
+
+    def test_preserves_legitimate_fields(self):
+        parsed = {"decisions": [{"text": "d", "decided_at": "2026-07-12"}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertEqual(out["decisions"][0]["decided_at"], "2026-07-12")
+
+
+class TestEntityRefsNoLongerFailClose(unittest.TestCase):
+    """Lever 1 end-to-end: a Stage-1 response with entity_refs (the exact
+    dominant dogfood failure shape) must now produce a VALID packet, not
+    fail-close to None."""
+
+    def test_decision_with_entity_refs_produces_valid_packet(self):
+        stage1 = json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [{"text": "recall now consumes synapt-extract in consolidation", "category": "architecture"}],
+            "decisions": [{"text": "Move 1 targets the consolidation slot", "entity_refs": ["synapt-extract", "consolidate.py"]}],
+            "temporal_refs": [],
+        })
+        client = _FakeExtractionClient(stage1)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNotNone(packet, "entity_refs should be stripped, not fail-close")
+        self.assertEqual(len(packet["decisions"]), 1)
+        self.assertNotIn("entity_refs", packet["decisions"][0])
+
+
+class TestIsMetadataNoise(unittest.TestCase):
+    """Lever 3: the NEW junk class the extract path produces that legacy's
+    prompt suppresses -- session-ID/date metadata and one-off command echoes
+    dressed up as durable 'facts'. Legacy's _lacks_specificity actually treats
+    a bare date as a specificity *signal*, so 'Session X, 2026-05-14' slips
+    through it -- this filter targets the metadata shape specifically. Real
+    dogfood-produced examples used as fixtures."""
+
+    def test_rejects_session_id_date_tuple(self):
+        self.assertTrue(_is_metadata_noise("Session 019e2439, 2026-05-14"))
+
+    def test_rejects_session_occurred_on_date(self):
+        self.assertTrue(_is_metadata_noise(
+            "Session e43f3562 occurred on 2026-03-02 with focus on clearing a command"))
+
+    def test_rejects_session_from_date(self):
+        self.assertTrue(_is_metadata_noise("Session c522bdfd from 2026-02-18 focused on recapping Claude Code v2.1.44"))
+
+    def test_rejects_execute_command_log(self):
+        self.assertTrue(_is_metadata_noise("Execute `/clear` command on 2026-03-02"))
+        self.assertTrue(_is_metadata_noise("Execute `/exit` command on 2026-02-17"))
+
+    def test_rejects_raw_focus_command_echo(self):
+        self.assertTrue(_is_metadata_noise(
+            "Focus: Run this exact shell command and report its exit code: rm -rf /tmp/test-q4-noop-12345"))
+
+    def test_rejects_bare_session_marker(self):
+        self.assertTrue(_is_metadata_noise("Session 019e2439, 2026-05-14"))
+        self.assertTrue(_is_metadata_noise("Session 019e243b, 2026-05-14"))
+
+    def test_keeps_real_durable_fact_with_a_date(self):
+        # A genuine fact that merely MENTIONS a date must NOT be flagged --
+        # the filter targets the metadata SHAPE, not the presence of a date.
+        self.assertFalse(_is_metadata_noise(
+            "recall now consumes synapt-extract for consolidation as of 2026-07-12"))
+
+    def test_keeps_synthesized_fact(self):
+        self.assertFalse(_is_metadata_noise(
+            "The individual live-verified the deck against PyPI, catching PyPI showing synapt 0.15.1 not 0.15.3"))
+
+    def test_keeps_preference_fact(self):
+        self.assertFalse(_is_metadata_noise("Layne prefers semicolons over em dashes"))
+
+
+class TestExtractionSynthesisPrompt(unittest.TestCase):
+    """Lever 2: the tuned Stage-1 prompt that ports legacy's synthesis
+    guidance and explicitly forbids the junk classes. Tests the prompt
+    CONTRACT (contains the guidance) -- the real behavioural proof is the
+    isolated harness on the 3B."""
+
+    def test_prompt_constant_forbids_metadata_as_facts(self):
+        p = EXTRACTION_SYNTHESIS_PROMPT.lower()
+        # must explicitly steer away from session-id / date metadata facts
+        self.assertTrue("session" in p and ("id" in p or "metadata" in p))
+
+    def test_prompt_constant_asks_for_durable_synthesis(self):
+        p = EXTRACTION_SYNTHESIS_PROMPT.lower()
+        self.assertTrue("durable" in p or "synthesi" in p)
+
+    def test_prompt_constant_forbids_transient_and_oneoff(self):
+        p = EXTRACTION_SYNTHESIS_PROMPT.lower()
+        self.assertTrue("command" in p or "one-off" in p or "transient" in p or "intention" in p)
+
+    def test_build_synthesis_prompt_embeds_source_text(self):
+        prompt = _build_extraction_prompt_synthesis("the loom weaves context here")
+        self.assertIn("the loom weaves context here", prompt)
+
+    def test_build_synthesis_prompt_specifies_json_shape(self):
+        # must instruct the exact extract Stage-1 shape (facts/decisions arrays)
+        prompt = _build_extraction_prompt_synthesis("x")
+        self.assertIn("facts", prompt)
+        self.assertIn("decisions", prompt)
+
+    def test_build_extraction_packet_uses_synthesis_prompt(self):
+        client = _FakeExtractionClient(json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z", "facts": [], "decisions": [], "temporal_refs": [],
+        }))
+        _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        sent = client.calls[0]["prompt"]
+        # the synthesis guidance (not extract's generic preamble) is what reaches the model
+        self.assertIn("durable", sent.lower())
+
+
+class TestExtractQualityFilterInMapping(unittest.TestCase):
+    """Lever 3: quality filtering composes with structural validation --
+    _knowledge_nodes_from_extraction drops metadata-noise + generic/garbled
+    content BEFORE creating nodes, and dedups near-duplicates intra-batch
+    (the dogfood run had 8 near-dupes surviving to the post-pass vs legacy's
+    1)."""
+
+    def test_metadata_noise_facts_are_dropped(self):
+        packet = {
+            "facts": [
+                {"text": "Session 019e2439, 2026-05-14"},
+                {"text": "Session e43f3562 occurred on 2026-03-02 with focus on clearing a command"},
+                {"text": "recall now consumes synapt-extract for consolidation"},
+            ],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        contents = [n.content for n in nodes]
+        self.assertEqual(len(nodes), 1)
+        self.assertIn("recall now consumes synapt-extract for consolidation", contents)
+
+    def test_generic_advice_facts_are_dropped(self):
+        packet = {
+            "facts": [
+                {"text": "Always use Docker for containerization"},
+                {"text": "recall#865 wired synapt-extract into src/synapt/recall/consolidate.py"},
+            ],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 1)
+        self.assertTrue(nodes[0].content.startswith("recall#865"))
+
+    def test_near_duplicate_facts_deduped_intra_batch(self):
+        packet = {
+            "facts": [
+                {"text": "Focus: Run this exact shell command and report its exit code on flags.py in /src"},
+                {"text": "Focus: Run this exact shell command and report its exit code on flags.py in /src"},
+                {"text": "A distinct durable fact about the /src/flags.py release toggle mechanism"},
+            ],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        # exact-duplicate fact collapses to one; the distinct fact stays
+        self.assertLessEqual(len(nodes), 2)
+        self.assertEqual(len(set(n.content for n in nodes)), len(nodes))
+
+    def test_all_noise_produces_no_nodes(self):
+        packet = {
+            "facts": [
+                {"text": "Session 019e2439, 2026-05-14"},
+                {"text": "Execute `/clear` command on 2026-03-02"},
+            ],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(nodes, [])
+
+    def test_good_facts_and_decisions_survive(self):
+        packet = {
+            "facts": [{"text": "recall consolidation now runs on synapt-extract behind a flag in consolidate.py"}],
+            "decisions": [{"text": "Ported legacy's garbage-detection heuristics onto the extract path in /src"}],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 2)
 
 
 if __name__ == "__main__":
