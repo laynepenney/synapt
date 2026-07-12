@@ -29,6 +29,7 @@ dependencies = [
     "mlx-lm>=0.10; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "anthropic>=0.70",
     "openai-agents>=0.10",
+    "synapt-extract>=0.5.0",
 ]
 authors = [
     {name = "Layne Penney"},

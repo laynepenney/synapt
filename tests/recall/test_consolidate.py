@@ -1,12 +1,14 @@
 """Tests for memory consolidation — clustering, prompt building, and action application."""
 
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from synapt.recall.journal import JournalEntry
-from synapt.recall.knowledge import KnowledgeNode, append_node, read_nodes
+from synapt.recall.knowledge import KnowledgeNode, append_node, read_nodes, compute_confidence
 from synapt.recall.consolidate import (
     CONTEXT_BUDGET,
     CONSOLIDATION_PROMPT_MINIMAL,
@@ -15,21 +17,26 @@ from synapt.recall.consolidate import (
     _DEFAULT_GOOD_EXAMPLES,
     _apply_consolidation_result,
     _build_consolidation_prompt,
+    _build_extraction_packet,
     _build_few_shot_examples,
     _cluster_cache_key,
     _dedup_decisions_path,
+    _earliest_temporal_ref_date,
     _estimate_response_budget,
     _extract_keywords,
+    _extract_source_id,
     _format_existing_knowledge,
     _format_journal_cluster,
     _get_project_context,
     _is_garbled_content,
     _is_generic_node,
+    _knowledge_nodes_from_extraction,
     _lacks_specificity,
     _load_response_cache,
     _save_cached_response,
     _jaccard,
     _log_dedup_decision,
+    _map_extraction_category,
     _parse_llm_response,
     _split_large_cluster,
     _temporal_window_clusters,
@@ -1871,6 +1878,286 @@ def test_resolve_source_offsets_omits_f_when_empty(tmp_path, monkeypatch):
     nodes = list(read_nodes(kn_path))
     offset = nodes[0].source_offsets[0]
     assert "f" not in offset, "Empty transcript_path should not be stored"
+
+
+# ---------------------------------------------------------------------------
+# recall#865 — wire extract into recall (consolidation slot, SYNAPT_USE_EXTRACT)
+#
+# Spec: config/design/move-1-extract-into-recall-2026-07-12.md
+# Contract-read: #dev, 2026-07-12 (field mapping, MLX-as-Stage-1 design,
+# hash-anchoring via source_id).
+# ---------------------------------------------------------------------------
+
+
+class TestSynaptExtractDependencyImports(unittest.TestCase):
+    """The new dependency must import cleanly (spec acceptance criterion)."""
+
+    def test_synapt_extract_imports_cleanly(self):
+        import synapt_extract  # noqa: F401
+        from synapt_extract import (  # noqa: F401
+            create_extraction_builder,
+            finalize_extraction,
+            validate_extraction,
+        )
+
+
+class TestExtractSourceId(unittest.TestCase):
+    """_extract_source_id: content-derived hash so the packet is addressable
+    (the "hash-anchored" acceptance criterion — not automatic from extract
+    itself, per the contract-read)."""
+
+    def test_deterministic_for_same_content(self):
+        self.assertEqual(_extract_source_id("hello world"), _extract_source_id("hello world"))
+
+    def test_differs_for_different_content(self):
+        self.assertNotEqual(_extract_source_id("hello world"), _extract_source_id("goodbye world"))
+
+    def test_matches_sha256_prefix(self):
+        text = "the loom weaves context"
+        expected = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        self.assertEqual(_extract_source_id(text), expected)
+
+
+class TestMapExtractionCategory(unittest.TestCase):
+    """extract's fact.category is free-form text, not constrained to recall's
+    VALID_CATEGORIES enum — map through with a "fact" fallback."""
+
+    def test_passthrough_for_valid_category(self):
+        self.assertEqual(_map_extraction_category("architecture"), "architecture")
+        self.assertEqual(_map_extraction_category("preference"), "preference")
+
+    def test_defaults_to_fact_for_unknown_category(self):
+        self.assertEqual(_map_extraction_category("random_unmapped_label"), "fact")
+
+    def test_defaults_to_fact_for_missing_category(self):
+        self.assertEqual(_map_extraction_category(None), "fact")
+        self.assertEqual(_map_extraction_category(""), "fact")
+
+
+class TestEarliestTemporalRefDate(unittest.TestCase):
+    """temporal_refs isn't per-fact-linked without the evidence_anchoring
+    capability (more prompt surface than this slot requests) — the earliest
+    resolved date sets valid_from for all nodes from the packet, same shape
+    as today's _cluster_valid_from() fallback."""
+
+    def test_empty_list_returns_none(self):
+        self.assertIsNone(_earliest_temporal_ref_date([]))
+
+    def test_single_resolved_ref(self):
+        refs = [{"raw": "March 2026", "resolved": "2026-03-01"}]
+        self.assertEqual(_earliest_temporal_ref_date(refs), "2026-03-01")
+
+    def test_picks_earliest_of_multiple(self):
+        refs = [
+            {"raw": "April 2026", "resolved": "2026-04-01"},
+            {"raw": "January 2026", "resolved": "2026-01-15"},
+            {"raw": "March 2026", "resolved": "2026-03-01"},
+        ]
+        self.assertEqual(_earliest_temporal_ref_date(refs), "2026-01-15")
+
+    def test_skips_refs_missing_resolved(self):
+        refs = [
+            {"raw": "sometime later"},
+            {"raw": "March 2026", "resolved": "2026-03-01"},
+        ]
+        self.assertEqual(_earliest_temporal_ref_date(refs), "2026-03-01")
+
+    def test_skips_unparseable_dates(self):
+        refs = [
+            {"raw": "garbled", "resolved": "not-a-date"},
+            {"raw": "March 2026", "resolved": "2026-03-01"},
+        ]
+        self.assertEqual(_earliest_temporal_ref_date(refs), "2026-03-01")
+
+    def test_all_unparseable_returns_none(self):
+        self.assertIsNone(_earliest_temporal_ref_date([{"raw": "garbled", "resolved": "not-a-date"}]))
+
+
+class TestKnowledgeNodesFromExtraction(unittest.TestCase):
+    """Core field mapping: SynaptExtraction packet (facts/decisions/
+    temporal_refs) -> KnowledgeNode list. entities are NOT materialized as
+    nodes in this slot (structural, not durable prose) — see contract-read."""
+
+    def _make_packet(self, **overrides):
+        packet = {
+            "version": "1",
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "produced_by": "mlx://mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+            "source_id": "abc123def4567890",
+            "entities": [],
+            "goals": [],
+            "themes": [],
+            "facts": [
+                {"text": "recall does not use extract as of 2026-07-12", "category": "architecture"},
+                {"text": "Layne prefers semicolons over em dashes"},
+            ],
+            "decisions": [
+                {"text": "Move 1 targets the consolidation slot, not enrich.py"},
+            ],
+            "temporal_refs": [
+                {"raw": "2026-07-12", "resolved": "2026-07-12"},
+            ],
+            "capabilities": ["facts", "decisions", "temporal_refs"],
+        }
+        packet.update(overrides)
+        return packet
+
+    def test_creates_one_node_per_fact_and_decision(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1", "s2"])
+        self.assertEqual(len(nodes), 3)
+
+    def test_fact_content_matches_text(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1"])
+        contents = {n.content for n in nodes}
+        self.assertIn("recall does not use extract as of 2026-07-12", contents)
+
+    def test_fact_category_mapped_when_valid(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1"])
+        node = next(n for n in nodes if n.content.startswith("recall does not use extract"))
+        self.assertEqual(node.category, "architecture")
+
+    def test_fact_category_defaults_to_fact_when_missing(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1"])
+        node = next(n for n in nodes if n.content.startswith("Layne prefers semicolons"))
+        self.assertEqual(node.category, "fact")
+
+    def test_decision_category_hardcoded(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1"])
+        node = next(n for n in nodes if n.content.startswith("Move 1 targets"))
+        self.assertEqual(node.category, "decision")
+
+    def test_confidence_uses_recall_compute_confidence(self):
+        cluster_sessions = ["s1", "s2", "s3"]
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), cluster_sessions)
+        expected = compute_confidence(len(cluster_sessions))
+        for n in nodes:
+            self.assertAlmostEqual(n.confidence, expected)
+
+    def test_source_sessions_populated_from_cluster(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1", "s2"])
+        for n in nodes:
+            self.assertEqual(n.source_sessions, ["s1", "s2"])
+
+    def test_valid_from_uses_earliest_temporal_ref(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1"])
+        for n in nodes:
+            self.assertEqual(n.valid_from, "2026-07-12")
+
+    def test_empty_facts_and_decisions_produce_no_nodes(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(facts=[], decisions=[]), ["s1"])
+        self.assertEqual(nodes, [])
+
+    def test_entities_are_not_materialized_as_nodes(self):
+        packet = self._make_packet(entities=[{"name": "recall", "type": "system"}])
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 3)  # unchanged: 2 facts + 1 decision, no entity node
+
+    def test_returns_knowledge_node_instances(self):
+        nodes = _knowledge_nodes_from_extraction(self._make_packet(), ["s1"])
+        for n in nodes:
+            self.assertIsInstance(n, KnowledgeNode)
+            self.assertTrue(n.id)
+            self.assertTrue(n.created_at)
+
+
+class _FakeExtractionClient:
+    """Duck-types synapt._models.base.ModelClient for extraction tests —
+    no real MLX runtime required."""
+
+    def __init__(self, response_text):
+        self.response_text = response_text
+        self.calls = []
+
+    def chat(self, model, messages, temperature=0.1, adapter_path=None, max_tokens=None, **kwargs):
+        self.calls.append({
+            "model": model,
+            "prompt": messages[0].content if messages else "",
+            "temperature": temperature,
+            "adapter_path": adapter_path,
+            "max_tokens": max_tokens,
+        })
+        return self.response_text
+
+
+class TestBuildExtractionPacket(unittest.TestCase):
+    """_build_extraction_packet: extract Stage 1 (via *client*) -> finalize
+    -> validate, synchronously. Bypasses extract.py's async orchestrator
+    (consolidate.py is sync; MLXClient.chat() is blocking) — see contract-read
+    point 2. Returns None (fail-closed) on unparseable or schema-invalid
+    output, mirroring today's unparseable-response handling."""
+
+    VALID_STAGE1_JSON = json.dumps({
+        "extracted_at": "2026-07-12T00:00:00Z",
+        "facts": [{"text": "recall does not use extract as of 2026-07-12", "category": "architecture"}],
+        "decisions": [{"text": "Move 1 targets the consolidation slot"}],
+        "temporal_refs": [{"raw": "2026-07-12", "resolved": "2026-07-12"}],
+    })
+
+    def test_valid_response_produces_validated_packet(self):
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet["version"], "1")
+        self.assertEqual(len(packet["facts"]), 1)
+        self.assertEqual(len(packet["decisions"]), 1)
+
+    def test_packet_is_hash_anchored(self):
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        text = "some cluster text"
+        packet = _build_extraction_packet(text, client, model="mlx-community/test-model")
+        self.assertEqual(packet["source_id"], _extract_source_id(text))
+
+    def test_packet_produced_by_is_mlx_uri(self):
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertEqual(packet["produced_by"], "mlx://mlx-community/test-model")
+
+    def test_calls_client_with_extraction_prompt(self):
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("some cluster text", client.calls[0]["prompt"])
+
+    def test_threads_adapter_path_and_max_tokens_to_client(self):
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        _build_extraction_packet(
+            "some cluster text", client, model="mlx-community/test-model",
+            adapter_path="/path/to/adapter", max_tokens=1234,
+        )
+        call = client.calls[0]
+        self.assertEqual(call["adapter_path"], "/path/to/adapter")
+        self.assertEqual(call["max_tokens"], 1234)
+
+    def test_unparseable_response_returns_none(self):
+        client = _FakeExtractionClient("this is not json at all {{{")
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNone(packet)
+
+    def test_schema_invalid_response_returns_none(self):
+        # Fact missing required "text" -- fails extract's structural validation.
+        bad_json = json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [{"category": "architecture"}],
+            "decisions": [],
+            "temporal_refs": [],
+        })
+        client = _FakeExtractionClient(bad_json)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNone(packet)
+
+    def test_backfills_missing_entities_goals_themes(self):
+        # extract's finalized schema unconditionally requires entities/goals/
+        # themes even though the Stage-1 request schema only requires the
+        # capabilities we asked for (facts/decisions/temporal_refs) -- a real
+        # gap found writing these tests, not covered by the original
+        # contract-read. _build_extraction_packet must backfill empty arrays
+        # so validation passes.
+        client = _FakeExtractionClient(self.VALID_STAGE1_JSON)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet["entities"], [])
+        self.assertEqual(packet["goals"], [])
+        self.assertEqual(packet["themes"], [])
 
 
 if __name__ == "__main__":
