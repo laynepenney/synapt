@@ -2460,14 +2460,55 @@ class TestSanitizeStage1Output(unittest.TestCase):
         out = _sanitize_stage1_output(parsed)
         self.assertNotIn("entity_refs", out["facts"][0])
 
-    def test_strips_entity_refs_from_actions_and_goals(self):
+    def test_drops_unrequested_actions_and_goals_wholesale(self):
+        # Sentinel HIGH-2: actions/goals are NOT in our selected capability
+        # surface, so the whitelist drops them entirely (not blacklist their
+        # entity_refs). This is what prevents corrupting a valid goal whose
+        # entity_refs are REQUIRED — we never carry goals through in this slot.
         parsed = {
+            "extracted_at": "2026-07-12T00:00:00Z",
             "actions": [{"text": "an action", "entity_refs": ["Bar"]}],
-            "goals": [{"text": "a goal", "entity_refs": ["Baz"]}],
+            "goals": [{"text": "a goal", "status": "open", "entity_refs": ["Baz"]}],
+            "facts": [{"text": "a real fact"}],
         }
         out = _sanitize_stage1_output(parsed)
-        self.assertNotIn("entity_refs", out["actions"][0])
-        self.assertNotIn("entity_refs", out["goals"][0])
+        self.assertNotIn("actions", out)
+        self.assertNotIn("goals", out)
+        self.assertEqual(out["facts"], [{"text": "a real fact"}])
+
+    def test_valid_reference_packet_not_corrupted_to_invalid(self):
+        # Sentinel HIGH-2 negative control: a packet with a declared entity +
+        # a goal whose entity_refs validly reference it must NOT be corrupted
+        # into an invalid packet. The whitelist drops goals/entities cleanly
+        # (they're unrequested) rather than stripping a REQUIRED goal.entity_refs
+        # and leaving a schema-invalid goal behind.
+        parsed = {
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "entities": [{"id": "e1", "name": "Widget", "type": "system"}],
+            "goals": [{"text": "ship it", "status": "open", "entity_refs": ["e1"]}],
+            "facts": [{"text": "a real fact"}],
+        }
+        out = _sanitize_stage1_output(parsed)
+        self.assertNotIn("goals", out)
+        self.assertNotIn("entities", out)
+        # what remains is a clean selected-surface packet
+        self.assertEqual(set(out.keys()) - {"extracted_at"}, {"facts"})
+
+    def test_strips_model_authored_context(self):
+        # Sentinel HIGH-2: a hallucinated user_id / source_type is model-authored
+        # context outside the selected Stage-1 surface — it must not survive into
+        # the finalized packet.
+        parsed = {
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [{"text": "f"}],
+            "user_id": "hallucinated-user",
+            "source_type": "forged",
+            "kind": "invented/kind",
+        }
+        out = _sanitize_stage1_output(parsed)
+        self.assertNotIn("user_id", out)
+        self.assertNotIn("source_type", out)
+        self.assertNotIn("kind", out)
 
     def test_leaves_non_dict_members_untouched(self):
         # sanitize runs before finalize's own guard; must not crash on the
@@ -2623,6 +2664,41 @@ class TestIsMetadataNoise(unittest.TestCase):
     def test_keeps_preference_fact(self):
         self.assertFalse(_is_metadata_noise("Layne prefers semicolons over em dashes"))
 
+    # --- Sentinel review 2026-07-12 (HIGH-1): the filter failed BOTH ways.
+    # RECALL: the 3B reworded forbidden junk into declarative prose that the
+    # anchored regex missed (a false-negative that fooled the quality counter).
+    def test_rejects_reworded_rm_rf_execution_event(self):
+        self.assertTrue(_is_metadata_noise(
+            "The /tmp/test-q4-noop-12345 directory was explicitly wiped with rm -rf "
+            "(forceful recursive deletion) to ensure no lingering artifacts from test Q4, "
+            "with exit code 0 confirmed."))
+
+    # PRECISION: the prior ^session<any-digit> / broad execute/focus/run patterns
+    # dropped legitimate durable facts. These 5 are Sentinel's KEEP controls and
+    # MUST survive (return False).
+    def test_keeps_session_config_facts(self):
+        self.assertFalse(_is_metadata_noise("Session v2 stores OAuth refresh tokens in encrypted cookies"))
+        self.assertFalse(_is_metadata_noise("Session 30 timeout is 15 minutes"))
+
+    def test_keeps_durable_command_convention(self):
+        # "Execute /migrate ..." with no date is a durable rule, not a dated log.
+        self.assertFalse(_is_metadata_noise("Execute /migrate after every schema upgrade"))
+
+    def test_keeps_focus_prefixed_real_fact(self):
+        self.assertFalse(_is_metadata_noise(
+            "Focus: visible focus rings are required for keyboard accessibility"))
+
+    def test_keeps_rm_rf_safety_rule(self):
+        # a durable RULE about rm -rf usage (no ephemeral /tmp path) is not an event.
+        self.assertFalse(_is_metadata_noise(
+            "Run cleanup with rm -rf only inside the generated build directory"))
+
+    def test_session_token_must_be_hex_id_not_any_digit(self):
+        # regression against the over-broad ^session<digit>: a short numeric or
+        # version-y token after "Session" is not a journal session hash.
+        self.assertFalse(_is_metadata_noise("Session 7 introduced the new auth flow"))
+        self.assertTrue(_is_metadata_noise("Session a1b2c3d4 occurred on 2026-03-02"))
+
 
 class TestExtractionSynthesisPrompt(unittest.TestCase):
     """Lever 2: the tuned Stage-1 prompt that ports legacy's synthesis
@@ -2642,6 +2718,14 @@ class TestExtractionSynthesisPrompt(unittest.TestCase):
     def test_prompt_constant_forbids_transient_and_oneoff(self):
         p = EXTRACTION_SYNTHESIS_PROMPT.lower()
         self.assertTrue("command" in p or "one-off" in p or "transient" in p or "intention" in p)
+
+    def test_prompt_constant_forbids_execution_event_reports(self):
+        # Sentinel HIGH-1: the primary defense against reworded execution-event
+        # junk (the rm-rf survivor) is the prompt, not the regex. The forbid-list
+        # must call out one-off operations that already happened / exit codes.
+        p = EXTRACTION_SYNTHESIS_PROMPT.lower()
+        self.assertIn("exit code", p)
+        self.assertTrue("already happened" in p or "transient event" in p)
 
     def test_build_synthesis_prompt_embeds_source_text(self):
         prompt = _build_extraction_prompt_synthesis("the loom weaves context here")
@@ -2699,19 +2783,23 @@ class TestExtractQualityFilterInMapping(unittest.TestCase):
         self.assertTrue(nodes[0].content.startswith("recall#865"))
 
     def test_near_duplicate_facts_deduped_intra_batch(self):
+        # Sentinel MEDIUM-3: the prior fixture used two "Focus:"-prefixed inputs
+        # that the metadata filter dropped BEFORE dedup, so the assertion passed
+        # even with dedup removed (vacuous). This uses two IDENTICAL ACCEPTED
+        # durable facts + a distinct one, and asserts EXACTLY 2 — so the collapse
+        # is genuinely attributable to dedup, not the filter.
         packet = {
             "facts": [
-                {"text": "Focus: Run this exact shell command and report its exit code on flags.py in /src"},
-                {"text": "Focus: Run this exact shell command and report its exit code on flags.py in /src"},
-                {"text": "A distinct durable fact about the /src/flags.py release toggle mechanism"},
+                {"text": "The /src/flags.py release toggle defaults to off until the ceremony PR merges"},
+                {"text": "The /src/flags.py release toggle defaults to off until the ceremony PR merges"},
+                {"text": "A distinct durable fact about the consolidate.py extract-path budget"},
             ],
             "decisions": [],
             "temporal_refs": [],
         }
         nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
-        # exact-duplicate fact collapses to one; the distinct fact stays
-        self.assertLessEqual(len(nodes), 2)
-        self.assertEqual(len(set(n.content for n in nodes)), len(nodes))
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(len(set(n.content for n in nodes)), 2)
 
     def test_all_noise_produces_no_nodes(self):
         packet = {

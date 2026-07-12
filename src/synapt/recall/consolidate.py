@@ -1424,8 +1424,13 @@ dense and specific, not verbose. Do not pad with speculation or restatement.
 ## NEVER produce these (they are noise, not durable knowledge):
 - Session metadata as facts: session IDs, bare dates, "Session <id> occurred on <date>",
   "Session <id> focused on X". The session/date bookkeeping is tracked elsewhere.
-- Raw command logs or one-off commands: "Execute /clear on <date>", "Run this shell
-  command: rm -rf ...". A command that ran once is not durable knowledge.
+- Reports of one-off operations that already happened — even phrased as a statement of
+  fact: "The /tmp/xyz directory was wiped with rm -rf", "the command ran and returned
+  exit code 0", "a test passed", "the file was deleted". A specific action that executed
+  once is a transient event, NOT durable knowledge. (A durable RULE about when to run
+  something — "run cleanup only inside the build directory" — is fine; a report that it
+  ran on a particular occasion is not.)
+- Raw command logs: "Execute /clear on <date>", "Run this shell command: rm -rf ...".
 - Transient intentions and to-dos ("check #dev later", "install X", "test Y next").
 - Generic advice true of any project ("always use Docker", "write tests").
 - Verbatim echoes of a session's focus line.
@@ -1491,97 +1496,120 @@ def _map_extraction_category(category: str | None) -> str:
 # SHAPE (a session-id/date bookkeeping tuple, a command-execution log, a raw
 # focus-line echo), not the mere presence of a date, so a genuine fact that
 # happens to mention a date is not flagged.
+# Lever 3 metadata-noise patterns, redesigned per Sentinel review 2026-07-12
+# (HIGH-1). The prior `^session<any-digit>` was far too broad — it dropped
+# legitimate durable facts ("Session 30 timeout is 15 minutes", "Session v2
+# stores OAuth refresh tokens..."). These target the actual bookkeeping SHAPES,
+# validated against Sentinel's KEEP controls (which must NOT match) and REJECT
+# fixtures (which must). A hex-ID session record and a date-bearing command log
+# are journal bookkeeping; a specific ephemeral /tmp path being wiped is a
+# one-off execution EVENT. Regex is a backstop only — reworded execution-event
+# junk is primarily prevented by the synthesis prompt's forbid-list, and this
+# filter can never fully catch a rewording model (reported honestly, not hidden).
 _METADATA_NOISE_PATTERNS = [
-    # "Session 019e2439, 2026-05-14" / "Session e43f3562 occurred on ..." —
-    # requires a session-ID-like token (contains a digit) so real prose like
-    # "Session management is handled by X" is NOT matched.
-    re.compile(r"(?i)^session\s+[\w-]*\d[\w-]*\b"),
-    # "... Session <id> occurred on/from/focused ..." mid-sentence bookkeeping
-    re.compile(r"(?i)\bsession\s+[\w-]*\d[\w-]*\s+(occurred|from|focus)"),
-    # Raw journal focus line echoed verbatim as a "fact"
-    re.compile(r"(?i)^focus:\s"),
-    # "Execute `/clear` command on <date>" — one-off slash-command log
-    re.compile(r"(?i)^execute\s+[`'\"]?/\w+"),
-    # A one-off shell command immortalized ("Run this exact shell command: rm -rf ...")
-    re.compile(r"(?i)^(run\b.*\brm\s+-rf|.*\brun this exact shell command)"),
+    # Session bookkeeping record: "Session <hex-id>" where the id is a real
+    # journal session hash (6+ hex chars) — NOT "Session 30" / "Session v2" /
+    # "Session management".
+    re.compile(r"(?i)^session\s+[0-9a-f]{6,}\b"),
+    re.compile(r"(?i)\bsession\s+[0-9a-f]{6,}\s+(occurred|from|focus)"),
+    # A slash-command execution log tied to a date: "Execute `/clear` command
+    # on 2026-03-02". The date is the discriminator — "Execute /migrate after
+    # every schema upgrade" (a durable convention) has none and is KEPT.
+    re.compile(r"(?i)^execute\s+[`'\"]?/\w+.*\d{4}-\d{2}-\d{2}"),
+    # A one-off execution EVENT on a specific ephemeral /tmp path: "The
+    # /tmp/test-q4-noop-12345 directory was wiped with rm -rf" (incl. the
+    # reworded-into-prose form). The ephemeral /tmp path + deletion is the
+    # discriminator — "Run cleanup with rm -rf only inside the generated build
+    # directory" (a durable rule, no /tmp path) is KEPT.
+    re.compile(r"(?i)/tmp/\S+.*\b(wiped|deleted|removed|rm\s+-rf)\b"),
+    re.compile(r"(?i)\brm\s+-rf\b\s+/tmp/\S+"),
 ]
 
 
 def _is_metadata_noise(content: str) -> bool:
-    """Return True if *content* is session/command bookkeeping dressed up as a
-    durable fact (lever 3 — recall#868). See _METADATA_NOISE_PATTERNS."""
+    """Return True if *content* is session/command bookkeeping or a one-off
+    execution event dressed up as a durable fact (lever 3 — recall#868;
+    redesigned per Sentinel review, HIGH-1).
+
+    Honest limitation: this is a shape-based backstop. A model that rewords
+    transient events into novel declarative prose can slip past any fixed
+    pattern set — the synthesis prompt's forbid-list is the primary defense,
+    and quality must be verified by READING nodes, not by this filter's own
+    count (which is circular). See _METADATA_NOISE_PATTERNS.
+    """
     for pat in _METADATA_NOISE_PATTERNS:
         if pat.search(content):
             return True
     return False
 
 
-# Extract v0.5.0 root keys that pass structural validation (validate.py
-# _ROOT_KEYS). The local 3B occasionally reverts to legacy's {"nodes": [...]}
-# shape or invents other top-level keys; those are stripped so a stray key
-# can't fail-close an otherwise-good packet.
-_EXTRACT_ROOT_KEYS = frozenset({
-    "version", "extracted_at", "source_id", "source_type", "user_id",
-    "produced_by", "kind", "entities", "goals", "themes", "keywords",
-    "sentiment", "summary", "facts", "questions", "actions", "decisions",
-    "temporal_refs", "language", "source_metadata", "confidence",
-    "capabilities", "embeddings", "extensions",
-})
-# Only extract facts carry a `category` field. The 3B over-generalizes the
-# category it sees on facts and stamps it onto decisions/actions/goals too,
-# where the schema forbids it ("additional property not allowed") — this was
-# the dominant post-lever-2 fail-close (17/25) in the dogfood diagnostic.
-_CATEGORYLESS_ITEM_KEYS = ("decisions", "actions", "goals")
+# The SELECTED Stage-1 root surface for THIS slot's capability request
+# (extracted_at + EXTRACTION_CAPABILITIES). Sanitize whitelists to exactly
+# this — NOT extract's full final-schema root set (Sentinel review 2026-07-12,
+# HIGH-2): mirroring the final schema let model-authored context (a
+# hallucinated user_id, source_type, etc.) survive into the finalized packet.
+_SELECTED_STAGE1_ROOT_KEYS = frozenset({"extracted_at", *EXTRACTION_CAPABILITIES})
+# Per-item field whitelists for the SELECTED item types. Keeping only valid,
+# selected fields means we strip INVENTED shapes (entity_refs, category on
+# decisions) without ever touching a legitimate required field on a type we
+# don't request — the unconditional entity_refs strip could have removed a
+# REQUIRED goals[].entity_refs and turned a valid packet into None (Sentinel
+# HIGH-2). We don't request goals/actions/entities at all, so they are dropped
+# wholesale here and re-added as empty arrays for the final schema.
+_SELECTED_ITEM_FIELDS = {
+    "facts": frozenset({"text", "category"}),      # category is free-form on facts (valid)
+    "decisions": frozenset({"text", "decided_at"}),  # decisions forbid category; keep valid fields
+    "temporal_refs": frozenset({"raw", "resolved", "type", "resolved_end", "context"}),
+}
 
 
 def _sanitize_stage1_output(parsed: dict) -> dict:
-    """Strip the structurally-invalid shapes the local 3B keeps inventing,
-    before finalize (lever 1 — recall#869, extended per the dogfood
-    diagnostic 2026-07-12).
+    """Whitelist the local 3B's Stage-1 output down to the SELECTED capability
+    surface before finalize (lever 1 — recall#869; rewritten per Sentinel
+    review 2026-07-12, HIGH-2).
 
-    The local 3B has no schema-constrained decoding, so parseable-but-invalid
-    output is the expected surface. Rather than fail-close on each, strip the
-    recurring invalid shapes structurally (they can then never fail-close):
+    The 3B has no schema-constrained decoding, so parseable-but-invalid output
+    is the expected surface (invented entity_refs, `category` copied onto
+    decisions, a hallucinated `user_id`, a legacy-`nodes` fallback). Rather
+    than blacklist each invented shape — which both missed some and, when it
+    stripped `entity_refs` unconditionally, could have removed a REQUIRED
+    goals[].entity_refs and corrupted a valid packet into None — this
+    whitelists to exactly what we requested:
 
-    - ``entity_refs`` on any item array — invented entity IDs with no declared
-      entities to reference (extract's referential validator rejects them).
-      This was 12/14 of the ORIGINAL 61% fail-closes.
-    - ``category`` on decisions/actions/goals — only facts allow it; the 3B
-      over-applies it. 17/25 of the post-synthesis-prompt fail-closes.
-    - unknown top-level keys (e.g. a legacy-style ``nodes`` fallback) — kept to
-      extract's known root-key set.
-    - a missing/blank ``extracted_at`` (a required root field) is backfilled.
+    - top level: only {extracted_at} ∪ EXTRACTION_CAPABILITIES. Everything
+      else (invented context, nodes, user_id, goals/actions/entities we did
+      not request) is dropped. The empty entities/goals/themes the FINAL
+      schema requires are re-added by the caller after this.
+    - within each selected item type: only that type's valid, selected fields
+      (facts keep text+category; decisions keep text+decided_at — category and
+      entity_refs are not selected fields for a decision, so they are dropped).
+    - a missing/blank required ``extracted_at`` is backfilled.
 
-    Non-dict members are left untouched (finalize's own guard handles those);
-    mutates and returns *parsed* for chaining. We don't use entity linkage or
-    per-decision categories in this slot, so nothing of value is lost.
+    Non-dict members are left untouched (finalize's own guard handles those).
+    Mutates and returns *parsed* for chaining. Because we never request goals
+    or entities, no legitimate reference is ever stripped — they simply aren't
+    in the selected surface.
     """
     if not isinstance(parsed, dict):
         return parsed
 
-    # Drop unknown top-level keys (legacy-style "nodes" fallback etc.)
-    for key in [k for k in parsed if k not in _EXTRACT_ROOT_KEYS]:
+    # Whitelist top-level keys to the selected surface
+    for key in [k for k in parsed if k not in _SELECTED_STAGE1_ROOT_KEYS]:
         parsed.pop(key, None)
 
     # Backfill the required extracted_at if the model dropped/blanked it
     if not isinstance(parsed.get("extracted_at"), str) or not parsed["extracted_at"].strip():
         parsed["extracted_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # Strip invented entity_refs from every item array
-    for key in ("decisions", "facts", "actions", "goals"):
+    # Whitelist each selected item array to its valid selected fields
+    for key, allowed in _SELECTED_ITEM_FIELDS.items():
         items = parsed.get(key)
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    item.pop("entity_refs", None)
-
-    # Strip category from item types that don't allow it (only facts do)
-    for key in _CATEGORYLESS_ITEM_KEYS:
-        items = parsed.get(key)
-        if isinstance(items, list):
-            for item in items:
-                if isinstance(item, dict):
-                    item.pop("category", None)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                for field in [f for f in item if f not in allowed]:
+                    item.pop(field, None)
 
     return parsed
 
