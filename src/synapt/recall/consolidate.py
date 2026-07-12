@@ -30,6 +30,7 @@ from synapt.recall.journal import (
 )
 from synapt.recall.knowledge import (
     KnowledgeNode,
+    VALID_CATEGORIES,
     _knowledge_path,
     append_node,
     batch_update_nodes,
@@ -42,6 +43,7 @@ from synapt.recall.clustering import _jaccard
 from synapt.recall.scrub import scrub_text, strip_markdown_formatting
 from synapt.recall.core import project_data_dir, project_index_dir
 from synapt.recall._llm_util import truncate_at_word as _tw
+from synapt_extract import create_extraction_builder, finalize_extraction, FinalizeContext
 
 logger = logging.getLogger("synapt.recall.consolidate")
 
@@ -1373,6 +1375,233 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
     return score_with_validation(get_active_strategy(), inputs)
 
 
+# ---------------------------------------------------------------------------
+# recall#865 — wire extract into recall (consolidation slot, SYNAPT_USE_EXTRACT)
+#
+# Spec: config/design/move-1-extract-into-recall-2026-07-12.md
+# Opt-in via SYNAPT_USE_EXTRACT=1. Legacy path (above) is untouched when off.
+# ---------------------------------------------------------------------------
+
+EXTRACTION_CAPABILITIES = ["facts", "decisions", "temporal_refs"]
+
+
+def _extract_source_id(text: str) -> str:
+    """Content-derived hash so the extraction packet has a real address.
+
+    Not automatic from extract itself — extract only hashes source text for
+    the optional artifact-bundle wrapper, not the packet. Setting source_id
+    here gives the packet the "addressable-unit" property from the
+    2026-05-08 intelligence-packet reframe.
+
+    source_id is a generic identifier field in extract's schema (a plain
+    optional string — no built-in content-hash semantic; verified against
+    schema.py/validate.py) so this doesn't stomp an existing extract
+    meaning. Forward-compat: if extract later adds a native packet-level
+    content_hash field, migrate to that instead of overloading source_id.
+    recall's own provenance (source_sessions / source_turns on
+    KnowledgeNode) is tracked separately from this field.
+    """
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _map_extraction_category(category: str | None) -> str:
+    """Map extract's free-form fact.category into recall's VALID_CATEGORIES,
+    defaulting to "fact" on no match."""
+    if category and category in VALID_CATEGORIES:
+        return category
+    return "fact"
+
+
+def _earliest_temporal_ref_date(temporal_refs: list[dict]) -> str | None:
+    """Earliest parseable resolved date across *temporal_refs*, or None.
+
+    temporal_refs isn't per-fact-linked without the evidence_anchoring
+    capability (more prompt surface than this slot requests), so this sets
+    valid_from for every node produced from the same packet — the same
+    "earliest wins" shape as _cluster_valid_from() uses for journal entries.
+    """
+    earliest: tuple[datetime, str] | None = None
+    for ref in temporal_refs:
+        if not isinstance(ref, dict):
+            continue
+        resolved = ref.get("resolved")
+        validated = _validate_iso_date(resolved)
+        if not validated:
+            continue
+        try:
+            dt = datetime.fromisoformat(validated.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        if earliest is None or dt < earliest[0]:
+            earliest = (dt, validated)
+    return earliest[1] if earliest is not None else None
+
+
+def _knowledge_nodes_from_extraction(
+    packet: dict,
+    cluster_sessions: list[str],
+) -> list[KnowledgeNode]:
+    """Map a validated SynaptExtraction packet's facts/decisions into
+    KnowledgeNodes.
+
+    entities are NOT materialized as nodes in this slot — they're
+    structural (name/type/aliases), not durable prose. Confidence reuses
+    recall's existing compute_confidence() rather than extract's per-item
+    signals.confidence (keeps the requested capability surface minimal).
+    Dedup/corroborate/contradict against existing knowledge is handled by
+    the existing post-consolidation pipeline (dedup_knowledge_nodes(),
+    resolve_source_turns(), resolve_source_offsets()) uniformly for nodes
+    from either path — not duplicated here.
+    """
+    valid_from = (
+        _earliest_temporal_ref_date(packet.get("temporal_refs") or [])
+        or datetime.now(timezone.utc).isoformat()
+    )
+    confidence = compute_confidence(len(cluster_sessions))
+    nodes: list[KnowledgeNode] = []
+
+    for fact in packet.get("facts") or []:
+        text = fact.get("text") if isinstance(fact, dict) else None
+        if not text:
+            continue
+        node = KnowledgeNode.create(
+            content=text,
+            category=_map_extraction_category(fact.get("category")),
+            source_sessions=cluster_sessions,
+            confidence=confidence,
+        )
+        node.valid_from = valid_from
+        nodes.append(node)
+
+    for decision in packet.get("decisions") or []:
+        text = decision.get("text") if isinstance(decision, dict) else None
+        if not text:
+            continue
+        node = KnowledgeNode.create(
+            content=text,
+            category="decision",
+            source_sessions=cluster_sessions,
+            confidence=confidence,
+        )
+        node.valid_from = valid_from
+        nodes.append(node)
+
+    return nodes
+
+
+def _build_extraction_packet(
+    text: str,
+    client,
+    model: str,
+    *,
+    adapter_path: str = "",
+    max_tokens: int | None = None,
+) -> dict | None:
+    """Run extract Stage 1 (via *client*, synchronously) → finalize →
+    validate.
+
+    Bypasses extract.py's async extract() orchestrator — consolidate.py is
+    fully sync and MLXClient.chat() is a blocking call, so this calls
+    create_extraction_builder().build() for the prompt/schema, the existing
+    MLX/router client for inference, and finalize_extraction() directly,
+    all synchronously.
+
+    max_tokens defaults to None, which scales the response budget to the
+    built extraction prompt via _estimate_response_budget() — the same
+    dynamic sizing the legacy path uses (CONTEXT_BUDGET=8000, floor
+    MIN_RESPONSE_TOKENS). A flat low budget silently truncates dense
+    clusters mid-JSON, which fails parsing/validation and skips the
+    cluster exactly where extraction has the most to offer (Opus review,
+    m_13ae8e8a, blocker 2). Pass an explicit value to override.
+
+    Returns the finalized, validated SynaptExtraction packet (dict), or
+    None if the LLM response is unparseable, fails schema validation, or
+    raises during finalization on a structurally malformed-but-parseable
+    shape (e.g. facts:[null] — extract v0.5.0's finalize_extraction()
+    assumes array members are dicts and doesn't guard against untrusted
+    LLM output; Sentinel review m_40b29111) — fail-closed in every case,
+    mirrors _process_cluster's unparseable-response handling on the legacy
+    path; no fallback to the legacy path mid-flag-on.
+
+    Returning None here propagates to _process_cluster returning False,
+    which triggers consolidate()'s existing retry-by-halving on the
+    cluster — the same behavior the legacy path has always had on any
+    inference/parse failure (deterministic or not). Splitting the cluster
+    also halves its prompt, so it can still help on residual budget
+    pressure at the floor; it won't help on genuine model schema
+    noncompliance, but that's an existing, shared cost, not a new one
+    introduced by the extract path (Opus review, m_13ae8e8a, medium 4).
+    """
+    built = create_extraction_builder(
+        text=text,
+        capabilities=list(EXTRACTION_CAPABILITIES),
+    ).build()
+    response_budget = (
+        max_tokens if max_tokens is not None else _estimate_response_budget(built["prompt"])
+    )
+
+    try:
+        response = client.chat(
+            model=model,
+            messages=[Message(role="user", content=built["prompt"])],
+            temperature=0.1,
+            adapter_path=adapter_path or None,
+            max_tokens=response_budget,
+        )
+    except Exception as exc:
+        logger.warning("Extraction Stage-1 inference failed: %s", exc)
+        return None
+
+    parsed = _parse_llm_response(response)
+    if not parsed:
+        logger.warning(
+            "Unparseable extraction Stage-1 response (%d chars): %.300s",
+            len(response), response,
+        )
+        return None
+
+    # extract's finalized schema unconditionally requires entities/goals/
+    # themes arrays even though the Stage-1 request schema only requires
+    # the capabilities we asked for — backfill so validation doesn't fail
+    # on containers we deliberately didn't request. Also defensively
+    # backfill the requested arrays in case the model dropped one.
+    for key in ("entities", "goals", "themes", *EXTRACTION_CAPABILITIES):
+        parsed.setdefault(key, [])
+
+    context = FinalizeContext(
+        produced_by=f"mlx://{model}",
+        source_id=_extract_source_id(text),
+        capabilities_hint=built["capabilities"],
+    )
+    # Sentinel review (m_40b29111): parseable Stage-1 JSON can still have
+    # non-dict members inside facts/decisions/temporal_refs (the local MLX
+    # client has no schema-constrained decoding) -- extract v0.5.0's
+    # finalize_extraction() -> _detect_capabilities() calls .get() on each
+    # array member without an isinstance guard, so e.g. facts:[null],
+    # decisions:[42], or temporal_refs:["tomorrow"] raise AttributeError
+    # instead of returning an invalid ValidationResult. That's untrusted
+    # LLM output; finalization must be inside the fail-closed boundary too,
+    # not just the inference call and the JSON parse.
+    try:
+        finalized = finalize_extraction(parsed, context)
+    except Exception as exc:
+        logger.warning("Extraction packet finalization failed on malformed Stage-1 output: %s", exc)
+        return None
+
+    if not finalized.validation.valid:
+        logger.warning(
+            "Extraction packet failed schema validation (%d error(s)): %s",
+            len(finalized.validation.errors),
+            "; ".join(f"{e.path}: {e.message}" for e in finalized.validation.errors[:5]),
+        )
+        return None
+
+    return finalized.extraction
+
+
 def consolidate(
     project_dir: Path | None = None,
     model: str = DEFAULT_MODEL,
@@ -1504,15 +1733,22 @@ def consolidate(
         """Process a single cluster. Returns True if successful."""
         nonlocal client
 
-        cache_key = _cluster_cache_key(cluster)
-        cached_entry = response_cache.get(cache_key)
+        use_extract = _env_flag("SYNAPT_USE_EXTRACT")
 
-        if cached_entry:
-            # Response was already applied on a previous run — the side
-            # effects (append_node / update_node) are on disk.  Re-applying
-            # would create duplicate nodes and double-count corroborations.
-            logger.debug("Cache hit for cluster %s — skipping", cache_key)
-            return True
+        cache_key = _cluster_cache_key(cluster)
+        if not use_extract:
+            # recall#865: the extract path doesn't share the legacy
+            # response cache — the prompt shapes differ, and reusing the
+            # same cache key across paths would risk feeding a
+            # legacy-shaped cached response into the extract parser (or
+            # vice versa) when the flag is toggled between runs.
+            cached_entry = response_cache.get(cache_key)
+            if cached_entry:
+                # Response was already applied on a previous run — the side
+                # effects (append_node / update_node) are on disk.  Re-applying
+                # would create duplicate nodes and double-count corroborations.
+                logger.debug("Cache hit for cluster %s — skipping", cache_key)
+                return True
 
         if client is None:
             from synapt.recall._model_router import get_client, RecallTask
@@ -1523,6 +1759,41 @@ def consolidate(
                     return False
                 from synapt._models.mlx_client import MLXClient, MLXOptions
                 client = MLXClient(MLXOptions(max_tokens=MIN_RESPONSE_TOKENS))
+
+        if use_extract:
+            # recall#865 medium 3 (Opus review m_13ae8e8a): crash/re-run
+            # idempotency, matching legacy's response_cache pattern -- a
+            # distinct ":extract" key namespace keeps this from colliding
+            # with the legacy path's cache entries for the same cluster
+            # (see the "not use_extract" guard above).
+            extract_cache_key = f"{cache_key}:extract"
+            if extract_cache_key in response_cache:
+                logger.debug("Extract cache hit for cluster %s — skipping", extract_cache_key)
+                return True
+
+            cluster_text = _format_journal_cluster(cluster)
+            packet = _build_extraction_packet(
+                cluster_text, client, model, adapter_path=adapter_path,
+            )
+            if packet is None:
+                return False
+            cluster_sessions = [e.session_id for e in cluster if e.session_id]
+            new_nodes = _knowledge_nodes_from_extraction(packet, cluster_sessions)
+            for node in new_nodes:
+                append_node(node, kn_path)
+                existing_nodes.append(node)
+            result.nodes_created += len(new_nodes)
+
+            # Side effects (append_node) are on disk once this line runs --
+            # a subsequent run must not redo them.  Cache the finalized
+            # packet (more useful for debugging than a placeholder) rather
+            # than the raw Stage-1 text, since that's what actually got
+            # applied.
+            packet_json = json.dumps(packet)
+            _save_cached_response(cache_path, extract_cache_key, packet_json, cluster_text)
+            response_cache[extract_cache_key] = {"response": packet_json, "prompt": cluster_text}
+            return True
+
         prompt = _build_consolidation_prompt(
             cluster, existing_nodes, project_dir,
             adapter_path=adapter_path,
