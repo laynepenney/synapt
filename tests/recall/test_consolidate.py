@@ -2211,6 +2211,53 @@ class TestBuildExtractionPacket(unittest.TestCase):
         packet = _build_extraction_packet("some cluster text", _RaisingClient(), model="mlx-community/test-model")
         self.assertIsNone(packet)
 
+    # Sentinel review (m_40b29111, HIGH blocker): parseable Stage-1 JSON can
+    # still have non-dict members inside facts/decisions/temporal_refs --
+    # the local MLX client has no schema-constrained decoding. Against real
+    # synapt_extract 0.5.0, finalize_extraction() -> _detect_capabilities()
+    # calls .get() on each array member without an isinstance guard, so
+    # each of these three shapes raises AttributeError instead of returning
+    # an invalid ValidationResult (confirmed directly against the installed
+    # package before writing these tests, not assumed from the review).
+    # These go through _build_extraction_packet() end-to-end -- the earlier
+    # per-item-guard tests in TestKnowledgeNodesFromExtractionGuards call
+    # _knowledge_nodes_from_extraction() directly with a hand-built packet
+    # that could never survive finalization, so they never exercised this
+    # boundary. Fail-closed here means None, not a raised exception.
+
+    def test_null_fact_member_does_not_crash(self):
+        bad_json = json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [None],
+            "decisions": [],
+            "temporal_refs": [],
+        })
+        client = _FakeExtractionClient(bad_json)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNone(packet)
+
+    def test_non_dict_decision_member_does_not_crash(self):
+        bad_json = json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [],
+            "decisions": [42],
+            "temporal_refs": [],
+        })
+        client = _FakeExtractionClient(bad_json)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNone(packet)
+
+    def test_string_temporal_ref_member_does_not_crash(self):
+        bad_json = json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [],
+            "decisions": [],
+            "temporal_refs": ["tomorrow"],
+        })
+        client = _FakeExtractionClient(bad_json)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNone(packet)
+
 
 class TestKnowledgeNodesFromExtractionGuards(unittest.TestCase):
     """Per-item guards (Opus review m_13ae8e8a, nit): malformed items within
@@ -2308,6 +2355,67 @@ class TestConsolidateLegacyPathUnchangedWhenFlagOff(unittest.TestCase):
              patch.dict("os.environ", env_without_flag, clear=True):
             consolidate(project_dir=self.project_dir, model="fake-model", min_entries=2)
         mock_extract.assert_not_called()
+
+
+class TestConsolidateFlagOnMalformedMlxOutputDoesNotCrash(unittest.TestCase):
+    """Sentinel review (m_40b29111, HIGH blocker): the real bug was that
+    structurally malformed Stage-1 JSON crashed the whole consolidate() run
+    instead of taking the documented None -> False -> skip/retry path.
+    Drives the real flag-on consolidate() entrypoint with each of the three
+    confirmed-crashing shapes and asserts the run completes gracefully."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.project_dir = Path(self.tmpdir)
+        journal_dir = self.project_dir / ".synapt" / "recall"
+        journal_dir.mkdir(parents=True, exist_ok=True)
+        entries = [
+            {
+                "timestamp": "2026-07-12T09:00:00", "session_id": "malformed-s1",
+                "focus": "Flag-on malformed-output lifecycle test session one",
+                "done": ["Did something specific in src/synapt/recall/consolidate.py"],
+                "decisions": [], "next_steps": [], "files_modified": ["src/synapt/recall/consolidate.py"],
+                "enriched": True,
+            },
+            {
+                "timestamp": "2026-07-12T09:30:00", "session_id": "malformed-s2",
+                "focus": "Flag-on malformed-output lifecycle test session two",
+                "done": ["Did something else specific in src/synapt/recall/consolidate.py"],
+                "decisions": [], "next_steps": [], "files_modified": ["src/synapt/recall/consolidate.py"],
+                "enriched": True,
+            },
+        ]
+        with open(journal_dir / "journal.jsonl", "w") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def _run_with_malformed_response(self, malformed_json):
+        client = _FakeExtractionClient(malformed_json)
+        with patch("synapt.recall._model_router.get_client", return_value=client), \
+             patch.dict("os.environ", {"SYNAPT_USE_EXTRACT": "1"}):
+            from synapt.recall.consolidate import consolidate
+            return consolidate(project_dir=self.project_dir, model="fake-model", min_entries=2)
+
+    def test_null_fact_member_completes_gracefully(self):
+        result = self._run_with_malformed_response(json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [None], "decisions": [], "temporal_refs": [],
+        }))
+        self.assertEqual(result.nodes_created, 0)
+
+    def test_non_dict_decision_member_completes_gracefully(self):
+        result = self._run_with_malformed_response(json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [], "decisions": [42], "temporal_refs": [],
+        }))
+        self.assertEqual(result.nodes_created, 0)
+
+    def test_string_temporal_ref_member_completes_gracefully(self):
+        result = self._run_with_malformed_response(json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [], "decisions": [], "temporal_refs": ["tomorrow"],
+        }))
+        self.assertEqual(result.nodes_created, 0)
 
 
 if __name__ == "__main__":

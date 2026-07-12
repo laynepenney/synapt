@@ -1518,9 +1518,13 @@ def _build_extraction_packet(
     m_13ae8e8a, blocker 2). Pass an explicit value to override.
 
     Returns the finalized, validated SynaptExtraction packet (dict), or
-    None if the LLM response is unparseable or fails schema validation
-    (fail-closed — mirrors _process_cluster's unparseable-response handling
-    on the legacy path; no fallback to the legacy path mid-flag-on).
+    None if the LLM response is unparseable, fails schema validation, or
+    raises during finalization on a structurally malformed-but-parseable
+    shape (e.g. facts:[null] — extract v0.5.0's finalize_extraction()
+    assumes array members are dicts and doesn't guard against untrusted
+    LLM output; Sentinel review m_40b29111) — fail-closed in every case,
+    mirrors _process_cluster's unparseable-response handling on the legacy
+    path; no fallback to the legacy path mid-flag-on.
 
     Returning None here propagates to _process_cluster returning False,
     which triggers consolidate()'s existing retry-by-halving on the
@@ -1572,7 +1576,21 @@ def _build_extraction_packet(
         source_id=_extract_source_id(text),
         capabilities_hint=built["capabilities"],
     )
-    finalized = finalize_extraction(parsed, context)
+    # Sentinel review (m_40b29111): parseable Stage-1 JSON can still have
+    # non-dict members inside facts/decisions/temporal_refs (the local MLX
+    # client has no schema-constrained decoding) -- extract v0.5.0's
+    # finalize_extraction() -> _detect_capabilities() calls .get() on each
+    # array member without an isinstance guard, so e.g. facts:[null],
+    # decisions:[42], or temporal_refs:["tomorrow"] raise AttributeError
+    # instead of returning an invalid ValidationResult. That's untrusted
+    # LLM output; finalization must be inside the fail-closed boundary too,
+    # not just the inference call and the JSON parse.
+    try:
+        finalized = finalize_extraction(parsed, context)
+    except Exception as exc:
+        logger.warning("Extraction packet finalization failed on malformed Stage-1 output: %s", exc)
+        return None
+
     if not finalized.validation.valid:
         logger.warning(
             "Extraction packet failed schema validation (%d error(s)): %s",
