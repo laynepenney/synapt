@@ -43,7 +43,7 @@ from synapt.recall.clustering import _jaccard
 from synapt.recall.scrub import scrub_text, strip_markdown_formatting
 from synapt.recall.core import project_data_dir, project_index_dir
 from synapt.recall._llm_util import truncate_at_word as _tw
-from synapt_extract import create_extraction_builder, finalize_extraction, FinalizeContext
+from synapt_extract import finalize_extraction, FinalizeContext
 
 logger = logging.getLogger("synapt.recall.consolidate")
 
@@ -1385,6 +1385,75 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
 EXTRACTION_CAPABILITIES = ["facts", "decisions", "temporal_refs"]
 
 
+# ---------------------------------------------------------------------------
+# recall#869 + #868 — quality scaffolding for the extract path.
+#
+# The dogfood proof (2026-07-12) showed the extract path regressed to
+# scattered/low-quality nodes vs legacy on the SAME local 3B, because we kept
+# only extract's STRUCTURAL schema validation and dropped legacy's quality
+# craft (tuned prompt + garbage heuristics). Schema-valid != quality. These
+# three levers port that craft onto extract's schema-first shape:
+#   Lever 1: _sanitize_stage1_output strips invented entity_refs (killed
+#            12/14 of the 61% fail-closes).
+#   Lever 2: EXTRACTION_SYNTHESIS_PROMPT replaces extract's generic Stage-1
+#            prompt with legacy-style synthesis guidance + a forbid-list.
+#   Lever 3: _is_metadata_noise + the legacy garbage heuristics + intra-batch
+#            dedup filter the mapped nodes.
+# ---------------------------------------------------------------------------
+
+# Lever 2 — synthesis-tuned Stage-1 prompt. Ports legacy CONSOLIDATION_PROMPT's
+# synthesis discipline (fewer/denser/durable, concrete over generic) onto
+# extract's Stage-1 JSON shape, and explicitly forbids the junk classes the
+# untuned generic prompt produced in the dogfood run. The local MLX client has
+# no schema-constrained decoding, so the prompt is where quality is won —
+# extract's structural validation runs afterward regardless (they compose).
+EXTRACTION_SYNTHESIS_PROMPT = """\
+You are distilling DURABLE knowledge from session summaries into a structured packet.
+
+## Recent Sessions
+{text}
+
+## Task
+Extract only durable, specific knowledge worth remembering across future sessions.
+Prefer FEWER, DENSER facts over many shallow ones. Synthesize across the sessions:
+combine a root cause + its fix into one fact; fold related observations together.
+Be concrete — include real names, values, paths, and details from the sessions.
+
+## NEVER produce these (they are noise, not durable knowledge):
+- Session metadata as facts: session IDs, bare dates, "Session <id> occurred on <date>",
+  "Session <id> focused on X". The session/date bookkeeping is tracked elsewhere.
+- Raw command logs or one-off commands: "Execute /clear on <date>", "Run this shell
+  command: rm -rf ...". A command that ran once is not durable knowledge.
+- Transient intentions and to-dos ("check #dev later", "install X", "test Y next").
+- Generic advice true of any project ("always use Docker", "write tests").
+- Verbatim echoes of a session's focus line.
+
+## Output
+Output ONLY valid JSON (no markdown fences, no prose) with this exact shape:
+{{"extracted_at": "<ISO timestamp>",
+  "facts": [{{"text": "durable specific fact", "category": "fact|decision|architecture|convention|tooling|debugging|infrastructure|preference|workflow|lesson-learned"}}],
+  "decisions": [{{"text": "an explicit choice made between alternatives"}}],
+  "temporal_refs": [{{"raw": "<phrase>", "resolved": "<ISO date or null>"}}]}}
+
+If nothing durable emerges, output {{"extracted_at": "<ISO timestamp>", "facts": [], "decisions": [], "temporal_refs": []}}.
+Empty is better than noise.
+"""
+
+
+def _build_extraction_prompt_synthesis(text: str) -> str:
+    """Build the synthesis-tuned Stage-1 prompt for *text* (lever 2).
+
+    Replaces extract's generic ``build_extraction_prompt`` output. We keep
+    extract's ``finalize_extraction`` for structural validation, but author
+    the model-facing prompt ourselves — exactly the way the legacy path
+    hand-authors CONSOLIDATION_PROMPT — so the quality guidance the 3B needs
+    is not diluted by extract's generic "extract structured data" preamble.
+    The requested capability surface (facts/decisions/temporal_refs) is
+    reflected in the prompt's output shape; finalize validates it.
+    """
+    return EXTRACTION_SYNTHESIS_PROMPT.format(text=text)
+
+
 def _extract_source_id(text: str) -> str:
     """Content-derived hash so the extraction packet has a real address.
 
@@ -1410,6 +1479,62 @@ def _map_extraction_category(category: str | None) -> str:
     if category and category in VALID_CATEGORIES:
         return category
     return "fact"
+
+
+# Lever 3 — metadata-noise filter. Targets the junk CLASS the extract path
+# produced in the dogfood run that legacy's tuned prompt suppresses. NOTE: this
+# is deliberately separate from legacy's _lacks_specificity, which treats a
+# bare date as a specificity *signal* — exactly backwards for this problem, so
+# "Session <id>, <date>" slips through it. These patterns target the metadata
+# SHAPE (a session-id/date bookkeeping tuple, a command-execution log, a raw
+# focus-line echo), not the mere presence of a date, so a genuine fact that
+# happens to mention a date is not flagged.
+_METADATA_NOISE_PATTERNS = [
+    # "Session 019e2439, 2026-05-14" / "Session e43f3562 occurred on ..." —
+    # requires a session-ID-like token (contains a digit) so real prose like
+    # "Session management is handled by X" is NOT matched.
+    re.compile(r"(?i)^session\s+[\w-]*\d[\w-]*\b"),
+    # "... Session <id> occurred on/from/focused ..." mid-sentence bookkeeping
+    re.compile(r"(?i)\bsession\s+[\w-]*\d[\w-]*\s+(occurred|from|focus)"),
+    # Raw journal focus line echoed verbatim as a "fact"
+    re.compile(r"(?i)^focus:\s"),
+    # "Execute `/clear` command on <date>" — one-off slash-command log
+    re.compile(r"(?i)^execute\s+[`'\"]?/\w+"),
+    # A one-off shell command immortalized ("Run this exact shell command: rm -rf ...")
+    re.compile(r"(?i)^(run\b.*\brm\s+-rf|.*\brun this exact shell command)"),
+]
+
+
+def _is_metadata_noise(content: str) -> bool:
+    """Return True if *content* is session/command bookkeeping dressed up as a
+    durable fact (lever 3 — recall#868). See _METADATA_NOISE_PATTERNS."""
+    for pat in _METADATA_NOISE_PATTERNS:
+        if pat.search(content):
+            return True
+    return False
+
+
+def _sanitize_stage1_output(parsed: dict) -> dict:
+    """Strip invented cross-references from Stage-1 output before finalize
+    (lever 1 — recall#869).
+
+    The local 3B (no schema-constrained decoding) keeps emitting ``entity_refs``
+    on decisions/facts/actions/goals with invented entity IDs. Because we don't
+    request the ``entities`` capability, nothing is declared for them to
+    reference, and extract's referential-integrity validator rejects the whole
+    packet — 12/14 of the 61% fail-closed rate in the dogfood proof. We don't
+    use entity linkage in this slot, so strip these fields structurally: they
+    can then never fail-close. Non-dict members are left untouched (finalize's
+    own guard handles those); mutates and returns *parsed* for chaining.
+    """
+    for key in ("decisions", "facts", "actions", "goals"):
+        items = parsed.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                item.pop("entity_refs", None)
+    return parsed
 
 
 def _earliest_temporal_ref_date(temporal_refs: list[dict]) -> str | None:
@@ -1445,16 +1570,25 @@ def _knowledge_nodes_from_extraction(
     cluster_sessions: list[str],
 ) -> list[KnowledgeNode]:
     """Map a validated SynaptExtraction packet's facts/decisions into
-    KnowledgeNodes.
+    KnowledgeNodes, applying legacy's quality craft (lever 3, recall#868).
 
     entities are NOT materialized as nodes in this slot — they're
     structural (name/type/aliases), not durable prose. Confidence reuses
     recall's existing compute_confidence() rather than extract's per-item
     signals.confidence (keeps the requested capability surface minimal).
-    Dedup/corroborate/contradict against existing knowledge is handled by
-    the existing post-consolidation pipeline (dedup_knowledge_nodes(),
-    resolve_source_turns(), resolve_source_offsets()) uniformly for nodes
-    from either path — not duplicated here.
+
+    Quality filtering composes with extract's structural validation (both,
+    not either — the dogfood proof showed schema-valid != quality). Each
+    candidate is scrubbed (markdown/topic-prefix, same as legacy's
+    _apply_consolidation_result) then dropped if it is metadata noise,
+    generic advice, or garbled — the classes the untuned extract path
+    scattered. Exact-content duplicates are collapsed intra-batch (the
+    dogfood run had 8 near-dupes vs legacy's 1); semantic near-dupes are
+    still caught by the existing post-consolidation dedup_knowledge_nodes()
+    pass. Deliberately does NOT apply legacy's _lacks_specificity, which
+    treats a bare date as a specificity signal and would both let
+    session-metadata through and over-reject legitimate short synthesized
+    facts (see _is_metadata_noise).
     """
     valid_from = (
         _earliest_temporal_ref_date(packet.get("temporal_refs") or [])
@@ -1462,32 +1596,38 @@ def _knowledge_nodes_from_extraction(
     )
     confidence = compute_confidence(len(cluster_sessions))
     nodes: list[KnowledgeNode] = []
+    seen_content: set[str] = set()
+
+    def _accept(raw_text, category) -> None:
+        content = strip_markdown_formatting(scrub_text(_tw(str(raw_text), 300)))
+        content = _strip_section_prefix(content)
+        if not content:
+            return
+        if _is_metadata_noise(content) or _is_generic_node(content) or _is_garbled_content(content):
+            logger.debug("Extract-path node rejected (quality): %s", content[:80])
+            return
+        key = content.strip().lower()
+        if key in seen_content:
+            return  # intra-batch exact-duplicate collapse
+        seen_content.add(key)
+        node = KnowledgeNode.create(
+            content=content,
+            category=category,
+            source_sessions=cluster_sessions,
+            confidence=confidence,
+        )
+        node.valid_from = valid_from
+        nodes.append(node)
 
     for fact in packet.get("facts") or []:
         text = fact.get("text") if isinstance(fact, dict) else None
-        if not text:
-            continue
-        node = KnowledgeNode.create(
-            content=text,
-            category=_map_extraction_category(fact.get("category")),
-            source_sessions=cluster_sessions,
-            confidence=confidence,
-        )
-        node.valid_from = valid_from
-        nodes.append(node)
+        if text:
+            _accept(text, _map_extraction_category(fact.get("category")))
 
     for decision in packet.get("decisions") or []:
         text = decision.get("text") if isinstance(decision, dict) else None
-        if not text:
-            continue
-        node = KnowledgeNode.create(
-            content=text,
-            category="decision",
-            source_sessions=cluster_sessions,
-            confidence=confidence,
-        )
-        node.valid_from = valid_from
-        nodes.append(node)
+        if text:
+            _accept(text, "decision")
 
     return nodes
 
@@ -1504,10 +1644,10 @@ def _build_extraction_packet(
     validate.
 
     Bypasses extract.py's async extract() orchestrator — consolidate.py is
-    fully sync and MLXClient.chat() is a blocking call, so this calls
-    create_extraction_builder().build() for the prompt/schema, the existing
-    MLX/router client for inference, and finalize_extraction() directly,
-    all synchronously.
+    fully sync and MLXClient.chat() is a blocking call, so this authors the
+    synthesis prompt (_build_extraction_prompt_synthesis), runs the existing
+    MLX/router client for inference, and calls finalize_extraction() directly
+    for structural validation, all synchronously.
 
     max_tokens defaults to None, which scales the response budget to the
     built extraction prompt via _estimate_response_budget() — the same
@@ -1535,18 +1675,19 @@ def _build_extraction_packet(
     noncompliance, but that's an existing, shared cost, not a new one
     introduced by the extract path (Opus review, m_13ae8e8a, medium 4).
     """
-    built = create_extraction_builder(
-        text=text,
-        capabilities=list(EXTRACTION_CAPABILITIES),
-    ).build()
+    # Lever 2 (recall#868): author the model-facing prompt ourselves with
+    # legacy-style synthesis guidance instead of extract's generic
+    # build_extraction_prompt output. finalize_extraction still validates the
+    # result structurally, so quality (prompt) and structure (schema) compose.
+    prompt = _build_extraction_prompt_synthesis(text)
     response_budget = (
-        max_tokens if max_tokens is not None else _estimate_response_budget(built["prompt"])
+        max_tokens if max_tokens is not None else _estimate_response_budget(prompt)
     )
 
     try:
         response = client.chat(
             model=model,
-            messages=[Message(role="user", content=built["prompt"])],
+            messages=[Message(role="user", content=prompt)],
             temperature=0.1,
             adapter_path=adapter_path or None,
             max_tokens=response_budget,
@@ -1563,6 +1704,10 @@ def _build_extraction_packet(
         )
         return None
 
+    # Lever 1 (recall#869): strip invented entity_refs before anything else —
+    # they were 12/14 of the dogfood fail-closes (see _sanitize_stage1_output).
+    parsed = _sanitize_stage1_output(parsed)
+
     # extract's finalized schema unconditionally requires entities/goals/
     # themes arrays even though the Stage-1 request schema only requires
     # the capabilities we asked for — backfill so validation doesn't fail
@@ -1574,7 +1719,7 @@ def _build_extraction_packet(
     context = FinalizeContext(
         produced_by=f"mlx://{model}",
         source_id=_extract_source_id(text),
-        capabilities_hint=built["capabilities"],
+        capabilities_hint=list(EXTRACTION_CAPABILITIES),
     )
     # Sentinel review (m_40b29111): parseable Stage-1 JSON can still have
     # non-dict members inside facts/decisions/temporal_refs (the local MLX
