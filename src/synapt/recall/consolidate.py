@@ -1418,6 +1418,8 @@ Extract only durable, specific knowledge worth remembering across future session
 Prefer FEWER, DENSER facts over many shallow ones. Synthesize across the sessions:
 combine a root cause + its fix into one fact; fold related observations together.
 Be concrete — include real names, values, paths, and details from the sessions.
+Keep each fact or decision to 1-2 sentences (roughly 200 characters or less):
+dense and specific, not verbose. Do not pad with speculation or restatement.
 
 ## NEVER produce these (they are noise, not durable knowledge):
 - Session metadata as facts: session IDs, bare dates, "Session <id> occurred on <date>",
@@ -1514,26 +1516,73 @@ def _is_metadata_noise(content: str) -> bool:
     return False
 
 
-def _sanitize_stage1_output(parsed: dict) -> dict:
-    """Strip invented cross-references from Stage-1 output before finalize
-    (lever 1 — recall#869).
+# Extract v0.5.0 root keys that pass structural validation (validate.py
+# _ROOT_KEYS). The local 3B occasionally reverts to legacy's {"nodes": [...]}
+# shape or invents other top-level keys; those are stripped so a stray key
+# can't fail-close an otherwise-good packet.
+_EXTRACT_ROOT_KEYS = frozenset({
+    "version", "extracted_at", "source_id", "source_type", "user_id",
+    "produced_by", "kind", "entities", "goals", "themes", "keywords",
+    "sentiment", "summary", "facts", "questions", "actions", "decisions",
+    "temporal_refs", "language", "source_metadata", "confidence",
+    "capabilities", "embeddings", "extensions",
+})
+# Only extract facts carry a `category` field. The 3B over-generalizes the
+# category it sees on facts and stamps it onto decisions/actions/goals too,
+# where the schema forbids it ("additional property not allowed") — this was
+# the dominant post-lever-2 fail-close (17/25) in the dogfood diagnostic.
+_CATEGORYLESS_ITEM_KEYS = ("decisions", "actions", "goals")
 
-    The local 3B (no schema-constrained decoding) keeps emitting ``entity_refs``
-    on decisions/facts/actions/goals with invented entity IDs. Because we don't
-    request the ``entities`` capability, nothing is declared for them to
-    reference, and extract's referential-integrity validator rejects the whole
-    packet — 12/14 of the 61% fail-closed rate in the dogfood proof. We don't
-    use entity linkage in this slot, so strip these fields structurally: they
-    can then never fail-close. Non-dict members are left untouched (finalize's
-    own guard handles those); mutates and returns *parsed* for chaining.
+
+def _sanitize_stage1_output(parsed: dict) -> dict:
+    """Strip the structurally-invalid shapes the local 3B keeps inventing,
+    before finalize (lever 1 — recall#869, extended per the dogfood
+    diagnostic 2026-07-12).
+
+    The local 3B has no schema-constrained decoding, so parseable-but-invalid
+    output is the expected surface. Rather than fail-close on each, strip the
+    recurring invalid shapes structurally (they can then never fail-close):
+
+    - ``entity_refs`` on any item array — invented entity IDs with no declared
+      entities to reference (extract's referential validator rejects them).
+      This was 12/14 of the ORIGINAL 61% fail-closes.
+    - ``category`` on decisions/actions/goals — only facts allow it; the 3B
+      over-applies it. 17/25 of the post-synthesis-prompt fail-closes.
+    - unknown top-level keys (e.g. a legacy-style ``nodes`` fallback) — kept to
+      extract's known root-key set.
+    - a missing/blank ``extracted_at`` (a required root field) is backfilled.
+
+    Non-dict members are left untouched (finalize's own guard handles those);
+    mutates and returns *parsed* for chaining. We don't use entity linkage or
+    per-decision categories in this slot, so nothing of value is lost.
     """
+    if not isinstance(parsed, dict):
+        return parsed
+
+    # Drop unknown top-level keys (legacy-style "nodes" fallback etc.)
+    for key in [k for k in parsed if k not in _EXTRACT_ROOT_KEYS]:
+        parsed.pop(key, None)
+
+    # Backfill the required extracted_at if the model dropped/blanked it
+    if not isinstance(parsed.get("extracted_at"), str) or not parsed["extracted_at"].strip():
+        parsed["extracted_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    # Strip invented entity_refs from every item array
     for key in ("decisions", "facts", "actions", "goals"):
         items = parsed.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if isinstance(item, dict):
-                item.pop("entity_refs", None)
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    item.pop("entity_refs", None)
+
+    # Strip category from item types that don't allow it (only facts do)
+    for key in _CATEGORYLESS_ITEM_KEYS:
+        items = parsed.get(key)
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    item.pop("category", None)
+
     return parsed
 
 

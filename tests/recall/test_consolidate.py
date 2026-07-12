@@ -2482,6 +2482,84 @@ class TestSanitizeStage1Output(unittest.TestCase):
         out = _sanitize_stage1_output(parsed)
         self.assertEqual(out["decisions"][0]["decided_at"], "2026-07-12")
 
+    # --- extensions from the dogfood diagnostic (2026-07-12): the synthesis
+    # prompt shifted the fail-close profile. The new dominant invalid shapes
+    # the 3B produces, each stripped structurally the same way as entity_refs.
+
+    def test_strips_category_from_decisions(self):
+        # decisions don't allow `category` in extract's schema; the 3B copies
+        # it from the facts example. Was 17/25 of the post-lever-2 fail-closes.
+        parsed = {"decisions": [{"text": "a decision", "category": "architecture"}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertNotIn("category", out["decisions"][0])
+        self.assertEqual(out["decisions"][0]["text"], "a decision")
+
+    def test_keeps_category_on_facts(self):
+        # facts DO allow category — must not be stripped.
+        parsed = {"facts": [{"text": "a fact", "category": "architecture"}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertEqual(out["facts"][0]["category"], "architecture")
+
+    def test_strips_unknown_top_level_keys(self):
+        # the 3B occasionally reverts to legacy's {"nodes": [...]} shape.
+        parsed = {"facts": [{"text": "f"}], "nodes": [{"content": "x"}], "bogus": 1}
+        out = _sanitize_stage1_output(parsed)
+        self.assertNotIn("nodes", out)
+        self.assertNotIn("bogus", out)
+        self.assertIn("facts", out)
+
+    def test_backfills_missing_extracted_at(self):
+        parsed = {"facts": [{"text": "f"}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertIsInstance(out.get("extracted_at"), str)
+        self.assertTrue(out["extracted_at"])
+
+    def test_backfills_blank_extracted_at(self):
+        parsed = {"extracted_at": "  ", "facts": [{"text": "f"}]}
+        out = _sanitize_stage1_output(parsed)
+        self.assertTrue(out["extracted_at"].strip())
+
+    def test_preserves_valid_extracted_at(self):
+        parsed = {"extracted_at": "2026-07-12T00:00:00Z", "facts": []}
+        out = _sanitize_stage1_output(parsed)
+        self.assertEqual(out["extracted_at"], "2026-07-12T00:00:00Z")
+
+
+class TestDecisionCategoryNoLongerFailCloses(unittest.TestCase):
+    """Dogfood diagnostic (2026-07-12): after the synthesis prompt, the 3B
+    stamped `category` onto decisions (17/25 fail-closes). A Stage-1 response
+    with a categorized decision must now produce a VALID packet end-to-end,
+    not fail-close."""
+
+    def test_categorized_decision_produces_valid_packet(self):
+        stage1 = json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [{"text": "recall consolidation runs on synapt-extract behind a flag", "category": "architecture"}],
+            "decisions": [{"text": "Ported legacy quality craft onto the extract path", "category": "decision"}],
+            "temporal_refs": [],
+        })
+        client = _FakeExtractionClient(stage1)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNotNone(packet, "category on a decision should be stripped, not fail-close")
+        self.assertEqual(len(packet["decisions"]), 1)
+        self.assertNotIn("category", packet["decisions"][0])
+        # facts keep their category
+        self.assertEqual(packet["facts"][0].get("category"), "architecture")
+
+    def test_legacy_nodes_fallback_shape_does_not_fail_close(self):
+        # model reverts to {"nodes": [...]} but still emits usable facts
+        stage1 = json.dumps({
+            "extracted_at": "2026-07-12T00:00:00Z",
+            "facts": [{"text": "a genuinely durable synthesized fact about /src/consolidate.py"}],
+            "decisions": [],
+            "temporal_refs": [],
+            "nodes": [{"content": "legacy-shaped leftover"}],
+        })
+        client = _FakeExtractionClient(stage1)
+        packet = _build_extraction_packet("some cluster text", client, model="mlx-community/test-model")
+        self.assertIsNotNone(packet)
+        self.assertNotIn("nodes", packet)
+
 
 class TestEntityRefsNoLongerFailClose(unittest.TestCase):
     """Lever 1 end-to-end: a Stage-1 response with entity_refs (the exact
