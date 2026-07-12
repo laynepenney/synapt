@@ -1392,6 +1392,14 @@ def _extract_source_id(text: str) -> str:
     the optional artifact-bundle wrapper, not the packet. Setting source_id
     here gives the packet the "addressable-unit" property from the
     2026-05-08 intelligence-packet reframe.
+
+    source_id is a generic identifier field in extract's schema (a plain
+    optional string — no built-in content-hash semantic; verified against
+    schema.py/validate.py) so this doesn't stomp an existing extract
+    meaning. Forward-compat: if extract later adds a native packet-level
+    content_hash field, migrate to that instead of overloading source_id.
+    recall's own provenance (source_sessions / source_turns on
+    KnowledgeNode) is tracked separately from this field.
     """
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
