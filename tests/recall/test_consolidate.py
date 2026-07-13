@@ -2736,6 +2736,14 @@ class TestExtractionSynthesisPrompt(unittest.TestCase):
         self.assertTrue("invent" in p)
         self.assertTrue("command marker" in p or "session boundar" in p or "thin input" in p)
 
+    def test_prompt_constant_forbids_answering_questions(self):
+        # Dual-path read (2026-07-12): on question-clusters ("recall what model
+        # we use") the 3B answered by inventing architecture (extract had 1
+        # hard-confab vs legacy 0). The prompt must forbid answering questions
+        # the sessions merely ASK.
+        p = EXTRACTION_SYNTHESIS_PROMPT.lower()
+        self.assertTrue("asks a question" in p or "answer questions" in p or "question is not knowledge" in p)
+
     def test_build_synthesis_prompt_embeds_source_text(self):
         prompt = _build_extraction_prompt_synthesis("the loom weaves context here")
         self.assertIn("the loom weaves context here", prompt)
@@ -2809,6 +2817,39 @@ class TestExtractQualityFilterInMapping(unittest.TestCase):
         nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
         self.assertEqual(len(nodes), 2)
         self.assertEqual(len(set(n.content for n in nodes)), 2)
+
+    def test_near_duplicate_reworded_facts_suppressed(self):
+        # Dual-path read (2026-07-12): the 3B atomizes and re-states the same
+        # fact in slightly different words (the modal.Mount / cm_-clusters
+        # near-dup pairs at 0.86-0.93 token overlap). Exact-dedup misses these;
+        # intra-batch token-overlap suppression collapses them. Legacy
+        # synthesizes and produced 0 near-dup pairs.
+        packet = {
+            "facts": [
+                {"text": "The cm_-clusters end-to-end pipeline workflow must be validated before proceeding to cm_-subchunks"},
+                {"text": "The cm_-clusters end-to-end pipeline workflow must be validated before moving on to cm_-subchunks"},
+                {"text": "The Vela Wood deck claims PyPI v0.15.3 but only 0.15.1 is actually published on PyPI"},
+            ],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 2)  # the near-dup pair collapses to one
+
+    def test_distinct_facts_not_over_suppressed(self):
+        # near-dup suppression must NOT collapse genuinely distinct facts that
+        # happen to share a few tokens.
+        packet = {
+            "facts": [
+                {"text": "The consolidation model uses a 3B Ministral variant for local inference"},
+                {"text": "The Vela Wood deck claims PyPI v0.15.3 but only 0.15.1 is published"},
+                {"text": "gitgrip remote swap fixed by pointing origin to the correct upstream repo"},
+            ],
+            "decisions": [],
+            "temporal_refs": [],
+        }
+        nodes = _knowledge_nodes_from_extraction(packet, ["s1"])
+        self.assertEqual(len(nodes), 3)
 
     def test_all_noise_produces_no_nodes(self):
         packet = {

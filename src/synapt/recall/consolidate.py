@@ -1449,6 +1449,13 @@ EMPTY. Do not invent behavior, semantics, or rules for a command or marker
 you merely saw executed — you do not know what it does. Extract only what the
 sessions actually state.
 
+## Do NOT answer questions the sessions ask
+If a session ASKS a question ("recall what model we use", "why was X chosen?"),
+that question is not knowledge and you do not know the answer. Do NOT invent an
+answer — especially do not invent technical specifics (internal architectures,
+mechanisms, component names) that the sessions never state. Extract only what
+the sessions assert as fact.
+
 If nothing durable emerges, output {{"extracted_at": "<ISO timestamp>", "facts": [], "decisions": [], "temporal_refs": []}}.
 Empty is better than noise, and far better than invented.
 """
@@ -1681,6 +1688,7 @@ def _knowledge_nodes_from_extraction(
     confidence = compute_confidence(len(cluster_sessions))
     nodes: list[KnowledgeNode] = []
     seen_content: set[str] = set()
+    seen_tokens: list[set[str]] = []
 
     def _accept(raw_text, category) -> None:
         content = strip_markdown_formatting(scrub_text(_tw(str(raw_text), 300)))
@@ -1693,6 +1701,20 @@ def _knowledge_nodes_from_extraction(
         key = content.strip().lower()
         if key in seen_content:
             return  # intra-batch exact-duplicate collapse
+        # Intra-batch NEAR-duplicate suppression (recall#868, Opus ≤-legacy
+        # bar): the 3B atomizes and re-states the same fact in slightly
+        # different words within a batch (the modal.Mount / cm_-clusters
+        # pairs in the dual-path read). Exact-dedup misses these; suppress a
+        # candidate that overlaps an already-accepted node by >0.8 of the
+        # smaller token set. Legacy synthesizes and produced 0 near-dup pairs.
+        cand_tokens = _extract_keywords(content)
+        if cand_tokens:
+            for prev in seen_tokens:
+                inter = len(cand_tokens & prev)
+                if inter >= 4 and inter / min(len(cand_tokens), len(prev)) > 0.8:
+                    logger.debug("Extract-path node rejected (near-dup): %s", content[:80])
+                    return
+            seen_tokens.append(cand_tokens)
         seen_content.add(key)
         node = KnowledgeNode.create(
             content=content,
