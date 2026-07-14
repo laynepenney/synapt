@@ -2,8 +2,10 @@
 
 Executable spec against Atlas's frozen config#481 corpus (design/results/
 identify-step-probe-2026-07-13, SHA-pinned fixtures copied into tests/fixtures/
-identify/). The DETERMINISTIC prefilter carries most of the load and is validated
-model-free here; the narrow SPLIT's fidelity is a separate Modal 3B gate (paced).
+identify/). Both the deterministic prefilter and the deterministic clause-splitter (1b)
+are validated model-free here. The narrow LLM split was measured and REJECTED by the
+split-fidelity gate (2026-07-13, Modal ap-nCK7lZHLtkD7Jrek8KDTY4): 24.6% word-salad at BF16.
+Sub-step 1b is now a conservative deterministic partition (verbatim, never fabricates).
 
 Reconciled target (design-note config 3030967 §RECONCILE, Opus, Layne-pending):
   124 gold source from done/decisions  → prefilter MUST capture (primary gate)
@@ -16,11 +18,12 @@ for v1, NOT recovered by an LLM classifier (would reintroduce the NO-GO fabricat
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
 from synapt.recall.consolidate import _read_all_entries, cluster_journal_entries
-from synapt.recall.identify import Candidate, is_compound, prefilter
+from synapt.recall.identify import Candidate, identify, is_compound, prefilter, split_candidate
 
 _FIX = Path(__file__).parent.parent / "fixtures" / "identify"
 _GOLD = [json.loads(line) for line in (_FIX / "gold-units.jsonl").read_text().splitlines() if line.strip()]
@@ -118,12 +121,83 @@ def test_prefilter_is_deterministic_no_model():
     assert a == b and a, "prefilter must be pure/deterministic"
 
 
-# --- compound-detection pretest (conservative-first; the split's own fidelity is Modal) ---
+# --- 1b deterministic clause-splitter (fidelity-first; the LLM narrow-split FAILED) -------
 
-def test_is_compound_flags_semicolon_and_multiclause_passes_atomic():
+def test_is_compound_means_the_splitter_partitions():
+    # high-precision boundaries: semicolons + sentence periods
     assert is_compound("Merged PR #12; filed issue #13; bumped version to 0.2.0")
-    assert is_compound("x" * 300)  # over-length
-    assert is_compound("Wrote the parser, and then verified it against the fixtures")
-    # atomic single facts pass through (no model call)
+    assert is_compound("Fixed the bug. Filed the issue. Bumped the version.")
+    # atomic single facts do not split
     assert not is_compound("The recall package is open source.")
     assert not is_compound("Grip issue #763 was filed for the tomllib migration follow-up.")
+    # CONSERVATIVE: comma-lists and comma-conjunctions stay MERGED (under-split is graceful;
+    # over-splitting a list fabricates false boundaries — the precision-killer)
+    assert not is_compound("surfaced blockers in trust, activation, introspection, and docs")
+    assert not is_compound("Wrote the parser, and then verified it against the fixtures")
+    # versions/filenames are not sentence boundaries (no space after the dot)
+    assert not is_compound("Added the synapt-extract>=0.5.0 dependency to eval.py")
+
+
+def test_split_partitions_at_high_precision_boundaries():
+    src = "Filed grip#754 for the add bug. Fixed the remote swap; wrote the journal."
+    cand = Candidate(text=src, attr={"entry_index": 0, "field": "done", "index": 0})
+    assert [c.text for c in split_candidate(cand)] == [
+        "Filed grip#754 for the add bug.",
+        "Fixed the remote swap",
+        "wrote the journal.",
+    ]
+
+
+def test_split_pieces_are_verbatim_ordered_and_inherit_attribution():
+    src = "Did A. Did B; did C."
+    attr = {"entry_index": 2, "field": "decisions", "index": 1}
+    out = split_candidate(Candidate(text=src, attr=attr))
+    pos = 0
+    for n, unit in enumerate(out):
+        found = src.index(unit.text.strip(), pos)   # verbatim, ordered, non-overlapping
+        pos = found + len(unit.text.strip())
+        assert unit.attr == attr                    # inherits parent attribution
+        assert unit.split_index == n                # tagged with split position
+
+
+def test_split_preserves_all_content_no_drop_no_add():
+    src = "Merged #12; filed #13. Bumped to 0.2.0."
+    joined = "".join(c.text for c in split_candidate(Candidate(text=src, attr={})))
+    alnum = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())  # noqa: E731
+    assert alnum(joined) == alnum(src)              # nothing dropped or fabricated
+
+
+def test_split_under_splits_gracefully_when_no_boundary():
+    # a delimiter-poor run-on stays ONE unit (graceful) — never word-salad
+    cand = Candidate(text="fixed the gr target gap via a scoped set rather than a full edit", attr={"k": 1})
+    out = split_candidate(cand)
+    assert len(out) == 1 and out[0] is cand         # returned unchanged
+
+
+def test_split_paren_guard_keeps_parentheticals_intact():
+    src = "Checked the fix (config PR #476. Rules were split) and it passed."
+    pieces = [c.text for c in split_candidate(Candidate(text=src, attr={}))]
+    assert pieces == [src]                          # the '. ' sits inside parens
+    assert pieces[0].count("(") == pieces[0].count(")")
+
+
+def test_split_abbreviation_guard():
+    pieces = [c.text for c in split_candidate(Candidate(text="Compared vs. Prod and shipped.", attr={}))]
+    assert pieces == ["Compared vs. Prod and shipped."]   # 'vs.' is not a sentence end
+
+
+def test_split_is_deterministic():
+    cand = Candidate(text="Alpha happened. Beta happened; gamma happened.", attr={})
+    a = [c.text for c in split_candidate(cand)]
+    assert a == [c.text for c in split_candidate(cand)] and len(a) == 3
+
+
+def test_identify_is_fully_deterministic_and_units_verbatim_on_real_clusters():
+    # strongest fidelity gate: on the real dogfood clusters, every identified unit is a
+    # verbatim substring of the exact source done/decisions item it is attributed to
+    clusters = _dogfood_clusters()
+    assert clusters
+    for cluster in clusters:
+        for unit in identify(cluster):              # no infer argument — fully deterministic
+            item = getattr(cluster[unit.attr["entry_index"]], unit.attr["field"])[unit.attr["index"]]
+            assert unit.text.strip() in item

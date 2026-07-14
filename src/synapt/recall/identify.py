@@ -7,11 +7,24 @@ already carries SEPARATE structured fields — `focus`, `done`, `decisions`,
 `next_steps` — and every durable gold unit lives in `done`/`decisions`. So DON'T
 flatten and re-segment; read the structure directly.
 
-Two sub-steps; the model appears only in the second, narrowly:
-  1a `prefilter` — deterministic (NO LLM): collect `entry.done[i]` + `entry.decisions[i]`
-     with free attribution; `focus`/`next_steps` are NEVER read.
-  1b `split` — narrow LLM call on COMPOUND candidates only (a `done` string carrying
-     >1 fact); atomic candidates pass through untouched.
+Two DETERMINISTIC sub-steps — NO LLM anywhere in identify:
+  1a `prefilter` — collect `entry.done[i]` + `entry.decisions[i]` with free attribution;
+     `focus`/`next_steps` are NEVER read.
+  1b `split_candidate` — a CONSERVATIVE deterministic clause-splitter partitions a compound
+     item at high-precision fact boundaries (`; ` and sentence `. `, paren/abbrev-guarded);
+     atomic candidates pass through untouched.
+
+Why deterministic, not a narrow LLM call: the split-fidelity gate (2026-07-13, Modal
+ap-nCK7lZHLtkD7Jrek8KDTY4) measured a 3B narrow-split on the 65 real compound candidates at
+BF16 (the upper-bound screen; 4-bit is strictly worse) and it FAILED — 24.6% word-salad
+(shatters a note into ~1-word-per-line), 44% seed-stable, plus real reword/drop/meaning-
+errors. That is false-memory injection at the split step, which precision-first cannot
+tolerate. A deterministic partition CANNOT confab, reword, drop, or reorder — every piece is
+a verbatim, ordered, non-overlapping substring of the source; its only failure modes are
+UNDER-split (graceful — one merged unit, recovered downstream by extract_batch) and
+over-split, which the high-precision markers + a paren-depth guard minimize (0 fabricated
+boundaries across the 65-case corpus). This is the design-note's own pre-planned fallback
+(line 151), promoted to primary.
 
 Design-note config 3030967 §RECONCILE (Opus, Layne-pending): the prefilter's
 done/decisions-only choice is PRECISION-FIRST and carries a KNOWN, MEASURED recall
@@ -28,8 +41,7 @@ Boundary: OSS — recall consolidation is a core primitive.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass
 
 from synapt.recall.journal import JournalEntry
 
@@ -84,65 +96,97 @@ def prefilter(cluster: list[JournalEntry]) -> list[Candidate]:
     return candidates
 
 
-# --- 1b — compound detection (deterministic pretest) + narrow LLM split -----------
+# --- 1b — deterministic conservative clause-splitter (recall, NO LLM) --------------
+#
+# Fidelity-first: partition a compound item into atomic units at HIGH-precision fact
+# boundaries ONLY, so every piece is a verbatim, ordered, non-overlapping substring of the
+# source. Prefer UNDER-split (leave merged; graceful — extract_batch re-extracts downstream)
+# over OVER-split (a false boundary fabricates a non-fact — the precision-killer). Split
+# markers: `; ` (semicolon) and a sentence boundary (`.`/`!`/`?` + whitespace + a fact-start
+# char), BOTH only at paren/bracket depth 0, with an abbreviation guard. NOT bare commas,
+# NOT bare " and ", NOT " + " (measured to over-split method chains + parenthetical lists).
 
-# Conservative multi-clause markers. Start narrow (design-note "open impl detail":
-# tune the false-negative rate in validation; a missed compound degrades gracefully
-# to one under-split unit, unlike the generic path's fabrication).
-_SEMICOLON = "; "
-_MULTI_CLAUSE = re.compile(
-    r",\s+(?:and|then|but|which|while|after|before)\s|\band\s+(?:also|then)\b",
-    re.IGNORECASE,
+# Common abbreviations whose trailing period is NOT a sentence boundary.
+_ABBREVIATIONS = (
+    "e.g", "i.e", "etc", "vs", "cf", " al", "approx",
+    "dr", "mr", "ms", "mrs", "sr", "jr", "st", "fig", " no", "inc", "ltd", "corp",
 )
+# Sentence boundary: end punctuation + whitespace + a fact-start char (Capital / digit /
+# quote / open-paren). Decimals, versions, and filenames ("0.5.0", "eval.py") lack the
+# space after the dot and are therefore naturally safe.
+_SENTENCE_BOUNDARY = re.compile(r"[.!?]\s+(?=[A-Z0-9\"'(])")
+_SEMICOLON = re.compile(r";\s+")
 
 
-def is_compound(text: str, *, length_threshold: int = 240) -> bool:
-    """Conservative pretest: does this candidate plausibly carry >1 fact (→ split)?
-
-    Flags a semicolon-joined list, a clear multi-clause conjunction, or an over-length
-    item. Everything else passes through atomic with NO model call. Conservative-first
-    by design — false negatives (missed compounds) degrade gracefully; the LLM surface
-    stays as small as possible.
-    """
-    if _SEMICOLON in text:
-        return True
-    if len(text) > length_threshold:
-        return True
-    return bool(_MULTI_CLAUSE.search(text))
+def _paren_depth(text: str, index: int) -> int:
+    head = text[:index]
+    return (head.count("(") - head.count(")")) + (head.count("[") - head.count("]"))
 
 
-_SPLIT_PROMPT = (
-    "Split this single journal note into separate atomic facts, one per line. "
-    "Only split — do not add, infer, reword, or drop anything. "
-    "If it is already a single fact, return it unchanged.\n\nNote: {text}"
-)
+def _ends_with_abbreviation(text: str, dot_index: int) -> bool:
+    tail = text[max(0, dot_index - 6):dot_index].lower()
+    return any(tail.endswith(abbr) for abbr in _ABBREVIATIONS)
 
 
-def split_candidate(candidate: Candidate, infer: Callable[[str], str]) -> list[Candidate]:
-    """1b — narrow LLM split of a COMPOUND candidate. Fidelity-first: only split, no
-    add/infer/reword/drop. Split units inherit the parent's attribution (+ split_index).
+def _split_on(text: str, marker: re.Pattern, keep_left: int) -> list[str]:
+    """Partition ``text`` at ``marker`` matches sitting at paren/bracket depth 0.
+    ``keep_left`` is how many chars of the match stay on the left piece (1 keeps sentence
+    punctuation, 0 drops the semicolon). Content is preserved; only the delimiter run and
+    inter-piece whitespace are dropped, so pieces stay verbatim substrings of the source."""
+    cuts: list[tuple[int, int]] = []
+    for match in marker.finditer(text):
+        if _paren_depth(text, match.start()) != 0:
+            continue
+        if keep_left and _ends_with_abbreviation(text, match.start()):
+            continue
+        cuts.append((match.start() + keep_left, match.end()))
+    if not cuts:
+        return [text]
+    pieces, start = [], 0
+    for cut, resume in cuts:
+        piece = text[start:cut].strip()
+        if piece:
+            pieces.append(piece)
+        start = resume
+    tail = text[start:].strip()
+    if tail:
+        pieces.append(tail)
+    return pieces or [text]
 
-    Non-compound candidates should not reach here (caller gates on ``is_compound``).
-    A blank/degenerate model response falls back to the unsplit candidate — never drops.
-    """
-    completion = infer(_SPLIT_PROMPT.format(text=candidate.text))
-    lines = [ln.strip() for ln in (completion or "").splitlines() if ln.strip()]
-    if not lines:
+
+def _split_markers(text: str) -> list[str]:
+    """The conservative partition: semicolons, then sentence boundaries (both depth-0)."""
+    pieces = [text]
+    pieces = [p for chunk in pieces for p in _split_on(chunk, _SEMICOLON, 0)]
+    pieces = [p for chunk in pieces for p in _split_on(chunk, _SENTENCE_BOUNDARY, 1)]
+    return [p.strip() for p in pieces if p.strip()]
+
+
+def is_compound(text: str) -> bool:
+    """True iff the deterministic splitter partitions ``text`` into more than one unit —
+    i.e. it carries a high-precision fact boundary. Advisory predicate; ``split_candidate``
+    is safe to call on any candidate regardless (an atomic one returns unchanged)."""
+    return len(_split_markers(text)) > 1
+
+
+def split_candidate(candidate: Candidate) -> list[Candidate]:
+    """1b — deterministic conservative split of a candidate into atomic units. Each unit is
+    a verbatim, ordered, non-overlapping substring of the source and inherits the parent's
+    attribution (+ ``split_index``). A candidate with no high-precision boundary returns
+    unchanged (single-element list) — graceful under-split, never a fabricated unit."""
+    pieces = _split_markers(candidate.text)
+    if len(pieces) <= 1:
         return [candidate]
     return [
-        Candidate(text=line, attr=dict(candidate.attr), split_index=n)
-        for n, line in enumerate(lines)
+        Candidate(text=piece, attr=dict(candidate.attr), split_index=n)
+        for n, piece in enumerate(pieces)
     ]
 
 
-def identify(cluster: list[JournalEntry], infer: Callable[[str], str] | None = None) -> list[Candidate]:
-    """Full structure-aware identify: prefilter → split compounds. ``infer`` is the
-    narrow split model call; if omitted, compound candidates pass through unsplit
-    (deterministic-only mode, for the prefilter gate / no-model contexts)."""
+def identify(cluster: list[JournalEntry]) -> list[Candidate]:
+    """Full structure-aware identify — fully deterministic (NO LLM): prefilter each entry's
+    `done`/`decisions` into candidates, then conservatively split any compound candidate."""
     units: list[Candidate] = []
     for candidate in prefilter(cluster):
-        if infer is not None and is_compound(candidate.text):
-            units.extend(split_candidate(candidate, infer))
-        else:
-            units.append(candidate)
+        units.extend(split_candidate(candidate))
     return units
