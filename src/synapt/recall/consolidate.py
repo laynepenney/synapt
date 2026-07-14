@@ -13,11 +13,13 @@ Requires mlx-lm (pip install mlx-lm). Degrades gracefully if not installed.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1373,6 +1375,227 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
     return score_with_validation(get_active_strategy(), inputs)
 
 
+# ---------------------------------------------------------------------------
+# B1 — decomposed extract path (behind SYNAPT_USE_EXTRACT)
+#
+# prefilter (identify.py) -> BatchUnits -> extract_batch -> per-unit envelopes.
+# This is the FRONT HALF only: the envelope->reconcile-node adapter, the
+# action-decision pass (B2), and the reconcile feed (B3) are downstream, so this
+# path produces envelopes + logs per-unit outcomes and creates NO knowledge
+# nodes. It replaces the monolithic CONSOLIDATION_PROMPT pass when the flag is on.
+# ---------------------------------------------------------------------------
+
+# provider URI for the extraction envelope's produced_by. validate_extraction REQUIRES a
+# `scheme://identifier` URI — the dotted form ("recall.consolidate") fails EVERY unit as
+# schema_invalid (verified against landed extract_batch). Scheme = recall's consolidate STEP
+# as the producer, stable across the pluggable model (which model ran is known out-of-band).
+_EXTRACT_PRODUCED_BY = "recall://consolidate"
+# The capability set recall requests from extract_batch (exact Stage-1 schema keys).
+_EXTRACT_CAPABILITIES = ["facts", "decisions", "temporal_refs"]
+
+
+def _get_consolidation_client(max_tokens: int = MIN_RESPONSE_TOKENS):
+    """Get a model client via the router (MLX -> Modal -> Ollama), with an MLX fallback.
+
+    Returns None when no backend is available. Shared by the monolithic path and the
+    decomposed extract path so both resolve the model the same way.
+    """
+    from synapt.recall._model_router import get_client, RecallTask
+    client = get_client(RecallTask.CONSOLIDATE, max_tokens=max_tokens)
+    if client is not None:
+        return client
+    if not _MLX_AVAILABLE:
+        return None
+    from synapt._models.mlx_client import MLXClient, MLXOptions
+    return MLXClient(MLXOptions(max_tokens=max_tokens))
+
+
+def _make_recall_infer(client, model: str):
+    """Build the SYNC inference seam that extract_batch injects: a
+    ``BatchInferRequest -> completion str`` callable wrapping recall's model client.
+
+    The model is a PLUGGABLE parameter — swapping Ministral / Qwen / Gemma is just a
+    different ``model`` routed through the same client; extract stays model-agnostic
+    (zero recall coupling). extract_batch calls this SYNCHRONOUSLY (never awaited), so it
+    stays a plain function.
+    """
+    def recall_infer(request) -> str:
+        raw_messages = request.get("messages") or []
+        messages = [
+            Message(role=m.get("role", "user"), content=m.get("content", ""))
+            for m in raw_messages
+        ]
+        if not messages:  # fall back to the flat prompt if the request carried no messages
+            messages = [Message(role="user", content=request.get("prompt", ""))]
+        return client.chat(
+            model=model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=MIN_RESPONSE_TOKENS,
+        )
+    return recall_infer
+
+
+def _run_coro_blocking(coro):
+    """Drive an async coroutine to completion from a sync caller, across BOTH consolidate
+    call-sites — which genuinely differ in whether an event loop is already running:
+
+    - CLI (``cmd_consolidate``): main thread, NO event loop → ``asyncio.run`` (the simple path).
+    - MCP (``recall_consolidate``): FastMCP 1.27 runs a sync tool INLINE on the event-loop thread
+      (verified: ``FuncMetadata.call_fn_with_arg_validation`` does ``return fn(...)`` directly,
+      no ``to_thread``), so a loop IS already running on this thread → ``asyncio.run`` would raise
+      ``RuntimeError('asyncio.run() cannot be called from a running event loop')``. We offload the
+      coroutine to a fresh thread with its own loop and block on ``join``.
+
+    That join holds the server's event-loop thread for the duration of extraction — acceptable
+    because the legacy sync ``consolidate()`` already blocks that same thread inline (consolidation
+    has always been a blocking call under FastMCP; this changes nothing about that). Errors from
+    the worker re-raise on the calling thread. (Sentinel probed the runtime: loop_running=True,
+    same_thread=True — this is the current MCP path, not a hypothetical future one.)
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # CLI path: no running loop
+
+    # MCP path: a loop is already running on THIS thread (FastMCP runs the sync tool inline) —
+    # asyncio.run would raise, so run the coroutine in a fresh thread with its own loop.
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["result"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 — surfaced on the calling thread below
+            box["error"] = exc
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+async def _extract_cluster_units(
+    cluster: list[JournalEntry],
+    cluster_id: str,
+    infer,
+    *,
+    produced_by: str = _EXTRACT_PRODUCED_BY,
+    capabilities: list[str] | None = None,
+):
+    """B1 front-half: prefilter -> BatchUnits -> extract_batch -> per-unit envelopes.
+
+    The deterministic prefilter (identify.py) reads structured ``done``/``decisions``; each
+    Candidate becomes a ``BatchUnit`` with a cluster-namespaced id (``batch_unit_id``);
+    extract_batch shapes + validates each into a per-unit SynaptExtraction envelope.
+    COUNT-INVARIANT — one ``BatchUnitResult`` per Candidate; failed units are marked
+    (``status == "failed"``), never dropped. The envelope->reconcile-node adapter and the
+    action-decision pass are B2/B3, so this returns raw envelopes and creates no nodes.
+
+    ``infer`` is the injected SYNC model seam (see ``_make_recall_infer``) — passed in rather
+    than built here so the helper is testable with a fake infer and zero model dependency,
+    mirroring extract_batch's own injected-seam design.
+    """
+    # Lazy import: the published synapt-extract lacks extract_batch, so importing at module
+    # scope would break every existing consolidate caller. Only the flag-on path needs it.
+    from synapt.extract.batch import extract_batch, BatchUnit
+    from synapt.recall.identify import identify, batch_unit_id
+
+    candidates = identify(cluster)
+    if not candidates:
+        return []
+    units = [
+        BatchUnit(id=batch_unit_id(cluster_id, cand), text=cand.text)
+        for cand in candidates
+    ]
+    caps = _EXTRACT_CAPABILITIES if capabilities is None else capabilities
+    return await extract_batch(
+        units,
+        infer=infer,
+        produced_by=produced_by,
+        capabilities=caps,
+    )
+
+
+def _log_extract_failure(failures_path: Path, cluster_id: str, envelope) -> bool:
+    """Append one per-unit extract failure marker to ``failures_path``. Returns True when the
+    marker is persisted, False when the write itself fails.
+
+    NEVER silent-drop: every non-ok ``BatchUnitResult`` is recorded with its ``status`` +
+    terminal ``reason`` and its ``source_unit_id`` (traceable to the exact journal field). If
+    the marker write ITSELF fails, that is a lost failed unit — it is surfaced loudly (error
+    log) and signalled to the caller (return False), never swallowed. Swallowing the write
+    error would silently lose the failed unit while the cluster looks processed.
+    """
+    try:
+        from synapt.recall._filelock import lock_exclusive, unlock
+        failures_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(failures_path, "a", encoding="utf-8") as ff:
+            lock_exclusive(ff)
+            try:
+                ff.write(json.dumps({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "path": "extract_batch",
+                    "cluster_id": cluster_id,
+                    "source_unit_id": envelope.source_unit_id,
+                    "status": envelope.status,
+                    "reason": envelope.reason,
+                }) + "\n")
+            finally:
+                unlock(ff)
+        return True
+    except OSError as exc:
+        logger.error(
+            "FAILED to persist extract failure marker for unit %s (cluster %s): %s — "
+            "the failed unit is NOT recorded (surfacing, not swallowing)",
+            envelope.source_unit_id, cluster_id, exc,
+        )
+        return False
+
+
+def _run_extract_path(
+    cluster: list[JournalEntry],
+    cluster_id: str,
+    client,
+    model: str,
+    failures_path: Path,
+) -> bool:
+    """B1 flag-branch body (SYNAPT_USE_EXTRACT): drive the decomposed front-half and log
+    per-unit outcomes. Produces envelopes; creates NO nodes (the envelope->node adapter +
+    action-decision (B2) + reconcile (B3) are pending). Failed units are logged, never
+    silent-dropped. Returns True when the cluster was processed (envelopes produced).
+    """
+    infer = _make_recall_infer(client, model)
+    try:
+        envelopes = _run_coro_blocking(_extract_cluster_units(cluster, cluster_id, infer))
+    except Exception as exc:
+        logger.warning("extract-path failed for cluster %s: %s", cluster_id, exc)
+        return False
+    ok = sum(1 for e in envelopes if e.status == "ok")
+    failed = [e for e in envelopes if e.status != "ok"]
+    all_logged = True
+    for e in failed:
+        if not _log_extract_failure(failures_path, cluster_id, e):
+            all_logged = False
+    logger.info(
+        "extract-path cluster %s: %d units -> %d ok, %d failed "
+        "(B1: envelopes only, no nodes created)",
+        cluster_id, len(envelopes), ok, len(failed),
+    )
+    # A failure marker that could not be persisted is a SILENTLY-lost failed unit — the
+    # never-silent-drop contract. Do not report the cluster as cleanly processed: return
+    # False so the loss is visible (and the caller's retry re-attempts it), never swallowed.
+    if not all_logged:
+        logger.error(
+            "extract-path cluster %s: one or more failure markers could not be persisted; "
+            "returning failure so the lost unit is visible, not swallowed as processed",
+            cluster_id,
+        )
+        return False
+    return True
+
+
 def consolidate(
     project_dir: Path | None = None,
     model: str = DEFAULT_MODEL,
@@ -1505,6 +1728,21 @@ def consolidate(
         nonlocal client
 
         cache_key = _cluster_cache_key(cluster)
+
+        # B1: decomposed extract path (behind the flag). Runs BEFORE the monolithic response
+        # cache — its call shape is per-unit, with no cluster-level response to cache, and it
+        # must not be skipped by a stale monolith cache entry. Produces envelopes + logs
+        # per-unit outcomes; creates no nodes (envelope->node adapter + B2/B3 pending).
+        if _env_flag("SYNAPT_USE_EXTRACT"):
+            if client is None:
+                client = _get_consolidation_client()
+                if client is None:
+                    logger.error(
+                        "No model backend available for extract-path consolidation"
+                    )
+                    return False
+            return _run_extract_path(cluster, cache_key, client, model, failures_path)
+
         cached_entry = response_cache.get(cache_key)
 
         if cached_entry:
@@ -1515,14 +1753,10 @@ def consolidate(
             return True
 
         if client is None:
-            from synapt.recall._model_router import get_client, RecallTask
-            client = get_client(RecallTask.CONSOLIDATE, max_tokens=MIN_RESPONSE_TOKENS)
+            client = _get_consolidation_client()
             if client is None:
-                if not _MLX_AVAILABLE:
-                    logger.error("No model backend available for consolidation")
-                    return False
-                from synapt._models.mlx_client import MLXClient, MLXOptions
-                client = MLXClient(MLXOptions(max_tokens=MIN_RESPONSE_TOKENS))
+                logger.error("No model backend available for consolidation")
+                return False
         prompt = _build_consolidation_prompt(
             cluster, existing_nodes, project_dir,
             adapter_path=adapter_path,
