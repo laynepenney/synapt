@@ -534,6 +534,63 @@ def test_derive_temporal_bounds_empty_or_none_yields_none_none():
     assert _derive_temporal_bounds([{"raw": "x", "type": "unresolved"}]) == (None, None)
 
 
+def test_derive_temporal_bounds_combines_bounds_split_across_two_refs():
+    """Opus's minor finding on the review-fix round (fruit-confirmed, non-blocking): the
+    original first-ref-wins logic returned as soon as ANY bound was present on a ref, so a
+    unit whose model output split start/end across TWO separate refs silently dropped
+    valid_until. Fixed: the two bounds are derived INDEPENDENTLY across all refs."""
+    refs = [
+        {"raw": "started in March", "type": "point", "resolved": "2026-03-01"},
+        {"raw": "wrapped up by April 30", "type": "point", "resolved_end": "2026-04-30"},
+    ]
+    assert _derive_temporal_bounds(refs) == ("2026-03-01", "2026-04-30")
+
+
+def test_derive_temporal_bounds_split_refs_order_independent():
+    """The resolved_end-carrying ref appearing FIRST must not cause valid_from to be missed —
+    both bounds are found regardless of which ref comes first."""
+    refs = [
+        {"raw": "wrapped up by April 30", "type": "point", "resolved_end": "2026-04-30"},
+        {"raw": "started in March", "type": "point", "resolved": "2026-03-01"},
+    ]
+    assert _derive_temporal_bounds(refs) == ("2026-03-01", "2026-04-30")
+
+
+def test_derive_temporal_bounds_single_ref_with_both_bounds_unchanged():
+    """The common range/duration case (one ref carries BOTH bounds together) behaves
+    identically to the pre-fix code — confirms the fix doesn't alter the dominant path."""
+    refs = [{"raw": "March to April 2026", "type": "range", "resolved": "2026-03-01", "resolved_end": "2026-04-30"}]
+    assert _derive_temporal_bounds(refs) == ("2026-03-01", "2026-04-30")
+
+
+def test_derive_temporal_bounds_first_resolved_wins_when_multiple_refs_carry_it():
+    """When MULTIPLE refs each carry a resolved (no split scenario), the first one found still
+    wins — the fix changes HOW bounds are combined across refs, not which value is picked when
+    more than one ref offers the same bound."""
+    refs = [
+        {"raw": "first mention", "type": "point", "resolved": "2026-03-01"},
+        {"raw": "second mention", "type": "point", "resolved": "2026-03-15"},
+    ]
+    assert _derive_temporal_bounds(refs) == ("2026-03-01", None)
+
+
+def test_decide_actions_threads_bounds_split_across_two_refs_into_the_same_fact():
+    """End-to-end through _decide_actions: a unit whose temporal_refs split the bounds across
+    two refs still produces a fact with BOTH valid_from and valid_until populated."""
+    cluster = [_entry(done=["the migration started in march and wrapped up by april 30"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0",
+        facts=[{"text": "the migration started in march and wrapped up by april 30"}],
+        temporal_refs=[
+            {"raw": "started in march", "type": "point", "resolved": "2026-03-01"},
+            {"raw": "wrapped up by april 30", "type": "point", "resolved_end": "2026-04-30"},
+        ],
+    )]
+    out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
+    assert out[0]["valid_from"] == "2026-03-01"
+    assert out[0]["valid_until"] == "2026-04-30"
+
+
 def test_decide_actions_threads_resolved_into_valid_from():
     cluster = [_entry(done=["the API key expires soon"])]
     envs = [_envelope_ok(

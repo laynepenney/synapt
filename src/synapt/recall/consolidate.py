@@ -1667,6 +1667,12 @@ def _run_extract_path(
 #      reconcile (which has NO fallback for valid_until, unlike valid_from). Fixed: temporal
 #      bounds are derived per-unit (temporal_refs are unit-level, not fact-level, in the
 #      extract_batch schema) and threaded onto every fact/decision from that unit.
+#
+# MINOR FOLLOW-UP (2026-07-14, Opus reviewer-1 APPROVE, non-blocking finding folded in):
+# _derive_temporal_bounds was first-ref-wins (returned as soon as ANY ref had EITHER bound),
+# so a unit whose temporal_refs SPLIT start/end across two separate refs silently dropped
+# valid_until — same harm-class as blocker #3, narrower trigger. Fixed: the two bounds are now
+# derived independently across all refs.
 # ---------------------------------------------------------------------------
 
 ACTION_DECISION_PROMPT = """\
@@ -1707,19 +1713,35 @@ def _derive_temporal_bounds(temporal_refs) -> tuple[str | None, str | None]:
     fact-level or index-level link back to a specific ``facts[]``/``decisions[]`` entry) — so
     every fact/decision extracted from the SAME unit inherits the SAME derived bounds; that is
     the correlation granularity the schema actually supports, not an approximation of a finer
-    one. Picks the first ref carrying a usable ``resolved``/``resolved_end``. No local ISO
-    validation here — ``resolved``/``resolved_end`` pass through as plain strings (or None);
-    reconcile's own ``_validate_iso_date`` already rejects anything malformed, so duplicating
-    that check here would be redundant, not defensive.
+    one.
+
+    The two bounds are derived INDEPENDENTLY across all refs (the first ``resolved`` ->
+    ``valid_from``, the first ``resolved_end`` -> ``valid_until``), not first-ref-wins: a unit
+    whose model output SPLITS the bounds across two separate refs (e.g. one ref carries the
+    start, a different ref the end — plausible when a unit's text expresses a start and end as
+    two distinct temporal mentions rather than one combined range) would otherwise silently
+    drop ``valid_until`` the moment the FIRST ref satisfied the old any-bound-present return
+    condition (Opus's minor finding on the review-fix round, fruit-confirmed 2026-07-14 — the
+    same harm-class as the original temporal_refs-discarded blocker, narrower trigger). A
+    single ref carrying BOTH bounds together (the common range/duration case) is unaffected —
+    both get set on the first pass and the loop short-circuits identically to before.
+
+    No local ISO validation here — ``resolved``/``resolved_end`` pass through as plain strings
+    (or None); reconcile's own ``_validate_iso_date`` already rejects anything malformed, so
+    duplicating that check here would be redundant, not defensive.
     """
+    valid_from: str | None = None
+    valid_until: str | None = None
     for ref in temporal_refs or []:
         if not isinstance(ref, dict):
             continue
-        valid_from = ref.get("resolved")
-        valid_until = ref.get("resolved_end")
-        if valid_from or valid_until:
-            return valid_from, valid_until
-    return None, None
+        if valid_from is None and ref.get("resolved"):
+            valid_from = ref.get("resolved")
+        if valid_until is None and ref.get("resolved_end"):
+            valid_until = ref.get("resolved_end")
+        if valid_from and valid_until:
+            break
+    return valid_from, valid_until
 
 
 def _flatten_envelope_facts(envelopes) -> list[dict]:
