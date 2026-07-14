@@ -181,7 +181,7 @@ def test_empty_cluster_yields_no_units():
     assert results == []
 
 
-# --- ASYNC->SYNC BRIDGE (defensive loop guard) ---------------------------------------------
+# --- ASYNC->SYNC BRIDGE (the CURRENT MCP running-loop path, not a future defense) -----------
 
 def test_run_coro_blocking_from_sync_context():
     async def coro():
@@ -190,7 +190,9 @@ def test_run_coro_blocking_from_sync_context():
 
 
 def test_run_coro_blocking_from_within_running_loop():
-    # a FUTURE async call-site: asyncio.run would RuntimeError; the guard must offload to a thread.
+    # this IS the current MCP call-site's shape: FastMCP 1.27 runs the sync recall_consolidate
+    # tool inline on the event-loop thread, so a loop is already running here — asyncio.run
+    # would RuntimeError, and the guard offloads to a fresh thread with its own loop.
     async def outer():
         async def inner():
             return 99
