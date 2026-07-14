@@ -245,13 +245,17 @@ def test_run_extract_path_logs_failed_markers_and_creates_no_nodes(tmp_path):
     client = _FakeClient(completion="garbage-not-json")
     ok = _run_extract_path(cluster, "clu", client, "m", failures_path)
     assert ok is True
-    # every failed unit logged (never silent-dropped), one line each
+    # every failed unit logged (never silent-dropped), one line each — WITH status, the
+    # never-silent contract (Sentinel blocker 1: status was previously omitted).
     records = [json.loads(raw) for raw in failures_path.read_text().splitlines() if raw.strip()]
     assert len(records) == 3
     assert {rec["source_unit_id"] for rec in records} == {
         batch_unit_id("clu", c) for c in identify(cluster)
     }
-    assert all(rec["reason"] == "unparseable" and rec["path"] == "extract_batch" for rec in records)
+    assert all(
+        rec["status"] == "failed" and rec["reason"] == "unparseable" and rec["path"] == "extract_batch"
+        for rec in records
+    )
 
 
 def test_run_extract_path_ok_units_produce_no_failure_log(tmp_path):
@@ -261,6 +265,53 @@ def test_run_extract_path_ok_units_produce_no_failure_log(tmp_path):
     ok = _run_extract_path(cluster, "clu", client, "m", failures_path)
     assert ok is True
     assert not failures_path.exists() or failures_path.read_text().strip() == ""
+
+
+# --- SILENT-DROP REGRESSION (Sentinel blocker 2): a marker-write failure must be VISIBLE ----
+
+def test_log_extract_failure_returns_false_when_write_fails(tmp_path, monkeypatch):
+    """If persisting the failure marker itself raises OSError, that must be reported (False),
+    never swallowed as success — a swallowed write-failure is a SILENTLY lost failed unit."""
+    from synapt.recall import consolidate as consolidate_mod
+
+    cluster = [_entry(done=["a"])]
+    envelope = _run_coro_blocking(
+        _extract_cluster_units(cluster, "clu", _garbage_infer)
+    )[0]
+    assert envelope.status == "failed"
+
+    def _boom_open(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(consolidate_mod, "open", _boom_open, raising=False)
+    persisted = consolidate_mod._log_extract_failure(
+        tmp_path / "consolidation_failures.jsonl", "clu", envelope
+    )
+    assert persisted is False  # NOT swallowed — the caller must see the loss
+
+
+def test_run_extract_path_returns_false_when_a_marker_write_fails(tmp_path, monkeypatch):
+    """THE silent-drop Sentinel caught: previously, an OSError in _log_extract_failure was
+    swallowed and _run_extract_path still returned True, declaring the cluster processed while
+    a failed unit vanished with no record. Must now propagate as a non-successful cluster."""
+    from synapt.recall import consolidate as consolidate_mod
+
+    cluster = [_entry(done=["a", "b"])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _FakeClient(completion="garbage-not-json")  # every unit fails -> every unit logs
+
+    real_log = consolidate_mod._log_extract_failure
+    calls = {"n": 0}
+
+    def _flaky_log(path, cluster_id, envelope):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return False  # simulate the first marker write failing
+        return real_log(path, cluster_id, envelope)
+
+    monkeypatch.setattr(consolidate_mod, "_log_extract_failure", _flaky_log)
+    ok = _run_extract_path(cluster, "clu", client, "m", failures_path)
+    assert ok is False  # the lost marker must NOT be reported as a clean success
 
 
 # --- INTEGRATION: the real consolidate() flag-branch dispatch ------------------------------

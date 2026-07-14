@@ -1437,20 +1437,29 @@ def _make_recall_infer(client, model: str):
 
 
 def _run_coro_blocking(coro):
-    """Drive an async coroutine to completion from a sync caller, robust to an already-running loop.
+    """Drive an async coroutine to completion from a sync caller, across BOTH consolidate
+    call-sites — which genuinely differ in whether an event loop is already running:
 
-    Both consolidate call-sites are off-loop today (the CLI runs on the main thread; the MCP
-    ``recall_consolidate`` is a sync tool, which FastMCP runs in an anyio worker thread), so
-    ``asyncio.run`` is correct. This guard is defensive scenario-thinking: a FUTURE async
-    call-site would make ``asyncio.run`` raise ``RuntimeError('asyncio.run() cannot be called
-    from a running event loop')``. When a loop is already running, offload the coroutine to a
-    fresh thread with its own loop and re-raise any error on the calling thread.
+    - CLI (``cmd_consolidate``): main thread, NO event loop → ``asyncio.run`` (the simple path).
+    - MCP (``recall_consolidate``): FastMCP 1.27 runs a sync tool INLINE on the event-loop thread
+      (verified: ``FuncMetadata.call_fn_with_arg_validation`` does ``return fn(...)`` directly,
+      no ``to_thread``), so a loop IS already running on this thread → ``asyncio.run`` would raise
+      ``RuntimeError('asyncio.run() cannot be called from a running event loop')``. We offload the
+      coroutine to a fresh thread with its own loop and block on ``join``.
+
+    That join holds the server's event-loop thread for the duration of extraction — acceptable
+    because the legacy sync ``consolidate()`` already blocks that same thread inline (consolidation
+    has always been a blocking call under FastMCP; this changes nothing about that). Errors from
+    the worker re-raise on the calling thread. (Sentinel probed the runtime: loop_running=True,
+    same_thread=True — this is the current MCP path, not a hypothetical future one.)
     """
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)  # no running loop — the common path for both call-sites
+        return asyncio.run(coro)  # CLI path: no running loop
 
+    # MCP path: a loop is already running on THIS thread (FastMCP runs the sync tool inline) —
+    # asyncio.run would raise, so run the coroutine in a fresh thread with its own loop.
     box: dict = {}
 
     def _worker():
@@ -1509,12 +1518,15 @@ async def _extract_cluster_units(
     )
 
 
-def _log_extract_failure(failures_path: Path, cluster_id: str, envelope) -> None:
-    """Append one per-unit extract failure marker to ``failures_path``.
+def _log_extract_failure(failures_path: Path, cluster_id: str, envelope) -> bool:
+    """Append one per-unit extract failure marker to ``failures_path``. Returns True when the
+    marker is persisted, False when the write itself fails.
 
-    NEVER silent-drop: every non-ok ``BatchUnitResult`` is recorded with its terminal reason
-    and its ``source_unit_id`` (traceable back to the exact journal field) for diagnostics.
-    Best-effort — logging must never disrupt consolidation.
+    NEVER silent-drop: every non-ok ``BatchUnitResult`` is recorded with its ``status`` +
+    terminal ``reason`` and its ``source_unit_id`` (traceable to the exact journal field). If
+    the marker write ITSELF fails, that is a lost failed unit — it is surfaced loudly (error
+    log) and signalled to the caller (return False), never swallowed. Swallowing the write
+    error would silently lose the failed unit while the cluster looks processed.
     """
     try:
         from synapt.recall._filelock import lock_exclusive, unlock
@@ -1527,12 +1539,19 @@ def _log_extract_failure(failures_path: Path, cluster_id: str, envelope) -> None
                     "path": "extract_batch",
                     "cluster_id": cluster_id,
                     "source_unit_id": envelope.source_unit_id,
+                    "status": envelope.status,
                     "reason": envelope.reason,
                 }) + "\n")
             finally:
                 unlock(ff)
-    except OSError:
-        pass  # diagnostics are best-effort
+        return True
+    except OSError as exc:
+        logger.error(
+            "FAILED to persist extract failure marker for unit %s (cluster %s): %s — "
+            "the failed unit is NOT recorded (surfacing, not swallowing)",
+            envelope.source_unit_id, cluster_id, exc,
+        )
+        return False
 
 
 def _run_extract_path(
@@ -1555,13 +1574,25 @@ def _run_extract_path(
         return False
     ok = sum(1 for e in envelopes if e.status == "ok")
     failed = [e for e in envelopes if e.status != "ok"]
+    all_logged = True
     for e in failed:
-        _log_extract_failure(failures_path, cluster_id, e)
+        if not _log_extract_failure(failures_path, cluster_id, e):
+            all_logged = False
     logger.info(
         "extract-path cluster %s: %d units -> %d ok, %d failed "
         "(B1: envelopes only, no nodes created)",
         cluster_id, len(envelopes), ok, len(failed),
     )
+    # A failure marker that could not be persisted is a SILENTLY-lost failed unit — the
+    # never-silent-drop contract. Do not report the cluster as cleanly processed: return
+    # False so the loss is visible (and the caller's retry re-attempts it), never swallowed.
+    if not all_logged:
+        logger.error(
+            "extract-path cluster %s: one or more failure markers could not be persisted; "
+            "returning failure so the lost unit is visible, not swallowed as processed",
+            cluster_id,
+        )
+        return False
     return True
 
 
