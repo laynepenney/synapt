@@ -4,8 +4,9 @@ The generic flattened-cluster identify was NO-GO (Atlas config#481: source-suppo
 91.5% < 98%, clean-atomic 40% << 85% — the 3B fabricates/promotes/drifts when asked
 to re-find durable units in a flattened blob). The fix: `JournalEntry` (journal.py)
 already carries SEPARATE structured fields — `focus`, `done`, `decisions`,
-`next_steps` — and every durable gold unit lives in `done`/`decisions`. So DON'T
-flatten and re-segment; read the structure directly.
+`next_steps` — and NEARLY every durable gold unit lives in `done`/`decisions` (a documented
+~7.3% live in rich `focus` lines — see §RECONCILE below). So DON'T flatten and re-segment;
+read the structure directly.
 
 identify is a single DETERMINISTIC step — the `prefilter` (NO LLM): collect
 `entry.done[i]` + `entry.decisions[i]` with free attribution; `focus`/`next_steps` are
@@ -40,8 +41,9 @@ from dataclasses import dataclass
 
 from synapt.recall.journal import JournalEntry
 
-# The only journal fields that carry durable units (per config#481 gold: every unit
-# sources from done[N] or decisions[N]). focus/next_steps are excluded structurally.
+# The journal fields that carry the durable units (per config#481 gold: ~93% source from
+# done[N] or decisions[N]; the ~7.3% focus/next remainder is the documented recall gap, see
+# §RECONCILE). focus/next_steps are excluded structurally.
 _DURABLE_FIELDS = ("done", "decisions")
 
 
@@ -68,9 +70,12 @@ def prefilter(cluster: list[JournalEntry]) -> list[Candidate]:
     the UNIQUENESS key, not ``session_id`` — journal entries frequently carry an empty
     or repeated ``session_id`` (an agent may write the journal several times per
     session, and older entries lack one), so a session-keyed id collides within a
-    cluster (and would trip extract_batch's dup-id guard downstream). This deletes the
-    entire junk / next-promoted / control-fabrication failure mass before any
-    inference — structurally, not by a model. Empty/whitespace items are skipped.
+    cluster (and would trip extract_batch's dup-id guard downstream). Excluding `focus`/
+    `next_steps` deletes the junk / next-promoted / control-fabrication failure mass at the
+    FIELD level before any inference — structurally, not by a model. Residue embedded
+    *within* a captured `done`/`decisions` item (e.g. a stray `</decisions>` envelope tag) is
+    preserved verbatim into the candidate; extract_batch's Class-A hygiene handles in-item
+    residue downstream. Empty/whitespace items are skipped.
     """
     candidates: list[Candidate] = []
     for entry_index, entry in enumerate(cluster):
