@@ -1,77 +1,87 @@
-"""Gold-test gate for structure-aware identify (recall#868 wiring, Phase A).
+"""Gold-test gate for structure-aware identify (recall#868 wiring, Phase A — PREFILTER-ONLY).
 
-Executable spec against Atlas's frozen config#481 corpus (design/results/
-identify-step-probe-2026-07-13, SHA-pinned fixtures copied into tests/fixtures/
-identify/). Both the deterministic prefilter and the deterministic clause-splitter (1b)
-are validated model-free here. The narrow LLM split was measured and REJECTED by the
-split-fidelity gate (2026-07-13, Modal ap-nCK7lZHLtkD7Jrek8KDTY4): 24.6% word-salad at BF16.
-Sub-step 1b is now a conservative deterministic partition (verbatim, never fabricates).
+Phase A is a single deterministic step: `prefilter` reads structured `done`/`decisions`, never
+`focus`/`next_steps`. There is NO split step — a narrow-split was built, measured, and DROPPED:
+the split-fidelity gate showed a 3B free-split word-salads (24.6% at BF16); the deterministic
+clause-splitter is lexically safe but semantically OVER-splits (reviewer-2 Sentinel/Atlas); and
+the DECISIVE atomization measurement showed extract_batch's STRUCTURED extraction atomizes
+compounds cleanly (0/65 word-salad, 62/65 ok, 0 confab). Path (b): prefilter → extract_batch
+directly. Evidence: config/design/results/{split-fidelity,extract-atomization}-probe-2026-07-13/.
 
-Reconciled target (design-note config 3030967 §RECONCILE, Opus, Layne-pending):
-  124 gold source from done/decisions  → prefilter MUST capture (primary gate)
-    3 gold are multi-field (focus AND done/decisions) → capturable via done/decisions
-   10 gold are pure focus/next          → KNOWN, MEASURED recall gap (~7.3%), documented
-The prefilter is done/decisions-only (precision-first); the ~10-unit gap is accepted
-for v1, NOT recovered by an LLM classifier (would reintroduce the NO-GO fabrication).
+This gate EXECUTES the frozen config#481 gold (not a label count — Atlas reviewer-2) over ALL 18
+clusters (dogfood slice + the atlas-journal reconstruction from corpus.json — closes Atlas's
+42.3% gap): it runs prefilter and checks every done/decisions gold unit's content is CAPTURED,
+and reports the focus/next gap per-cluster. The EXACT per-index gold→item mapping is Atlas's
+frozen-boundary domain (pending ratification); this uses content-coverage + the gold's own field
+labels, robust to the gold's reworded atomization.
 """
 
 from __future__ import annotations
 
 import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
+from types import SimpleNamespace
 
 from synapt.recall.consolidate import _read_all_entries, cluster_journal_entries
-from synapt.recall.identify import Candidate, identify, is_compound, prefilter, split_candidate
+from synapt.recall.identify import batch_unit_id, identify, prefilter
 
 _FIX = Path(__file__).parent.parent / "fixtures" / "identify"
 _GOLD = [json.loads(line) for line in (_FIX / "gold-units.jsonl").read_text().splitlines() if line.strip()]
+_ATLAS = json.loads((_FIX / "atlas-journal-structured.json").read_text())
 
 
-def _classify_source(source: str) -> str:
-    """Classify a gold unit's source-field attribution vs the done/decisions-only prefilter."""
+def _distinctive(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9#]+", text.lower()) if len(w) > 3}
+
+
+def _classify_field(source: str) -> str:
+    """Classify a gold unit's source-field vs the done/decisions-only prefilter (from the
+    gold's own frozen source label — exact, not fuzzy)."""
     s = source.lower()
-    focus_or_next = ("focus" in s) or ("next" in s)
-    done_or_decisions = ("done" in s) or ("decision" in s)
-    if focus_or_next and done_or_decisions:
-        return "multi_field"        # a focus+done/decisions unit → capturable via done/decisions
-    if focus_or_next:
-        return "pure_focus_next"    # lives only in focus/next → documented recall gap
-    return "done_decisions"         # prefilter-capturable
+    focus_next = ("focus" in s) or ("next" in s)
+    done_dec = ("done" in s) or ("decision" in s)
+    if focus_next and done_dec:
+        return "multi_field"     # focus AND done/decisions → capturable via done/decisions
+    if focus_next:
+        return "focus_next"      # documented recall gap
+    return "done_decisions"
+
+
+def _dogfood_rich():
+    return [e for e in _read_all_entries(_FIX / "dogfood-journal-slice.jsonl") if e.has_rich_content()]
 
 
 def _dogfood_clusters():
-    """Reconstruct the 11 dogfood clusters exactly as consolidation does — the same
-    loader + clustering the real path uses, on the SHA-pinned structured journal slice."""
-    entries = _read_all_entries(_FIX / "dogfood-journal-slice.jsonl")
-    rich = [e for e in entries if e.has_rich_content()]
-    return cluster_journal_entries(rich)
+    return cluster_journal_entries(_dogfood_rich())
 
 
-# --- gold field-attribution: the reconciled target (model-free, the validation bulk) ---
-
-def test_gold_field_attribution_matches_reconcile():
-    counts = Counter(_classify_source(g["source"]) for g in _GOLD)
-    assert len(_GOLD) == 137
-    assert counts["done_decisions"] == 124   # primary gate: prefilter must capture these
-    assert counts["multi_field"] == 3        # capturable via their done/decisions component
-    assert counts["pure_focus_next"] == 10   # the accepted, documented recall gap
-
-
-def test_documented_recall_gap_is_measured_and_small():
-    counts = Counter(_classify_source(g["source"]) for g in _GOLD)
-    gap = counts["pure_focus_next"] / len(_GOLD)
-    # ~7.3%, concentrated in the dogfood-04 summary-in-focus outlier. Precision-first
-    # accepts it for v1; the dogfood <=-legacy measure is the real arbiter (Phase B).
-    assert 0.06 <= gap <= 0.08
+def _atlas_clusters():
+    """The 7 atlas-journal clusters as duck-typed entries (prefilter reads done/decisions/
+    session_id; classification reads focus/next_steps)."""
+    clusters = []
+    for entries in _ATLAS.values():
+        clusters.append([
+            SimpleNamespace(
+                session_id=e.get("session_id", ""), focus=e.get("focus", ""),
+                done=e.get("done", []), decisions=e.get("decisions", []),
+                next_steps=e.get("next_steps", []),
+            )
+            for e in entries
+        ])
+    return clusters
 
 
-# --- prefilter structural correctness on the real dogfood clusters (deterministic) ---
+def _all_clusters():
+    return _dogfood_clusters() + _atlas_clusters()
+
+
+# --- prefilter structural correctness, on ALL 18 clusters (dogfood + atlas) ----------------
 
 def test_prefilter_reads_only_done_decisions_never_focus_next():
-    clusters = _dogfood_clusters()
-    assert clusters, "expected dogfood clusters"
+    clusters = _all_clusters()
+    assert clusters
     focus_next_material = set()
     for cluster in clusters:
         for entry in cluster:
@@ -80,124 +90,123 @@ def test_prefilter_reads_only_done_decisions_never_focus_next():
             for item in entry.next_steps:
                 if item.strip():
                     focus_next_material.add(item.strip())
-
     for cluster in clusters:
         for cand in prefilter(cluster):
             assert cand.attr["field"] in ("done", "decisions")
+            assert isinstance(cand.attr["entry_index"], int)
             assert isinstance(cand.attr["index"], int)
-            assert isinstance(cand.attr["entry_index"], int)  # uniqueness key
             assert cand.text.strip()
-            # exclusion: no candidate is focus/next material
             assert cand.text not in focus_next_material
 
 
 def test_prefilter_covers_every_done_decisions_item():
-    """The prefilter candidate set is exactly the non-empty done/decisions items across
-    the clusters — so it covers 100% of where the 124 done/decisions gold live."""
-    clusters = _dogfood_clusters()
-    for cluster in clusters:
+    for cluster in _all_clusters():
         expected = 0
         for entry in cluster:
             expected += sum(1 for x in entry.done if isinstance(x, str) and x.strip())
             expected += sum(1 for x in entry.decisions if isinstance(x, str) and x.strip())
         cands = prefilter(cluster)
         assert len(cands) == expected
-        # round-trip: every candidate's text is exactly its attributed structured item,
-        # keyed on entry_index (session_id is NOT unique — often empty/repeated)
         for cand in cands:
             entry = cluster[cand.attr["entry_index"]]
             items = getattr(entry, cand.attr["field"])
             assert items[cand.attr["index"]].strip() == cand.text
-        # attribution uniqueness — the Phase-B BatchUnit id must not collide even when
-        # session_id is empty/repeated within the cluster (extract_batch dup-id guard)
         keys = [(c.attr["entry_index"], c.attr["field"], c.attr["index"]) for c in cands]
-        assert len(keys) == len(set(keys))
+        assert len(keys) == len(set(keys))          # attribution unique within cluster
 
 
 def test_prefilter_is_deterministic_no_model():
-    clusters = _dogfood_clusters()
+    clusters = _all_clusters()
     a = [(c.text, c.attr["field"], c.attr["index"]) for cl in clusters for c in prefilter(cl)]
     b = [(c.text, c.attr["field"], c.attr["index"]) for cl in clusters for c in prefilter(cl)]
-    assert a == b and a, "prefilter must be pure/deterministic"
+    assert a == b and a
 
 
-# --- 1b deterministic clause-splitter (fidelity-first; the LLM narrow-split FAILED) -------
+# --- EXECUTE the gold (Atlas reviewer-2: run prefilter, don't count labels) ----------------
 
-def test_is_compound_means_the_splitter_partitions():
-    # high-precision boundaries: semicolons + sentence periods
-    assert is_compound("Merged PR #12; filed issue #13; bumped version to 0.2.0")
-    assert is_compound("Fixed the bug. Filed the issue. Bumped the version.")
-    # atomic single facts do not split
-    assert not is_compound("The recall package is open source.")
-    assert not is_compound("Grip issue #763 was filed for the tomllib migration follow-up.")
-    # CONSERVATIVE: comma-lists and comma-conjunctions stay MERGED (under-split is graceful;
-    # over-splitting a list fabricates false boundaries — the precision-killer)
-    assert not is_compound("surfaced blockers in trust, activation, introspection, and docs")
-    assert not is_compound("Wrote the parser, and then verified it against the fixtures")
-    # versions/filenames are not sentence boundaries (no space after the dot)
-    assert not is_compound("Added the synapt-extract>=0.5.0 dependency to eval.py")
+def test_gold_executes_prefilter_captures_done_decisions_content():
+    """The core execute-the-gold check: build the prefilter candidate token-pool over ALL 18
+    clusters, then confirm every done/decisions gold unit's distinctive content is CAPTURED.
+    Tolerant of the gold's reworded atomization (>=0.5 distinctive-token overlap = captured);
+    asserts the aggregate capture rate with margin and surfaces any uncovered units."""
+    pool: set[str] = set()
+    for cluster in _all_clusters():
+        for cand in prefilter(cluster):
+            pool |= _distinctive(cand.text)
 
-
-def test_split_partitions_at_high_precision_boundaries():
-    src = "Filed grip#754 for the add bug. Fixed the remote swap; wrote the journal."
-    cand = Candidate(text=src, attr={"entry_index": 0, "field": "done", "index": 0})
-    assert [c.text for c in split_candidate(cand)] == [
-        "Filed grip#754 for the add bug.",
-        "Fixed the remote swap",
-        "wrote the journal.",
-    ]
+    dd_gold = [g for g in _GOLD if _classify_field(g["source"]) in ("done_decisions", "multi_field")]
+    uncovered = []
+    for g in dd_gold:
+        gt = _distinctive(g["text"])
+        covered = len(gt & pool) / len(gt) if gt else 1.0
+        if covered < 0.5:
+            uncovered.append((g["cluster_id"], g["source"], round(covered, 2)))
+    capture_rate = 1 - len(uncovered) / len(dd_gold)
+    # >=95% of done/decisions gold is captured by prefilter's output; the residue is reworded
+    # gold (e.g. "vs" -> "versus"), not a prefilter miss. Surfaces uncovered for inspection.
+    assert capture_rate >= 0.95, f"only {capture_rate:.3f} captured; uncovered={uncovered}"
 
 
-def test_split_pieces_are_verbatim_ordered_and_inherit_attribution():
-    src = "Did A. Did B; did C."
-    attr = {"entry_index": 2, "field": "decisions", "index": 1}
-    out = split_candidate(Candidate(text=src, attr=attr))
-    pos = 0
-    for n, unit in enumerate(out):
-        found = src.index(unit.text.strip(), pos)   # verbatim, ordered, non-overlapping
-        pos = found + len(unit.text.strip())
-        assert unit.attr == attr                    # inherits parent attribution
-        assert unit.split_index == n                # tagged with split position
+def test_gold_field_classification_per_cluster_and_documented_gap():
+    """Per-cluster reporting (Atlas reviewer-2), from the gold's own frozen source labels.
+    The focus/next gap is KNOWN, SMALL (~7.3%), and CONCENTRATED — it must stay visible per
+    cluster, not hidden in an aggregate; the >=-legacy dogfood measures it per cluster too."""
+    per_cluster = defaultdict(Counter)
+    for g in _GOLD:
+        per_cluster[g["cluster_id"]][_classify_field(g["source"])] += 1
+
+    totals = Counter()
+    for counts in per_cluster.values():
+        totals.update(counts)
+    assert sum(totals.values()) == 137
+    assert totals["done_decisions"] == 124        # prefilter-capturable
+    assert totals["multi_field"] == 3             # capturable via their done/decisions component
+    assert totals["focus_next"] == 10             # documented recall gap
+
+    gap = totals["focus_next"] / 137
+    assert 0.06 <= gap <= 0.08                     # ~7.3%
+    # the gap is CONCENTRATED, not spread — the three carriers must be exactly these clusters
+    gap_clusters = {cid for cid, c in per_cluster.items() if c["focus_next"]}
+    assert gap_clusters == {"dogfood-01", "dogfood-04", "dogfood-06"}
 
 
-def test_split_preserves_all_content_no_drop_no_add():
-    src = "Merged #12; filed #13. Bumped to 0.2.0."
-    joined = "".join(c.text for c in split_candidate(Candidate(text=src, attr={})))
-    alnum = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())  # noqa: E731
-    assert alnum(joined) == alnum(src)              # nothing dropped or fabricated
+def test_gold_covers_all_18_corpus_clusters_no_atlas_gap():
+    """Atlas reviewer-2: the prior gate omitted the 7 atlas clusters (58/137 = 42.3% of gold).
+    This gate exercises prefilter on the atlas clusters too, and the gold spans all 15
+    gold-carrying clusters (11 dogfood minus 3 empty + 7 atlas)."""
+    gold_clusters = {g["cluster_id"] for g in _GOLD}
+    atlas_gold = [g for g in _GOLD if g["cluster_id"].startswith("atlas-journal")]
+    assert len(atlas_gold) == 58                   # the previously-omitted 42.3%
+    assert {c for c in gold_clusters if c.startswith("atlas-journal")} == set(_ATLAS.keys())
+    # prefilter actually runs on the atlas clusters and yields their durable items
+    atlas_units = sum(len(prefilter(cluster)) for cluster in _atlas_clusters())
+    assert atlas_units > 0
 
 
-def test_split_under_splits_gracefully_when_no_boundary():
-    # a delimiter-poor run-on stays ONE unit (graceful) — never word-salad
-    cand = Candidate(text="fixed the gr target gap via a scoped set rather than a full edit", attr={"k": 1})
-    out = split_candidate(cand)
-    assert len(out) == 1 and out[0] is cand         # returned unchanged
+# --- Phase-B id scheme: the BatchUnit id must be cluster-namespaced (Atlas reviewer-2) -----
 
-
-def test_split_paren_guard_keeps_parentheticals_intact():
-    src = "Checked the fix (config PR #476. Rules were split) and it passed."
-    pieces = [c.text for c in split_candidate(Candidate(text=src, attr={}))]
-    assert pieces == [src]                          # the '. ' sits inside parens
-    assert pieces[0].count("(") == pieces[0].count(")")
-
-
-def test_split_abbreviation_guard():
-    pieces = [c.text for c in split_candidate(Candidate(text="Compared vs. Prod and shipped.", attr={}))]
-    assert pieces == ["Compared vs. Prod and shipped."]   # 'vs.' is not a sentence end
-
-
-def test_split_is_deterministic():
-    cand = Candidate(text="Alpha happened. Beta happened; gamma happened.", attr={})
-    a = [c.text for c in split_candidate(cand)]
-    assert a == [c.text for c in split_candidate(cand)] and len(a) == 3
-
-
-def test_identify_is_fully_deterministic_and_units_verbatim_on_real_clusters():
-    # strongest fidelity gate: on the real dogfood clusters, every identified unit is a
-    # verbatim substring of the exact source done/decisions item it is attributed to
+def test_batch_unit_id_is_globally_unique_across_clusters():
     clusters = _dogfood_clusters()
-    assert clusters
-    for cluster in clusters:
-        for unit in identify(cluster):              # no infer argument — fully deterministic
-            item = getattr(cluster[unit.attr["entry_index"]], unit.attr["field"])[unit.attr["index"]]
-            assert unit.text.strip() in item
+    namespaced, bare = [], []
+    for ci, cluster in enumerate(clusters):
+        cluster_id = f"dogfood-{ci}"
+        for cand in prefilter(cluster):
+            namespaced.append(batch_unit_id(cluster_id, cand))
+            bare.append(f"{cand.attr['entry_index']}:{cand.attr['field']}:{cand.attr['index']}")
+    # entry_index resets per cluster -> bare ids COLLIDE across clusters (the bug Atlas named)...
+    assert len(bare) > len(set(bare))
+    # ...but the cluster namespace makes them globally unique (extract_batch dup-id guard safe)
+    assert len(namespaced) == len(set(namespaced))
+
+
+# --- identify is now exactly the prefilter (no split) --------------------------------------
+
+def test_identify_equals_prefilter_no_split():
+    for cluster in _all_clusters():
+        got = identify(cluster)
+        want = prefilter(cluster)
+        assert [(c.text, c.attr) for c in got] == [(c.text, c.attr) for c in want]
+        # no unit is a fabricated fragment: every identified unit is a whole structured item
+        for cand in got:
+            entry = cluster[cand.attr["entry_index"]]
+            assert getattr(entry, cand.attr["field"])[cand.attr["index"]].strip() == cand.text

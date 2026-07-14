@@ -7,40 +7,35 @@ already carries SEPARATE structured fields — `focus`, `done`, `decisions`,
 `next_steps` — and every durable gold unit lives in `done`/`decisions`. So DON'T
 flatten and re-segment; read the structure directly.
 
-Two DETERMINISTIC sub-steps — NO LLM anywhere in identify:
-  1a `prefilter` — collect `entry.done[i]` + `entry.decisions[i]` with free attribution;
-     `focus`/`next_steps` are NEVER read.
-  1b `split_candidate` — a CONSERVATIVE deterministic clause-splitter partitions a compound
-     item at high-precision fact boundaries (`; ` and sentence `. `, paren/abbrev-guarded);
-     atomic candidates pass through untouched.
+identify is a single DETERMINISTIC step — the `prefilter` (NO LLM): collect
+`entry.done[i]` + `entry.decisions[i]` with free attribution; `focus`/`next_steps` are
+NEVER read. It does NOT atomize compound items — atomization is extract_batch's job.
 
-Why deterministic, not a narrow LLM call: the split-fidelity gate (2026-07-13, Modal
-ap-nCK7lZHLtkD7Jrek8KDTY4) measured a 3B narrow-split on the 65 real compound candidates at
-BF16 (the upper-bound screen; 4-bit is strictly worse) and it FAILED — 24.6% word-salad
-(shatters a note into ~1-word-per-line), 44% seed-stable, plus real reword/drop/meaning-
-errors. That is false-memory injection at the split step, which precision-first cannot
-tolerate. A deterministic partition CANNOT confab, reword, drop, or reorder — every piece is
-a verbatim, ordered, non-overlapping substring of the source; its only failure modes are
-UNDER-split (graceful — one merged unit, recovered downstream by extract_batch) and
-over-split, which the high-precision markers + a paren-depth guard minimize (0 fabricated
-boundaries across the 65-case corpus). This is the design-note's own pre-planned fallback
-(line 151), promoted to primary.
+Why there is no split step (a narrow-split sub-step was built, measured, and dropped):
+  1. A 3B FREE split ("emit atomic facts one per line") word-salads — 24.6% at BF16, the
+     upper-bound screen (split-fidelity gate 2026-07-13, Modal ap-nCK7lZHLtkD7Jrek8KDTY4).
+  2. A deterministic clause-splitter is lexically safe (verbatim) but semantically
+     OVER-splits (anaphoric fragments, initialisms) — reviewer-2 (Sentinel + Atlas).
+  3. The DECISIVE measurement (Modal ap-y0V0GsYUHqY49KAiFF6pmI): extract_batch's STRUCTURED
+     extraction atomizes compounds cleanly — 0/65 word-salad, 62/65 ok, 0 confab, 36/39 of
+     the would-be-under-split cases atomized. So the split is REDUNDANT (Opus decided,
+     path b): `prefilter` → extract_batch DIRECTLY on raw candidates; extract_batch atomizes.
+The ~5% extract_batch drop-to-empty is the honest cost, arbitrated by the ≤-legacy dogfood.
+Full evidence: config/design/results/{split-fidelity,extract-atomization}-probe-2026-07-13/.
 
-Design-note config 3030967 §RECONCILE (Opus, Layne-pending): the prefilter's
-done/decisions-only choice is PRECISION-FIRST and carries a KNOWN, MEASURED recall
-gap of ~7.3% — the ~10 config#481 gold units that live in rich `focus` lines
-(concentrated in the dogfood-04 "summary-in-focus" outlier). This is accepted for
-v1 and NOT recovered by an LLM focus-classifier: that reintroduces the exact 3B
-fabrication the NO-GO proved, and a false memory pollutes worse than a missing one
-omits. The dogfood ≤-legacy measure is the real arbiter; a v2 recovery, if needed,
-is a DETERMINISTIC heuristic, never an LLM classifier.
+Design-note config §RECONCILE: the prefilter's done/decisions-only choice is PRECISION-FIRST
+and carries a KNOWN, MEASURED recall gap of ~7.3% — the ~10 config#481 gold units that live
+in rich `focus` lines (concentrated in the dogfood-04 "summary-in-focus" outlier). Accepted
+for v1 and NOT recovered by an LLM focus-classifier: that reintroduces the exact 3B
+fabrication the NO-GO proved, and a false memory pollutes worse than a missing one omits. The
+dogfood ≤-legacy measure is the real arbiter; a v2 recovery, if needed, is a DETERMINISTIC
+heuristic, never an LLM classifier.
 
 Boundary: OSS — recall consolidation is a core primitive.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 from synapt.recall.journal import JournalEntry
@@ -54,13 +49,14 @@ _DURABLE_FIELDS = ("done", "decisions")
 class Candidate:
     """A pre-identified durable-unit candidate plus its structural attribution.
 
-    ``attr`` = ``{session_id, field, index}`` (+ ``split`` once a compound is split),
-    so every downstream envelope is traceable to the exact journal field it came from.
+    ``attr`` = ``{session_id, entry_index, field, index}`` — every downstream envelope is
+    traceable to the exact journal field it came from. ``entry_index`` (position in the
+    cluster) is the within-cluster UNIQUENESS key; ``batch_unit_id`` namespaces it by
+    cluster for global uniqueness.
     """
 
     text: str
     attr: dict
-    split_index: int | None = None
 
 
 def prefilter(cluster: list[JournalEntry]) -> list[Candidate]:
@@ -96,97 +92,22 @@ def prefilter(cluster: list[JournalEntry]) -> list[Candidate]:
     return candidates
 
 
-# --- 1b — deterministic conservative clause-splitter (recall, NO LLM) --------------
-#
-# Fidelity-first: partition a compound item into atomic units at HIGH-precision fact
-# boundaries ONLY, so every piece is a verbatim, ordered, non-overlapping substring of the
-# source. Prefer UNDER-split (leave merged; graceful — extract_batch re-extracts downstream)
-# over OVER-split (a false boundary fabricates a non-fact — the precision-killer). Split
-# markers: `; ` (semicolon) and a sentence boundary (`.`/`!`/`?` + whitespace + a fact-start
-# char), BOTH only at paren/bracket depth 0, with an abbreviation guard. NOT bare commas,
-# NOT bare " and ", NOT " + " (measured to over-split method chains + parenthetical lists).
+def batch_unit_id(cluster_id: str, candidate: Candidate) -> str:
+    """The stable, GLOBALLY-unique id for a candidate's extract_batch ``BatchUnit`` (Phase B).
 
-# Common abbreviations whose trailing period is NOT a sentence boundary.
-_ABBREVIATIONS = (
-    "e.g", "i.e", "etc", "vs", "cf", " al", "approx",
-    "dr", "mr", "ms", "mrs", "sr", "jr", "st", "fig", " no", "inc", "ltd", "corp",
-)
-# Sentence boundary: end punctuation + whitespace + a fact-start char (Capital / digit /
-# quote / open-paren). Decimals, versions, and filenames ("0.5.0", "eval.py") lack the
-# space after the dot and are therefore naturally safe.
-_SENTENCE_BOUNDARY = re.compile(r"[.!?]\s+(?=[A-Z0-9\"'(])")
-_SEMICOLON = re.compile(r";\s+")
-
-
-def _paren_depth(text: str, index: int) -> int:
-    head = text[:index]
-    return (head.count("(") - head.count(")")) + (head.count("[") - head.count("]"))
-
-
-def _ends_with_abbreviation(text: str, dot_index: int) -> bool:
-    tail = text[max(0, dot_index - 6):dot_index].lower()
-    return any(tail.endswith(abbr) for abbr in _ABBREVIATIONS)
-
-
-def _split_on(text: str, marker: re.Pattern, keep_left: int) -> list[str]:
-    """Partition ``text`` at ``marker`` matches sitting at paren/bracket depth 0.
-    ``keep_left`` is how many chars of the match stay on the left piece (1 keeps sentence
-    punctuation, 0 drops the semicolon). Content is preserved; only the delimiter run and
-    inter-piece whitespace are dropped, so pieces stay verbatim substrings of the source."""
-    cuts: list[tuple[int, int]] = []
-    for match in marker.finditer(text):
-        if _paren_depth(text, match.start()) != 0:
-            continue
-        if keep_left and _ends_with_abbreviation(text, match.start()):
-            continue
-        cuts.append((match.start() + keep_left, match.end()))
-    if not cuts:
-        return [text]
-    pieces, start = [], 0
-    for cut, resume in cuts:
-        piece = text[start:cut].strip()
-        if piece:
-            pieces.append(piece)
-        start = resume
-    tail = text[start:].strip()
-    if tail:
-        pieces.append(tail)
-    return pieces or [text]
-
-
-def _split_markers(text: str) -> list[str]:
-    """The conservative partition: semicolons, then sentence boundaries (both depth-0)."""
-    pieces = [text]
-    pieces = [p for chunk in pieces for p in _split_on(chunk, _SEMICOLON, 0)]
-    pieces = [p for chunk in pieces for p in _split_on(chunk, _SENTENCE_BOUNDARY, 1)]
-    return [p.strip() for p in pieces if p.strip()]
-
-
-def is_compound(text: str) -> bool:
-    """True iff the deterministic splitter partitions ``text`` into more than one unit —
-    i.e. it carries a high-precision fact boundary. Advisory predicate; ``split_candidate``
-    is safe to call on any candidate regardless (an atomic one returns unchanged)."""
-    return len(_split_markers(text)) > 1
-
-
-def split_candidate(candidate: Candidate) -> list[Candidate]:
-    """1b — deterministic conservative split of a candidate into atomic units. Each unit is
-    a verbatim, ordered, non-overlapping substring of the source and inherits the parent's
-    attribution (+ ``split_index``). A candidate with no high-precision boundary returns
-    unchanged (single-element list) — graceful under-split, never a fabricated unit."""
-    pieces = _split_markers(candidate.text)
-    if len(pieces) <= 1:
-        return [candidate]
-    return [
-        Candidate(text=piece, attr=dict(candidate.attr), split_index=n)
-        for n, piece in enumerate(pieces)
-    ]
+    Namespaced by ``cluster_id`` because ``entry_index`` only resets per cluster (Atlas,
+    reviewer-2): a batch spanning clusters would collide on ``entry_index`` alone and trip
+    extract_batch's dup-id guard. Form: ``{cluster_id}:{entry_index}:{field}:{index}``. The
+    id rides into the extraction envelope as ``source_unit_id`` (out-of-band), so a
+    merge/split/drop stays detectable back to the exact journal field.
+    """
+    attr = candidate.attr
+    return f"{cluster_id}:{attr['entry_index']}:{attr['field']}:{attr['index']}"
 
 
 def identify(cluster: list[JournalEntry]) -> list[Candidate]:
-    """Full structure-aware identify — fully deterministic (NO LLM): prefilter each entry's
-    `done`/`decisions` into candidates, then conservatively split any compound candidate."""
-    units: list[Candidate] = []
-    for candidate in prefilter(cluster):
-        units.extend(split_candidate(candidate))
-    return units
+    """The identify step (Phase A) — a single deterministic pass, exactly the `prefilter`.
+    It does NOT atomize compound items; extract_batch's structured extraction does that
+    downstream (measured clean: config/design/results/extract-atomization-probe-2026-07-13).
+    Kept as the named step-① entry point for the consolidation pipeline + Phase-B wiring."""
+    return prefilter(cluster)
