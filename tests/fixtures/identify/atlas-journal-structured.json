@@ -1,0 +1,179 @@
+{
+  "atlas-journal-038": [
+    {
+      "session_id": "",
+      "focus": "Premium boundary doc queue and harness communication failure mode",
+      "done": [
+        "Merged premium#568 (OSS vs premium boundary)",
+        "opened premium#569 (dashboard boundary), premium#570 (agent identity boundary), premium#571 (unread/presence boundary)",
+        "filed premium#572 for premium-only sprint/task queue design",
+        "confirmed repeated $dev-loop/autonomy-heavy context intermittently blocks recall_channel posts even when work itself succeeds"
+      ],
+      "decisions": [
+        "Stop opening more premium boundary PRs until 569/570/571 get review traffic or merge",
+        "treat queue/sprint as premium-only with sprint as parent container and tasks as actual queue units",
+        "prefer GitHub issues/PRs as durable source of truth when channel posting is unreliable"
+      ],
+      "next_steps": [
+        "In a fresh/compacted thread, post a short #dev update pointing team to premium#569/#570/#571 and premium#572",
+        "continue bounded dev-loop cycles only",
+        "avoid repeated autonomous-language prompts in one thread",
+        "if review arrives on 569/570/571, address it before starting new design lanes"
+      ]
+    }
+  ],
+  "atlas-journal-040": [
+    {
+      "session_id": "",
+      "focus": "Sprint 33 gr2 M1 overlay substrate TDD/spec lane, adversarial implementation review, and ceremony readiness cleanup",
+      "done": [
+        "Landed all 7 TDD spec PRs on sprint-33: S1 overlay object encoding, S2 refs namespace, S3 driver registry, S4 trust model, S5 activate/deactivate, S6 introspection, and S7 perf gates",
+        "Reviewed Apollo implementation PRs across the substrate lane and surfaced concrete blockers in trust, activation, introspection, perf, acceptance, and docs",
+        "Merged the ceremony lint cleanup PR #651 after clearing remaining ruff drift in gr2/tests",
+        "Posted Sprint 33 retro feedback to #dev"
+      ],
+      "decisions": [
+        "Keep M1 Python-only and bind all substrate contracts to the live gr2_overlay package surface",
+        "Treat trust durability and cross-story state-contract mismatches as blockers, not post-M1 polish",
+        "Use executable TDD specs as the source of truth for sprint sequencing instead of implementation-first interpretation"
+      ],
+      "next_steps": [
+        "Support sprint-33 ceremony coordination and the sprint-33 -> main ceremony PR if asked",
+        "Carry forward the trust normalization issue, activate/introspection state contract mismatch, and acceptance/doc overclaim fixes into the next sprint if they do not land before ceremony",
+        "Keep one shared state-contract artifact per cross-story seam before implementation begins"
+      ]
+    }
+  ],
+  "atlas-journal-041": [
+    {
+      "session_id": "",
+      "focus": "M6 premium lane primitive TDD spec lane plus implementation review in synapt-private.",
+      "done": [],
+      "decisions": [
+        "M6 keeps on_merge at sequential mode only; coordinated remains explicitly unsupported in-milestone.",
+        "Lane mutations are entitlement-gated, but read paths remain available offline without entitlement reachability.",
+        "Lane ownership transfer is treated as a premium mutation seam distinct from create/apply and must preserve the manifest unchanged on denial."
+      ],
+      "next_steps": [
+        "Support Sprint 38 ceremony truth-in-body review once the premium and playground PRs open.",
+        "Carry the antagonist-first design pattern into M7 GitHub bridge specs, especially around remote state, entitlement, and external-system ambiguity.",
+        "Keep synapt-private sprint branch hygiene strict and avoid normalizing the lingering eval artifact as acceptable dirty state."
+      ]
+    }
+  ],
+  "atlas-journal-042-043": [
+    {
+      "session_id": "",
+      "focus": "Vorn-mat empirical arc closeout through cross-context sweet-spot mapping and the first cross-model gate, stopping at a natural respawn boundary after PR #145.",
+      "done": [],
+      "decisions": [
+        "Treated the Qwen 2.5 7B run as a gate result rather than a publishable generalization claim because vanilla itself scored 0.00 on the target slice and the early outputs were visibly garbled.",
+        "Did not spend further on Llama sweeps after confirming the Modal Hugging Face secret lacks access to the gated Meta Llama 3.1 8B repository; recorded the block explicitly in the artifact instead of routing around it.",
+        "Promoted model_id to a first-class remote runner parameter before further cross-model work so future experiments are runner-clean rather than relying on ad hoc code edits.",
+        "Stopped at PR #145 cleanup because this is the natural boundary for respawn: branch is pushed, PR is open, workspace is clean, and the next move depends on whether the post-respawn session wants another cross-model attempt or a different validation lane."
+      ],
+      "next_steps": [
+        "After respawn, if the team still wants cross-model validity, either obtain gated-model access for Meta Llama 3.1 8B or select a different open instruct model with demonstrated vanilla headroom on niah_multikey_1_4k before spending on a full matrix.",
+        "If the paper-shaping lane stays primary, synthesize the 4k and 8k sweet-spot artifacts into the writeup as a context-dependent budget law rather than a generic sentence-granularity win.",
+        "If empirical work continues first, the cleanest follow-up is likely a compatibility pass on Qwen prompt/runtime behavior or a third context-length test using a cleaner slice than the mixed 8k/16k RULER availability.",
+        "Respawn this session so the merged codex -a never fix activates before the next substantive lane."
+      ]
+    },
+    {
+      "session_id": "",
+      "focus": "Post-respawn queue amendment from Layne/Opus: revisit Qwen as a possible positive constrained-budget signal rather than treating PR #145's gate result as a terminal block.",
+      "done": [],
+      "decisions": [
+        "The earlier Qwen framing was too quick: `token_vorn@1024 = 0.04` against `vanilla = 0.00` means the constrained policy may already be extracting signal where full-context vanilla drowns.",
+        "Do not treat Mistral's 4k sweet-spot budget (`1024`) as Qwen's sweet-spot by default; Qwen needs its own budget sweep before any cross-model read is trustworthy.",
+        "If the Qwen sweep surfaces a different sweet-spot band, the stronger paper claim becomes model-dependent necessity under drowning regimes rather than simple cross-model replication of Mistral's curve."
+      ],
+      "next_steps": [
+        "After respawn, run Qwen 2.5 7B on `niah_multikey_1_4k validation[:50]` across budgets `256, 512, 1024, 1536, 2048`.",
+        "At each budget, fire `sentence_vorn` guarded, `sentence_vorn` no-guardrails, and guarded `token_vorn` as the reference row; vanilla `0.00` is already established as the floor.",
+        "Use the `model_id` seam from config#145 and preserve envelope schema v0.2 with per-fixture observations plus McNemar paired tests on same-slice comparisons.",
+        "Budget guardrail for the sweep is `$5`; surface before continuing if exceeded.",
+        "Interpretation target: characterize Qwen's sweet-spot if it exists, and test whether the cross-context absolute-retained-token law has a model-dependent analogue."
+      ]
+    }
+  ],
+  "atlas-journal-044": [
+    {
+      "session_id": "",
+      "focus": "On-call wrap after the gr2 agent-API design review arc and PR #211 merge; stop all new research lanes and leave the workspace in a durable idle posture for cross-org reach-back.",
+      "done": [],
+      "decisions": [
+        "Do not start any new vorn-mat or cross-family research lanes during the on-call window; stop at the current durable mainline state.",
+        "Treat the remaining non-main branches in synapt/grip/memU as workspace-shape artifacts rather than active work, because there are no open PRs and no uncommitted changes attached to them.",
+        "Leave further branch-topology normalization for a later deliberate cleanup pass instead of forcing worktree-conflicting branch moves during the on-call transition."
+      ],
+      "next_steps": [
+        "Idle on-call until Opus dispatches a new need from Layne or from Conversa-side reach-back.",
+        "If a cross-org design/research ask lands, pick it up from the current clean baseline rather than reopening closed vorn-mat lanes.",
+        "If a future cleanup window opens, normalize the residual branch topology across repos with gr-aware workspace handling rather than ad hoc checkouts."
+      ]
+    }
+  ],
+  "atlas-journal-045": [
+    {
+      "session_id": "",
+      "focus": "Elyon direction v1 scripture attention experiment: token audit, prereg renegotiations, 128k smoke, anti-degeneracy full run, and final verdict discipline.",
+      "done": [
+        "Ran Modal token audit for Hebrew/Greek/English and stopped before execution when Hebrew/Greek exceeded single-context feasibility",
+        "bubbled and received v1.1 decisions: Llama-3.1-8B windowed, Hebrew cantillation-stripped pointed WLC primary, consonantal sensitivity, Greek co-present closed arc separate",
+        "ran 128k smoke and found raw query-row attention plus external sentence vectors were sink/window-start dominated",
+        "held before full corpus and got v1.3 anti-degeneracy ratification",
+        "implemented full checkpointed Modal runner with overlapping windows, shuffle-control, Stage 2a external sentence-vector attention, Stage 2b soft-token attention pattern study, and Stage 3 targeted windows",
+        "completed full run across Hebrew 23,213 verses / 57 windows, Greek 36,536 verses / 43 windows, English 31,098 verses / 15 windows",
+        "wrote results to /tmp/atlas-elyon-v13-results-2026-07-03.md, later committed by Opus as RESULTS-v1.md",
+        "bubbled final no-H1 verdict and artifact paths."
+      ],
+      "decisions": [
+        "Held at token audit instead of forcing single-context or Qwen-1M because Hebrew/Greek tokenization made the prereg infeasible as written",
+        "selected Hebrew pointed cantillation-stripped WLC as primary because Isaiah root-play needs vowel morphology",
+        "split Greek closed-arc as explicit co-present targeted window because passive stitched windows cannot colocate Genesis 14 and Hebrews 7",
+        "after smoke, held again rather than running raw-only because raw attention and Stage 2a vectors were sink/window-start dominated",
+        "selected shuffle-control as cheap discriminator and overlapping margin-trim as harvest-quality fix",
+        "patched Stage 2b to SDPA prefill plus eager query rows after eager soft-token prefill OOMed",
+        "patched Stage 3 Greek co-present arc to use explicit listed verses instead of a contiguous Gen-to-Heb corpus span",
+        "final verdict: no H1 separation claim, sink is finding #1, Stage 2b patterns mostly uniform/positional and do not match Stage 2a, Stage 2a instrument disagreement is disagreement not discovery."
+      ],
+      "next_steps": [
+        "No further Elyon runs commissioned",
+        "line rests unless Layne reopens it. If reopened, recorded path is sink-removed attention instrument or trained bridge for sentence-vorn vectors, not raw frozen Llama attention. Preserve methodology through-line: center first then measure, after v0 embedding anisotropy, v0.5 Aramaic register, v1 attention sink. Carry Modal lessons forward: always detached/checkpointed for long runs",
+        "SDPA prefill and eager query rows when only query-row attention is needed.",
+        "Idle on-call until Opus dispatches a new need from Layne or from Conversa-side reach-back.",
+        "If a cross-org design/research ask lands, pick it up from the current clean baseline rather than reopening closed vorn-mat lanes.",
+        "If a future cleanup window opens, normalize the residual branch topology across repos with gr-aware workspace handling rather than ad hoc checkouts."
+      ]
+    }
+  ],
+  "atlas-journal-046": [
+    {
+      "session_id": "",
+      "focus": "Closed #54 oracle-confidence-adherence ceiling test and recorded the falsification boundary for the v1 confident-wrong wrinkle.",
+      "done": [
+        "Implemented premium#742 on branch atlas/oracle-confidence-adherence-2026-07-10 at 98924e1",
+        "ran the #54 conv3 oracle-confidence adherence ceiling test with LOCOMO qa.evidence turn-level presence as the oracle",
+        "generated and committed runner, README, summary, artifact, prefire estimate, and audit entry",
+        "posted #dev result and bubbled Opus, verified tmux submission",
+        "Opus accepted the result and marked #54 done, with reviewer-1 posted and Sentinel routed."
+      ],
+      "decisions": [
+        "Do not build a sufficiency scorer for supply-the-signal, because the perfect oracle signal did not beat shuffled labels on the key adherence measure",
+        "interpret as lip-service/caveat reaction, not content adherence. Claim boundary: result is Llama-3.1-8B-Instruct specific and thin on LOW-case count, so it is not a strongly-powered universal null, but it falsifies the ceiling assumption cheaply enough to close this direction. Remaining wrinkle lever is retrieval precision, not deterministic gates or handed confidence signals."
+      ],
+      "next_steps": [
+        "Wait for Sentinel review on premium#742",
+        "if review feedback lands, address it narrowly. Otherwise await Opus/Layne next research direction, likely retrieval-precision. Preserve the closed lanes: #49 entropy gate null, #53 deterministic sufficiency gate null, #54 supply-the-signal ceiling fail",
+        "do not reopen semantic/NLI/scorer work without explicit new authorization.",
+        "No further Elyon runs commissioned",
+        "line rests unless Layne reopens it. If reopened, recorded path is sink-removed attention instrument or trained bridge for sentence-vorn vectors, not raw frozen Llama attention. Preserve methodology through-line: center first then measure, after v0 embedding anisotropy, v0.5 Aramaic register, v1 attention sink. Carry Modal lessons forward: always detached/checkpointed for long runs",
+        "SDPA prefill and eager query rows when only query-row attention is needed.",
+        "Idle on-call until Opus dispatches a new need from Layne or from Conversa-side reach-back.",
+        "If a cross-org design/research ask lands, pick it up from the current clean baseline rather than reopening closed vorn-mat lanes.",
+        "If a future cleanup window opens, normalize the residual branch topology across repos with gr-aware workspace handling rather than ad hoc checkouts."
+      ]
+    }
+  ]
+}
