@@ -1376,13 +1376,14 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
 
 
 # ---------------------------------------------------------------------------
-# B1 — decomposed extract path (behind SYNAPT_USE_EXTRACT)
+# B1 — decomposed extract path, the front half (behind SYNAPT_USE_EXTRACT)
 #
-# prefilter (identify.py) -> BatchUnits -> extract_batch -> per-unit envelopes.
-# This is the FRONT HALF only: the envelope->reconcile-node adapter, the
-# action-decision pass (B2), and the reconcile feed (B3) are downstream, so this
-# path produces envelopes + logs per-unit outcomes and creates NO knowledge
-# nodes. It replaces the monolithic CONSOLIDATION_PROMPT pass when the flag is on.
+# prefilter (identify.py) -> BatchUnits -> extract_batch -> per-unit envelopes. This half
+# produces envelopes + logs per-unit failed-unit markers (never silent-dropped); it does not
+# itself decide create/corroborate/contradict or touch knowledge.jsonl — B2 (below) computes
+# the action, B3 (_run_extract_path's tail) feeds the SAME reconcile the monolith uses. See the
+# "B2 — the action-decision pass" block below for the rest of the pipeline. Together, B1+B2+B3
+# replace the monolithic CONSOLIDATION_PROMPT pass when the flag is on.
 # ---------------------------------------------------------------------------
 
 # provider URI for the extraction envelope's produced_by. validate_extraction REQUIRES a
@@ -1560,40 +1561,264 @@ def _run_extract_path(
     client,
     model: str,
     failures_path: Path,
-) -> bool:
-    """B1 flag-branch body (SYNAPT_USE_EXTRACT): drive the decomposed front-half and log
-    per-unit outcomes. Produces envelopes; creates NO nodes (the envelope->node adapter +
-    action-decision (B2) + reconcile (B3) are pending). Failed units are logged, never
-    silent-dropped. Returns True when the cluster was processed (envelopes produced).
+    existing_nodes: list[KnowledgeNode],
+    kn_path: Path,
+    decision_log_path: Path | None = None,
+    db=None,
+    content_profile=None,
+) -> ConsolidationResult | None:
+    """The decomposed extract path (SYNAPT_USE_EXTRACT): B1 (extract) -> B2 (action-decision)
+    -> B3 (reconcile — the SAME ``_apply_consolidation_result`` the monolithic path uses).
+    Failed extract units are logged (never silent-dropped, see ``_log_extract_failure``); facts
+    that extract successfully are handed to the focused action-decision pass (B2), then fed to
+    reconcile exactly as the monolith's parsed LLM output would be.
+
+    Returns a ``ConsolidationResult`` when the cluster was PROCESSED — including a zero-valued
+    result when every unit failed extraction or the cluster produced no usable facts, matching
+    the monolith's own "no durable patterns" outcome (a processed-but-empty cluster is not a
+    failure). Returns ``None`` only on an INFRASTRUCTURE failure: an extract-inference
+    exception, or a failure marker that could not be persisted — never silently reported as a
+    clean (if empty) success.
     """
     infer = _make_recall_infer(client, model)
     try:
         envelopes = _run_coro_blocking(_extract_cluster_units(cluster, cluster_id, infer))
     except Exception as exc:
         logger.warning("extract-path failed for cluster %s: %s", cluster_id, exc)
-        return False
-    ok = sum(1 for e in envelopes if e.status == "ok")
+        return None
+    ok = [e for e in envelopes if e.status == "ok"]
     failed = [e for e in envelopes if e.status != "ok"]
     all_logged = True
     for e in failed:
         if not _log_extract_failure(failures_path, cluster_id, e):
             all_logged = False
-    logger.info(
-        "extract-path cluster %s: %d units -> %d ok, %d failed "
-        "(B1: envelopes only, no nodes created)",
-        cluster_id, len(envelopes), ok, len(failed),
-    )
     # A failure marker that could not be persisted is a SILENTLY-lost failed unit — the
     # never-silent-drop contract. Do not report the cluster as cleanly processed: return
-    # False so the loss is visible (and the caller's retry re-attempts it), never swallowed.
+    # None so the loss is visible (and the caller's retry re-attempts it), never swallowed.
     if not all_logged:
         logger.error(
             "extract-path cluster %s: one or more failure markers could not be persisted; "
             "returning failure so the lost unit is visible, not swallowed as processed",
             cluster_id,
         )
-        return False
-    return True
+        return None
+    logger.info(
+        "extract-path cluster %s: %d units -> %d ok, %d failed",
+        cluster_id, len(envelopes), len(ok), len(failed),
+    )
+
+    # B2: decide actions for the successfully-extracted facts against existing knowledge.
+    action_items = _decide_actions(cluster, cluster_id, ok, existing_nodes, infer) if ok else []
+
+    # B3: feed the SAME reconcile the monolithic path uses.
+    cluster_result = _apply_consolidation_result(
+        {"nodes": action_items}, existing_nodes, cluster, kn_path,
+        decision_log_path=decision_log_path, db=db, content_profile=content_profile,
+    )
+    logger.info(
+        "extract-path cluster %s: reconcile -> %d created, %d corroborated, %d contradicted",
+        cluster_id, cluster_result.nodes_created, cluster_result.nodes_corroborated,
+        cluster_result.nodes_contradicted,
+    )
+    return cluster_result
+
+
+# ---------------------------------------------------------------------------
+# B2 — the action-decision pass (behind SYNAPT_USE_EXTRACT, same flag as B1)
+#
+# The §FINDING gap: extract_batch never sees existing knowledge and emits no action, so
+# identify -> extract_batch -> reconcile with everything defaulting to "create" drops
+# corroborate/contradict entirely -> node inflation (the ~70-vs-46 over-feeding dogfood).
+# B2 restores the monolith's action-logic (existing-knowledge-in-context -> action +
+# existing_id) as its own focused pass, batched per cluster, over B1's clean extracted facts.
+#
+# GATE (reframed 2026-07-14, Opus ratified): the frontier ideal (config#482, 185 nodes) turned
+# out to be an END-STATE node-set (no action/existing_id/contradiction fields, 0 corpus
+# reversals) — NOT a per-fact action-gold, so B2 has no standalone corpus-accuracy gate the way
+# identify did. This is a MECHANISM gate (synthetic existing-knowledge + facts via a fake infer,
+# proving create/corroborate/contradict all fire correctly — see test_consolidate_action_-
+# decision.py). Corpus-scale contradiction accuracy is descoped v1 (0 examples to validate
+# against); the anti-inflation + 40-merge-group corroboration claim is measured by the Phase-C
+# dogfood (B2+B3 end-state vs the 185-node ideal), not here.
+# ---------------------------------------------------------------------------
+
+ACTION_DECISION_PROMPT = """\
+You are deciding how new facts relate to existing knowledge.
+
+## Existing Knowledge
+{existing_knowledge}
+
+## New Facts (indexed)
+{candidates}
+
+## Task
+For EACH new fact above, decide exactly one action:
+- "create": this is genuinely new information, not already captured above.
+- "corroborate": this confirms/reinforces an EXISTING node — give its exact [id] from above.
+- "contradict": this REVERSES or invalidates an EXISTING node's claim — give its exact [id] \
+and a one-sentence contradiction_note explaining the reversal.
+
+Rules:
+1. Only use "corroborate" or "contradict" when you can cite the EXACT existing node id shown \
+in brackets above. Never invent an id.
+2. Default to "create" when uncertain.
+3. contradiction_note is required for "contradict", omit or leave empty otherwise.
+
+Output ONLY valid JSON, no markdown fences, no explanation. One action object PER fact index, \
+matched by "index" (not by list position):
+{{"actions": [{{"index": 0, "action": "create", "existing_id": null, "contradiction_note": ""}}, \
+{{"index": 1, "action": "corroborate", "existing_id": "kn_abc123", "contradiction_note": ""}}]}}
+"""
+
+_VALID_ACTIONS = ("create", "corroborate", "contradict")
+
+
+def _flatten_envelope_facts(envelopes) -> list[dict]:
+    """Flatten B1's per-unit envelopes into a flat, ordered list of candidate facts for the
+    action-decision pass. Only ``status == "ok"`` envelopes contribute — failed units were
+    already logged by B1 (never silently re-surfaced here). Both ``facts[]`` (tagged with their
+    own ``category``, default "fact") and ``decisions[]`` (tagged "decision") flow through, each
+    carrying its source envelope's ``source_unit_id`` for traceability (not threaded onto the
+    KnowledgeNode itself — see ``_decide_actions``'s ``source_turns`` note).
+    """
+    out: list[dict] = []
+    for env in envelopes:
+        if env.status != "ok" or not env.extraction:
+            continue
+        extraction = env.extraction
+        for fact in extraction.get("facts") or []:
+            text = fact.get("text") if isinstance(fact, dict) else None
+            if not text:
+                continue
+            out.append({
+                "text": text,
+                "category": fact.get("category") or "fact",
+                "source_unit_id": env.source_unit_id,
+            })
+        for dec in extraction.get("decisions") or []:
+            text = dec.get("text") if isinstance(dec, dict) else None
+            if not text:
+                continue
+            out.append({
+                "text": text,
+                "category": "decision",
+                "source_unit_id": env.source_unit_id,
+            })
+    return out
+
+
+def _format_facts_for_action_decision(facts: list[dict]) -> str:
+    """Render flattened facts as an indexed list for the action-decision prompt. The index is
+    the matching key the model must echo back (robust to a batched call reordering or only
+    partially addressing the facts — see ``_parse_action_decision_response``)."""
+    return "\n".join(f"[{i}] ({f['category']}) {f['text']}" for i, f in enumerate(facts))
+
+
+def _build_action_decision_prompt(
+    facts: list[dict],
+    existing_nodes: list[KnowledgeNode],
+    cluster: list[JournalEntry],
+) -> str:
+    """Build the action-decision prompt: the SAME existing-knowledge formatting the monolith
+    prompt + reconcile already use (``_format_existing_knowledge``, reused not rebuilt), plus
+    the indexed candidate facts."""
+    existing = _format_existing_knowledge(existing_nodes, cluster=cluster)
+    candidates = _format_facts_for_action_decision(facts)
+    return ACTION_DECISION_PROMPT.format(existing_knowledge=existing, candidates=candidates)
+
+
+def _parse_action_decision_response(response: str) -> dict[int, dict] | None:
+    """Parse the action-decision response into an ``index -> action-item`` dict, or None if the
+    response is unparseable / not the expected shape. A malformed individual entry (non-dict,
+    missing/non-int index) is skipped rather than failing the whole batch — the caller degrades
+    any un-matched fact index to ``action="create"`` (fail-closed, never dropped)."""
+    parsed = _parse_llm_response(response)
+    if not parsed:
+        return None
+    raw_actions = parsed.get("actions")
+    if not isinstance(raw_actions, list):
+        return None
+    by_index: dict[int, dict] = {}
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        if not isinstance(idx, int):
+            continue
+        by_index[idx] = item
+    return by_index
+
+
+def _decide_actions(
+    cluster: list[JournalEntry],
+    cluster_id: str,
+    ok_envelopes,
+    existing_nodes: list[KnowledgeNode],
+    infer,
+) -> list[dict]:
+    """B2: the action-decision pass. Flattens B1's successfully-extracted facts, asks a focused
+    LLM pass (existing knowledge + new facts -> per-fact action) and returns reconcile-ready
+    dicts: EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
+    ``existing_id``, ``content``, ``category``, ``tags``, ``source_turns``,
+    ``contradiction_note``). ``confidence``/``valid_from``/``valid_until`` are NOT included —
+    reconcile computes those itself (B1 contract-read Finding 3).
+
+    FAIL-CLOSED, never drops a fact: an unparseable/malformed response, an infer exception, an
+    invalid action value, or any fact index the response didn't address all degrade that fact's
+    ACTION to "create" (mirrors the monolith's own existing_id-not-found -> create fallback) —
+    the fact itself is always represented in the output (count-invariant, matching B1's
+    discipline at this layer).
+
+    ``infer`` is the SAME pluggable sync seam B1 uses (``_make_recall_infer``) — one call per
+    cluster (a cluster's facts + its existing-knowledge set are bounded, so batching per cluster
+    is v1; see the B2 spec for the per-fact-vs-batched tradeoff).
+
+    ``source_turns`` is intentionally always ``[]`` here — see module note: the deterministic
+    prefilter's ``Candidate.attr`` (session_id/entry_index/field/index) is NOT transcript-turn-
+    shaped, and populating a KnowledgeNode's ``source_turns`` with a non-turn value would make
+    ``resolve_source_turns()`` SKIP real enrichment for that node forever (its early-exit is
+    ``if node.source_turns: continue``, verified at consolidate.py) — worse than leaving it
+    empty for the SAME post-processing resolver that already backfills genuine transcript
+    matches for monolith-path nodes when the LLM didn't supply turns.
+    """
+    facts = _flatten_envelope_facts(ok_envelopes)
+    if not facts:
+        return []
+
+    prompt = _build_action_decision_prompt(facts, existing_nodes, cluster)
+    request = {"prompt": prompt, "messages": [{"role": "user", "content": prompt}], "capabilities": []}
+    try:
+        response = infer(request)
+    except Exception as exc:
+        logger.warning("action-decision inference failed for cluster %s: %s", cluster_id, exc)
+        response = None
+
+    by_index = _parse_action_decision_response(response) if response else None
+    if by_index is None:
+        by_index = {}
+
+    results: list[dict] = []
+    for i, fact in enumerate(facts):
+        item = by_index.get(i, {})
+        action = item.get("action")
+        if action not in _VALID_ACTIONS:
+            action = "create"
+        tags = item.get("tags")
+        if not isinstance(tags, list):
+            tags = []
+        contradiction_note = item.get("contradiction_note")
+        if not isinstance(contradiction_note, str):
+            contradiction_note = ""
+        results.append({
+            "action": action,
+            "existing_id": item.get("existing_id"),
+            "content": fact["text"],
+            "category": fact["category"],
+            "tags": tags,
+            "source_turns": [],
+            "contradiction_note": contradiction_note,
+        })
+    return results
 
 
 def consolidate(
@@ -1729,10 +1954,12 @@ def consolidate(
 
         cache_key = _cluster_cache_key(cluster)
 
-        # B1: decomposed extract path (behind the flag). Runs BEFORE the monolithic response
-        # cache — its call shape is per-unit, with no cluster-level response to cache, and it
-        # must not be skipped by a stale monolith cache entry. Produces envelopes + logs
-        # per-unit outcomes; creates no nodes (envelope->node adapter + B2/B3 pending).
+        # Decomposed extract path (behind the flag): B1 (extract) -> B2 (action-decision) ->
+        # B3 (reconcile). Runs BEFORE the monolithic response cache — its call shape is
+        # per-unit/per-cluster, with no monolith-shaped cluster response to cache, and it must
+        # not be skipped by a stale monolith cache entry. Reuses the SAME closed-over
+        # existing_nodes/kn_path/decision_path/db/content_profile the monolith branch below
+        # already uses — one consistent knowledge-state view regardless of which path ran.
         if _env_flag("SYNAPT_USE_EXTRACT"):
             if client is None:
                 client = _get_consolidation_client()
@@ -1741,7 +1968,16 @@ def consolidate(
                         "No model backend available for extract-path consolidation"
                     )
                     return False
-            return _run_extract_path(cluster, cache_key, client, model, failures_path)
+            cluster_result = _run_extract_path(
+                cluster, cache_key, client, model, failures_path,
+                existing_nodes, kn_path, decision_path, db, content_profile,
+            )
+            if cluster_result is None:
+                return False
+            result.nodes_created += cluster_result.nodes_created
+            result.nodes_corroborated += cluster_result.nodes_corroborated
+            result.nodes_contradicted += cluster_result.nodes_contradicted
+            return True
 
         cached_entry = response_cache.get(cache_key)
 
