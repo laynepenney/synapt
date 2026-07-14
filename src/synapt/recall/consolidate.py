@@ -1411,7 +1411,7 @@ def _get_consolidation_client(max_tokens: int = MIN_RESPONSE_TOKENS):
     return MLXClient(MLXOptions(max_tokens=max_tokens))
 
 
-def _make_recall_infer(client, model: str):
+def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESPONSE_TOKENS):
     """Build the SYNC inference seam that extract_batch injects: a
     ``BatchInferRequest -> completion str`` callable wrapping recall's model client.
 
@@ -1419,6 +1419,14 @@ def _make_recall_infer(client, model: str):
     different ``model`` routed through the same client; extract stays model-agnostic
     (zero recall coupling). extract_batch calls this SYNCHRONOUSLY (never awaited), so it
     stays a plain function.
+
+    ``max_tokens`` is read PER-REQUEST from an optional ``request["max_tokens"]`` key
+    (falling back to ``default_max_tokens`` when absent) rather than fixed once at build
+    time — one ``infer`` closure serves BOTH B1's per-unit extract_batch calls (small,
+    fixed-shape responses, the default floor is fine) AND B2's per-CLUSTER action-decision
+    call (whose response size scales with candidate count — a flat floor silently truncates
+    a dense cluster's response, see ``_estimate_action_decision_budget``). extract_batch's
+    own ``BatchInferRequest`` never sets this key, so B1's behavior is unchanged.
     """
     def recall_infer(request) -> str:
         raw_messages = request.get("messages") or []
@@ -1428,11 +1436,12 @@ def _make_recall_infer(client, model: str):
         ]
         if not messages:  # fall back to the flat prompt if the request carried no messages
             messages = [Message(role="user", content=request.get("prompt", ""))]
+        max_tokens = request.get("max_tokens") or default_max_tokens
         return client.chat(
             model=model,
             messages=messages,
             temperature=0.1,
-            max_tokens=MIN_RESPONSE_TOKENS,
+            max_tokens=max_tokens,
         )
     return recall_infer
 
@@ -1640,6 +1649,24 @@ def _run_extract_path(
 # decision.py). Corpus-scale contradiction accuracy is descoped v1 (0 examples to validate
 # against); the anti-inflation + 40-merge-group corroboration claim is measured by the Phase-C
 # dogfood (B2+B3 end-state vs the 185-node ideal), not here.
+#
+# REVIEW FIXES (2026-07-14, Sentinel + Opus REQUEST-CHANGES, both independently fruit/code-
+# confirmed): the first cut had 3 wiring gaps, all fixed here —
+#   1. dense-cluster inflation: the per-CLUSTER action call inherited B1's flat per-UNIT
+#      800-token floor, so a response covering many candidates truncated partway and every
+#      unaddressed index fail-closed to "create" — the "inflation fix" silently didn't fix
+#      inflation on dense clusters. Fixed: _estimate_action_decision_budget scales with
+#      candidate count.
+#   2. fail-closed-to-create persisted duplicates: an unaddressed/malformed index defaults to
+#      create + existing_id=None with no dedup check. Fixed: _normalize_for_dedup + an exact-
+#      match check against existing_nodes converts a create whose content is verbatim-
+#      identical (mod case/whitespace) to corroborate — cheap, deterministic, belt-and-
+#      suspenders ahead of reconcile's own fuzzy dedup, which stays untouched.
+#   3. temporal_refs discarded: _flatten_envelope_facts read only facts[]/decisions[], so B1's
+#      extracted temporal bounds died at the B2 boundary and valid_until expiry never reached
+#      reconcile (which has NO fallback for valid_until, unlike valid_from). Fixed: temporal
+#      bounds are derived per-unit (temporal_refs are unit-level, not fact-level, in the
+#      extract_batch schema) and threaded onto every fact/decision from that unit.
 # ---------------------------------------------------------------------------
 
 ACTION_DECISION_PROMPT = """\
@@ -1673,19 +1700,44 @@ matched by "index" (not by list position):
 _VALID_ACTIONS = ("create", "corroborate", "contradict")
 
 
+def _derive_temporal_bounds(temporal_refs) -> tuple[str | None, str | None]:
+    """Derive ``(valid_from, valid_until)`` from a unit's ``temporal_refs[]``.
+
+    ``temporal_refs`` are UNIT-LEVEL in the extract_batch schema (emitted per envelope, with no
+    fact-level or index-level link back to a specific ``facts[]``/``decisions[]`` entry) — so
+    every fact/decision extracted from the SAME unit inherits the SAME derived bounds; that is
+    the correlation granularity the schema actually supports, not an approximation of a finer
+    one. Picks the first ref carrying a usable ``resolved``/``resolved_end``. No local ISO
+    validation here — ``resolved``/``resolved_end`` pass through as plain strings (or None);
+    reconcile's own ``_validate_iso_date`` already rejects anything malformed, so duplicating
+    that check here would be redundant, not defensive.
+    """
+    for ref in temporal_refs or []:
+        if not isinstance(ref, dict):
+            continue
+        valid_from = ref.get("resolved")
+        valid_until = ref.get("resolved_end")
+        if valid_from or valid_until:
+            return valid_from, valid_until
+    return None, None
+
+
 def _flatten_envelope_facts(envelopes) -> list[dict]:
     """Flatten B1's per-unit envelopes into a flat, ordered list of candidate facts for the
     action-decision pass. Only ``status == "ok"`` envelopes contribute — failed units were
     already logged by B1 (never silently re-surfaced here). Both ``facts[]`` (tagged with their
     own ``category``, default "fact") and ``decisions[]`` (tagged "decision") flow through, each
     carrying its source envelope's ``source_unit_id`` for traceability (not threaded onto the
-    KnowledgeNode itself — see ``_decide_actions``'s ``source_turns`` note).
+    KnowledgeNode itself — see ``_decide_actions``'s ``source_turns`` note) and its unit's
+    derived ``valid_from``/``valid_until`` (see ``_derive_temporal_bounds`` — None when the unit
+    carried no usable temporal_refs, matching reconcile's existing no-signal behavior exactly).
     """
     out: list[dict] = []
     for env in envelopes:
         if env.status != "ok" or not env.extraction:
             continue
         extraction = env.extraction
+        valid_from, valid_until = _derive_temporal_bounds(extraction.get("temporal_refs"))
         for fact in extraction.get("facts") or []:
             text = fact.get("text") if isinstance(fact, dict) else None
             if not text:
@@ -1694,6 +1746,8 @@ def _flatten_envelope_facts(envelopes) -> list[dict]:
                 "text": text,
                 "category": fact.get("category") or "fact",
                 "source_unit_id": env.source_unit_id,
+                "valid_from": valid_from,
+                "valid_until": valid_until,
             })
         for dec in extraction.get("decisions") or []:
             text = dec.get("text") if isinstance(dec, dict) else None
@@ -1703,8 +1757,44 @@ def _flatten_envelope_facts(envelopes) -> list[dict]:
                 "text": text,
                 "category": "decision",
                 "source_unit_id": env.source_unit_id,
+                "valid_from": valid_from,
+                "valid_until": valid_until,
             })
     return out
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Lowercase + collapse whitespace, for a cheap EXACT-match dedup check — NOT the fuzzy
+    Jaccard/embedding dedup reconcile's own create-path already does downstream (that stays
+    untouched). This catches the specific failure mode a fail-closed-to-create fact's content
+    is verbatim-identical (modulo case/whitespace) to something already persisted, without
+    needing embeddings or a similarity threshold."""
+    return " ".join(text.lower().split())
+
+
+# ~4 chars/token (the same approximation _estimate_response_budget already uses); a per-fact
+# action item ({"index":N,"action":"corroborate","existing_id":"kn_xxxxxxxx","contradiction_
+# note":"..."}) runs ~60-80 tokens generously — 60 leaves headroom without being wasteful.
+_ACTION_ITEM_TOKEN_ESTIMATE = 60
+
+
+def _estimate_action_decision_budget(prompt: str, n_facts: int) -> int:
+    """Estimate ``max_tokens`` for B2's action-decision response, scaled to candidate count.
+
+    ``_estimate_response_budget`` (built for the monolith's fixed-shape cluster-summary output)
+    SHRINKS its allowance as the prompt grows — the wrong direction for B2: its per-cluster
+    batched call can address up to ~50-65 candidates (a full cluster's prefiltered facts), and
+    its OUTPUT size scales with candidate count, not just prompt size. The flat
+    ``MIN_RESPONSE_TOKENS`` floor silently truncated a dense cluster's response around fact
+    15-20; every unaddressed index then fail-closed to "create" — the exact dense-cluster
+    inflation Sentinel's fruit-check and Opus's independent code-read both caught (the
+    "inflation fix" wasn't fixing inflation on dense clusters). Takes whichever is LARGER of a
+    fact-count-scaled estimate and the monolith's own context-aware estimate — generous is
+    free ("no upper cap, the model stops at EOS naturally" per ``_estimate_response_budget``'s
+    own rationale); only a too-small floor was ever the actual bug.
+    """
+    scaled = MIN_RESPONSE_TOKENS + _ACTION_ITEM_TOKEN_ESTIMATE * n_facts
+    return max(scaled, _estimate_response_budget(prompt))
 
 
 def _format_facts_for_action_decision(facts: list[dict]) -> str:
@@ -1760,18 +1850,26 @@ def _decide_actions(
     LLM pass (existing knowledge + new facts -> per-fact action) and returns reconcile-ready
     dicts: EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
     ``existing_id``, ``content``, ``category``, ``tags``, ``source_turns``,
-    ``contradiction_note``). ``confidence``/``valid_from``/``valid_until`` are NOT included —
-    reconcile computes those itself (B1 contract-read Finding 3).
+    ``contradiction_note``, ``valid_from``, ``valid_until``). ``confidence`` is NOT included —
+    reconcile computes it itself (B1 contract-read Finding 3) with no fallback gap.
+    ``valid_from``/``valid_until`` ARE included when a unit's temporal_refs supply them
+    (``_derive_temporal_bounds``) — unlike ``valid_from``, reconcile has NO fallback for
+    ``valid_until``, so omitting it here would silently drop every extracted expiry bound.
 
     FAIL-CLOSED, never drops a fact: an unparseable/malformed response, an infer exception, an
     invalid action value, or any fact index the response didn't address all degrade that fact's
     ACTION to "create" (mirrors the monolith's own existing_id-not-found -> create fallback) —
     the fact itself is always represented in the output (count-invariant, matching B1's
-    discipline at this layer).
+    discipline at this layer). A create-defaulted (or model-CHOSEN-create) fact whose content
+    EXACTLY matches (``_normalize_for_dedup``) an already-existing node is converted to
+    corroborate that node instead — never-drop must not mean never-dedup; see the REVIEW FIXES
+    module note (blocker #2, the persisted-duplicate finding).
 
     ``infer`` is the SAME pluggable sync seam B1 uses (``_make_recall_infer``) — one call per
     cluster (a cluster's facts + its existing-knowledge set are bounded, so batching per cluster
-    is v1; see the B2 spec for the per-fact-vs-batched tradeoff).
+    is v1; see the B2 spec for the per-fact-vs-batched tradeoff). The request's ``max_tokens``
+    is scaled to candidate count (``_estimate_action_decision_budget``, blocker #1) — a flat
+    per-unit floor silently truncated dense clusters and mass-triggered the fail-closed path.
 
     ``source_turns`` is intentionally always ``[]`` here — see module note: the deterministic
     prefilter's ``Candidate.attr`` (session_id/entry_index/field/index) is NOT transcript-turn-
@@ -1786,7 +1884,13 @@ def _decide_actions(
         return []
 
     prompt = _build_action_decision_prompt(facts, existing_nodes, cluster)
-    request = {"prompt": prompt, "messages": [{"role": "user", "content": prompt}], "capabilities": []}
+    budget = _estimate_action_decision_budget(prompt, len(facts))
+    request = {
+        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
+        "capabilities": [],
+        "max_tokens": budget,
+    }
     try:
         response = infer(request)
     except Exception as exc:
@@ -1797,26 +1901,40 @@ def _decide_actions(
     if by_index is None:
         by_index = {}
 
+    # Exact-match dedup ahead of reconcile: see _normalize_for_dedup. Built once per cluster,
+    # not per-fact, since existing_nodes is fixed for the whole call.
+    existing_by_normalized = {
+        _normalize_for_dedup(n.content): n.id for n in existing_nodes
+    }
+
     results: list[dict] = []
     for i, fact in enumerate(facts):
         item = by_index.get(i, {})
         action = item.get("action")
         if action not in _VALID_ACTIONS:
             action = "create"
+        existing_id = item.get("existing_id")
         tags = item.get("tags")
         if not isinstance(tags, list):
             tags = []
         contradiction_note = item.get("contradiction_note")
         if not isinstance(contradiction_note, str):
             contradiction_note = ""
+        if action == "create":
+            matched_id = existing_by_normalized.get(_normalize_for_dedup(fact["text"]))
+            if matched_id:
+                action = "corroborate"
+                existing_id = matched_id
         results.append({
             "action": action,
-            "existing_id": item.get("existing_id"),
+            "existing_id": existing_id,
             "content": fact["text"],
             "category": fact["category"],
             "tags": tags,
             "source_turns": [],
             "contradiction_note": contradiction_note,
+            "valid_from": fact.get("valid_from"),
+            "valid_until": fact.get("valid_until"),
         })
     return results
 

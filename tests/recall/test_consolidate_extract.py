@@ -494,3 +494,30 @@ def test_consolidate_flag_branch_creates_nodes_end_to_end(tmp_path, monkeypatch)
     assert len(fake.calls) > 0                  # the extract path actually ran the model seam
     kn_path = tmp_path / ".synapt" / "recall" / "knowledge.jsonl"
     assert kn_path.exists() and kn_path.read_text().strip() != ""
+
+
+# --- REVIEW-FIX: dense-cluster token budget reaches the REAL client (not just _decide_actions) --
+
+def test_run_extract_path_dense_cluster_scaled_budget_reaches_the_real_client(tmp_path):
+    """B3-level proof that the scaled action-decision budget (Opus/Sentinel blocker #2) reaches
+    the ACTUAL client through _run_extract_path -> _make_recall_infer, not just the isolated
+    _decide_actions unit tests (which inject infer directly, bypassing _make_recall_infer's
+    per-request max_tokens reading entirely — a wiring gap those tests structurally cannot
+    see, the same class of gap the flag-branch dispatch test exists to catch for B1)."""
+    n = 40
+    cluster = [_entry(session_id="s1", done=[f"recall#875 dense fact number {i} extract_batch" for i in range(n)])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope("dense"),
+        action_completion='{"actions": [{"index": 0, "action": "create"}]}',
+    )
+    kn_path = tmp_path / "knowledge.jsonl"
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+    assert result is not None
+    action_calls = [c for c in client.calls if "New Facts (indexed)" in c["messages"][0].content]
+    assert len(action_calls) == 1
+    requested_budget = action_calls[0]["kwargs"]["max_tokens"]
+    assert requested_budget > 800, (
+        f"action-decision call requested only {requested_budget} tokens for a {n}-candidate "
+        "cluster — the scaled budget did not reach the real client through _run_extract_path"
+    )

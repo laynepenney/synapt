@@ -18,6 +18,9 @@ the QUALITY is correct.
 
 from __future__ import annotations
 
+import json
+import re
+
 import pytest
 
 pytest.importorskip("synapt.extract.batch")
@@ -25,8 +28,12 @@ pytest.importorskip("synapt.extract.batch")
 from synapt.recall.journal import JournalEntry
 from synapt.recall.knowledge import KnowledgeNode
 from synapt.recall.consolidate import (
+    MIN_RESPONSE_TOKENS,
     _decide_actions,
+    _derive_temporal_bounds,
+    _estimate_action_decision_budget,
     _flatten_envelope_facts,
+    _normalize_for_dedup,
     _run_coro_blocking,
     _extract_cluster_units,
 )
@@ -43,7 +50,7 @@ def _node(content, category="fact", node_id=None) -> KnowledgeNode:
     return KnowledgeNode.create(content=content, category=category, node_id=node_id)
 
 
-def _envelope_ok(source_unit_id: str, *, facts=None, decisions=None):
+def _envelope_ok(source_unit_id: str, *, facts=None, decisions=None, temporal_refs=None):
     """A minimal fake BatchUnitResult-shaped object (status='ok') carrying a SynaptExtraction
     envelope, without needing a real extract_batch round trip — _flatten_envelope_facts /
     _decide_actions only read .status/.extraction/.source_unit_id."""
@@ -54,6 +61,7 @@ def _envelope_ok(source_unit_id: str, *, facts=None, decisions=None):
         extraction={
             "facts": facts or [],
             "decisions": decisions or [],
+            "temporal_refs": temporal_refs or [],
         },
         reason=None,
     )
@@ -275,12 +283,15 @@ def test_decide_actions_count_invariant_across_multiple_facts():
 
 def test_decide_actions_output_matches_apply_consolidation_result_shape():
     """Explicit contract-shape check: output keys are EXACTLY what
-    _apply_consolidation_result's parsed['nodes'] item reads (consolidate.py ~1044-1076)."""
+    _apply_consolidation_result's parsed['nodes'] item reads (consolidate.py ~1044-1076),
+    INCLUDING valid_from/valid_until (added in the review-fix round — reconcile has no
+    fallback for valid_until, so it must be supplied when derivable, not omitted)."""
     cluster = [_entry(done=["a"])]
     envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "a", "category": "fact"}])]
     out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
     assert set(out[0].keys()) == {
-        "action", "existing_id", "content", "category", "tags", "source_turns", "contradiction_note",
+        "action", "existing_id", "content", "category", "tags", "source_turns",
+        "contradiction_note", "valid_from", "valid_until",
     }
 
 
@@ -329,3 +340,261 @@ def test_decide_actions_with_real_b1_envelopes():
     assert len(out) == 1
     assert out[0]["action"] == "create"
     assert out[0]["content"].startswith("fact from:")
+
+
+# =============================================================================================
+# REVIEW-FIX REGRESSION SUITE (2026-07-14, Sentinel + Opus REQUEST-CHANGES)
+# =============================================================================================
+
+# --- Blocker #1: dense-cluster token-cap truncation → mass fail-closed-to-create -------------
+
+def _truncating_action_infer_factory():
+    """A fake infer SIMULATING a token-budget-limited model: builds the full action response
+    for every candidate in the prompt, then truncates the "actions" array to whatever fits
+    within the REQUESTED max_tokens (~4 chars/token, the same approximation the codebase
+    already uses) — reproducing the exact causal mechanism the dense-cluster inflation bug
+    depended on. Returns (infer, calls) so a test can inspect the actual requested budget."""
+    calls: list[dict] = []
+
+    def infer(request):
+        calls.append(request)
+        max_tokens = request.get("max_tokens") or MIN_RESPONSE_TOKENS
+        budget_chars = max_tokens * 4
+        n = len(re.findall(r"^\[(\d+)\]", request["prompt"], re.MULTILINE))
+        kept: list[dict] = []
+        for i in range(n):
+            candidate = kept + [{"index": i, "action": "corroborate", "existing_id": f"kn_{i:04d}"}]
+            if len(json.dumps({"actions": candidate})) > budget_chars:
+                break
+            kept = candidate
+        return json.dumps({"actions": kept})
+
+    return infer, calls
+
+
+def test_truncating_fixture_is_faithful_flat_800_budget_truncates_dense_response():
+    """Negative control for the fixture itself: with the OLD flat 800-token budget, a
+    64-candidate response DOES truncate — proving the fixture genuinely simulates truncation,
+    so the positive test below isn't vacuously passing because nothing ever truncates."""
+    n = 64
+    infer, _ = _truncating_action_infer_factory()
+    request = {
+        "prompt": "\n".join(f"[{i}] (fact) durable fact number {i}" for i in range(n)),
+        "messages": [], "capabilities": [], "max_tokens": 800,
+    }
+    parsed = json.loads(infer(request))
+    assert len(parsed["actions"]) < n
+
+
+def test_decide_actions_dense_cluster_all_facts_addressed_with_scaled_budget():
+    """THE dense-cluster inflation bug (Opus blocker #2 / Sentinel's original finding): B2's
+    per-cluster call inherited B1's flat per-unit 800-token floor, so a response covering many
+    candidates truncated partway and every unaddressed index fail-closed to "create" — the
+    "inflation fix" silently didn't fix inflation on dense clusters. This proves the FIX
+    (_estimate_action_decision_budget scaling with candidate count) threads a big-enough
+    budget through, so a 64-candidate cluster's response is NOT truncated."""
+    n = 64
+    cluster = [_entry(done=[f"durable fact number {i}" for i in range(n)])]
+    envs = [
+        _envelope_ok(f"clu:0:done:{i}", facts=[{"text": f"durable fact number {i}"}])
+        for i in range(n)
+    ]
+    infer, calls = _truncating_action_infer_factory()
+
+    out = _decide_actions(cluster, "clu", envs, [], infer)
+
+    assert len(out) == n  # count-invariant regardless of truncation
+    assert len(calls) == 1
+    requested_budget = calls[0]["max_tokens"]
+    assert requested_budget > 800, "the scaled budget was NOT requested — still the flat floor"
+    addressed = [o for o in out if o["action"] == "corroborate"]
+    assert len(addressed) == n, (
+        f"only {len(addressed)}/{n} facts were addressed by the model — "
+        "the response was still truncated despite the scaled budget"
+    )
+
+
+def test_estimate_action_decision_budget_scales_with_fact_count():
+    # A short, identical prompt for both n_facts values would let _estimate_response_budget's
+    # OWN context-awareness (near CONTEXT_BUDGET for a tiny prompt) dominate both calls
+    # equally, masking whether the fact-count term does anything. The scenario where it
+    # actually MATTERS is a prompt heavy with existing-knowledge context — close enough to
+    # consuming the assumed context budget that _estimate_response_budget alone floors at
+    # MIN_RESPONSE_TOKENS regardless of fact count; the scaled term must grow past that floor.
+    heavy_existing = "x" * 28000
+    small = _estimate_action_decision_budget(heavy_existing, 1)
+    dense = _estimate_action_decision_budget(heavy_existing, 64)
+    assert dense > small
+    assert dense > MIN_RESPONSE_TOKENS * 3  # a 64-candidate cluster needs substantially more
+
+
+def test_estimate_action_decision_budget_never_below_the_monolith_context_estimate():
+    # a huge prompt (lots of existing knowledge) with FEW facts should still get at least
+    # what _estimate_response_budget itself would grant — the scaled-by-facts floor never
+    # UNDERCUTS the monolith's own context-aware estimate.
+    huge_prompt = "x" * 20000
+    budget = _estimate_action_decision_budget(huge_prompt, 1)
+    assert budget >= MIN_RESPONSE_TOKENS
+
+
+# --- Blocker #2: fail-closed-to-create persisted duplicates ----------------------------------
+
+def test_normalize_for_dedup_case_and_whitespace_insensitive():
+    a = _normalize_for_dedup("Recall#875   Wired  Extract_Batch")
+    b = _normalize_for_dedup("recall#875 wired extract_batch")
+    assert a == b
+    assert _normalize_for_dedup("  leading and trailing  ") == "leading and trailing"
+
+
+def test_decide_actions_exact_match_dedup_converts_fail_closed_create_to_corroborate():
+    existing = [_node("recall#875 wired extract_batch into consolidation", node_id="kn_dup01")]
+    cluster = [_entry(done=["recall#875 wired extract_batch into consolidation"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0", facts=[{"text": "recall#875 wired extract_batch into consolidation"}]
+    )]
+    # malformed response -> every fact fail-closes to create, INCLUDING this exact-duplicate one
+    out = _decide_actions(cluster, "clu", envs, existing, lambda req: "not json")
+    assert out[0]["action"] == "corroborate"
+    assert out[0]["existing_id"] == "kn_dup01"
+
+
+def test_decide_actions_exact_match_dedup_case_and_whitespace_insensitive():
+    existing = [_node("Recall#875   Wired Extract_Batch", node_id="kn_dup02")]
+    cluster = [_entry(done=["recall#875 wired extract_batch"])]
+    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "recall#875 wired extract_batch"}])]
+    out = _decide_actions(cluster, "clu", envs, existing, lambda req: "not json")
+    assert out[0]["action"] == "corroborate"
+    assert out[0]["existing_id"] == "kn_dup02"
+
+
+def test_decide_actions_exact_match_dedup_does_not_fire_on_dissimilar_content():
+    """Negative control: a genuinely NEW fact (no exact match) stays create+None — the dedup
+    check must not over-match."""
+    existing = [_node("recall#875 wired extract_batch into consolidation", node_id="kn_other")]
+    cluster = [_entry(done=["a completely different fact about extract_batch tests"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0", facts=[{"text": "a completely different fact about extract_batch tests"}]
+    )]
+    out = _decide_actions(cluster, "clu", envs, existing, lambda req: "not json")
+    assert out[0]["action"] == "create"
+    assert out[0]["existing_id"] is None
+
+
+def test_decide_actions_exact_match_dedup_applies_to_model_chosen_create_too():
+    """The dedup check applies UNIVERSALLY to any action that resolves to create — even when
+    the MODEL explicitly (not fail-closed) chose create — since exact-duplicate content is
+    never the right create, regardless of WHY the action ended up "create"."""
+    existing = [_node("recall#875 wired extract_batch into consolidation", node_id="kn_explicit")]
+    cluster = [_entry(done=["recall#875 wired extract_batch into consolidation"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0", facts=[{"text": "recall#875 wired extract_batch into consolidation"}]
+    )]
+
+    def infer(request):
+        return '{"actions": [{"index": 0, "action": "create", "existing_id": null}]}'
+
+    out = _decide_actions(cluster, "clu", envs, existing, infer)
+    assert out[0]["action"] == "corroborate"
+    assert out[0]["existing_id"] == "kn_explicit"
+
+
+def test_decide_actions_exact_match_dedup_does_not_override_model_chosen_corroborate():
+    """The dedup check only touches action=="create" — a model-chosen corroborate against a
+    DIFFERENT existing node is never silently redirected to the exact-match one."""
+    existing = [
+        _node("recall#875 wired extract_batch into consolidation", node_id="kn_exact"),
+        _node("a totally different node", node_id="kn_target"),
+    ]
+    cluster = [_entry(done=["recall#875 wired extract_batch into consolidation"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0", facts=[{"text": "recall#875 wired extract_batch into consolidation"}]
+    )]
+
+    def infer(request):
+        return '{"actions": [{"index": 0, "action": "corroborate", "existing_id": "kn_target"}]}'
+
+    out = _decide_actions(cluster, "clu", envs, existing, infer)
+    assert out[0]["action"] == "corroborate"
+    assert out[0]["existing_id"] == "kn_target"  # the model's own choice, NOT overridden
+
+
+# --- Blocker #3: temporal_refs discarded ------------------------------------------------------
+
+def test_derive_temporal_bounds_picks_first_usable_ref():
+    refs = [
+        {"raw": "no dates here", "type": "unresolved"},  # neither resolved nor resolved_end
+        {"raw": "March 2026", "type": "point", "resolved": "2026-03-01"},
+    ]
+    assert _derive_temporal_bounds(refs) == ("2026-03-01", None)
+
+
+def test_derive_temporal_bounds_empty_or_none_yields_none_none():
+    assert _derive_temporal_bounds(None) == (None, None)
+    assert _derive_temporal_bounds([]) == (None, None)
+    assert _derive_temporal_bounds([{"raw": "x", "type": "unresolved"}]) == (None, None)
+
+
+def test_decide_actions_threads_resolved_into_valid_from():
+    cluster = [_entry(done=["the API key expires soon"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0",
+        facts=[{"text": "the API key expires soon"}],
+        temporal_refs=[{"raw": "expires April 30", "type": "point", "resolved": "2026-04-30"}],
+    )]
+    out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
+    assert out[0]["valid_from"] == "2026-04-30"
+    assert out[0]["valid_until"] is None
+
+
+def test_decide_actions_threads_resolved_end_into_valid_until():
+    cluster = [_entry(done=["the migration window ran march to april"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0",
+        facts=[{"text": "the migration window ran march to april"}],
+        temporal_refs=[{
+            "raw": "March to April 2026", "type": "range",
+            "resolved": "2026-03-01", "resolved_end": "2026-04-30",
+        }],
+    )]
+    out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
+    assert out[0]["valid_from"] == "2026-03-01"
+    assert out[0]["valid_until"] == "2026-04-30"
+
+
+def test_decide_actions_temporal_refs_absent_yields_none_bounds():
+    """Negative control: matches reconcile's EXISTING no-signal fallback exactly (valid_from
+    falls back to cluster timestamp / now; valid_until stays unset) — unchanged behavior."""
+    cluster = [_entry(done=["a fact with no temporal signal"])]
+    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "a fact with no temporal signal"}])]
+    out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
+    assert out[0]["valid_from"] is None
+    assert out[0]["valid_until"] is None
+
+
+def test_decide_actions_temporal_refs_apply_to_all_facts_from_same_unit():
+    """temporal_refs are UNIT-level in the extract_batch schema (no fact-level link) — every
+    fact/decision extracted from the SAME unit inherits the SAME derived bounds."""
+    cluster = [_entry(done=["fact one and fact two from the same note, expiring soon"])]
+    envs = [_envelope_ok(
+        "clu:0:done:0",
+        facts=[{"text": "fact one"}, {"text": "fact two"}],
+        temporal_refs=[{"raw": "expires soon", "type": "point", "resolved": "2026-05-01"}],
+    )]
+    out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
+    assert out[0]["valid_from"] == out[1]["valid_from"] == "2026-05-01"
+
+
+def test_decide_actions_temporal_refs_do_not_bleed_across_different_units():
+    """Two DIFFERENT units, only one carrying a temporal_ref — confirms bounds are per-unit,
+    not accidentally shared across the whole batch."""
+    cluster = [_entry(done=["fact with a date", "fact with no date"])]
+    envs = [
+        _envelope_ok(
+            "clu:0:done:0", facts=[{"text": "fact with a date"}],
+            temporal_refs=[{"raw": "in March", "type": "point", "resolved": "2026-03-01"}],
+        ),
+        _envelope_ok("clu:0:done:1", facts=[{"text": "fact with no date"}]),
+    ]
+    out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
+    assert out[0]["valid_from"] == "2026-03-01"
+    assert out[1]["valid_from"] is None
