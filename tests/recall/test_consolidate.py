@@ -500,6 +500,30 @@ class TestApplyConsolidation(unittest.TestCase):
         self.assertGreater(nodes[0].confidence, 0.45)
         self.assertEqual(nodes[0].valid_until, "2026-12-31")
 
+    def test_apply_corroborate_update_does_not_mutate_memory_when_persist_fails(self):
+        # Sentinel's explicit requirement, verbatim (re-clear on 296879d, 2026-07-15): "Do not
+        # mutate memory if persistence failed." If update_node reports failure (the target isn't
+        # actually found on disk), the in-memory node must stay EXACTLY as it was -- no phantom
+        # state where memory claims a bound was filled but nothing was ever persisted.
+        from synapt.recall.consolidate import _apply_corroborate_update
+
+        missing_kn_path = Path(self.tmpdir) / "does-not-exist.jsonl"  # update_node returns False
+        target = KnowledgeNode.create(content="orphaned in-memory node", category="fact")
+        original_valid_from = target.valid_from
+        original_valid_until = target.valid_until
+        original_confidence = target.confidence
+
+        ok = _apply_corroborate_update(
+            target,
+            {"valid_from": "2025-01-01", "valid_until": "2025-12-31", "confidence": 0.99},
+            missing_kn_path,
+        )
+        self.assertFalse(ok)  # update_node correctly reports failure
+        # In-memory target UNCHANGED -- no phantom fill despite the attempted updates dict
+        self.assertEqual(target.valid_from, original_valid_from)
+        self.assertEqual(target.valid_until, original_valid_until)
+        self.assertEqual(target.confidence, original_confidence)
+
     # --- BLOCKER 2 fix: LEGACY contradict (no db) CARRIES candidate bounds onto the replacement
     # node — before this fix, the replacement always got a cluster-derived valid_from and NEVER
     # got a valid_until at all (Sentinel's fruit: "contradict (legacy) -> replacement had

@@ -34,7 +34,10 @@ from synapt.recall.knowledge import KnowledgeNode, read_nodes
 from synapt.recall.consolidate import (
     _EXTRACT_PRODUCED_BY,
     _extract_cluster_units,
+    _extract_keywords,
+    _jaccard,
     _make_recall_infer,
+    _normalize_for_dedup,
     _run_coro_blocking,
     _run_extract_path,
 )
@@ -656,23 +659,54 @@ def test_run_extract_path_two_candidates_corroborate_same_node_first_bound_wins(
     assert persisted["kn-policy"].valid_until == "2025-04-30"
 
 
-def test_run_extract_path_mixed_explicit_and_auto_corroborate_same_node_first_bound_wins(tmp_path):
+def test_run_extract_path_mixed_auto_then_explicit_corroborate_same_node_first_bound_wins(tmp_path):
     """Sentinel's explicit mandate: "the same shared-state defect spans explicit/auto mixes."
-    Candidate 1 hits the EXPLICIT corroborate action branch; candidate 2 hits the create branch's
-    similarity-triggered AUTO-corroborate (action stays "create", never touches raw_node["action"]
-    at all). Both target the same existing node. Since _apply_corroborate_update mutates the SAME
-    in-memory KnowledgeNode object both call sites operate on, candidate 1's fill must still be
-    visible (and preserved, not overwritten) when candidate 2's auto-corroborate runs second."""
+    Candidate 1 hits the create branch's similarity-triggered AUTO-corroborate (action stays
+    "create", never touches raw_node["action"] at all); candidate 2 hits the EXPLICIT corroborate
+    action branch. Both target the same existing node.
+
+    Test-fidelity fixes (Opus's fruit + Sentinel's REQUEST CHANGES @ 296879d, 2026-07-15), TWO
+    distinct issues in the original test:
+
+    (1) The original fact_auto was BYTE-IDENTICAL to existing_content, so _decide_actions's own
+    exact-match dedup (_normalize_for_dedup) silently converted it to action="corroborate" with
+    existing_id set BEFORE it ever reached _apply_consolidation_result -- meaning BOTH candidates
+    actually went through the EXPLICIT branch. Fixed: fact_auto is a REORDERING of the exact same
+    keyword tokens (Jaccard=1.0 via the set-based _extract_keywords) but a DIFFERENT literal
+    string (_normalize_for_dedup's lowercase+whitespace-join IS order-sensitive), so the exact-
+    match guard does not fire and it's genuinely the create branch's Jaccard auto-corroborate that
+    converts it -- proven, not assumed: asserts the decision log records "auto-corroborate".
+
+    (2) MUTATION-PROOF gap: even with (1) fixed, the original candidate ORDER (explicit first,
+    auto second) left the test green under Sentinel's decisive mutation (reverting ONLY the auto
+    call site's _apply_corroborate_update -> update_node). Root cause: the explicit candidate ran
+    FIRST and its (unmutated) sync already left the in-memory node's bound filled, so
+    _corroborate_bound_fill's OWN "is target.valid_until None" check meant the auto candidate's
+    updates dict never included valid_until in the first place -- the auto call site's sync was
+    never exercised, mutated or not. Fixed by SWAPPING the order: the AUTO candidate now runs
+    FIRST and is the one that actually WRITES the bound, so the test's outcome genuinely depends
+    on whether ITS call site syncs memory on success. Verified: reverting only the auto call site
+    now makes this test fail (confirmed via targeted mutation before landing this fix)."""
     kn_path = tmp_path / "knowledge.jsonl"
     existing_content = "the api_key_rotation_policy governs when API keys expire in production_env"
     existing = KnowledgeNode.create(content=existing_content, category="fact", node_id="kn-policy")
     from synapt.recall.knowledge import append_node
     append_node(existing, kn_path)
 
+    # Same keyword SET as existing_content (Jaccard=1.0), different literal STRING (exact-match
+    # dedup, which is order-sensitive, must NOT fire) -- genuinely routes through the create
+    # branch's own Jaccard-similarity auto-corroborate, not _decide_actions's exact-match guard.
+    fact_auto = "when API keys expire in production_env, the api_key_rotation_policy governs"
     fact_explicit = "reminder to review the api_key_rotation_policy before the next audit"
-    fact_auto = existing_content  # identical text -> guarantees Jaccard=1.0 auto-corroborate match
-    cluster = [_entry(session_id="s1", done=[fact_explicit, fact_auto], ts="2025-03-01T09:00:00Z")]
+    assert fact_auto != existing_content  # sanity: genuinely non-exact
+    assert _normalize_for_dedup(fact_auto) != _normalize_for_dedup(existing_content)  # exact-match won't fire
+    assert _jaccard(_extract_keywords(fact_auto), _extract_keywords(existing_content)) == 1.0  # but still Jaccard-identical
+
+    # Auto candidate FIRST (index 0) -- it is the one that WRITES the bound, so the test's
+    # pass/fail genuinely depends on its call site's sync-on-success, not the explicit branch's.
+    cluster = [_entry(session_id="s1", done=[fact_auto, fact_explicit], ts="2025-03-01T09:00:00Z")]
     failures_path = tmp_path / "consolidation_failures.jsonl"
+    decision_log_path = tmp_path / "decisions.jsonl"
 
     def extract_completion_for(fact_text, resolved):
         return json.dumps({
@@ -684,23 +718,34 @@ def test_run_extract_path_mixed_explicit_and_auto_corroborate_same_node_first_bo
 
     client = _PerUnitRoutingFakeClient(
         extract_by_marker={
-            fact_explicit: extract_completion_for(fact_explicit, "2025-04-30"),
-            fact_auto: extract_completion_for(fact_auto, "2026-04-30"),
+            fact_auto: extract_completion_for(fact_auto, "2025-04-30"),
+            fact_explicit: extract_completion_for(fact_explicit, "2026-04-30"),
         },
         action_completion=(
             '{"actions": ['
-            '{"index": 0, "action": "corroborate", "existing_id": "kn-policy"}, '
-            '{"index": 1, "action": "create"}'  # never touches "corroborate" -- similarity converts it
+            '{"index": 0, "action": "create"}, '  # never touches "corroborate" -- similarity converts it
+            '{"index": 1, "action": "corroborate", "existing_id": "kn-policy"}'
             ']}'
         ),
     )
-    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [existing], kn_path)
+    result = _run_extract_path(
+        cluster, "clu", client, "m", failures_path, [existing], kn_path,
+        decision_log_path=decision_log_path,
+    )
     assert result is not None
-    assert result.nodes_corroborated == 2  # BOTH routed through corroborate (one explicit, one auto)
+    assert result.nodes_corroborated == 2  # BOTH routed through corroborate (one auto, one explicit)
     assert result.nodes_created == 0
+
+    # PROVE candidate 1 genuinely took the auto-corroborate path (not silently re-routed to the
+    # explicit branch by _decide_actions's own exact-match dedup).
+    decisions = [json.loads(line) for line in decision_log_path.read_text().splitlines() if line]
+    log_actions = [d["action"] for d in decisions]
+    assert "auto-corroborate" in log_actions
+    assert log_actions.count("corroborate") == 1  # exactly one explicit, one auto -- not two of either
+
     persisted = {n.id: n for n in read_nodes(kn_path)}
-    # Candidate 1's (explicit corroborate) bound wins; candidate 2 (auto-corroborate, second) must
-    # see it as already-filled via the synced in-memory node and decline to overwrite it.
+    # Candidate 1's (auto-corroborate) bound wins; candidate 2 (explicit, second) must see it as
+    # already-filled via the synced in-memory node and decline to overwrite it.
     assert persisted["kn-policy"].valid_until == "2025-04-30"
 
 
