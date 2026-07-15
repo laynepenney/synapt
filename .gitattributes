@@ -1,0 +1,18 @@
+# Normalize line endings to LF on checkout, regardless of platform or local git config.
+#
+# Without this file, Windows CI runners (core.autocrlf-driven) convert LF -> CRLF for files git
+# treats as text, changing their raw bytes. tests/recall/test_identify.py's
+# test_frozen_map_is_sha_pinned hardcodes a SHA256 computed from the LF-committed fixture, so a
+# CRLF checkout breaks it on every Windows job (recall#877) -- confirmed pre-existing since #873,
+# not introduced by any later PR. Swept for other byte/SHA-pinned fixtures: none found (only this
+# one test pins a fixture file's raw-byte hash).
+
+* text=auto eol=lf
+
+*.json text eol=lf
+*.jsonl text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
