@@ -1674,29 +1674,18 @@ def _run_extract_path(
 #      hand-built envelope, not the REAL extract_batch contract; abandoned in favor of a
 #      content-based per-fact approach once that was fruit-checked, see next block).
 #
-# TEMPORAL — REVISED (2026-07-14, Opus WITHDREW his approve on this axis after fruit-checking
-# a REAL extract_batch call, catching his own premature clear): the temporal_refs-derivation
-# fix (#3 above) rested on a HAND-BUILT test envelope carrying `resolved_end`/`type`/`context`.
-# The REAL extract_batch strips these for OUR capability request — VERIFIED (Apollo, direct
-# extract_batch call + isolated build_extraction_schema probe): `temporal_refs`'s base
-# capability schema only allows `{raw, resolved}`; `resolved_end`/`type`/`context` require the
-# SEPARATE `temporal_classes` capability, which B1 never requested. So `resolved_end` can
-# NEVER arrive via this path — the derivation was silently dead code for its primary purpose.
-# WORSE, even requesting `temporal_classes` would not fully fix it: a "point"-type ref (the
-# common case — a single date mention) carries `resolved` with NO field indicating whether it
-# is a START-of-validity or an END-of-validity (an expiry) — that direction is a SEMANTIC
-# judgment a bare ISO string cannot encode; only reading the fact's own sentence can (exactly
-# what the monolith's proven prompt already does — see CONSOLIDATION_PROMPT's valid_from/
-# valid_until instructions). Blindly mapping resolved->valid_from would silently persist
-# REVERSED temporal truth for every point-type expiry ref extract_batch does return.
-# ABANDONED the temporal_refs-derivation approach entirely (removed `_derive_temporal_bounds`
-# + its split-refs follow-up + the `temporal_refs` capability request — unused once nothing
-# reads it). REPLACED with: B2's OWN LLM pass now ALSO judges valid_from/valid_until per fact,
-# reading the fact's content directly — reusing the monolith's proven content-based temporal
-# reasoning (same instruction language + examples as CONSOLIDATION_PROMPT), not inventing a
-# new mechanism. This is PER-FACT (not per-unit), which also structurally eliminates Sentinel's
-# unit-level-bleed hazard: a temporal bound can no longer inherit onto unrelated atomized facts
-# from the same source unit, because there is no unit-level derivation left to bleed from.
+# TEMPORAL — HELD, NULL PLACEHOLDER (2026-07-15, Layne layer-redirect via Opus): the B2-LLM-
+# judges-temporal approach (2026-07-14, replaced the equally-abandoned temporal_refs-derivation
+# attempt before it) is ITSELF duct tape — recall re-deriving via a second LLM pass what
+# extraction already read once and should capture directly at the source. Right fix lives in
+# extract: emit a validity ROLE (effective/expiry/range/superseded/point) alongside each
+# resolved date; recall maps role -> valid_from/valid_until DETERMINISTICALLY, no LLM
+# re-judgment (spec: config/design/extract-temporal-role-2026-07-14.md). Until that lands,
+# temporal is a NULL PLACEHOLDER here — B2 does not attempt to judge it at all (not even via
+# LLM instruction), matching "null is better than guessing" honestly rather than duct-taping a
+# second mechanism on top of the first. Budget (#1, _estimate_action_decision_budget) and
+# dedup (#2, _normalize_for_dedup) are UNAFFECTED — independent of temporal, already fruit-
+# confirmed by two reviewers, stay exactly as they are.
 # ---------------------------------------------------------------------------
 
 ACTION_DECISION_PROMPT = """\
@@ -1715,13 +1704,6 @@ For EACH new fact above, decide exactly one action:
 - "contradict": this REVERSES or invalidates an EXISTING node's claim — give its exact [id] \
 and a one-sentence contradiction_note explaining the reversal.
 
-Also decide valid_from/valid_until (ISO 8601 dates, e.g. "2026-03-15", or null). Set these \
-ONLY when the fact has a clear temporal boundary:
-- "We migrated to PostgreSQL in March 2026" -> valid_from: "2026-03-01"
-- "The API key expires April 30" -> valid_until: "2026-04-30"
-- "Before the refactor, we used callbacks" -> valid_until: (date of the reversal)
-Most facts have no clear boundary — leave both null rather than guessing.
-
 Rules:
 1. Only use "corroborate" or "contradict" when you can cite the EXACT existing node id shown \
 in brackets above. Never invent an id.
@@ -1730,9 +1712,8 @@ in brackets above. Never invent an id.
 
 Output ONLY valid JSON, no markdown fences, no explanation. One action object PER fact index, \
 matched by "index" (not by list position):
-{{"actions": [{{"index": 0, "action": "create", "existing_id": null, "contradiction_note": "", \
-"valid_from": null, "valid_until": null}}, {{"index": 1, "action": "corroborate", \
-"existing_id": "kn_abc123", "contradiction_note": "", "valid_from": null, "valid_until": "2026-04-30"}}]}}
+{{"actions": [{{"index": 0, "action": "create", "existing_id": null, "contradiction_note": ""}}, \
+{{"index": 1, "action": "corroborate", "existing_id": "kn_abc123", "contradiction_note": ""}}]}}
 """
 
 _VALID_ACTIONS = ("create", "corroborate", "contradict")
@@ -1860,19 +1841,18 @@ def _decide_actions(
     infer,
 ) -> list[dict]:
     """B2: the action-decision pass. Flattens B1's successfully-extracted facts, asks a focused
-    LLM pass (existing knowledge + new facts -> per-fact action + temporal bounds) and returns
-    reconcile-ready dicts: EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item
-    shape (``action``, ``existing_id``, ``content``, ``category``, ``tags``, ``source_turns``,
+    LLM pass (existing knowledge + new facts -> per-fact action) and returns reconcile-ready
+    dicts: EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
+    ``existing_id``, ``content``, ``category``, ``tags``, ``source_turns``,
     ``contradiction_note``, ``valid_from``, ``valid_until``). ``confidence`` is NOT included —
     reconcile computes it itself (B1 contract-read Finding 3) with no fallback gap.
 
-    ``valid_from``/``valid_until`` are judged by THIS SAME LLM pass, directly from each fact's
-    content (see ``ACTION_DECISION_PROMPT``'s temporal instructions, reused verbatim in spirit
-    from the monolith's proven ``CONSOLIDATION_PROMPT``) — NOT derived from extract_batch's
-    ``temporal_refs`` (abandoned; see the module's TEMPORAL — REVISED note). Reconcile has NO
-    fallback for ``valid_until`` (unlike ``valid_from``), so an unaddressed index's temporal
-    bounds default to None here — same as the monolith's own "null is better than guessing"
-    instruction, never a fabricated date.
+    ``valid_from``/``valid_until`` are ALWAYS ``None`` here — a deliberate NULL PLACEHOLDER, not
+    an oversight. See the module's TEMPORAL — HELD note: neither extract_batch's temporal_refs
+    (dead for its purpose — resolved_end unreachable at this capability, and even reachable a
+    bare date has no start-vs-end direction) NOR a second recall-side LLM judgment (duct tape —
+    re-deriving what extraction already read once) are the right mechanism. Temporal returns
+    once extract emits a validity role and recall maps it deterministically — not before.
 
     FAIL-CLOSED, never drops a fact: an unparseable/malformed response, an infer exception, an
     invalid action value, or any fact index the response didn't address all degrade that fact's
@@ -1938,12 +1918,6 @@ def _decide_actions(
         contradiction_note = item.get("contradiction_note")
         if not isinstance(contradiction_note, str):
             contradiction_note = ""
-        valid_from = item.get("valid_from")
-        if not isinstance(valid_from, str):
-            valid_from = None
-        valid_until = item.get("valid_until")
-        if not isinstance(valid_until, str):
-            valid_until = None
         if action == "create":
             matched_id = existing_by_normalized.get(_normalize_for_dedup(fact["text"]))
             if matched_id:
@@ -1957,8 +1931,8 @@ def _decide_actions(
             "tags": tags,
             "source_turns": [],
             "contradiction_note": contradiction_note,
-            "valid_from": valid_from,
-            "valid_until": valid_until,
+            "valid_from": None,   # NULL PLACEHOLDER — see TEMPORAL — HELD module note
+            "valid_until": None,  # temporal returns via extract's role field, not LLM re-judgment
         })
     return results
 

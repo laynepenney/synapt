@@ -518,161 +518,68 @@ def test_decide_actions_exact_match_dedup_does_not_override_model_chosen_corrobo
     assert out[0]["existing_id"] == "kn_target"  # the model's own choice, NOT overridden
 
 
-# --- Blocker #3 REVISED: temporal_refs-derivation ABANDONED, content-based LLM judgment ------
+# --- TEMPORAL — HELD, NULL PLACEHOLDER (2026-07-15, Layne layer-redirect via Opus) -----------
 #
-# Opus withdrew his approve on the ORIGINAL temporal_refs-derivation fix after fruit-checking a
-# REAL extract_batch call (not a hand-built envelope): resolved_end/type/context are stripped
-# by the base "temporal_refs" capability's schema (VERIFIED — a separate "temporal_classes"
-# capability is required to unlock them, which was never requested), so resolved_end could
-# NEVER arrive. WORSE, even a "point"-type ref's bare "resolved" is directionally AMBIGUOUS (no
-# field says start-vs-expiry) — a semantic judgment only reading the fact's own sentence can
-# make. ABANDONED that mechanism entirely; B2's OWN LLM pass now judges valid_from/valid_until
-# per fact directly from content, reusing the monolith's proven instruction language. These
-# tests prove the WIRING (does the parsed action item's valid_from/valid_until thread through
-# correctly) — NOT whether a real model judges the RIGHT direction for a given sentence, which
-# is a model-quality question the Phase-C dogfood measures, not a fake-infer unit test.
+# The B2-LLM-judges-temporal mechanism (2026-07-14) was ITSELF duct tape — recall re-deriving
+# via a second LLM pass what extraction already read once and should capture directly. Pulled
+# entirely; valid_from/valid_until are now an HONEST NULL PLACEHOLDER (not even an LLM attempt)
+# until extract emits a validity role and recall maps it deterministically
+# (config/design/extract-temporal-role-2026-07-14.md). These tests confirm the placeholder is
+# unconditional — a model that TRIES to supply temporal fields (however it's prompted, however
+# it responds) has zero effect, since _decide_actions no longer reads those keys at all.
 
-def test_build_action_decision_prompt_includes_temporal_instructions():
-    """Sanity check that the prompt actually carries the new temporal instructions — not a
-    full wording pin (too brittle), just confirms the instruction text made it into the
-    rendered prompt."""
-    from synapt.recall.consolidate import _build_action_decision_prompt
-    facts = [{"text": "a fact", "category": "fact"}]
-    prompt = _build_action_decision_prompt(facts, [], [_entry(done=["a fact"])])
-    assert "valid_from" in prompt and "valid_until" in prompt
-    assert "expires" in prompt.lower()  # the monolith's own expiry example, reused
+def test_decide_actions_temporal_is_always_null_placeholder():
+    """The baseline: even a genuinely new, temporally-loaded fact gets null bounds — no
+    attempt at judgment, honest placeholder rather than a guess."""
+    cluster = [_entry(done=["the API key expires April 30"])]
+    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "the API key expires April 30"}])]
+    out = _decide_actions(cluster, "clu", envs, [], lambda req: '{"actions": [{"index": 0, "action": "create"}]}')
+    assert out[0]["valid_from"] is None
+    assert out[0]["valid_until"] is None
 
 
-def test_decide_actions_llm_supplies_valid_from():
+def test_decide_actions_temporal_placeholder_ignores_model_supplied_values():
+    """Even if a model UNPROMPTED tries to supply valid_from/valid_until (e.g. from residual
+    training-time habit, or a future prompt regression that re-adds the instruction by
+    accident), the wiring must not read them — this is the regression guard against the
+    duct-tape mechanism silently creeping back in."""
     cluster = [_entry(done=["we migrated to PostgreSQL in March 2026"])]
     envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "we migrated to PostgreSQL in March 2026"}])]
 
     def infer(request):
-        return '{"actions": [{"index": 0, "action": "create", "valid_from": "2026-03-01", "valid_until": null}]}'
+        return '{"actions": [{"index": 0, "action": "create", "valid_from": "2026-03-01", "valid_until": "2026-04-30"}]}'
 
     out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] == "2026-03-01"
-    assert out[0]["valid_until"] is None
+    assert out[0]["valid_from"] is None  # NOT "2026-03-01" — the model's attempt is ignored
+    assert out[0]["valid_until"] is None  # NOT "2026-04-30"
 
 
-def test_decide_actions_llm_supplies_valid_until_for_an_expiry():
-    """THE semantic-direction regression guard: an EXPIRY fact must thread as valid_until, not
-    valid_from — the exact reversal risk Opus's withdrawal flagged. The wiring here just
-    trusts whichever field the model populates; this confirms it threads the CORRECT field
-    (valid_until) without accidentally cross-wiring it to valid_from."""
-    cluster = [_entry(done=["the API key expires April 30"])]
-    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "the API key expires April 30"}])]
-
-    def infer(request):
-        return '{"actions": [{"index": 0, "action": "create", "valid_from": null, "valid_until": "2026-04-30"}]}'
-
-    out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] is None
-    assert out[0]["valid_until"] == "2026-04-30"  # NOT valid_from — direction preserved
-
-
-def test_decide_actions_llm_supplies_both_bounds():
-    cluster = [_entry(done=["the migration window ran march to april"])]
-    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "the migration window ran march to april"}])]
-
-    def infer(request):
-        return (
-            '{"actions": [{"index": 0, "action": "create", '
-            '"valid_from": "2026-03-01", "valid_until": "2026-04-30"}]}'
-        )
-
-    out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] == "2026-03-01"
-    assert out[0]["valid_until"] == "2026-04-30"
-
-
-def test_decide_actions_no_temporal_signal_yields_none_bounds():
-    """Negative control: most facts have no clear temporal boundary — the model (and reconcile
-    downstream) treats null as correct, not a gap. Matches "null is better than guessing"."""
-    cluster = [_entry(done=["a fact with no temporal signal"])]
-    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "a fact with no temporal signal"}])]
-
-    def infer(request):
-        return '{"actions": [{"index": 0, "action": "create", "valid_from": null, "valid_until": null}]}'
-
-    out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] is None
-    assert out[0]["valid_until"] is None
-
-
-def test_decide_actions_temporal_fields_absent_from_response_yield_none():
-    """The model may omit valid_from/valid_until entirely (not even null keys) — must not
-    crash, defaults to None same as an explicit null."""
-    cluster = [_entry(done=["a fact"])]
-    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "a fact"}])]
-
-    def infer(request):
-        return '{"actions": [{"index": 0, "action": "create"}]}'  # no temporal keys at all
-
-    out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] is None
-    assert out[0]["valid_until"] is None
-
-
-def test_decide_actions_invalid_temporal_type_coerced_to_none():
-    """A non-string valid_from/valid_until (e.g. a number or nested object) is coerced to
-    None, not propagated raw — reconcile's _validate_iso_date would reject a malformed STRING
-    gracefully, but a non-string should never reach it in the first place."""
-    cluster = [_entry(done=["a fact"])]
-    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "a fact"}])]
-
-    def infer(request):
-        return '{"actions": [{"index": 0, "action": "create", "valid_from": 20260301, "valid_until": {}}]}'
-
-    out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] is None
-    assert out[0]["valid_until"] is None
-
-
-def test_decide_actions_temporal_bounds_are_per_fact_not_shared():
-    """Two facts in the SAME response, only one carrying a temporal signal — confirms bounds
-    are genuinely PER-FACT (the structural fix for Sentinel's unit-level-bleed hazard: there
-    is no unit-level derivation left to bleed from, since each fact gets its OWN judgment)."""
-    cluster = [_entry(done=["a fact with a date", "a fact with no date"])]
+def test_decide_actions_temporal_placeholder_holds_across_all_actions():
+    """Null placeholder applies regardless of the resolved action (create/corroborate/
+    contradict) — temporal is orthogonal to the action decision."""
+    existing = [_node("some existing fact", node_id="kn_1")]
+    cluster = [_entry(done=["a"], decisions=["reversed: b"])]
     envs = [
-        _envelope_ok("clu:0:done:0", facts=[{"text": "a fact with a date"}]),
-        _envelope_ok("clu:0:done:1", facts=[{"text": "a fact with no date"}]),
+        _envelope_ok("clu:0:done:0", facts=[{"text": "a"}]),
+        _envelope_ok("clu:0:decisions:0", decisions=[{"text": "reversed: b"}]),
     ]
 
     def infer(request):
         return (
             '{"actions": ['
-            '{"index": 0, "action": "create", "valid_from": "2026-03-01", "valid_until": null}, '
-            '{"index": 1, "action": "create", "valid_from": null, "valid_until": null}'
+            '{"index": 0, "action": "corroborate", "existing_id": "kn_1"}, '
+            '{"index": 1, "action": "contradict", "existing_id": "kn_1", "contradiction_note": "x"}'
             ']}'
         )
 
-    out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] == "2026-03-01"
-    assert out[1]["valid_from"] is None  # NOT bled from index 0
+    out = _decide_actions(cluster, "clu", envs, existing, infer)
+    assert out[0]["action"] == "corroborate" and out[0]["valid_from"] is None and out[0]["valid_until"] is None
+    assert out[1]["action"] == "contradict" and out[1]["valid_from"] is None and out[1]["valid_until"] is None
 
 
-def test_decide_actions_unaddressed_index_yields_none_temporal_not_fabricated():
-    """An unaddressed index (fail-closed to create) must not fabricate a temporal bound — null
-    is correct here, matching the monolith's own "null is better than guessing" instruction."""
-    cluster = [_entry(done=["addressed", "not addressed"])]
-    envs = [
-        _envelope_ok("clu:0:done:0", facts=[{"text": "addressed"}]),
-        _envelope_ok("clu:0:done:1", facts=[{"text": "not addressed"}]),
-    ]
-
-    def infer(request):
-        return '{"actions": [{"index": 0, "action": "create", "valid_from": "2026-03-01"}]}'
-
-    out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] == "2026-03-01"
-    assert out[1]["action"] == "create"  # fail-closed, per the existing discipline
-    assert out[1]["valid_from"] is None and out[1]["valid_until"] is None  # not fabricated
-
-
-def test_decide_actions_malformed_response_yields_none_temporal_for_every_fact():
-    """An unparseable response fail-closes every fact's action to create AND leaves temporal
-    bounds None for all of them — no fabrication anywhere in the fail-closed path."""
+def test_decide_actions_temporal_placeholder_holds_under_malformed_response():
+    """The fail-closed path (garbage response) also carries the null placeholder — no
+    fabrication anywhere, matching the honest "we don't judge this yet" posture."""
     cluster = [_entry(done=["a", "b"])]
     envs = [
         _envelope_ok("clu:0:done:0", facts=[{"text": "a"}]),
@@ -681,3 +588,12 @@ def test_decide_actions_malformed_response_yields_none_temporal_for_every_fact()
     out = _decide_actions(cluster, "clu", envs, [], lambda req: "not json")
     assert all(o["action"] == "create" for o in out)
     assert all(o["valid_from"] is None and o["valid_until"] is None for o in out)
+
+
+def test_build_action_decision_prompt_does_not_mention_temporal():
+    """Sanity check the prompt itself carries NO temporal instructions — confirms the pull-back
+    is complete at the prompt layer, not just the parsing layer."""
+    from synapt.recall.consolidate import _build_action_decision_prompt
+    facts = [{"text": "a fact", "category": "fact"}]
+    prompt = _build_action_decision_prompt(facts, [], [_entry(done=["a fact"])])
+    assert "valid_from" not in prompt and "valid_until" not in prompt
