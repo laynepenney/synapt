@@ -1055,6 +1055,32 @@ def _corroborate_bound_fill(target: KnowledgeNode, raw_node: dict) -> dict:
     return updates
 
 
+def _apply_corroborate_update(target: KnowledgeNode, updates: dict, knowledge_path: Path) -> bool:
+    """Apply *updates* to the persisted node via ``update_node``, and — ONLY on success —
+    mutate *target* in place to match (Sentinel's re-clear finding, 2026-07-15).
+
+    ``existing_by_id``/``existing_nodes`` are built ONCE at the top of
+    ``_apply_consolidation_result`` and never re-read from disk mid-batch. Without this sync, TWO
+    candidates in the SAME batch that both corroborate the SAME node each compute their bound-fill
+    from the SAME stale ``target`` object: candidate 1's ``update_node`` call appends a fresh
+    persisted version, but candidate 2 still sees the pre-batch ``target.valid_until is None`` and
+    silently overwrites candidate 1's now-persisted fill — reproduced through the real B1->B2->B3
+    path (two prefilter candidates corroborating one node, first candidate's bound lost). Mutating
+    ``target`` here — the SAME object both ``existing_by_id`` and ``existing_nodes`` reference —
+    means a later same-batch candidate targeting this node sees the just-applied state, restoring
+    fill-missing/never-overwrite-conflicting WITHIN a batch, not just across separate calls.
+
+    "Never mutate memory if persistence failed": if ``update_node`` returns ``False`` (target not
+    found on disk), *target* is left untouched — an in-memory node claiming a bound that was never
+    actually persisted would be worse than the staleness this fixes.
+    """
+    ok = update_node(target.id, updates, knowledge_path)
+    if ok:
+        for key, value in updates.items():
+            setattr(target, key, value)
+    return ok
+
+
 def _apply_consolidation_result(
     parsed: dict,
     existing_nodes: list[KnowledgeNode],
@@ -1152,7 +1178,7 @@ def _apply_consolidation_result(
                     "confidence": new_confidence,
                 }
                 updates.update(_corroborate_bound_fill(target, raw_node))
-                update_node(target.id, updates, knowledge_path)
+                _apply_corroborate_update(target, updates, knowledge_path)
                 result.nodes_corroborated += 1
                 if decision_log_path:
                     _log_dedup_decision(
@@ -1299,7 +1325,7 @@ def _apply_consolidation_result(
                 # similarity — needs the SAME fill-missing-bound treatment as the explicit
                 # corroborate branch (_corroborate_bound_fill), or the fix doesn't reach here.
                 auto_updates.update(_corroborate_bound_fill(best_match, raw_node))
-                update_node(best_match.id, auto_updates, knowledge_path)
+                _apply_corroborate_update(best_match, auto_updates, knowledge_path)
                 result.nodes_corroborated += 1
                 if decision_log_path:
                     _log_dedup_decision(

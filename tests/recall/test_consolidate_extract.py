@@ -321,6 +321,28 @@ class _RoutingFakeClient:
         return self.extract_completion
 
 
+class _PerUnitRoutingFakeClient:
+    """Like _RoutingFakeClient, but routes EXTRACTION completions per-unit by matching a
+    substring (the unit's own candidate text, which rides verbatim into its Stage-1 prompt) —
+    needed when 2+ units in one _run_extract_path call need DIFFERENT extraction completions
+    (e.g. two candidates that each resolve a different expiry date)."""
+
+    def __init__(self, *, extract_by_marker: dict, action_completion="{}"):
+        self.extract_by_marker = extract_by_marker
+        self.action_completion = action_completion
+        self.calls = []
+
+    def chat(self, *, model, messages, **kwargs):
+        self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+        content = messages[0].content if messages else ""
+        if "New Facts (indexed)" in content:
+            return self.action_completion
+        for marker, completion in self.extract_by_marker.items():
+            if marker in content:
+                return completion
+        raise AssertionError(f"no extract_by_marker key matched prompt: {content[:200]!r}")
+
+
 # --- B1 FLAG-BRANCH: envelope extraction + failure logging (feeds B2/B3 below) --------------
 
 def test_run_extract_path_logs_failed_markers(tmp_path):
@@ -573,6 +595,113 @@ def test_run_extract_path_contradict_legacy_persists_candidate_bound_on_replacem
     persisted = {n.id: n for n in read_nodes(kn_path)}
     replacement = [n for n in persisted.values() if n.status == "active"][0]
     assert replacement.valid_until == "2025-04-30"  # candidate's bound, persisted
+
+
+def test_run_extract_path_two_candidates_corroborate_same_node_first_bound_wins(tmp_path):
+    """Sentinel's exact re-clear blocker (2026-07-15, reproduced through the REAL B1->B2->B3
+    path, not a hand-built reconcile dict): "fill missing only, never overwrite a conflicting
+    persisted bound" fails when TWO candidates in the SAME _apply_consolidation_result call
+    corroborate the SAME existing node. _corroborate_bound_fill reads the stale
+    existing_by_id/existing_nodes object -- update_node appends a fresh persisted version but
+    never mutates that in-memory object, so candidate 2 still sees the bound as missing and
+    silently overwrites candidate 1's ALREADY-PERSISTED fill. Required: after a successful
+    update_node, synchronize the in-memory KnowledgeNode fields actually filled (never mutate
+    memory if persistence itself failed) -- so the SAME fill-missing/never-overwrite semantics
+    that already hold ACROSS separate calls also hold WITHIN one batch.
+
+    Sentinel's own repro shape: one cluster, 2 prefilter candidates, real extract_batch fake-
+    infer outputs single facts with expiry 2025-04-30 then 2026-04-30, B2 explicitly corroborates
+    BOTH to the same existing node. Before the fix: corroborated=2, persisted valid_until=
+    2026-04-30 (candidate 1's 2025 bound silently overwritten)."""
+    kn_path = tmp_path / "knowledge.jsonl"
+    existing = KnowledgeNode.create(
+        content="policy note about API key expiry", category="fact", node_id="kn-policy",
+    )
+    from synapt.recall.knowledge import append_node
+    append_node(existing, kn_path)
+
+    fact_a = "the API key policy A expires 2025-04-30"
+    fact_b = "the API key policy B expires 2026-04-30"
+    cluster = [_entry(session_id="s1", done=[fact_a, fact_b], ts="2025-03-01T09:00:00Z")]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+
+    def extract_completion_for(fact_text, resolved):
+        return json.dumps({
+            "extracted_at": "2025-03-01T09:00:00Z",
+            "facts": [{"text": fact_text, "category": "fact"}],
+            "decisions": [],
+            "temporal_refs": [{"raw": "expiry", "resolved": resolved, "role": "expiry"}],
+        })
+
+    client = _PerUnitRoutingFakeClient(
+        extract_by_marker={
+            fact_a: extract_completion_for(fact_a, "2025-04-30"),
+            fact_b: extract_completion_for(fact_b, "2026-04-30"),
+        },
+        action_completion=(
+            '{"actions": ['
+            '{"index": 0, "action": "corroborate", "existing_id": "kn-policy"}, '
+            '{"index": 1, "action": "corroborate", "existing_id": "kn-policy"}'
+            ']}'
+        ),
+    )
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [existing], kn_path)
+    assert result is not None
+    assert result.nodes_corroborated == 2
+    persisted = {n.id: n for n in read_nodes(kn_path)}
+    # First candidate's bound (2025-04-30) must win -- fill-missing, first-come. The second
+    # candidate must see the bound as ALREADY filled (in-memory synced after candidate 1's
+    # update) and correctly decline to overwrite it, matching the never-overwrite-conflicting
+    # semantics this WHOLE feature is built on.
+    assert persisted["kn-policy"].valid_until == "2025-04-30"
+
+
+def test_run_extract_path_mixed_explicit_and_auto_corroborate_same_node_first_bound_wins(tmp_path):
+    """Sentinel's explicit mandate: "the same shared-state defect spans explicit/auto mixes."
+    Candidate 1 hits the EXPLICIT corroborate action branch; candidate 2 hits the create branch's
+    similarity-triggered AUTO-corroborate (action stays "create", never touches raw_node["action"]
+    at all). Both target the same existing node. Since _apply_corroborate_update mutates the SAME
+    in-memory KnowledgeNode object both call sites operate on, candidate 1's fill must still be
+    visible (and preserved, not overwritten) when candidate 2's auto-corroborate runs second."""
+    kn_path = tmp_path / "knowledge.jsonl"
+    existing_content = "the api_key_rotation_policy governs when API keys expire in production_env"
+    existing = KnowledgeNode.create(content=existing_content, category="fact", node_id="kn-policy")
+    from synapt.recall.knowledge import append_node
+    append_node(existing, kn_path)
+
+    fact_explicit = "reminder to review the api_key_rotation_policy before the next audit"
+    fact_auto = existing_content  # identical text -> guarantees Jaccard=1.0 auto-corroborate match
+    cluster = [_entry(session_id="s1", done=[fact_explicit, fact_auto], ts="2025-03-01T09:00:00Z")]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+
+    def extract_completion_for(fact_text, resolved):
+        return json.dumps({
+            "extracted_at": "2025-03-01T09:00:00Z",
+            "facts": [{"text": fact_text, "category": "fact"}],
+            "decisions": [],
+            "temporal_refs": [{"raw": "expiry", "resolved": resolved, "role": "expiry"}],
+        })
+
+    client = _PerUnitRoutingFakeClient(
+        extract_by_marker={
+            fact_explicit: extract_completion_for(fact_explicit, "2025-04-30"),
+            fact_auto: extract_completion_for(fact_auto, "2026-04-30"),
+        },
+        action_completion=(
+            '{"actions": ['
+            '{"index": 0, "action": "corroborate", "existing_id": "kn-policy"}, '
+            '{"index": 1, "action": "create"}'  # never touches "corroborate" -- similarity converts it
+            ']}'
+        ),
+    )
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [existing], kn_path)
+    assert result is not None
+    assert result.nodes_corroborated == 2  # BOTH routed through corroborate (one explicit, one auto)
+    assert result.nodes_created == 0
+    persisted = {n.id: n for n in read_nodes(kn_path)}
+    # Candidate 1's (explicit corroborate) bound wins; candidate 2 (auto-corroborate, second) must
+    # see it as already-filled via the synced in-memory node and decline to overwrite it.
+    assert persisted["kn-policy"].valid_until == "2025-04-30"
 
 
 def test_run_extract_path_all_failed_extraction_yields_zero_result_not_none(tmp_path):
