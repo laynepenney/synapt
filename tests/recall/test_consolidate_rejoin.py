@@ -922,13 +922,22 @@ def test_decision_log_write_failure_rejects_the_composition_not_an_untraceable_p
     """Guard 3 chose the decision log as v1's ONLY durable member provenance. A write failure
     that gets silently swallowed would persist a compound node with NO record anywhere of what
     it was composed from (fruit-confirmed, Sentinel). B4 must reject the composition instead —
-    members fall back to individual pass-through, which at least stays traceable as atoms."""
+    members fall back to individual pass-through, which at least stays traceable as atoms.
+
+    Composed content is deliberately kept over B3's real 120-char specificity floor (Opus,
+    recall#884 re-review: an earlier 80-char version of this string was itself rejected by
+    the content-safety guard BEFORE _log_b4_compose_decision was ever called — the two guards
+    shadowed each other, so the test passed for the wrong reason and a mutated
+    except-OSError-return-True never turned it red). The direct call below additionally pins
+    that the OSError genuinely fires INSIDE _log_b4_compose_decision itself, independent of
+    _rejoin_create_actions, closing that seam for good."""
     fruit = _real_pipeline([
         _FactSpec("The B4 provenance-failure probe records the first member's identity."),
         _FactSpec("The B4 provenance-failure probe records the second member's identity."),
     ])
     composed = (
-        "The B4 provenance-failure probe composes both members' identities into one node."
+        "The B4 provenance-failure probe composes both indexed members' durable "
+        "identities into one compound node during the sprint-41 decision-log gate."
     )
     # decision_log_path's PARENT already exists as a FILE (not a directory), so the real
     # mkdir(parents=True) inside _log_b4_compose_decision raises OSError — a genuine write
@@ -936,6 +945,12 @@ def test_decision_log_write_failure_rejects_the_composition_not_an_untraceable_p
     blocker = tmp_path / "blocker"
     blocker.write_text("not a directory")
     unwritable_log = blocker / "decisions.jsonl"
+
+    direct_logged_ok = consolidate._log_b4_compose_decision(
+        unwritable_log, fruit.cluster_id, [0, 1], fruit.action_items, composed,
+    )
+    assert direct_logged_ok is False
+    assert not unwritable_log.exists()
 
     output, _ = _invoke_rejoin(
         fruit, _response(([0, 1], composed)), decision_log_path=unwritable_log,
