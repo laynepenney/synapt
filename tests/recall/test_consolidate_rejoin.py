@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import synapt.recall.consolidate as consolidate
+from synapt.recall.content_profile import ContentProfile
 from synapt.recall.journal import JournalEntry
 from synapt.recall.knowledge import KnowledgeNode, read_nodes
 
@@ -144,6 +145,7 @@ def _invoke_rejoin(
     *,
     action_items: list[dict] | None = None,
     decision_log_path: Path | None = None,
+    content_profile=None,
 ) -> tuple[list[dict], list[dict]]:
     requests: list[dict] = []
 
@@ -160,6 +162,7 @@ def _invoke_rejoin(
         fruit.cluster_id,
         infer,
         decision_log_path=decision_log_path,
+        content_profile=content_profile,
     )
     return output, requests
 
@@ -724,11 +727,12 @@ def test_run_extract_path_inserts_b4_between_real_b2_output_and_b3(
         }
     ]
 
-    def rejoin_spy(action_items, cluster_id, infer, *, decision_log_path=None):
+    def rejoin_spy(action_items, cluster_id, infer, *, decision_log_path=None, content_profile=None):
         seen["b2_items"] = deepcopy(action_items)
         seen["cluster_id"] = cluster_id
         seen["infer"] = infer
         seen["decision_log_path"] = decision_log_path
+        seen["content_profile"] = content_profile
         return deepcopy(rejoined)
 
     def apply_spy(parsed, *_args, **_kwargs):
@@ -837,6 +841,97 @@ def test_low_specificity_composed_content_rejects_the_group_and_persists_origina
     ])
     low_specificity = "The build finished and all tests passed without any errors."
     output, _ = _invoke_rejoin(fruit, _response(([0, 1], low_specificity)))
+
+    assert output == fruit.action_items
+
+    knowledge_path = tmp_path / "knowledge.jsonl"
+    result = consolidate._apply_consolidation_result(
+        {"nodes": output}, [], fruit.cluster, knowledge_path,
+    )
+    assert result.nodes_created == 2
+    assert len(read_nodes(knowledge_path)) == 2
+
+
+def test_mixed_profile_specificity_threshold_rejects_the_group_and_persists_original_members(
+    tmp_path,
+):
+    """A composed sentence can pass B4's no-profile check (well over 120 chars) yet still be
+    dropped by REAL B3 once the actual production content_profile is threaded through — B3's
+    mixed profile relaxes the specificity threshold to 200, not B4's old hard-coded 120
+    (Sentinel, recall#884 re-review round 2, fruit 1: this exact composition passes with no
+    profile, then real _apply_consolidation_result under a mixed profile creates 0, persists
+    0 — both members gone, and the decision log would have claimed a composition that never
+    persisted). The two original member facts are deliberately kept over 200 chars (the
+    mixed profile's OWN threshold) so this test isolates the composed-content rejection —
+    without that length margin, the mixed profile's relaxed-but-still-real specificity check
+    can reject the pass-through ORIGINAL members too, which is a fixture-quality concern, not
+    the mechanism this test targets."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The adapter failures reported in this cluster are unrelated to SQLite "
+            "locking behavior observed during the retry-boundary investigation, "
+            "confirmed independently across two separate dogfood runs this sprint."
+        ),
+        _FactSpec(
+            "Recall stores durable node revisions in an append-versioned "
+            "knowledge.jsonl file that survives process restarts without data loss, "
+            "verified independently across two separate dogfood runs this sprint."
+        ),
+    ])
+    mixed_profile = ContentProfile(_type="mixed")
+    borderline = (
+        "The build finished successfully and every configured test suite in the "
+        "pipeline passed without reporting any errors or warnings along the way."
+    )
+    # Sanity-pin the exact threshold gap this test exercises, against the real functions.
+    assert not consolidate._lacks_specificity(borderline, threshold=120, content_type=None)
+    assert consolidate._lacks_specificity(borderline, threshold=200, content_type="mixed")
+
+    output, _ = _invoke_rejoin(
+        fruit, _response(([0, 1], borderline)), content_profile=mixed_profile,
+    )
+
+    assert output == fruit.action_items
+
+    knowledge_path = tmp_path / "knowledge.jsonl"
+    result = consolidate._apply_consolidation_result(
+        {"nodes": output}, [], fruit.cluster, knowledge_path, content_profile=mixed_profile,
+    )
+    assert result.nodes_created == 2
+    assert len(read_nodes(knowledge_path)) == 2
+
+
+def test_section_prefix_normalization_rejects_the_group_and_persists_original_members(
+    tmp_path,
+):
+    """A composed sentence that reads as specific with its section-header prefix intact can
+    strip down to a low-specificity remainder — B4 must normalize (scrub/markdown/section-
+    prefix-strip) BEFORE checking specificity, in the same order real B3 does, not check the
+    raw string (Sentinel, recall#884 re-review round 2, fruit 2: a topic-prefixed composition
+    passed B4 raw, then real B3 stripped the prefix and dropped the low-specificity remainder
+    — created 0, persisted 0; no content_profile needed to reproduce this one)."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The adapter failures reported in this cluster are unrelated to SQLite "
+            "locking behavior observed during the retry-boundary investigation."
+        ),
+        _FactSpec(
+            "Recall stores durable node revisions in an append-versioned "
+            "knowledge.jsonl file that survives process restarts without data loss."
+        ),
+    ])
+    prefixed = (
+        "Operational Deployment Readiness: The build finished and all configured "
+        "tests passed without reporting any errors."
+    )
+    # Sanity-pin: raw passes, but the REAL stripped remainder (what B3 actually evaluates)
+    # lacks specificity — against the real functions, not asserted from prose.
+    assert not consolidate._lacks_specificity(prefixed, threshold=120, content_type=None)
+    stripped = consolidate._strip_section_prefix(prefixed)
+    assert stripped != prefixed
+    assert consolidate._lacks_specificity(stripped, threshold=120, content_type=None)
+
+    output, _ = _invoke_rejoin(fruit, _response(([0, 1], prefixed)))
 
     assert output == fruit.action_items
 

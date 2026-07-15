@@ -465,6 +465,89 @@ def _strip_section_prefix(content: str) -> str:
     return content
 
 
+def _normalize_create_content(raw_content: str) -> str:
+    """The exact normalization ``_apply_consolidation_result``'s create branch runs before
+    any filter sees the content: truncate to 300 chars, scrub, strip markdown formatting,
+    strip section-header prefixes. Factored out so B4 (``_evaluate_create_content`` below)
+    can run the IDENTICAL sequence on its own composed candidates — a raw string that isn't
+    whitespace can still normalize down to empty or low-specificity (e.g. a pure markdown/
+    section-prefix wrapper), which only checking the raw string misses (Sentinel, recall#884
+    re-review, fruit 2: a 152-char "Operational Deployment Readiness: ..." composition strips
+    to a 118-char low-specificity remainder at real B3)."""
+    content = scrub_text(_tw(str(raw_content), 300))
+    content = strip_markdown_formatting(content)
+    content = _strip_section_prefix(content)
+    return content
+
+
+def _create_content_passes_filters(
+    content: str, content_profile=None, *, is_create: bool = True,
+) -> bool:
+    """The rejection filters ``_apply_consolidation_result``'s create branch runs, extracted
+    into the SAME function both B3's create branch and B4 call — parity by construction,
+    immune to drift (Sentinel, recall#884 re-review: B4's own hard-coded
+    ``threshold=120``/``content_type=None`` diverged from what B3 actually evaluates once
+    ``content_profile`` flows in — which it already does at B3, via ``_run_extract_path``,
+    just not at B4).
+
+    ``is_create`` matches the original inline code's own ``action == "create"`` gating: the
+    generic/specificity/garbled checks only ever applied to create-action nodes in B3, but
+    the few-shot contamination check ("[PersonA]"/"[PersonB]") is UNCONDITIONAL there — it
+    also protects corroborate/contradict content. B4 only ever evaluates create candidates,
+    so it always passes ``is_create=True`` (the default); B3 passes the real
+    ``action == "create"`` so corroborate/contradict keep their exact prior behavior
+    (contamination-checked, generic/specificity/garbled-exempt).
+
+    Assumes *content* is ALREADY normalized (``_normalize_create_content``) and non-empty —
+    callers run that + the empty check themselves (B3 already does, unconditionally, for
+    every action, not just create; see ``_evaluate_create_content`` for B4's full pipeline).
+    """
+    if is_create:
+        _ap = None
+        if content_profile is not None:
+            from synapt.recall.content_profile import adaptive_params
+            _ap = adaptive_params(content_profile)
+
+        if _ap is None or _ap.generic_filter_enabled:
+            if _is_generic_node(content):
+                logger.info("Rejected generic node (pattern): %s", content[:80])
+                return False
+        spec_threshold = _ap.specificity_threshold if _ap else 120
+        _ct = content_profile.content_type if content_profile is not None else None
+        if _lacks_specificity(content, threshold=spec_threshold, content_type=_ct):
+            logger.info("Rejected generic node (low specificity): %s", content[:80])
+            return False
+
+    if "[PersonA]" in content or "[PersonB]" in content:
+        logger.info("Rejected example-contaminated node: %s", content[:80])
+        return False
+
+    if is_create and _is_garbled_content(content):
+        logger.info("Rejected garbled node: %s", content[:80])
+        return False
+    return True
+
+
+def _evaluate_create_content(raw_content: str, content_profile=None) -> str | None:
+    """The single source of truth for whether ``_apply_consolidation_result``'s create
+    branch will accept *raw_content*, and what NORMALIZED string it will persist if so.
+    Normalizes (``_normalize_create_content``), rejects if empty, then runs the same 4
+    filters B3 runs (``_create_content_passes_filters``). Returns the normalized content on
+    acceptance, ``None`` on rejection.
+
+    This is B4's own entry point (it has no already-normalized ``content`` variable lying
+    around the way B3's loop body does) — B4 uses ONLY the verdict (whether this returns
+    ``None``), never the normalized string itself, so B3 remains the single writer/
+    normalizer of persisted content at apply time.
+    """
+    content = _normalize_create_content(raw_content)
+    if not content:
+        return None
+    if not _create_content_passes_filters(content, content_profile):
+        return None
+    return content
+
+
 # Default GOOD examples used when no existing knowledge nodes are available.
 # These are replaced dynamically by the project's own nodes when they exist.
 # IMPORTANT: These must be clearly generic/hypothetical so small models don't
@@ -1114,11 +1197,11 @@ def _apply_consolidation_result(
             continue
 
         action = raw_node.get("action", "create")
-        content = scrub_text(_tw(str(raw_node.get("content", "")), 300))
-        # Strip markdown formatting (bold/italic) that small models inject
-        content = strip_markdown_formatting(content)
-        # Strip section header prefixes ("LGBTQ+ Support: ..." → "...")
-        content = _strip_section_prefix(content)
+        # Normalize + filter via the shared gate B4 also calls (_evaluate_create_content) —
+        # parity by construction, see that function's docstring. is_create mirrors the
+        # original per-check action=="create" gating exactly (contamination stays
+        # unconditional; generic/specificity/garbled stay create-only).
+        content = _normalize_create_content(str(raw_node.get("content", "")))
         category = scrub_text(str(raw_node.get("category", "workflow")))
         tags = raw_node.get("tags", [])
         if not isinstance(tags, list):
@@ -1134,34 +1217,9 @@ def _apply_consolidation_result(
         if not content:
             continue
 
-        # Get adaptive params for content-aware filtering
-        _ap = None
-        if content_profile is not None:
-            from synapt.recall.content_profile import adaptive_params
-            _ap = adaptive_params(content_profile)
-
-        # Reject generic programming advice (disabled for personal content)
-        if action == "create" and (_ap is None or _ap.generic_filter_enabled):
-            if _is_generic_node(content):
-                logger.info("Rejected generic node (pattern): %s", content[:80])
-                continue
-        # Reject low-specificity (threshold + patterns adapt to content type)
-        if action == "create":
-            spec_threshold = _ap.specificity_threshold if _ap else 120
-            _ct = content_profile.content_type if content_profile is not None else None
-            if _lacks_specificity(content, threshold=spec_threshold, content_type=_ct):
-                logger.info("Rejected generic node (low specificity): %s", content[:80])
-                continue
-
-        # Reject contamination from few-shot example placeholders
-        if "[PersonA]" in content or "[PersonB]" in content:
-            logger.info("Rejected example-contaminated node: %s", content[:80])
-            continue
-
-        # Reject garbled content from 3B parsing failures — raw LLM
-        # structural metadata leaked into content.
-        if action == "create" and _is_garbled_content(content):
-            logger.info("Rejected garbled node: %s", content[:80])
+        if not _create_content_passes_filters(
+            content, content_profile, is_create=(action == "create"),
+        ):
             continue
 
         if action == "corroborate":
@@ -1734,8 +1792,12 @@ def _run_extract_path(
 
     # B4: rejoin CREATE-bound items into compound memories before reconcile executes.
     # Shape-preserving (see _rejoin_create_actions) — B3 below needs zero changes.
+    # content_profile threaded through so B4 evaluates composed content under the SAME
+    # adaptive thresholds B3 will actually apply below (Sentinel, recall#884 re-review
+    # round 2: this call site already receives content_profile for B3; B4 was missing it).
     action_items = _rejoin_create_actions(
-        action_items, cluster_id, infer, decision_log_path=decision_log_path,
+        action_items, cluster_id, infer,
+        decision_log_path=decision_log_path, content_profile=content_profile,
     )
 
     # B3: feed the SAME reconcile the monolithic path uses.
@@ -2273,35 +2335,30 @@ def _group_temporal_bound(members: list[dict]) -> tuple[str | None, str | None] 
 _B4_COMPOSE_CONTENT_MAX_CHARS = 300
 
 
-def _b4_composed_content_is_safe(content: str) -> bool:
-    """Whether *content* would survive ``_apply_consolidation_result``'s real create branch,
-    not just the empty/oversize cases above. Empty-after-scrub and over-length are ONE class
-    of silent B3 drop; the create branch runs FOUR MORE unconditionally (or content-profile-
-    default when no profile is supplied, which is B4's own reality — it has no
-    ``content_profile`` to thread through): generic-pattern rejection (``_is_generic_node``),
-    low-specificity rejection (``_lacks_specificity``, threshold 120 — B3's own default when
-    ``content_profile`` is None), few-shot example-placeholder contamination
-    (``"[PersonA]"``/``"[PersonB]"``), and garbled-parse-leak rejection (``_is_garbled_content``).
+def _b4_composed_content_is_safe(content: str, content_profile=None) -> bool:
+    """Whether *content* is safe to persist as a B4-composed node.
 
-    Adversarial verification of the length/whitespace guard alone found this empirically: a
-    62-char, non-whitespace, well-under-300-char composed sentence ("The build finished and
-    all tests passed without any errors.") sailed past a length-only check and then silently
-    vanished at B3 via ``_lacks_specificity`` — the IDENTICAL both-members-lost symptom
-    Sentinel's original finding named, just through an uncovered gate. Reusing B3's own
-    functions (not reimplementing their logic) closes the general failure class, not only the
-    literal repro.
+    Two parts. First, ONE check B4 alone needs, stricter than B3 itself: reject (don't
+    silently truncate) raw content over B3's real 300-char ceiling. B3 tolerates truncation —
+    ``_tw`` silently cuts at 300 chars and moves on, the monolith's long-standing behavior for
+    ANY create-action content. B4 does not: a COMPOSED sentence that needs truncation has
+    already lost information the model was told to preserve faithfully (guard 2), and unlike
+    an atomic fact, B4 has a safe fallback B3 doesn't — degrade the whole group back to its
+    original, already-safe, un-composed members — so it refuses rather than risk a silently
+    cut load-bearing clause (Sentinel, recall#884 re-review, original finding).
+
+    Second, everything else routes through ``_evaluate_create_content`` — the SAME function
+    B3's create branch calls — so this verdict is provably identical to what B3 will compute
+    later: parity by construction (Sentinel, recall#884 re-review round 2: an earlier version
+    of this function hard-coded ``threshold=120``/``content_type=None``/no-normalize and
+    diverged from what B3 actually evaluates once ``content_profile`` flows in, which it
+    already does at B3 via ``_run_extract_path`` — fruit: a real mixed-profile threshold=200
+    dropped a 144-char composition B4 had waved through; a 152-char section-prefixed
+    composition B4 waved through stripped to a 118-char low-specificity remainder at B3).
     """
-    if not content.strip() or len(content) > _B4_COMPOSE_CONTENT_MAX_CHARS:
+    if len(content) > _B4_COMPOSE_CONTENT_MAX_CHARS:
         return False
-    if _is_generic_node(content):
-        return False
-    if _lacks_specificity(content, threshold=120, content_type=None):
-        return False
-    if "[PersonA]" in content or "[PersonB]" in content:
-        return False
-    if _is_garbled_content(content):
-        return False
-    return True
+    return _evaluate_create_content(content, content_profile) is not None
 
 
 def _log_b4_compose_decision(
@@ -2361,6 +2418,7 @@ def _rejoin_create_actions(
     infer,
     *,
     decision_log_path: Path | None = None,
+    content_profile=None,
 ) -> list[dict]:
     """B4: rejoin CREATE-bound action items into compound memories at natural granularity
     before B3 reconcile executes. Consumes B2's action-item list and emits a possibly-shorter
@@ -2370,6 +2428,13 @@ def _rejoin_create_actions(
 
     See config/design/recall-B4-rejoin-stage-2026-07-15.md for the full contract; the guard
     numbers referenced below match that spec.
+
+    ``content_profile`` is threaded from ``_run_extract_path`` (which already receives it and
+    passes it to B3) so B4's content-safety check (``_b4_composed_content_is_safe`` ->
+    ``_evaluate_create_content``) evaluates composed content under the SAME adaptive
+    thresholds B3 will actually apply at persist time — B4 has a real production
+    ``content_profile`` to thread through; it is not the profile-less default some earlier
+    revisions of this docstring claimed (Sentinel, recall#884 re-review round 2).
 
     NOTE: ``decision_log_path=None`` is a total, silent opt-out of guard 3's traceability —
     a composition proceeds with zero provenance logged, the same as if the write had failed.
@@ -2479,7 +2544,7 @@ def _rejoin_create_actions(
         # reaches _apply_consolidation_result's real create branch — see
         # _b4_composed_content_is_safe for the full list of checks reused from B3. Members
         # fall back to individual pass-through.
-        if not _b4_composed_content_is_safe(content):
+        if not _b4_composed_content_is_safe(content, content_profile):
             continue
 
         members = [creates[i] for i in idxs]
