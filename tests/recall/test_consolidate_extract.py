@@ -30,6 +30,7 @@ pytest.importorskip("synapt.extract.batch")
 
 from synapt.recall.journal import JournalEntry
 from synapt.recall.identify import identify, batch_unit_id
+from synapt.recall.knowledge import KnowledgeNode, read_nodes
 from synapt.recall.consolidate import (
     _EXTRACT_PRODUCED_BY,
     _extract_cluster_units,
@@ -239,14 +240,45 @@ def test_make_recall_infer_falls_back_to_prompt_when_no_messages():
     assert [m.content for m in client.calls[0]["messages"]] == ["only-a-prompt"]
 
 
-# --- FLAG-BRANCH BODY: envelopes + failure logging, NO nodes -------------------------------
+def _run_extract(cluster, cluster_id, client, model, failures_path, tmp_path,
+                  existing_nodes=None, **kwargs):
+    """Test helper: call _run_extract_path with a fresh knowledge.jsonl path (matching the
+    tests/recall/test_consolidate.py convention of Path(tmpdir) / "knowledge.jsonl")."""
+    kn_path = tmp_path / "knowledge.jsonl"
+    return _run_extract_path(
+        cluster, cluster_id, client, model, failures_path,
+        existing_nodes if existing_nodes is not None else [], kn_path, **kwargs,
+    )
 
-def test_run_extract_path_logs_failed_markers_and_creates_no_nodes(tmp_path):
+
+class _RoutingFakeClient:
+    """A fake client returning DIFFERENT completions depending on which prompt it receives —
+    needed once B1's extract call and B2's action-decision call share the same infer seam but
+    need distinct canned responses. Routes on ACTION_DECISION_PROMPT's distinctive marker text
+    ("New Facts (indexed)"), which never appears in extract's Stage-1 prompt."""
+
+    def __init__(self, *, extract_completion, action_completion="{}"):
+        self.extract_completion = extract_completion
+        self.action_completion = action_completion
+        self.calls = []
+
+    def chat(self, *, model, messages, **kwargs):
+        self.calls.append({"model": model, "messages": messages, "kwargs": kwargs})
+        content = messages[0].content if messages else ""
+        if "New Facts (indexed)" in content:
+            return self.action_completion
+        return self.extract_completion
+
+
+# --- B1 FLAG-BRANCH: envelope extraction + failure logging (feeds B2/B3 below) --------------
+
+def test_run_extract_path_logs_failed_markers(tmp_path):
     cluster = [_entry(done=["a", "b"], decisions=["c"])]
     failures_path = tmp_path / "consolidation_failures.jsonl"
     client = _FakeClient(completion="garbage-not-json")
-    ok = _run_extract_path(cluster, "clu", client, "m", failures_path)
-    assert ok is True
+    result = _run_extract(cluster, "clu", client, "m", failures_path, tmp_path)
+    assert result is not None  # a fully-failed extract batch is still a PROCESSED cluster
+    assert result.nodes_created == 0  # nothing to create — every unit failed extraction
     # every failed unit logged (never silent-dropped), one line each — WITH status, the
     # never-silent contract (Sentinel blocker 1: status was previously omitted).
     records = [json.loads(raw) for raw in failures_path.read_text().splitlines() if raw.strip()]
@@ -263,9 +295,11 @@ def test_run_extract_path_logs_failed_markers_and_creates_no_nodes(tmp_path):
 def test_run_extract_path_ok_units_produce_no_failure_log(tmp_path):
     cluster = [_entry(done=["a"])]
     failures_path = tmp_path / "consolidation_failures.jsonl"
-    client = _FakeClient(completion=_ok_envelope("a"))
-    ok = _run_extract_path(cluster, "clu", client, "m", failures_path)
-    assert ok is True
+    # extract succeeds; the action-decision call gets "{}" (no "actions" key) -> fail-closed to
+    # create, which still exercises the full B1->B2->B3 path without asserting on node identity.
+    client = _RoutingFakeClient(extract_completion=_ok_envelope("a"))
+    result = _run_extract(cluster, "clu", client, "m", failures_path, tmp_path)
+    assert result is not None
     assert not failures_path.exists() or failures_path.read_text().strip() == ""
 
 
@@ -292,10 +326,11 @@ def test_log_extract_failure_returns_false_when_write_fails(tmp_path, monkeypatc
     assert persisted is False  # NOT swallowed — the caller must see the loss
 
 
-def test_run_extract_path_returns_false_when_a_marker_write_fails(tmp_path, monkeypatch):
+def test_run_extract_path_returns_none_when_a_marker_write_fails(tmp_path, monkeypatch):
     """THE silent-drop Sentinel caught: previously, an OSError in _log_extract_failure was
     swallowed and _run_extract_path still returned True, declaring the cluster processed while
-    a failed unit vanished with no record. Must now propagate as a non-successful cluster."""
+    a failed unit vanished with no record. Must now propagate as a non-successful cluster
+    (None) — never a ConsolidationResult that LOOKS like a clean, if empty, success."""
     from synapt.recall import consolidate as consolidate_mod
 
     cluster = [_entry(done=["a", "b"])]
@@ -312,17 +347,122 @@ def test_run_extract_path_returns_false_when_a_marker_write_fails(tmp_path, monk
         return real_log(path, cluster_id, envelope)
 
     monkeypatch.setattr(consolidate_mod, "_log_extract_failure", _flaky_log)
-    ok = _run_extract_path(cluster, "clu", client, "m", failures_path)
-    assert ok is False  # the lost marker must NOT be reported as a clean success
+    result = _run_extract(cluster, "clu", client, "m", failures_path, tmp_path)
+    assert result is None  # the lost marker must NOT be reported as a clean success
 
 
-# --- INTEGRATION: the real consolidate() flag-branch dispatch ------------------------------
+# --- B3: the FULL B1->B2->B3 pipeline via _run_extract_path (reconcile, real nodes) ----------
 
-def test_consolidate_flag_branch_dispatches_and_creates_no_nodes(tmp_path, monkeypatch):
+def test_run_extract_path_creates_a_node_when_action_is_create(tmp_path):
+    # fact text needs a specificity signal (snake_case "extract_batch") to clear
+    # _apply_consolidation_result's EXISTING low-specificity filter — the same filter the
+    # monolith path already contends with; this is not new B2/B3 behavior.
+    fact = "recall#875 wired extract_batch into consolidation"
+    cluster = [_entry(session_id="s1", done=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope(fact),
+        action_completion='{"actions": [{"index": 0, "action": "create"}]}',
+    )
+    kn_path = tmp_path / "knowledge.jsonl"
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+    assert result is not None
+    assert result.nodes_created == 1
+    assert result.nodes_corroborated == 0
+    persisted = read_nodes(kn_path)
+    assert len(persisted) == 1
+    assert persisted[0].source_turns == []  # journal-field attribution isn't turn-shaped (design note)
+    assert persisted[0].source_sessions == ["s1"]  # cluster provenance still flows through
+
+
+def test_run_extract_path_corroborates_against_existing_node(tmp_path):
+    kn_path = tmp_path / "knowledge.jsonl"
+    existing_node = KnowledgeNode.create(
+        content="recall#875 wired extract_batch", category="fact", node_id="kn_abc123",
+    )
+    from synapt.recall.knowledge import append_node
+    append_node(existing_node, kn_path)  # must be ON DISK — update_node reads/writes the file
+    existing = [existing_node]
+
+    fact = "recall#875 wired extract_batch into consolidation"
+    cluster = [_entry(session_id="s2", done=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope(fact),
+        action_completion='{"actions": [{"index": 0, "action": "corroborate", "existing_id": "kn_abc123"}]}',
+    )
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, existing, kn_path)
+    assert result is not None
+    assert result.nodes_corroborated == 1
+    assert result.nodes_created == 0  # corroborate must NOT create a duplicate node
+    persisted = {n.id: n for n in read_nodes(kn_path)}
+    assert len(persisted) == 1  # still just the ONE original node, updated in place
+    assert "s2" in persisted["kn_abc123"].source_sessions  # the new session was added
+
+
+def test_run_extract_path_contradicts_and_auto_applies_without_db(tmp_path):
+    """No RecallDB passed -> _apply_consolidation_result's legacy auto-apply contradiction path
+    (queues nothing, marks the old node contradicted, creates the reversing node directly)."""
+    kn_path = tmp_path / "knowledge.jsonl"
+    existing_node = KnowledgeNode.create(
+        content="extract_batch: production model is Ministral-3B", category="decision", node_id="kn_old",
+    )
+    from synapt.recall.knowledge import append_node
+    append_node(existing_node, kn_path)  # must be ON DISK — update_node reads/writes the file
+    existing = [existing_node]
+
+    fact = "extract_batch reversed course: production model switched to Qwen3.5-4B"
+    cluster = [_entry(session_id="s1", decisions=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope(fact),
+        action_completion=(
+            '{"actions": [{"index": 0, "action": "contradict", "existing_id": "kn_old", '
+            '"contradiction_note": "model switched from Ministral to Qwen3.5-4B"}]}'
+        ),
+    )
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, existing, kn_path)
+    assert result is not None
+    assert result.nodes_contradicted == 1
+    assert result.nodes_created == 1  # legacy no-db path creates the reversing node directly
+    persisted = {n.id: n for n in read_nodes(kn_path)}
+    assert persisted["kn_old"].status == "contradicted"
+
+
+def test_run_extract_path_all_failed_extraction_yields_zero_result_not_none(tmp_path):
+    """A fully-failed EXTRACT batch (every unit fails B1) is still a PROCESSED cluster — the
+    same semantics as the monolith's own "no durable patterns" empty-nodes-list outcome. Only an
+    infrastructure failure (exception, lost marker) returns None."""
+    cluster = [_entry(done=["a"])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _FakeClient(completion="garbage-not-json")
+    kn_path = tmp_path / "knowledge.jsonl"
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+    assert result is not None
+    assert result.nodes_created == 0
+    assert result.nodes_corroborated == 0
+    assert result.nodes_contradicted == 0
+
+
+def test_run_extract_path_empty_cluster_returns_empty_result(tmp_path):
+    cluster = [_entry(focus="just a focus line")]  # prefilter reads neither focus nor next_steps
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _FakeClient(completion="{}")
+    kn_path = tmp_path / "knowledge.jsonl"
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+    assert result is not None
+    assert result.nodes_created == 0
+
+
+# --- INTEGRATION: the real consolidate() flag-branch dispatch, full B1->B2->B3 --------------
+
+def test_consolidate_flag_branch_creates_nodes_end_to_end(tmp_path, monkeypatch):
     """End-to-end through the real consolidate(): with SYNAPT_USE_EXTRACT on, the
-    _process_cluster flag-branch must fire, resolve its closure vars (model/failures_path/
-    client), run the extract path, and create NO nodes (B1 stops at envelopes). Catches the
-    dispatch/closure-scoping class the direct-call unit tests cannot see."""
+    _process_cluster flag-branch fires, resolves its closure vars (model/failures_path/client/
+    existing_nodes/kn_path), and now runs the FULL B1->B2->B3 pipeline — nodes ARE created
+    (superseding the earlier B1-only "creates no nodes" assertion, which was true only before
+    B2/B3 landed). Catches the dispatch/closure-scoping class the direct-call unit tests
+    cannot see."""
     from synapt.recall.consolidate import consolidate
     from synapt.recall.journal import JournalEntry, append_entry, _journal_path
 
@@ -334,7 +474,13 @@ def test_consolidate_flag_branch_dispatches_and_creates_no_nodes(tmp_path, monke
     ]:
         append_entry(JournalEntry(timestamp=ts, session_id=sid, done=done), jpath)
 
-    fake = _FakeClient(completion=_ok_envelope("durable"))
+    # fact text needs a specificity signal (snake_case "extract_batch") to clear
+    # _apply_consolidation_result's EXISTING low-specificity filter — same filter the monolith
+    # path already contends with, not new B2/B3 behavior.
+    fake = _RoutingFakeClient(
+        extract_completion=_ok_envelope("recall#875 wired extract_batch"),
+        action_completion='{"actions": [{"index": 0, "action": "create"}]}',
+    )
     monkeypatch.setattr(
         "synapt.recall.consolidate._get_consolidation_client", lambda *a, **k: fake
     )
@@ -344,9 +490,34 @@ def test_consolidate_flag_branch_dispatches_and_creates_no_nodes(tmp_path, monke
 
     assert result.entries_processed == 3
     assert result.clusters_found >= 1
-    assert result.nodes_created == 0          # B1 creates no nodes — envelopes only
-    assert result.nodes_corroborated == 0
-    assert len(fake.calls) > 0                 # the extract path actually ran the model seam
-    # no knowledge file written
-    assert not (tmp_path / ".synapt" / "recall" / "knowledge.jsonl").exists() or \
-        (tmp_path / ".synapt" / "recall" / "knowledge.jsonl").read_text().strip() == ""
+    assert result.nodes_created > 0            # B1->B2->B3: the pipeline now creates real nodes
+    assert len(fake.calls) > 0                  # the extract path actually ran the model seam
+    kn_path = tmp_path / ".synapt" / "recall" / "knowledge.jsonl"
+    assert kn_path.exists() and kn_path.read_text().strip() != ""
+
+
+# --- REVIEW-FIX: dense-cluster token budget reaches the REAL client (not just _decide_actions) --
+
+def test_run_extract_path_dense_cluster_scaled_budget_reaches_the_real_client(tmp_path):
+    """B3-level proof that the scaled action-decision budget (Opus/Sentinel blocker #2) reaches
+    the ACTUAL client through _run_extract_path -> _make_recall_infer, not just the isolated
+    _decide_actions unit tests (which inject infer directly, bypassing _make_recall_infer's
+    per-request max_tokens reading entirely — a wiring gap those tests structurally cannot
+    see, the same class of gap the flag-branch dispatch test exists to catch for B1)."""
+    n = 40
+    cluster = [_entry(session_id="s1", done=[f"recall#875 dense fact number {i} extract_batch" for i in range(n)])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope("dense"),
+        action_completion='{"actions": [{"index": 0, "action": "create"}]}',
+    )
+    kn_path = tmp_path / "knowledge.jsonl"
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+    assert result is not None
+    action_calls = [c for c in client.calls if "New Facts (indexed)" in c["messages"][0].content]
+    assert len(action_calls) == 1
+    requested_budget = action_calls[0]["kwargs"]["max_tokens"]
+    assert requested_budget > 800, (
+        f"action-decision call requested only {requested_budget} tokens for a {n}-candidate "
+        "cluster — the scaled budget did not reach the real client through _run_extract_path"
+    )
