@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synapt"
-version = "0.15.3"
+version = "0.16.0"
 description = "Persistent conversational memory for AI coding assistants"
 readme = "README.md"
 license = "MIT"
