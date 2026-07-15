@@ -238,6 +238,35 @@ def test_unaddressed_creates_pass_through_and_invented_indices_are_ignored(truth
     }
 
 
+def test_group_mixing_real_and_invented_indices_drops_only_that_group(truth_fruit):
+    """A composition describing an invented member is unsafe even when some indices are real.
+
+    Filtering ``999`` and trusting the same composed text for members 0 and 1 would persist text
+    written for a different membership set. Drop that proposed group, pass its real members through
+    unchanged, and still accept an independent valid group from the same one-pass response.
+    """
+    valid_composed = (
+        "The report uses LOW as a severity convention, and Recall stores append-versioned "
+        "knowledge.jsonl revisions."
+    )
+    output, _ = _invoke_rejoin(
+        truth_fruit,
+        _response(
+            ([0, 1, 999], "This composition was written for a fabricated membership set."),
+            ([2, 3], valid_composed),
+        ),
+    )
+
+    assert len(output) == 3
+    assert truth_fruit.action_items[0] in output
+    assert truth_fruit.action_items[1] in output
+    assert _by_content(output, valid_composed)["content"] == valid_composed
+    assert all(
+        item["content"] != "This composition was written for a fabricated membership set."
+        for item in output
+    )
+
+
 def test_singleton_group_passes_the_original_item_through_unchanged(truth_fruit):
     output, _ = _invoke_rejoin(
         truth_fruit,
@@ -536,6 +565,33 @@ def test_conflicting_non_null_bounds_split_back_to_original_bound_compatible_mem
     output, requests = _invoke_rejoin(
         fruit,
         _response(([0, 1], "Both signing keys expire April 30.")),
+    )
+
+    assert output == fruit.action_items
+    assert len(requests) == 1
+
+
+def test_non_overlapping_single_sided_bounds_split_instead_of_synthesizing_a_range():
+    """Two attributed boundaries on different members do not jointly assert one validity range."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The hardened signing workflow becomes effective March 1.",
+            temporal_role="effective",
+            resolved="2025-03-01",
+        ),
+        _FactSpec(
+            "The release candidate signing key expires April 30.",
+            temporal_role="expiry",
+            resolved="2025-04-30",
+        ),
+    ])
+    output, requests = _invoke_rejoin(
+        fruit,
+        _response((
+            [0, 1],
+            "The hardened signing workflow and release candidate key are valid from March 1 "
+            "through April 30.",
+        )),
     )
 
     assert output == fruit.action_items
