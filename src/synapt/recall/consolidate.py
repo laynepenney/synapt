@@ -13,11 +13,13 @@ Requires mlx-lm (pip install mlx-lm). Degrades gracefully if not installed.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1026,6 +1028,59 @@ def _parse_llm_response(response: str) -> dict | None:
     return parse_llm_json(response)
 
 
+def _corroborate_bound_fill(target: KnowledgeNode, raw_node: dict) -> dict:
+    """BLOCKER 2 fix (Sentinel, 2026-07-15): the FILL-MISSING-bounds-only update-dict fragment
+    shared by every corroborate-shaped path — the explicit ``action == "corroborate"`` branch AND
+    the create branch's own similarity-triggered auto-corroborate (a THIRD path found in
+    self-review, structurally identical: a create-action candidate silently becomes a corroborate
+    via Jaccard/cosine match, never touching ``raw_node["action"]``, so it needs the exact same
+    fix or the defect just reappears under a different name).
+
+    Each bound filled INDEPENDENTLY, only when *target*'s persisted value is missing (``None``)
+    — a conflicting persisted bound is NEVER overwritten. Returns only the keys that should
+    change, so the caller's ``update_node`` (a targeted ``dict.update()``) leaves everything else
+    — including a conflicting bound — untouched.
+    """
+    updates: dict = {}
+    if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
+        return updates
+    if target.valid_from is None:
+        candidate_valid_from = _validate_iso_date(raw_node.get("valid_from"))
+        if candidate_valid_from:
+            updates["valid_from"] = candidate_valid_from
+    if target.valid_until is None:
+        candidate_valid_until = _validate_iso_date(raw_node.get("valid_until"))
+        if candidate_valid_until:
+            updates["valid_until"] = candidate_valid_until
+    return updates
+
+
+def _apply_corroborate_update(target: KnowledgeNode, updates: dict, knowledge_path: Path) -> bool:
+    """Apply *updates* to the persisted node via ``update_node``, and — ONLY on success —
+    mutate *target* in place to match (Sentinel's re-clear finding, 2026-07-15).
+
+    ``existing_by_id``/``existing_nodes`` are built ONCE at the top of
+    ``_apply_consolidation_result`` and never re-read from disk mid-batch. Without this sync, TWO
+    candidates in the SAME batch that both corroborate the SAME node each compute their bound-fill
+    from the SAME stale ``target`` object: candidate 1's ``update_node`` call appends a fresh
+    persisted version, but candidate 2 still sees the pre-batch ``target.valid_until is None`` and
+    silently overwrites candidate 1's now-persisted fill — reproduced through the real B1->B2->B3
+    path (two prefilter candidates corroborating one node, first candidate's bound lost). Mutating
+    ``target`` here — the SAME object both ``existing_by_id`` and ``existing_nodes`` reference —
+    means a later same-batch candidate targeting this node sees the just-applied state, restoring
+    fill-missing/never-overwrite-conflicting WITHIN a batch, not just across separate calls.
+
+    "Never mutate memory if persistence failed": if ``update_node`` returns ``False`` (target not
+    found on disk), *target* is left untouched — an in-memory node claiming a bound that was never
+    actually persisted would be worse than the staleness this fixes.
+    """
+    ok = update_node(target.id, updates, knowledge_path)
+    if ok:
+        for key, value in updates.items():
+            setattr(target, key, value)
+    return ok
+
+
 def _apply_consolidation_result(
     parsed: dict,
     existing_nodes: list[KnowledgeNode],
@@ -1118,14 +1173,12 @@ def _apply_consolidation_result(
                 # Add new source sessions, bump confidence
                 new_sources = list(set(target.source_sessions + cluster_sessions))
                 new_confidence = compute_confidence(len(new_sources))
-                update_node(
-                    target.id,
-                    {
-                        "source_sessions": new_sources,
-                        "confidence": new_confidence,
-                    },
-                    knowledge_path,
-                )
+                updates: dict = {
+                    "source_sessions": new_sources,
+                    "confidence": new_confidence,
+                }
+                updates.update(_corroborate_bound_fill(target, raw_node))
+                _apply_corroborate_update(target, updates, knowledge_path)
                 result.nodes_corroborated += 1
                 if decision_log_path:
                     _log_dedup_decision(
@@ -1156,8 +1209,19 @@ def _apply_consolidation_result(
                 logger.info("Rejected generic contradict node: %s", content[:80])
                 continue
             target = existing_by_id.get(existing_id)
+            # BLOCKER 2 fix (Sentinel, 2026-07-15): contradict CARRIES candidate bounds onto the
+            # replacement node + the queued-contradiction payload — validated once, shared by
+            # both sub-paths below. Disabled uniformly by the same flag create/corroborate use.
+            if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
+                candidate_valid_from = None
+                candidate_valid_until = None
+            else:
+                candidate_valid_from = _validate_iso_date(raw_node.get("valid_from"))
+                candidate_valid_until = _validate_iso_date(raw_node.get("valid_until"))
             if target and db is not None:
-                # Queue for user review instead of auto-applying
+                # Queue for user review instead of auto-applying. Bounds carried into the
+                # payload so a confirm-time materialization (server.py's _apply_supersession)
+                # can apply them — they would otherwise be lost the moment this is queued.
                 db.add_pending_contradiction(
                     old_node_id=target.id,
                     new_content=content,
@@ -1165,6 +1229,8 @@ def _apply_consolidation_result(
                     reason=contradiction_note,
                     source_sessions=cluster_sessions,
                     detected_by="consolidation",
+                    valid_from=candidate_valid_from,
+                    valid_until=candidate_valid_until,
                 )
                 result.nodes_contradicted += 1
                 logger.info(
@@ -1188,7 +1254,11 @@ def _apply_consolidation_result(
                     confidence=compute_confidence(len(cluster_sessions)),
                     tags=tags,
                 )
-                new_node.valid_from = cluster_valid_from or now
+                # Candidate's bound preferred (mirrors the create branch's exact logic); falls
+                # back to cluster_valid_from/now only when the candidate supplies nothing.
+                new_node.valid_from = candidate_valid_from or cluster_valid_from or now
+                if candidate_valid_until:
+                    new_node.valid_until = candidate_valid_until
                 update_node(target.id, {"superseded_by": new_node.id}, knowledge_path)
                 append_node(new_node, knowledge_path)
                 result.nodes_created += 1
@@ -1249,11 +1319,13 @@ def _apply_consolidation_result(
                 )
                 new_sources = list(set(best_match.source_sessions + cluster_sessions))
                 new_confidence = compute_confidence(len(new_sources))
-                update_node(
-                    best_match.id,
-                    {"source_sessions": new_sources, "confidence": new_confidence},
-                    knowledge_path,
-                )
+                auto_updates: dict = {"source_sessions": new_sources, "confidence": new_confidence}
+                # BLOCKER 2 fix (Sentinel, 2026-07-15, third path found in self-review): this
+                # create-action candidate just got silently converted to corroborate by
+                # similarity — needs the SAME fill-missing-bound treatment as the explicit
+                # corroborate branch (_corroborate_bound_fill), or the fix doesn't reach here.
+                auto_updates.update(_corroborate_bound_fill(best_match, raw_node))
+                _apply_corroborate_update(best_match, auto_updates, knowledge_path)
                 result.nodes_corroborated += 1
                 if decision_log_path:
                     _log_dedup_decision(
@@ -1371,6 +1443,671 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
         for i, entry in enumerate(ordered)
     ]
     return score_with_validation(get_active_strategy(), inputs)
+
+
+# ---------------------------------------------------------------------------
+# B1 — decomposed extract path, the front half (behind SYNAPT_USE_EXTRACT)
+#
+# prefilter (identify.py) -> BatchUnits -> extract_batch -> per-unit envelopes. This half
+# produces envelopes + logs per-unit failed-unit markers (never silent-dropped); it does not
+# itself decide create/corroborate/contradict or touch knowledge.jsonl — B2 (below) computes
+# the action, B3 (_run_extract_path's tail) feeds the SAME reconcile the monolith uses. See the
+# "B2 — the action-decision pass" block below for the rest of the pipeline. Together, B1+B2+B3
+# replace the monolithic CONSOLIDATION_PROMPT pass when the flag is on.
+# ---------------------------------------------------------------------------
+
+# provider URI for the extraction envelope's produced_by. validate_extraction REQUIRES a
+# `scheme://identifier` URI — the dotted form ("recall.consolidate") fails EVERY unit as
+# schema_invalid (verified against landed extract_batch). Scheme = recall's consolidate STEP
+# as the producer, stable across the pluggable model (which model ran is known out-of-band).
+_EXTRACT_PRODUCED_BY = "recall://consolidate"
+# The capability set recall requests from extract_batch (exact Stage-1 schema keys).
+# "temporal_refs" INCLUDED (2026-07-15, extract#31 landed the role field): extraction now emits a
+# validity ROLE (effective/expiry/range/superseded/point) + resolved date at the BASE temporal_refs
+# capability — no separate "temporal_classes" needed. That base-tier reachability is the exact fix
+# extract#31 shipped; the original derivation was silently non-functional because role/resolved_end
+# used to sit behind temporal_classes (which recall never requested). recall now maps role ->
+# valid_from/valid_until DETERMINISTICALLY in _flatten_envelope_facts (_map_temporal_refs_to_bounds),
+# with ZERO LLM re-judgment — direction is read once, at extraction, where the source sentence and
+# source date live. See the module's TEMPORAL — ROLE note.
+_EXTRACT_CAPABILITIES = ["facts", "decisions", "temporal_refs"]
+
+
+def _get_consolidation_client(max_tokens: int = MIN_RESPONSE_TOKENS):
+    """Get a model client via the router (MLX -> Modal -> Ollama), with an MLX fallback.
+
+    Returns None when no backend is available. Shared by the monolithic path and the
+    decomposed extract path so both resolve the model the same way.
+    """
+    from synapt.recall._model_router import get_client, RecallTask
+    client = get_client(RecallTask.CONSOLIDATE, max_tokens=max_tokens)
+    if client is not None:
+        return client
+    if not _MLX_AVAILABLE:
+        return None
+    from synapt._models.mlx_client import MLXClient, MLXOptions
+    return MLXClient(MLXOptions(max_tokens=max_tokens))
+
+
+def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESPONSE_TOKENS):
+    """Build the SYNC inference seam that extract_batch injects: a
+    ``BatchInferRequest -> completion str`` callable wrapping recall's model client.
+
+    The model is a PLUGGABLE parameter — swapping Ministral / Qwen / Gemma is just a
+    different ``model`` routed through the same client; extract stays model-agnostic
+    (zero recall coupling). extract_batch calls this SYNCHRONOUSLY (never awaited), so it
+    stays a plain function.
+
+    ``max_tokens`` is read PER-REQUEST from an optional ``request["max_tokens"]`` key
+    (falling back to ``default_max_tokens`` when absent) rather than fixed once at build
+    time — one ``infer`` closure serves BOTH B1's per-unit extract_batch calls (small,
+    fixed-shape responses, the default floor is fine) AND B2's per-CLUSTER action-decision
+    call (whose response size scales with candidate count — a flat floor silently truncates
+    a dense cluster's response, see ``_estimate_action_decision_budget``). extract_batch's
+    own ``BatchInferRequest`` never sets this key, so B1's behavior is unchanged.
+    """
+    def recall_infer(request) -> str:
+        raw_messages = request.get("messages") or []
+        messages = [
+            Message(role=m.get("role", "user"), content=m.get("content", ""))
+            for m in raw_messages
+        ]
+        if not messages:  # fall back to the flat prompt if the request carried no messages
+            messages = [Message(role="user", content=request.get("prompt", ""))]
+        max_tokens = request.get("max_tokens") or default_max_tokens
+        return client.chat(
+            model=model,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=max_tokens,
+        )
+    return recall_infer
+
+
+def _run_coro_blocking(coro):
+    """Drive an async coroutine to completion from a sync caller, across BOTH consolidate
+    call-sites — which genuinely differ in whether an event loop is already running:
+
+    - CLI (``cmd_consolidate``): main thread, NO event loop → ``asyncio.run`` (the simple path).
+    - MCP (``recall_consolidate``): FastMCP 1.27 runs a sync tool INLINE on the event-loop thread
+      (verified: ``FuncMetadata.call_fn_with_arg_validation`` does ``return fn(...)`` directly,
+      no ``to_thread``), so a loop IS already running on this thread → ``asyncio.run`` would raise
+      ``RuntimeError('asyncio.run() cannot be called from a running event loop')``. We offload the
+      coroutine to a fresh thread with its own loop and block on ``join``.
+
+    That join holds the server's event-loop thread for the duration of extraction — acceptable
+    because the legacy sync ``consolidate()`` already blocks that same thread inline (consolidation
+    has always been a blocking call under FastMCP; this changes nothing about that). Errors from
+    the worker re-raise on the calling thread. (Sentinel probed the runtime: loop_running=True,
+    same_thread=True — this is the current MCP path, not a hypothetical future one.)
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # CLI path: no running loop
+
+    # MCP path: a loop is already running on THIS thread (FastMCP runs the sync tool inline) —
+    # asyncio.run would raise, so run the coroutine in a fresh thread with its own loop.
+    box: dict = {}
+
+    def _worker():
+        try:
+            box["result"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 — surfaced on the calling thread below
+            box["error"] = exc
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join()
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def _candidate_source_date(cluster: list[JournalEntry], candidate) -> str | None:
+    """The source date to anchor a candidate's relative-date resolution: its OWN journal entry's
+    timestamp, date-only (``YYYY-MM-DD``). ``candidate.attr["entry_index"]`` indexes back into
+    *cluster* — both come from the same prefilter pass, so the index is in range in the normal
+    path. FAIL-SAFE: returns None when the index is missing/out-of-range or the entry has no
+    timestamp, so the unit is still built with no anchor rather than crashing or fabricating a
+    date (an absent anchor renders no ``Resolve relative dates using:`` line — never the literal
+    string "None")."""
+    ei = candidate.attr.get("entry_index")
+    if not isinstance(ei, int) or not (0 <= ei < len(cluster)):
+        return None
+    ts = cluster[ei].timestamp
+    return ts[:10] if ts else None
+
+
+async def _extract_cluster_units(
+    cluster: list[JournalEntry],
+    cluster_id: str,
+    infer,
+    *,
+    produced_by: str = _EXTRACT_PRODUCED_BY,
+    capabilities: list[str] | None = None,
+):
+    """B1 front-half: prefilter -> BatchUnits -> extract_batch -> per-unit envelopes.
+
+    The deterministic prefilter (identify.py) reads structured ``done``/``decisions``; each
+    Candidate becomes a ``BatchUnit`` with a cluster-namespaced id (``batch_unit_id``);
+    extract_batch shapes + validates each into a per-unit SynaptExtraction envelope.
+    COUNT-INVARIANT — one ``BatchUnitResult`` per Candidate; failed units are marked
+    (``status == "failed"``), never dropped. The envelope->reconcile-node adapter and the
+    action-decision pass are B2/B3, so this returns raw envelopes and creates no nodes.
+
+    ``infer`` is the injected SYNC model seam (see ``_make_recall_infer``) — passed in rather
+    than built here so the helper is testable with a fake infer and zero model dependency,
+    mirroring extract_batch's own injected-seam design.
+    """
+    # Lazy import: the published synapt-extract lacks extract_batch, so importing at module
+    # scope would break every existing consolidate caller. Only the flag-on path needs it.
+    from synapt.extract.batch import extract_batch, BatchUnit
+    from synapt.recall.identify import identify, batch_unit_id
+
+    candidates = identify(cluster)
+    if not candidates:
+        return []
+    # Source-date resolution anchor: each candidate's OWN journal-entry timestamp (date-only)
+    # threads into BatchUnit.date, which extract_batch renders into the Stage-1 prompt so a
+    # relative date ("April 30") resolves against the SOURCE year, not the extraction year —
+    # recall's half of the wrong-year fix (Sentinel's real-path finding). Fail-safe to None.
+    units = [
+        BatchUnit(
+            id=batch_unit_id(cluster_id, cand),
+            text=cand.text,
+            date=_candidate_source_date(cluster, cand),
+        )
+        for cand in candidates
+    ]
+    caps = _EXTRACT_CAPABILITIES if capabilities is None else capabilities
+    return await extract_batch(
+        units,
+        infer=infer,
+        produced_by=produced_by,
+        capabilities=caps,
+    )
+
+
+def _log_extract_failure(failures_path: Path, cluster_id: str, envelope) -> bool:
+    """Append one per-unit extract failure marker to ``failures_path``. Returns True when the
+    marker is persisted, False when the write itself fails.
+
+    NEVER silent-drop: every non-ok ``BatchUnitResult`` is recorded with its ``status`` +
+    terminal ``reason`` and its ``source_unit_id`` (traceable to the exact journal field). If
+    the marker write ITSELF fails, that is a lost failed unit — it is surfaced loudly (error
+    log) and signalled to the caller (return False), never swallowed. Swallowing the write
+    error would silently lose the failed unit while the cluster looks processed.
+    """
+    try:
+        from synapt.recall._filelock import lock_exclusive, unlock
+        failures_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(failures_path, "a", encoding="utf-8") as ff:
+            lock_exclusive(ff)
+            try:
+                ff.write(json.dumps({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "path": "extract_batch",
+                    "cluster_id": cluster_id,
+                    "source_unit_id": envelope.source_unit_id,
+                    "status": envelope.status,
+                    "reason": envelope.reason,
+                }) + "\n")
+            finally:
+                unlock(ff)
+        return True
+    except OSError as exc:
+        logger.error(
+            "FAILED to persist extract failure marker for unit %s (cluster %s): %s — "
+            "the failed unit is NOT recorded (surfacing, not swallowing)",
+            envelope.source_unit_id, cluster_id, exc,
+        )
+        return False
+
+
+def _run_extract_path(
+    cluster: list[JournalEntry],
+    cluster_id: str,
+    client,
+    model: str,
+    failures_path: Path,
+    existing_nodes: list[KnowledgeNode],
+    kn_path: Path,
+    decision_log_path: Path | None = None,
+    db=None,
+    content_profile=None,
+) -> ConsolidationResult | None:
+    """The decomposed extract path (SYNAPT_USE_EXTRACT): B1 (extract) -> B2 (action-decision)
+    -> B3 (reconcile — the SAME ``_apply_consolidation_result`` the monolithic path uses).
+    Failed extract units are logged (never silent-dropped, see ``_log_extract_failure``); facts
+    that extract successfully are handed to the focused action-decision pass (B2), then fed to
+    reconcile exactly as the monolith's parsed LLM output would be.
+
+    Returns a ``ConsolidationResult`` when the cluster was PROCESSED — including a zero-valued
+    result when every unit failed extraction or the cluster produced no usable facts, matching
+    the monolith's own "no durable patterns" outcome (a processed-but-empty cluster is not a
+    failure). Returns ``None`` only on an INFRASTRUCTURE failure: an extract-inference
+    exception, or a failure marker that could not be persisted — never silently reported as a
+    clean (if empty) success.
+    """
+    infer = _make_recall_infer(client, model)
+    try:
+        envelopes = _run_coro_blocking(_extract_cluster_units(cluster, cluster_id, infer))
+    except Exception as exc:
+        logger.warning("extract-path failed for cluster %s: %s", cluster_id, exc)
+        return None
+    ok = [e for e in envelopes if e.status == "ok"]
+    failed = [e for e in envelopes if e.status != "ok"]
+    all_logged = True
+    for e in failed:
+        if not _log_extract_failure(failures_path, cluster_id, e):
+            all_logged = False
+    # A failure marker that could not be persisted is a SILENTLY-lost failed unit — the
+    # never-silent-drop contract. Do not report the cluster as cleanly processed: return
+    # None so the loss is visible (and the caller's retry re-attempts it), never swallowed.
+    if not all_logged:
+        logger.error(
+            "extract-path cluster %s: one or more failure markers could not be persisted; "
+            "returning failure so the lost unit is visible, not swallowed as processed",
+            cluster_id,
+        )
+        return None
+    logger.info(
+        "extract-path cluster %s: %d units -> %d ok, %d failed",
+        cluster_id, len(envelopes), len(ok), len(failed),
+    )
+
+    # B2: decide actions for the successfully-extracted facts against existing knowledge.
+    action_items = _decide_actions(cluster, cluster_id, ok, existing_nodes, infer) if ok else []
+
+    # B3: feed the SAME reconcile the monolithic path uses.
+    cluster_result = _apply_consolidation_result(
+        {"nodes": action_items}, existing_nodes, cluster, kn_path,
+        decision_log_path=decision_log_path, db=db, content_profile=content_profile,
+    )
+    logger.info(
+        "extract-path cluster %s: reconcile -> %d created, %d corroborated, %d contradicted",
+        cluster_id, cluster_result.nodes_created, cluster_result.nodes_corroborated,
+        cluster_result.nodes_contradicted,
+    )
+    return cluster_result
+
+
+# ---------------------------------------------------------------------------
+# B2 — the action-decision pass (behind SYNAPT_USE_EXTRACT, same flag as B1)
+#
+# The §FINDING gap: extract_batch never sees existing knowledge and emits no action, so
+# identify -> extract_batch -> reconcile with everything defaulting to "create" drops
+# corroborate/contradict entirely -> node inflation (the ~70-vs-46 over-feeding dogfood).
+# B2 restores the monolith's action-logic (existing-knowledge-in-context -> action +
+# existing_id) as its own focused pass, batched per cluster, over B1's clean extracted facts.
+#
+# GATE (reframed 2026-07-14, Opus ratified): the frontier ideal (config#482, 185 nodes) turned
+# out to be an END-STATE node-set (no action/existing_id/contradiction fields, 0 corpus
+# reversals) — NOT a per-fact action-gold, so B2 has no standalone corpus-accuracy gate the way
+# identify did. This is a MECHANISM gate (synthetic existing-knowledge + facts via a fake infer,
+# proving create/corroborate/contradict all fire correctly — see test_consolidate_action_-
+# decision.py). Corpus-scale contradiction accuracy is descoped v1 (0 examples to validate
+# against); the anti-inflation + 40-merge-group corroboration claim is measured by the Phase-C
+# dogfood (B2+B3 end-state vs the 185-node ideal), not here.
+#
+# REVIEW FIXES (2026-07-14, Sentinel + Opus REQUEST-CHANGES, both independently fruit/code-
+# confirmed): the first cut had 3 wiring gaps —
+#   1. dense-cluster inflation: the per-CLUSTER action call inherited B1's flat per-UNIT
+#      800-token floor, so a response covering many candidates truncated partway and every
+#      unaddressed index fail-closed to "create" — the "inflation fix" silently didn't fix
+#      inflation on dense clusters. Fixed: _estimate_action_decision_budget scales with
+#      candidate count.
+#   2. fail-closed-to-create persisted duplicates: an unaddressed/malformed index defaults to
+#      create + existing_id=None with no dedup check. Fixed: _normalize_for_dedup + an exact-
+#      match check against existing_nodes converts a create whose content is verbatim-
+#      identical (mod case/whitespace) to corroborate — cheap, deterministic, belt-and-
+#      suspenders ahead of reconcile's own fuzzy dedup, which stays untouched.
+#   3. temporal_refs discarded — SUPERSEDED, see below (the temporal_refs-derivation fix and
+#      its 2026-07-14 minor follow-up were both correct-in-isolation but built against a
+#      hand-built envelope, not the REAL extract_batch contract; abandoned in favor of a
+#      content-based per-fact approach once that was fruit-checked, see next block).
+#
+# TEMPORAL — ROLE, LANDED (2026-07-15, extract#31 merged to extract sprint-39): the two prior
+# attempts were both duct tape — the temporal_refs-derivation cut (built against a hand-built
+# envelope; role/resolved_end were unreachable at the base capability) and the B2-LLM-judges-
+# temporal cut (recall re-deriving via a SECOND LLM pass what extraction already read once). The
+# right fix lives in extract and now ships: extraction emits a validity ROLE (effective/expiry/
+# range/superseded/point) + resolved date at the BASE temporal_refs capability, and threads each
+# unit's SOURCE date as the relative-date resolution anchor (spec: config/design/extract-temporal-
+# role-2026-07-14.md). recall consumes it DETERMINISTICALLY, no LLM re-judgment: _EXTRACT_-
+# CAPABILITIES requests temporal_refs; _extract_cluster_units threads BatchUnit.date
+# (_candidate_source_date); _flatten_envelope_facts maps role -> valid_from/valid_until
+# (_map_temporal_refs_to_bounds); _decide_actions PASSES THE BOUND THROUGH without judging it (the
+# action LLM never touches temporal). A ref-less fact falls back to null — honest fallback, not the
+# old unconditional placeholder. Budget (#1, _estimate_action_decision_budget) and dedup (#2,
+# _normalize_for_dedup) are UNAFFECTED — independent of temporal, already fruit-confirmed by two
+# reviewers, stay exactly as they are.
+#
+# FULL-PATH REVIEW FIXES (2026-07-15, Sentinel REQUEST CHANGES, both real, ratified by Opus after
+# withdrawing his own approve on these two surfaces):
+#   1. FAN-OUT FABRICATION: the first cut shared one unit-level bound onto every fact/decision the
+#      unit emitted. Sentinel's real full-eb.json fruit killed the "rare" premise: 61/62 compound
+#      units emit >1 output (mean 5.0) — compounds are preserved BY DESIGN so extract can atomize
+#      them. Fixed in _flatten_envelope_facts: bounds SUPPRESS entirely once a unit yields >1
+#      usable output — losing the one true bound beats fabricating it onto N-1 siblings.
+#   2. RECONCILE SILENTLY DROPS BOUNDS ON CORROBORATE/CONTRADICT: bounds only ever reached
+#      _apply_consolidation_result's create branch. The exact-match dedup guard MECHANICALLY
+#      converts many creates to corroborate, so a real temporal fact routinely lost its bound one
+#      layer past where the B2 tests stopped looking (dict, not persisted node). Fixed: corroborate
+#      fills only MISSING persisted bounds (never overwrites a conflicting one); contradict carries
+#      candidate bounds onto the replacement node AND the queued-contradiction payload — which
+#      required a pending_contradictions schema migration (storage.py) and a fix to
+#      server.py's _apply_supersession (previously hardcoded valid_from=now/valid_until=None on
+#      confirm), so the round trip survives to the actually-persisted node, not just the queue row.
+# ---------------------------------------------------------------------------
+
+ACTION_DECISION_PROMPT = """\
+You are deciding how new facts relate to existing knowledge.
+
+## Existing Knowledge
+{existing_knowledge}
+
+## New Facts (indexed)
+{candidates}
+
+## Task
+For EACH new fact above, decide exactly one action:
+- "create": this is genuinely new information, not already captured above.
+- "corroborate": this confirms/reinforces an EXISTING node — give its exact [id] from above.
+- "contradict": this REVERSES or invalidates an EXISTING node's claim — give its exact [id] \
+and a one-sentence contradiction_note explaining the reversal.
+
+Rules:
+1. Only use "corroborate" or "contradict" when you can cite the EXACT existing node id shown \
+in brackets above. Never invent an id.
+2. Default to "create" when uncertain.
+3. contradiction_note is required for "contradict", omit or leave empty otherwise.
+
+Output ONLY valid JSON, no markdown fences, no explanation. One action object PER fact index, \
+matched by "index" (not by list position):
+{{"actions": [{{"index": 0, "action": "create", "existing_id": null, "contradiction_note": ""}}, \
+{{"index": 1, "action": "corroborate", "existing_id": "kn_abc123", "contradiction_note": ""}}]}}
+"""
+
+_VALID_ACTIONS = ("create", "corroborate", "contradict")
+
+
+# Role -> bound routing. Direction rides in extract's ROLE field (extract#31); recall never
+# re-judges it. ``point`` defaults to a start (a bare instant with no start/end direction).
+_ROLE_TO_VALID_FROM = frozenset({"effective", "point"})
+_ROLE_TO_VALID_UNTIL = frozenset({"expiry", "superseded"})
+
+
+def _map_temporal_refs_to_bounds(temporal_refs) -> tuple[str | None, str | None]:
+    """Map a unit's extract_batch ``temporal_refs`` to ``(valid_from, valid_until)`` by ROLE,
+    DETERMINISTICALLY — the recall-side replacement for both the abandoned second-LLM judgment
+    and the held null placeholder (module TEMPORAL — ROLE note).
+
+    Role -> bound: ``effective`` -> valid_from; ``expiry``/``superseded`` -> valid_until;
+    ``range`` -> both (resolved, resolved_end); ``point`` -> valid_from. A ref with no role (or
+    an unknown one) cannot encode direction and contributes nothing — null is the honest
+    FALLBACK, now scoped to exactly that case rather than unconditional. First-non-null-wins per
+    bound in list order (deterministic; no min/max heuristic that could reorder under ties).
+    Dates pass ``_validate_iso_date`` — a malformed date yields no bound. Non-dict refs are
+    skipped so a single bad element never crashes a cluster's consolidation."""
+    valid_from: str | None = None
+    valid_until: str | None = None
+    for ref in temporal_refs or []:
+        if not isinstance(ref, dict):
+            continue
+        role = ref.get("role")
+        resolved = _validate_iso_date(ref.get("resolved"))
+        if role in _ROLE_TO_VALID_FROM:
+            valid_from = valid_from or resolved
+        elif role in _ROLE_TO_VALID_UNTIL:
+            valid_until = valid_until or resolved
+        elif role == "range":
+            valid_from = valid_from or resolved
+            valid_until = valid_until or _validate_iso_date(ref.get("resolved_end"))
+        # role absent/unknown -> no contribution (direction is unknowable)
+    return valid_from, valid_until
+
+
+def _flatten_envelope_facts(envelopes) -> list[dict]:
+    """Flatten B1's per-unit envelopes into a flat, ordered list of candidate facts for the
+    action-decision pass. Only ``status == "ok"`` envelopes contribute — failed units were
+    already logged by B1 (never silently re-surfaced here). Both ``facts[]`` (tagged with their
+    own ``category``, default "fact") and ``decisions[]`` (tagged "decision") flow through, each
+    carrying its source envelope's ``source_unit_id`` for traceability (not threaded onto the
+    KnowledgeNode itself — see ``_decide_actions``'s ``source_turns`` note).
+
+    TEMPORAL: each fact/decision carries the ``valid_from``/``valid_until`` mapped
+    DETERMINISTICALLY from its unit's ``temporal_refs`` by role (``_map_temporal_refs_to_bounds``,
+    module TEMPORAL — ROLE note). ``temporal_refs`` are extraction(unit)-level (siblings of
+    ``facts[]``, confirmed against real extract_batch output) — the IL has NO fact<->ref
+    attribution, so assigning a ref to one output out of several is a guess, not a derivation.
+
+    FAN-OUT SUPPRESSION (Sentinel, 2026-07-15, real full-eb.json fruit: of 62 OK compound units,
+    61 emitted >1 durable output, mean 5.0 — compounds are preserved BY DESIGN precisely so
+    extract can atomize them, so multi-output units are the NORM, not the rare case the original
+    bound-sharing design assumed): bounds are computed per envelope ONLY when that unit yields
+    exactly one usable output (facts + decisions combined). Once a unit yields >1 output, its
+    bound is SUPPRESSED entirely (null for every output from that unit) — sharing would fabricate
+    a boundary on N-1 unrelated memories; losing the one true bound is the safer failure. No LLM
+    re-judgment either way; a ref-less or suppressed unit falls back to null bounds.
+    """
+    out: list[dict] = []
+    for env in envelopes:
+        if env.status != "ok" or not env.extraction:
+            continue
+        extraction = env.extraction
+        # Usable outputs FIRST — the suppression decision needs the TRUE combined count before
+        # any bound is computed, so it can't be decided while iterating facts alone.
+        unit_items: list[dict] = []
+        for fact in extraction.get("facts") or []:
+            text = fact.get("text") if isinstance(fact, dict) else None
+            if text:
+                unit_items.append({"text": text, "category": fact.get("category") or "fact"})
+        for dec in extraction.get("decisions") or []:
+            text = dec.get("text") if isinstance(dec, dict) else None
+            if text:
+                unit_items.append({"text": text, "category": "decision"})
+
+        if len(unit_items) > 1:
+            valid_from, valid_until = None, None  # fan-out: suppress, never fabricate
+        else:
+            valid_from, valid_until = _map_temporal_refs_to_bounds(extraction.get("temporal_refs"))
+
+        for item in unit_items:
+            out.append({
+                "text": item["text"],
+                "category": item["category"],
+                "source_unit_id": env.source_unit_id,
+                "valid_from": valid_from,
+                "valid_until": valid_until,
+            })
+    return out
+
+
+def _normalize_for_dedup(text: str) -> str:
+    """Lowercase + collapse whitespace, for a cheap EXACT-match dedup check — NOT the fuzzy
+    Jaccard/embedding dedup reconcile's own create-path already does downstream (that stays
+    untouched). This catches the specific failure mode a fail-closed-to-create fact's content
+    is verbatim-identical (modulo case/whitespace) to something already persisted, without
+    needing embeddings or a similarity threshold."""
+    return " ".join(text.lower().split())
+
+
+# ~4 chars/token (the same approximation _estimate_response_budget already uses); a per-fact
+# action item ({"index":N,"action":"corroborate","existing_id":"kn_xxxxxxxx","contradiction_
+# note":"..."}) runs ~60-80 tokens generously — 60 leaves headroom without being wasteful.
+_ACTION_ITEM_TOKEN_ESTIMATE = 60
+
+
+def _estimate_action_decision_budget(prompt: str, n_facts: int) -> int:
+    """Estimate ``max_tokens`` for B2's action-decision response, scaled to candidate count.
+
+    ``_estimate_response_budget`` (built for the monolith's fixed-shape cluster-summary output)
+    SHRINKS its allowance as the prompt grows — the wrong direction for B2: its per-cluster
+    batched call can address up to ~50-65 candidates (a full cluster's prefiltered facts), and
+    its OUTPUT size scales with candidate count, not just prompt size. The flat
+    ``MIN_RESPONSE_TOKENS`` floor silently truncated a dense cluster's response around fact
+    15-20; every unaddressed index then fail-closed to "create" — the exact dense-cluster
+    inflation Sentinel's fruit-check and Opus's independent code-read both caught (the
+    "inflation fix" wasn't fixing inflation on dense clusters). Takes whichever is LARGER of a
+    fact-count-scaled estimate and the monolith's own context-aware estimate — generous is
+    free ("no upper cap, the model stops at EOS naturally" per ``_estimate_response_budget``'s
+    own rationale); only a too-small floor was ever the actual bug.
+    """
+    scaled = MIN_RESPONSE_TOKENS + _ACTION_ITEM_TOKEN_ESTIMATE * n_facts
+    return max(scaled, _estimate_response_budget(prompt))
+
+
+def _format_facts_for_action_decision(facts: list[dict]) -> str:
+    """Render flattened facts as an indexed list for the action-decision prompt. The index is
+    the matching key the model must echo back (robust to a batched call reordering or only
+    partially addressing the facts — see ``_parse_action_decision_response``)."""
+    return "\n".join(f"[{i}] ({f['category']}) {f['text']}" for i, f in enumerate(facts))
+
+
+def _build_action_decision_prompt(
+    facts: list[dict],
+    existing_nodes: list[KnowledgeNode],
+    cluster: list[JournalEntry],
+) -> str:
+    """Build the action-decision prompt: the SAME existing-knowledge formatting the monolith
+    prompt + reconcile already use (``_format_existing_knowledge``, reused not rebuilt), plus
+    the indexed candidate facts."""
+    existing = _format_existing_knowledge(existing_nodes, cluster=cluster)
+    candidates = _format_facts_for_action_decision(facts)
+    return ACTION_DECISION_PROMPT.format(existing_knowledge=existing, candidates=candidates)
+
+
+def _parse_action_decision_response(response: str) -> dict[int, dict] | None:
+    """Parse the action-decision response into an ``index -> action-item`` dict, or None if the
+    response is unparseable / not the expected shape. A malformed individual entry (non-dict,
+    missing/non-int index) is skipped rather than failing the whole batch — the caller degrades
+    any un-matched fact index to ``action="create"`` (fail-closed, never dropped)."""
+    parsed = _parse_llm_response(response)
+    if not parsed:
+        return None
+    raw_actions = parsed.get("actions")
+    if not isinstance(raw_actions, list):
+        return None
+    by_index: dict[int, dict] = {}
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("index")
+        if not isinstance(idx, int):
+            continue
+        by_index[idx] = item
+    return by_index
+
+
+def _decide_actions(
+    cluster: list[JournalEntry],
+    cluster_id: str,
+    ok_envelopes,
+    existing_nodes: list[KnowledgeNode],
+    infer,
+) -> list[dict]:
+    """B2: the action-decision pass. Flattens B1's successfully-extracted facts, asks a focused
+    LLM pass (existing knowledge + new facts -> per-fact action) and returns reconcile-ready
+    dicts: EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
+    ``existing_id``, ``content``, ``category``, ``tags``, ``source_turns``,
+    ``contradiction_note``, ``valid_from``, ``valid_until``). ``confidence`` is NOT included —
+    reconcile computes it itself (B1 contract-read Finding 3) with no fallback gap.
+
+    ``valid_from``/``valid_until`` come from each fact's unit-level ``temporal_refs``, mapped
+    DETERMINISTICALLY by role in ``_flatten_envelope_facts`` (module TEMPORAL — ROLE note) — this
+    pass PASSES THEM THROUGH, it does not judge them. Direction is read once at extraction
+    (extract#31's role field), never re-derived by a second recall-side LLM pass. A ref-less fact
+    carries null (the honest fallback), and a garbage action response fail-closes the ACTION to
+    create while the bound rides through unchanged — temporal is decoupled from the action.
+
+    FAIL-CLOSED, never drops a fact: an unparseable/malformed response, an infer exception, an
+    invalid action value, or any fact index the response didn't address all degrade that fact's
+    ACTION to "create" (mirrors the monolith's own existing_id-not-found -> create fallback) —
+    the fact itself is always represented in the output (count-invariant, matching B1's
+    discipline at this layer). A create-defaulted (or model-CHOSEN-create) fact whose content
+    EXACTLY matches (``_normalize_for_dedup``) an already-existing node is converted to
+    corroborate that node instead — never-drop must not mean never-dedup; see the REVIEW FIXES
+    module note (blocker #2, the persisted-duplicate finding).
+
+    ``infer`` is the SAME pluggable sync seam B1 uses (``_make_recall_infer``) — one call per
+    cluster (a cluster's facts + its existing-knowledge set are bounded, so batching per cluster
+    is v1; see the B2 spec for the per-fact-vs-batched tradeoff). The request's ``max_tokens``
+    is scaled to candidate count (``_estimate_action_decision_budget``, blocker #1) — a flat
+    per-unit floor silently truncated dense clusters and mass-triggered the fail-closed path.
+
+    ``source_turns`` is intentionally always ``[]`` here — see module note: the deterministic
+    prefilter's ``Candidate.attr`` (session_id/entry_index/field/index) is NOT transcript-turn-
+    shaped, and populating a KnowledgeNode's ``source_turns`` with a non-turn value would make
+    ``resolve_source_turns()`` SKIP real enrichment for that node forever (its early-exit is
+    ``if node.source_turns: continue``, verified at consolidate.py) — worse than leaving it
+    empty for the SAME post-processing resolver that already backfills genuine transcript
+    matches for monolith-path nodes when the LLM didn't supply turns.
+    """
+    facts = _flatten_envelope_facts(ok_envelopes)
+    if not facts:
+        return []
+
+    prompt = _build_action_decision_prompt(facts, existing_nodes, cluster)
+    budget = _estimate_action_decision_budget(prompt, len(facts))
+    request = {
+        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
+        "capabilities": [],
+        "max_tokens": budget,
+    }
+    try:
+        response = infer(request)
+    except Exception as exc:
+        logger.warning("action-decision inference failed for cluster %s: %s", cluster_id, exc)
+        response = None
+
+    by_index = _parse_action_decision_response(response) if response else None
+    if by_index is None:
+        by_index = {}
+
+    # Exact-match dedup ahead of reconcile: see _normalize_for_dedup. Built once per cluster,
+    # not per-fact, since existing_nodes is fixed for the whole call.
+    existing_by_normalized = {
+        _normalize_for_dedup(n.content): n.id for n in existing_nodes
+    }
+
+    results: list[dict] = []
+    for i, fact in enumerate(facts):
+        item = by_index.get(i, {})
+        action = item.get("action")
+        if action not in _VALID_ACTIONS:
+            action = "create"
+        existing_id = item.get("existing_id")
+        tags = item.get("tags")
+        if not isinstance(tags, list):
+            tags = []
+        contradiction_note = item.get("contradiction_note")
+        if not isinstance(contradiction_note, str):
+            contradiction_note = ""
+        if action == "create":
+            matched_id = existing_by_normalized.get(_normalize_for_dedup(fact["text"]))
+            if matched_id:
+                action = "corroborate"
+                existing_id = matched_id
+        results.append({
+            "action": action,
+            "existing_id": existing_id,
+            "content": fact["text"],
+            "category": fact["category"],
+            "tags": tags,
+            "source_turns": [],
+            "contradiction_note": contradiction_note,
+            # Temporal bounds are mapped from the ENVELOPE's role in _flatten_envelope_facts
+            # (module TEMPORAL — ROLE note), NOT judged by this action pass — a ref-less fact
+            # carries null (honest fallback), and the action LLM's response never supplies these
+            # (it is not even asked to; see the action-decision prompt). Decoupling the bound from
+            # the action means it survives the fail-closed-to-create path unchanged.
+            "valid_from": fact.get("valid_from"),
+            "valid_until": fact.get("valid_until"),
+        })
+    return results
 
 
 def consolidate(
@@ -1505,6 +2242,32 @@ def consolidate(
         nonlocal client
 
         cache_key = _cluster_cache_key(cluster)
+
+        # Decomposed extract path (behind the flag): B1 (extract) -> B2 (action-decision) ->
+        # B3 (reconcile). Runs BEFORE the monolithic response cache — its call shape is
+        # per-unit/per-cluster, with no monolith-shaped cluster response to cache, and it must
+        # not be skipped by a stale monolith cache entry. Reuses the SAME closed-over
+        # existing_nodes/kn_path/decision_path/db/content_profile the monolith branch below
+        # already uses — one consistent knowledge-state view regardless of which path ran.
+        if _env_flag("SYNAPT_USE_EXTRACT"):
+            if client is None:
+                client = _get_consolidation_client()
+                if client is None:
+                    logger.error(
+                        "No model backend available for extract-path consolidation"
+                    )
+                    return False
+            cluster_result = _run_extract_path(
+                cluster, cache_key, client, model, failures_path,
+                existing_nodes, kn_path, decision_path, db, content_profile,
+            )
+            if cluster_result is None:
+                return False
+            result.nodes_created += cluster_result.nodes_created
+            result.nodes_corroborated += cluster_result.nodes_corroborated
+            result.nodes_contradicted += cluster_result.nodes_contradicted
+            return True
+
         cached_entry = response_cache.get(cache_key)
 
         if cached_entry:
@@ -1515,14 +2278,10 @@ def consolidate(
             return True
 
         if client is None:
-            from synapt.recall._model_router import get_client, RecallTask
-            client = get_client(RecallTask.CONSOLIDATE, max_tokens=MIN_RESPONSE_TOKENS)
+            client = _get_consolidation_client()
             if client is None:
-                if not _MLX_AVAILABLE:
-                    logger.error("No model backend available for consolidation")
-                    return False
-                from synapt._models.mlx_client import MLXClient, MLXOptions
-                client = MLXClient(MLXOptions(max_tokens=MIN_RESPONSE_TOKENS))
+                logger.error("No model backend available for consolidation")
+                return False
         prompt = _build_consolidation_prompt(
             cluster, existing_nodes, project_dir,
             adapter_path=adapter_path,

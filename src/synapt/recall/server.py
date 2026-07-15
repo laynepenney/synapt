@@ -925,6 +925,11 @@ def recall_contradict(
                         category=pending_row["category"],
                         reason=pending_row["reason"],
                         source_sessions=json.loads(pending_row["source_sessions"]),
+                        # BLOCKER 2 fix (Sentinel, 2026-07-15): carry the candidate bounds queued
+                        # with this contradiction through to the materialized replacement — the
+                        # queue payload only matters if confirm actually reads it.
+                        valid_from=pending_row["valid_from"],
+                        valid_until=pending_row["valid_until"],
                     )
                 elif pending_row and not pending_row["old_node_id"]:
                     # Free-text claim confirmed — create a new knowledge node
@@ -1095,8 +1100,29 @@ def _apply_supersession(
     category: str,
     reason: str,
     source_sessions: list[str],
+    valid_from: str | None = None,
+    valid_until: str | None = None,
 ) -> None:
-    """Execute a confirmed supersession: mark old node, create replacement."""
+    """Execute a confirmed supersession: mark old node, create replacement.
+
+    *valid_from*/*valid_until* are the queued contradiction's candidate bounds (BLOCKER 2 fix,
+    Sentinel 2026-07-15) — the candidate's bound is preferred over the confirm-time ``now()``
+    default, mirroring consolidate.py's create/legacy-contradict preference. Without this, a
+    bound that survived all the way to the queue was still lost at the final materialization
+    step — the exact "fruit-to-the-dict is not fruit-to-the-database" failure mode.
+
+    Both are re-validated HERE (adversarial verification finding, 2026-07-15) — every other
+    bound-consuming site in this feature validates via ``_validate_iso_date`` before a dict
+    update or DB write; this was the one that didn't, so a non-string shape reaching this
+    function directly (today unreachable via the live MCP surface — every current caller
+    validates upstream — but a real landmine for any future caller that doesn't) would raise
+    ``sqlite3.ProgrammingError`` on the SECOND of two non-atomic upserts, leaving the old node
+    marked contradicted with ``superseded_by`` pointing at a replacement that was never created,
+    permanently (the confirm status flip already committed, so there is no retry path).
+    """
+    from synapt.recall.consolidate import _validate_iso_date
+    valid_from = _validate_iso_date(valid_from)
+    valid_until = _validate_iso_date(valid_until)
     now = datetime.now(timezone.utc).isoformat()
 
     old_node = db.get_knowledge_node(old_node_id)
@@ -1129,8 +1155,8 @@ def _apply_supersession(
         "superseded_by": "",
         "contradiction_note": "",
         "tags": old_node.get("tags", []),
-        "valid_from": now,
-        "valid_until": None,
+        "valid_from": valid_from or now,
+        "valid_until": valid_until,
         "version": old_version + 1,
         "lineage_id": lineage_id,
     }
