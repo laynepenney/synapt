@@ -325,8 +325,8 @@ def test_only_create_actions_enter_b4_and_other_actions_pass_through_untouched()
     ]
     fruit = _real_pipeline(specs, existing_nodes=[corroborated, contradicted])
     composed = (
-        "The sprint-41 B4 stage stays behind SYNAPT_USE_EXTRACT and guards indexed member "
-        "groups deterministically."
+        "The sprint-41 B4 stage stays behind the SYNAPT_USE_EXTRACT flag and guards indexed "
+        "member groups deterministically before reconcile executes."
     )
     output, requests = _invoke_rejoin(fruit, _response(([0, 1], composed)))
 
@@ -415,7 +415,8 @@ def test_metadata_unions_tags_and_uses_member_category_majority():
         _FactSpec("The release record also captures the operator decision.", "decision", ("operator",)),
     ])
     composed = (
-        "The B4 adapter groups both indexed release facts and records the related operator decision."
+        "The B4 adapter groups both indexed release facts together and records the related "
+        "operator decision alongside them for the sprint-41 release."
     )
     output, _ = _invoke_rejoin(fruit, _response(([0, 1, 2], composed)))
     node = _by_content(output, composed)
@@ -430,7 +431,10 @@ def test_category_tie_uses_the_first_member_in_the_model_group():
         _FactSpec("The architecture record names the indexed B4 adapter.", "architecture"),
         _FactSpec("The decision record enables the indexed B4 adapter.", "decision"),
     ])
-    composed = "The decision enables the indexed B4 adapter named by the architecture record."
+    composed = (
+        "The operator decision enables the indexed B4 adapter named by the architecture "
+        "record for the full sprint-41 rollout window."
+    )
     output, _ = _invoke_rejoin(fruit, _response(([1, 0], composed)))
 
     assert _by_content(output, composed)["category"] == "decision"
@@ -442,7 +446,8 @@ def test_composition_decision_log_binds_members_sources_digests_and_content(tmp_
         _FactSpec("The B4 adapter records the second member's content digest.", tags=("audit",)),
     ])
     composed = (
-        "The B4 adapter records each member's durable source identity and content digest."
+        "The B4 adapter records each indexed member's durable source identity and content "
+        "digest inside the sprint-41 decision log."
     )
     decision_path = tmp_path / "decisions.jsonl"
     _invoke_rejoin(
@@ -750,3 +755,191 @@ def test_run_extract_path_inserts_b4_between_real_b2_output_and_b3(
     assert all(item["source_unit_id"].startswith("b4-wiring-real:") for item in seen["b2_items"])
     assert seen["decision_log_path"] == decision_path
     assert seen["b3_nodes"] == rejoined
+
+
+# Guard closures — Sentinel's recall#884 re-review (2026-07-15), all four fruit-reproduced.
+
+
+def test_whitespace_composed_content_rejects_the_group_and_persists_original_members(tmp_path):
+    """A whitespace-only composition is silently DROPPED by real _apply_consolidation_result
+    (0 nodes created — verified against the actual create branch, not assumed). B4 must catch
+    this before B3 ever sees it, or both members are lost."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The adapter failures reported in this cluster are unrelated to SQLite "
+            "locking behavior observed during the retry-boundary investigation."
+        ),
+        _FactSpec(
+            "Recall stores durable node revisions in an append-versioned "
+            "knowledge.jsonl file that survives process restarts without data loss."
+        ),
+    ])
+    output, _ = _invoke_rejoin(fruit, _response(([0, 1], "   ")))
+
+    assert output == fruit.action_items
+
+    knowledge_path = tmp_path / "knowledge.jsonl"
+    result = consolidate._apply_consolidation_result(
+        {"nodes": output}, [], fruit.cluster, knowledge_path,
+    )
+    assert result.nodes_created == 2
+    assert len(read_nodes(knowledge_path)) == 2
+
+
+def test_composed_content_over_b3_ceiling_rejects_the_group_instead_of_silently_truncating(
+    tmp_path,
+):
+    """A composition over 300 chars is silently WORD-TRUNCATED by real
+    _apply_consolidation_result (verified: a 339-char input persists at 298 chars, the final
+    clause gone with no warning). B4 must reject it before that happens."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The adapter failures reported in this cluster are unrelated to SQLite "
+            "locking behavior observed during the retry-boundary investigation."
+        ),
+        _FactSpec(
+            "Recall stores durable node revisions in an append-versioned "
+            "knowledge.jsonl file that survives process restarts without data loss."
+        ),
+    ])
+    over_limit = "x" * (consolidate._B4_COMPOSE_CONTENT_MAX_CHARS + 1)
+    output, _ = _invoke_rejoin(fruit, _response(([0, 1], over_limit)))
+
+    assert output == fruit.action_items
+
+    knowledge_path = tmp_path / "knowledge.jsonl"
+    result = consolidate._apply_consolidation_result(
+        {"nodes": output}, [], fruit.cluster, knowledge_path,
+    )
+    assert result.nodes_created == 2
+    assert len(read_nodes(knowledge_path)) == 2
+
+
+def test_low_specificity_composed_content_rejects_the_group_and_persists_original_members(
+    tmp_path,
+):
+    """A short, NON-whitespace, well-under-300-char composed sentence can still silently
+    vanish at real B3: _apply_consolidation_result's create branch also runs
+    _is_generic_node/_lacks_specificity/contamination/_is_garbled_content, not just the
+    empty/oversize checks. Discovered via adversarial verification (not Sentinel's original
+    finding, but the same failure CLASS): "The build finished and all tests passed without
+    any errors." (62 chars) sails past a length-only guard, then _lacks_specificity(...,
+    threshold=120) drops it at B3 with nodes_created=0 — both members lost, same symptom."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The adapter failures reported in this cluster are unrelated to SQLite "
+            "locking behavior observed during the retry-boundary investigation."
+        ),
+        _FactSpec(
+            "Recall stores durable node revisions in an append-versioned "
+            "knowledge.jsonl file that survives process restarts without data loss."
+        ),
+    ])
+    low_specificity = "The build finished and all tests passed without any errors."
+    output, _ = _invoke_rejoin(fruit, _response(([0, 1], low_specificity)))
+
+    assert output == fruit.action_items
+
+    knowledge_path = tmp_path / "knowledge.jsonl"
+    result = consolidate._apply_consolidation_result(
+        {"nodes": output}, [], fruit.cluster, knowledge_path,
+    )
+    assert result.nodes_created == 2
+    assert len(read_nodes(knowledge_path)) == 2
+
+
+def test_duplicate_membership_across_a_valid_and_an_invalid_group_still_fails_open(
+    truth_fruit, caplog,
+):
+    """A real index appearing in a DROPPED (invalid-index-containing) group AND a separately
+    valid group is still cross-group duplicate membership — the model's own bookkeeping is
+    incoherent even though one of the two groups also happens to be invalid. Filtering the
+    invalid group out before scanning for duplicates would hide this (fruit-confirmed,
+    Sentinel: [0,1,999] + [0,2] let index 0 slip through under the old ordering)."""
+    caplog.set_level(logging.WARNING)
+    output, _ = _invoke_rejoin(
+        truth_fruit,
+        _response(
+            ([0, 1, 999], "corrupted mixed group"),
+            ([0, 2], "otherwise-valid group"),
+        ),
+    )
+
+    assert output == truth_fruit.action_items
+    messages = _warning_messages(caplog)
+    assert any("B4_COMPOSE_FAIL_OPEN" in message for message in messages)
+    assert any("duplicate" in message.lower() for message in messages)
+
+
+def test_malformed_group_indices_type_fails_open_the_whole_cluster_with_loud_marker(
+    truth_fruit, caplog,
+):
+    """A group whose ``indices`` is the WRONG TYPE (a string, not a list) is a schema
+    violation, not an intentional unaddressed response — it must fail open loudly, not
+    silently vanish via the same per-element skip that handles a genuinely absent index
+    (fruit-confirmed, Sentinel: this shape produced zero B4_COMPOSE_FAIL_OPEN warnings under
+    the old per-element ``continue``)."""
+    caplog.set_level(logging.WARNING)
+    output, _ = _invoke_rejoin(
+        truth_fruit,
+        {"groups": [{"indices": "0,1", "content": "joined"}]},
+    )
+
+    assert output == truth_fruit.action_items
+    messages = _warning_messages(caplog)
+    assert any("B4_COMPOSE_FAIL_OPEN" in message for message in messages)
+
+
+def test_non_string_tag_element_is_sanitized_not_crashed():
+    """A real B2 response can carry a non-string tag element (int 7 alongside "good") — a bare
+    ``sorted({...})`` over the unioned tag set raises TypeError on a mixed str/int comparison,
+    crashing B4 entirely OUTSIDE the fail-open path (fruit-confirmed, Sentinel). Tag elements
+    must be sanitized the same way _apply_consolidation_result's own monolith-path tags are
+    (``scrub_text(str(t)) for t in tags if t``) before the union, so this can never crash."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The B4 tag-safety probe records the first member with a numeric tag element.",
+            tags=("good", 7),
+        ),
+        _FactSpec(
+            "The B4 tag-safety probe records the second member with only string tags.",
+            tags=("clean",),
+        ),
+    ])
+    composed = (
+        "The B4 tag-safety probe composes both indexed members together without crashing "
+        "on the numeric tag element during sprint-41."
+    )
+    output, _ = _invoke_rejoin(fruit, _response(([0, 1], composed)))
+
+    node = _by_content(output, composed)
+    assert set(node["tags"]) == {"good", "7", "clean"}
+
+
+def test_decision_log_write_failure_rejects_the_composition_not_an_untraceable_persist(
+    tmp_path,
+):
+    """Guard 3 chose the decision log as v1's ONLY durable member provenance. A write failure
+    that gets silently swallowed would persist a compound node with NO record anywhere of what
+    it was composed from (fruit-confirmed, Sentinel). B4 must reject the composition instead —
+    members fall back to individual pass-through, which at least stays traceable as atoms."""
+    fruit = _real_pipeline([
+        _FactSpec("The B4 provenance-failure probe records the first member's identity."),
+        _FactSpec("The B4 provenance-failure probe records the second member's identity."),
+    ])
+    composed = (
+        "The B4 provenance-failure probe composes both members' identities into one node."
+    )
+    # decision_log_path's PARENT already exists as a FILE (not a directory), so the real
+    # mkdir(parents=True) inside _log_b4_compose_decision raises OSError — a genuine write
+    # failure, not a mocked one.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    unwritable_log = blocker / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit, _response(([0, 1], composed)), decision_log_path=unwritable_log,
+    )
+
+    assert output == fruit.action_items
+    assert not unwritable_log.exists()

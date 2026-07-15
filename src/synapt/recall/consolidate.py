@@ -2262,18 +2262,66 @@ def _group_temporal_bound(members: list[dict]) -> tuple[str | None, str | None] 
     return None
 
 
+# The composed content's own safety ceiling, matched to _apply_consolidation_result's real
+# create-branch pipeline (content = scrub_text(_tw(str(raw_node.get("content", "")), 300))) —
+# NOT a new independent limit. A composition that would arrive at B3 empty-after-scrub (e.g.
+# whitespace-only) is silently DROPPED there (0 nodes created, both members lost); one that
+# exceeds 300 chars is silently WORD-TRUNCATED (the load-bearing final clause can vanish with
+# no warning). Both are real, fruit-confirmed (Sentinel, recall#884 re-review): B4 must reject
+# a group whose composed content would hit either path, BEFORE it ever reaches B3, and fall
+# the group's members back to individual pass-through instead.
+_B4_COMPOSE_CONTENT_MAX_CHARS = 300
+
+
+def _b4_composed_content_is_safe(content: str) -> bool:
+    """Whether *content* would survive ``_apply_consolidation_result``'s real create branch,
+    not just the empty/oversize cases above. Empty-after-scrub and over-length are ONE class
+    of silent B3 drop; the create branch runs FOUR MORE unconditionally (or content-profile-
+    default when no profile is supplied, which is B4's own reality — it has no
+    ``content_profile`` to thread through): generic-pattern rejection (``_is_generic_node``),
+    low-specificity rejection (``_lacks_specificity``, threshold 120 — B3's own default when
+    ``content_profile`` is None), few-shot example-placeholder contamination
+    (``"[PersonA]"``/``"[PersonB]"``), and garbled-parse-leak rejection (``_is_garbled_content``).
+
+    Adversarial verification of the length/whitespace guard alone found this empirically: a
+    62-char, non-whitespace, well-under-300-char composed sentence ("The build finished and
+    all tests passed without any errors.") sailed past a length-only check and then silently
+    vanished at B3 via ``_lacks_specificity`` — the IDENTICAL both-members-lost symptom
+    Sentinel's original finding named, just through an uncovered gate. Reusing B3's own
+    functions (not reimplementing their logic) closes the general failure class, not only the
+    literal repro.
+    """
+    if not content.strip() or len(content) > _B4_COMPOSE_CONTENT_MAX_CHARS:
+        return False
+    if _is_generic_node(content):
+        return False
+    if _lacks_specificity(content, threshold=120, content_type=None):
+        return False
+    if "[PersonA]" in content or "[PersonB]" in content:
+        return False
+    if _is_garbled_content(content):
+        return False
+    return True
+
+
 def _log_b4_compose_decision(
     decision_log_path: Path,
     cluster_id: str,
     member_indices: list[int],
     members: list[dict],
     composed_content: str,
-) -> None:
+) -> bool:
     """Durable v1 traceability for a B4 composition (guard 3): the full member -> group
     mapping in the decision log — the existing durable audit substrate — rather than a new
-    KnowledgeNode field (B3/schema stay unchanged). Pure logging — never disrupts
-    consolidation; a write failure is swallowed the same way ``_log_dedup_decision`` already
-    does for its own entries."""
+    KnowledgeNode field (B3/schema stay unchanged).
+
+    Returns whether the entry was actually persisted. UNLIKE ``_log_dedup_decision`` (whose
+    write failure is harmless best-effort telemetry), guard 3 chose the decision log as v1's
+    ONLY durable member provenance — best-effort-swallow-the-OSError would silently persist an
+    untraceable compound with no record anywhere of what it was composed from (fruit-confirmed,
+    Sentinel, recall#884 re-review). The caller must reject the composition on ``False``, not
+    treat this as fire-and-forget logging.
+    """
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "action": "b4-compose",
@@ -2292,8 +2340,10 @@ def _log_b4_compose_decision(
             lock_exclusive(f)
             f.write(json.dumps(entry) + "\n")
             f.flush()
+        return True
     except OSError:
         logger.debug("Failed to write B4 compose decision log")
+        return False
 
 
 def _b4_fail_open(action_items: list[dict], cluster_id: str, reason: str) -> list[dict]:
@@ -2320,6 +2370,11 @@ def _rejoin_create_actions(
 
     See config/design/recall-B4-rejoin-stage-2026-07-15.md for the full contract; the guard
     numbers referenced below match that spec.
+
+    NOTE: ``decision_log_path=None`` is a total, silent opt-out of guard 3's traceability —
+    a composition proceeds with zero provenance logged, the same as if the write had failed.
+    Every real production call site (``_run_extract_path``) always supplies a concrete path,
+    so this is reachable only for a caller that deliberately omits it.
     """
     create_indices = [i for i, item in enumerate(action_items) if item.get("action") == "create"]
     if not create_indices:
@@ -2351,49 +2406,113 @@ def _rejoin_create_actions(
             "compose response unparseable or wrong group shape/schema",
         )
 
-    # Guard 1: build the valid-membership candidate groups. A group with ANY out-of-range or
-    # non-int index is dropped WHOLE — its real members are not partially trusted under text
-    # written for a fabricated/different membership set (per-group degradation).
-    candidate_groups: list[tuple[list[int], str]] = []
+    # Guard 3 (schema): a group entry with the WRONG TYPE for indices/content (e.g. a string
+    # "0,1" instead of a list) is not an intentional unaddressed response — it means the
+    # model's response as a whole doesn't conform to the contract, so it fails open the ENTIRE
+    # cluster (fruit-confirmed, Sentinel: {"indices": "0,1", ...} silently produced zero
+    # B4_COMPOSE_FAIL_OPEN marker under the old per-element ``continue``). An empty indices
+    # list is structurally valid but vacuous — that group simply contributes nothing, no
+    # schema violation.
+    raw_groups: list[tuple[list, str]] = []
     for g in parsed["groups"]:
         if not isinstance(g, dict):
-            continue
+            return _b4_fail_open(
+                action_items, cluster_id,
+                "compose response contains a structurally malformed group entry (not an object)",
+            )
         idxs = g.get("indices")
         content = g.get("content")
-        if not isinstance(idxs, list) or not idxs or not isinstance(content, str):
-            continue
-        if any(not isinstance(i, int) or isinstance(i, bool) or not (0 <= i < n) for i in idxs):
-            continue
-        candidate_groups.append((idxs, content))
+        if not isinstance(idxs, list) or not isinstance(content, str):
+            return _b4_fail_open(
+                action_items, cluster_id,
+                "compose response contains a structurally malformed group entry "
+                "(indices/content wrong type — schema violation)",
+            )
+        raw_groups.append((idxs, content))
 
-    # Duplicate membership ACROSS groups is a stronger violation than one bad group — the
-    # model's own bookkeeping is incoherent — so it invalidates the ENTIRE response.
+    # Guard 1 (never-drop) + duplicate detection: compute each group's REAL (in-range, non-bool
+    # int) member indices BEFORE deciding whether to drop any group for containing an invalid
+    # one. Duplicate membership must be scanned across every group's real members regardless of
+    # whether that specific group later gets dropped — a real index appearing in two DIFFERENT
+    # proposed groups means the model's own bookkeeping is incoherent even if one of those
+    # groups also happens to contain a hallucinated index (fruit-confirmed, Sentinel: [0,1,999]
+    # + [0,2] let index 0's cross-group collision through when the first group was filtered
+    # BEFORE the duplicate scan ran). Scanning real members up front closes that ordering gap.
+    group_real_members: list[list[int]] = []
     seen: set[int] = set()
     duplicate = False
-    for idxs, _ in candidate_groups:
-        for i in idxs:
+    for idxs, _content in raw_groups:
+        real = [
+            i for i in idxs
+            if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
+        ]
+        group_real_members.append(real)
+        for i in real:
             if i in seen:
                 duplicate = True
             seen.add(i)
     if duplicate:
         return _b4_fail_open(action_items, cluster_id, "duplicate membership across groups")
 
+    # NOW drop any group that contained an invalid/hallucinated index (per-group degradation —
+    # its real members are not partially trusted under text written for a fabricated/different
+    # membership set) or was empty to begin with.
+    candidate_groups: list[tuple[list[int], str]] = []
+    for (idxs, content), real in zip(raw_groups, group_real_members):
+        if not real or len(real) != len(idxs):
+            continue
+        candidate_groups.append((real, content))
+
     # Guard 4 + composition: singleton groups (len 1) are pass-through, never rewritten, even
     # if the model proposed text for them. Multi-member groups compose only if their bounds
-    # don't conflict (guard 4); a conflicting-bounds group is per-group-degraded, not the
-    # whole cluster.
+    # don't conflict (guard 4), their composed content is safe for B3's real content pipeline
+    # (guard "content" below), and — when a decision-log path was given — provenance actually
+    # persisted (guard 3 traceability below). Any of these failing is per-group degradation,
+    # not the whole cluster.
     successful_by_first_pos: dict[int, dict] = {}
     composed_member_positions: set[int] = set()
     for idxs, content in candidate_groups:
         if len(idxs) < 2:
             continue
+
+        # Guard "content": reject a composition that would silently vanish or degrade once it
+        # reaches _apply_consolidation_result's real create branch — see
+        # _b4_composed_content_is_safe for the full list of checks reused from B3. Members
+        # fall back to individual pass-through.
+        if not _b4_composed_content_is_safe(content):
+            continue
+
         members = [creates[i] for i in idxs]
         bound = _group_temporal_bound(members)
         if bound is None:
             continue  # guard 4 conflict: this group's members fall back to pass-through
         categories = [m["category"] for m in members]
         category = Counter(categories).most_common(1)[0][0]
-        tags = sorted({t for m in members for t in (m.get("tags") or [])})
+        # Sanitize member-supplied tag elements the SAME way _apply_consolidation_result's own
+        # monolith-path tags do (scrub_text(str(t)) for t in tags if t) — a real B2 response can
+        # carry a non-string tag element (fruit-confirmed, Sentinel: ["good", 7]), and a bare
+        # sorted({...}) over a mixed-type set raises TypeError, crashing B4 entirely outside the
+        # fail-open path. str() coercion first means the set is always string-only; sorted()
+        # can never see a type it can't compare.
+        tags = sorted({
+            scrub_text(str(t)) for m in members for t in (m.get("tags") or []) if t
+        })
+
+        if decision_log_path is not None:
+            logged_ok = _log_b4_compose_decision(
+                decision_log_path, cluster_id, idxs, members, content,
+            )
+            if not logged_ok:
+                # Guard 3 traceability: the decision log is v1's ONLY durable member
+                # provenance (fruit-confirmed, Sentinel). A write failure means this
+                # composition CANNOT be traced back to its members — reject it loudly rather
+                # than persist an untraceable compound; members fall back to pass-through.
+                logger.warning(
+                    "B4_COMPOSE_FAIL_OPEN cluster=%s reason=%s member_indices=%s",
+                    cluster_id, "decision-log provenance write failed", idxs,
+                )
+                continue
+
         composed = {
             "action": "create",
             "existing_id": None,
@@ -2409,8 +2528,6 @@ def _rejoin_create_actions(
         successful_by_first_pos[first_original_pos] = composed
         for i in idxs:
             composed_member_positions.add(create_indices[i])
-        if decision_log_path:
-            _log_b4_compose_decision(decision_log_path, cluster_id, idxs, members, content)
 
     output: list[dict] = []
     for pos, item in enumerate(action_items):
