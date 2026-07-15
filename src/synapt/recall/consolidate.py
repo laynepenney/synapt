@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import threading
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1489,7 +1490,7 @@ def _get_consolidation_client(max_tokens: int = MIN_RESPONSE_TOKENS):
     return MLXClient(MLXOptions(max_tokens=max_tokens))
 
 
-def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESPONSE_TOKENS):
+def _make_recall_infer(client, model: str):
     """Build the SYNC inference seam that extract_batch injects: a
     ``BatchInferRequest -> completion str`` callable wrapping recall's model client.
 
@@ -1498,13 +1499,21 @@ def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESP
     (zero recall coupling). extract_batch calls this SYNCHRONOUSLY (never awaited), so it
     stays a plain function.
 
-    ``max_tokens`` is read PER-REQUEST from an optional ``request["max_tokens"]`` key
-    (falling back to ``default_max_tokens`` when absent) rather than fixed once at build
-    time — one ``infer`` closure serves BOTH B1's per-unit extract_batch calls (small,
-    fixed-shape responses, the default floor is fine) AND B2's per-CLUSTER action-decision
-    call (whose response size scales with candidate count — a flat floor silently truncates
-    a dense cluster's response, see ``_estimate_action_decision_budget``). extract_batch's
-    own ``BatchInferRequest`` never sets this key, so B1's behavior is unchanged.
+    ``max_tokens`` is read PER-REQUEST from an optional ``request["max_tokens"]`` key. One
+    ``infer`` closure serves B1's per-unit extract_batch calls, B2's per-cluster
+    action-decision call, and B4's per-cluster rejoin call — B2/B4 always set their own
+    ``request["max_tokens"]`` explicitly (candidate-count-scaled), so this fallback only
+    ever fires for B1.
+
+    B1's ``BatchInferRequest`` (extract#33, synapt-extract) never sets ``max_tokens`` — it
+    is out of recall's control (extract_batch owns per-unit request construction). The
+    fallback used to be a flat ``MIN_RESPONSE_TOKENS`` (800) floor on the theory that B1's
+    per-unit responses were small and fixed-shape; the Phase C dogfood (RESULTS.md
+    "Truncation read") falsified that on 3 real unit shapes — Qwen hit 8 extract-unit
+    length-finishes against exactly those 3 prompts. Reusing ``_estimate_response_budget``
+    (already context-aware: gives most short prompts up to ``CONTEXT_BUDGET`` tokens, only
+    drops toward the 800 floor as the prompt itself grows large) closes the gap with no new
+    estimator — the same fix class B2 already applied to its own flat-floor bug.
     """
     def recall_infer(request) -> str:
         raw_messages = request.get("messages") or []
@@ -1514,7 +1523,9 @@ def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESP
         ]
         if not messages:  # fall back to the flat prompt if the request carried no messages
             messages = [Message(role="user", content=request.get("prompt", ""))]
-        max_tokens = request.get("max_tokens") or default_max_tokens
+        max_tokens = request.get("max_tokens") or _estimate_response_budget(
+            request.get("prompt", "")
+        )
         return client.chat(
             model=model,
             messages=messages,
@@ -1678,8 +1689,9 @@ def _run_extract_path(
     content_profile=None,
 ) -> ConsolidationResult | None:
     """The decomposed extract path (SYNAPT_USE_EXTRACT): B1 (extract) -> B2 (action-decision)
-    -> B3 (reconcile — the SAME ``_apply_consolidation_result`` the monolithic path uses).
-    Failed extract units are logged (never silent-dropped, see ``_log_extract_failure``); facts
+    -> B4 (rejoin — see ``_rejoin_create_actions``) -> B3 (reconcile — the SAME
+    ``_apply_consolidation_result`` the monolithic path uses). Failed extract units are logged
+    (never silent-dropped, see ``_log_extract_failure``); facts
     that extract successfully are handed to the focused action-decision pass (B2), then fed to
     reconcile exactly as the monolith's parsed LLM output would be.
 
@@ -1719,6 +1731,12 @@ def _run_extract_path(
 
     # B2: decide actions for the successfully-extracted facts against existing knowledge.
     action_items = _decide_actions(cluster, cluster_id, ok, existing_nodes, infer) if ok else []
+
+    # B4: rejoin CREATE-bound items into compound memories before reconcile executes.
+    # Shape-preserving (see _rejoin_create_actions) — B3 below needs zero changes.
+    action_items = _rejoin_create_actions(
+        action_items, cluster_id, infer, decision_log_path=decision_log_path,
+    )
 
     # B3: feed the SAME reconcile the monolithic path uses.
     cluster_result = _apply_consolidation_result(
@@ -2009,11 +2027,14 @@ def _decide_actions(
     infer,
 ) -> list[dict]:
     """B2: the action-decision pass. Flattens B1's successfully-extracted facts, asks a focused
-    LLM pass (existing knowledge + new facts -> per-fact action) and returns reconcile-ready
-    dicts: EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
+    LLM pass (existing knowledge + new facts -> per-fact action) and returns B4-ready dicts:
+    EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
     ``existing_id``, ``content``, ``category``, ``tags``, ``source_turns``,
-    ``contradiction_note``, ``valid_from``, ``valid_until``). ``confidence`` is NOT included —
-    reconcile computes it itself (B1 contract-read Finding 3) with no fallback gap.
+    ``contradiction_note``, ``valid_from``, ``valid_until``), PLUS ``source_unit_id`` — a
+    pass-through B4 needs for decision-log provenance (guard 3, contract-answer
+    2026-07-15); reconcile ignores the extra key (verified, not assumed — B3 stays
+    zero-changes). ``confidence`` is NOT included — reconcile computes it itself (B1
+    contract-read Finding 3) with no fallback gap.
 
     ``valid_from``/``valid_until`` come from each fact's unit-level ``temporal_refs``, mapped
     DETERMINISTICALLY by role in ``_flatten_envelope_facts`` (module TEMPORAL — ROLE note) — this
@@ -2106,8 +2127,302 @@ def _decide_actions(
             # the action means it survives the fail-closed-to-create path unchanged.
             "valid_from": fact.get("valid_from"),
             "valid_until": fact.get("valid_until"),
+            # Pass-through provenance for B4 (config/design/recall-B4-rejoin-stage-2026-07-15.md
+            # guard 3, contract-answer 2026-07-15): reconcile ignores unknown dict keys (verified,
+            # not assumed — every field _apply_consolidation_result reads comes off .get(), never
+            # **kwargs/dataclass unpacking), so this rides through B3 unused until B4 unions member
+            # ids into the decision log. Not a KnowledgeNode field — no schema/storage change.
+            "source_unit_id": fact.get("source_unit_id"),
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# B4 — the rejoin/compose stage (behind SYNAPT_USE_EXTRACT, same flag as B1/B2)
+#
+# Position: B2 -> B4 -> B3. Every stage up to here atomizes or passes atoms through; nothing
+# ever reassembles. The Phase C dogfood (config/design/recall-B4-rejoin-stage-2026-07-15.md)
+# found the decomposed path finds more and lies less than legacy but fragments compound
+# memories (378 nodes vs the 185-node frontier ideal, boundary F1 9.1% vs legacy's 23.0%) —
+# and fragmentation CORRUPTS truth (3 concrete false memories in verification). B4 rejoins:
+# it takes a cluster's CREATE-bound action items and composes them into compound memories at
+# ideal granularity before reconcile executes. Only CREATE items participate — corroborate/
+# contradict target existing nodes and carry no new granularity, so they pass through B4
+# untouched and never reach the model.
+#
+# Five contract guards, each its own mechanism-TDD test (recall#883, Sentinel):
+#   1. COUNT-INVARIANT, never-drop: every create index appears in exactly one output group.
+#      A group with ANY invalid/hallucinated index is dropped WHOLE (per-group degradation —
+#      the composed text was written describing a membership set that doesn't exist once one
+#      member is fake; trusting it for the survivors would persist text written for a
+#      different group). Duplicate membership ACROSS groups invalidates the ENTIRE response
+#      (whole-cluster fail-open) — a stronger violation than a single bad group, since it
+#      means the model's own bookkeeping is incoherent, not just one group's target set.
+#   2. COMPOSE FROM MEMBERS ONLY: v1 enforcement is PROMPT-LEVEL (the composition prompt pins
+#      anti-corruption instructions against the three observed truth-corruption classes —
+#      negation flip, convention misread, relation/causal misread). Runtime entailment
+#      checking is v2, gated on the dogfood's source-clean precision axis.
+#   3. METADATA UNION: tags unioned, category by majority-of-members (ties broken by the
+#      FIRST member in the MODEL's own group order — Counter.most_common()'s stable sort
+#      naturally does this when members are visited in group order). Durable NODE-level
+#      provenance is a v2 follow-up; v1 traceability lives in the decision log (member
+#      source_unit_ids + content digests + composed content), keeping B3/KnowledgeNode
+#      unchanged.
+#   4. TEMPORAL CONFLICT RULE: identical bounds across bounded members -> carry; conflicting
+#      non-null bounds (including two members with different single-sided bounds that would
+#      otherwise synthesize an unasserted range) -> the group is REJECTED and its members
+#      revert to individual pass-through (per-group degradation, same mechanism as #1's
+#      invalid-index drop — NOT the whole-cluster fail-open of #1's duplicate case); exactly
+#      one bounded member -> carry that member's bound verbatim (safe because #878's fan-out
+#      suppression already made "non-null bound => sole output of its source unit" true at
+#      write time — no text re-detection needed here).
+#   5. FAIL-OPEN degradation: an unparseable/wrong-shape response or an infer exception
+#      degrades the WHOLE cluster's creates to pass-through, never blocked, never dropped —
+#      plus a loud, non-silent B4_COMPOSE_FAIL_OPEN warning naming the cluster and reason.
+# ---------------------------------------------------------------------------
+
+_B4_COMPOSE_PROMPT = """\
+You are grouping and composing related facts into compound memories.
+
+## Facts to consider (indexed)
+{candidates}
+
+## Task
+Decide which of the facts above describe the SAME underlying memory and should be composed \
+together into one compound entry. A fact that stands alone should be its own singleton group.
+
+For EACH fact index above, put it in exactly one group. Give each group's member indices and \
+ONE composed content string for that group.
+
+Rules:
+1. Compose ONLY from the given MEMBER facts — never assert a relation, cause, or qualifier \
+that is not directly present in a member's own text. Do not flip a negation (a fact stating \
+something is unrelated must stay unrelated in the composition). Do not alter a stated \
+convention or definition (e.g. what a label means) when restating it.
+2. Every index above must appear in EXACTLY ONE group.
+3. Output ONLY valid JSON, no markdown fences, no explanation.
+
+{{"groups": [{{"indices": [0, 1], "content": "..."}}, {{"indices": [2], "content": "..."}}]}}
+"""
+
+
+def _build_rejoin_prompt(creates: list[dict]) -> str:
+    """Render the create-only candidates as an indexed list for the compose prompt. Indices
+    are positions within *creates* (the FILTERED create-only list the model sees) — NOT
+    positions in the full action_items list, since the model never sees non-create items."""
+    candidates = "\n".join(f"[{i}] {item['content']}" for i, item in enumerate(creates))
+    return _B4_COMPOSE_PROMPT.format(candidates=candidates)
+
+
+# A composed group's content is a full merged sentence (potentially several member facts
+# folded together) — larger than a single action-decision item, so a bigger per-group
+# estimate than B2's _ACTION_ITEM_TOKEN_ESTIMATE. Mirrors _estimate_action_decision_budget's
+# shape: do NOT repeat the flat-800-floor bug class at this stage either.
+_B4_COMPOSE_GROUP_TOKEN_ESTIMATE = 150
+
+
+def _estimate_rejoin_budget(prompt: str, n_creates: int) -> int:
+    """Estimate ``max_tokens`` for B4's compose response, scaled to create-item count (see
+    module note — the same fix class as ``_estimate_action_decision_budget``).
+
+    Deliberately does NOT take ``max(..., _estimate_response_budget(prompt))`` the way B2
+    does: B4's prompt itself grows with ``n_creates`` (more candidates listed), so
+    ``_estimate_response_budget``'s CONTEXT_BUDGET-minus-prompt-tokens term actively SHRINKS
+    as the cluster gets denser — the opposite of what "scale with create count" needs. A
+    pure count-scaled floor is generous on its own (no upper cap; the model stops at EOS)
+    and, unlike the combinator, never fights its own growth as the prompt lengthens.
+    """
+    return MIN_RESPONSE_TOKENS + _B4_COMPOSE_GROUP_TOKEN_ESTIMATE * n_creates
+
+
+def _group_temporal_bound(members: list[dict]) -> tuple[str | None, str | None] | None:
+    """Guard 4: decide the (valid_from, valid_until) a composed group should carry, or None
+    if the group must be REJECTED for conflicting bounds (caller then reverts its members to
+    individual pass-through — see module note, per-group degradation).
+
+    A member "has a bound" when either field is non-null. Zero bounded members -> (None,
+    None), trivially. Exactly one bounded member -> carry its tuple verbatim (safe per #878's
+    fan-out suppression: a non-null bound already means "sole output of its unit"). Two or
+    more bounded members whose tuples are ALL identical -> carry that shared tuple. Any
+    difference between bounded members' tuples — including two members with different
+    single-sided bounds that would otherwise synthesize an unasserted range — is a conflict:
+    reject the group. Precision-first: a validity boundary is real evidence of two different
+    memories; do not merge across it.
+    """
+    bounded = [
+        (m.get("valid_from"), m.get("valid_until"))
+        for m in members
+        if m.get("valid_from") or m.get("valid_until")
+    ]
+    if not bounded:
+        return (None, None)
+    distinct = set(bounded)
+    if len(distinct) == 1:
+        return bounded[0]
+    return None
+
+
+def _log_b4_compose_decision(
+    decision_log_path: Path,
+    cluster_id: str,
+    member_indices: list[int],
+    members: list[dict],
+    composed_content: str,
+) -> None:
+    """Durable v1 traceability for a B4 composition (guard 3): the full member -> group
+    mapping in the decision log — the existing durable audit substrate — rather than a new
+    KnowledgeNode field (B3/schema stay unchanged). Pure logging — never disrupts
+    consolidation; a write failure is swallowed the same way ``_log_dedup_decision`` already
+    does for its own entries."""
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "b4-compose",
+        "cluster_id": cluster_id,
+        "member_indices": list(member_indices),
+        "source_unit_ids": [m.get("source_unit_id") for m in members],
+        "member_content_digests": [
+            hashlib.sha256(m["content"].encode("utf-8")).hexdigest() for m in members
+        ],
+        "composed_content": composed_content,
+    }
+    try:
+        from synapt.recall._filelock import lock_exclusive
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(decision_log_path, "a", encoding="utf-8") as f:
+            lock_exclusive(f)
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except OSError:
+        logger.debug("Failed to write B4 compose decision log")
+
+
+def _b4_fail_open(action_items: list[dict], cluster_id: str, reason: str) -> list[dict]:
+    """Guard 5: degrade the WHOLE cluster's creates to pass-through, loudly. Never blocked,
+    never dropped — worst case is the status quo ante (every create stays atomic)."""
+    logger.warning(
+        "B4_COMPOSE_FAIL_OPEN cluster=%s reason=%s", cluster_id, reason,
+    )
+    return action_items
+
+
+def _rejoin_create_actions(
+    action_items: list[dict],
+    cluster_id: str,
+    infer,
+    *,
+    decision_log_path: Path | None = None,
+) -> list[dict]:
+    """B4: rejoin CREATE-bound action items into compound memories at natural granularity
+    before B3 reconcile executes. Consumes B2's action-item list and emits a possibly-shorter
+    list of the SAME shape — grouped creates replaced by composed creates, everything else
+    (corroborate/contradict, unaddressed/singleton/rejected-group creates) passed through
+    unchanged at its original position. B3 needs ZERO changes (see module note).
+
+    See config/design/recall-B4-rejoin-stage-2026-07-15.md for the full contract; the guard
+    numbers referenced below match that spec.
+    """
+    create_indices = [i for i, item in enumerate(action_items) if item.get("action") == "create"]
+    if not create_indices:
+        return action_items  # guard 1 scope line: nothing to compose, no inference call
+
+    creates = [action_items[i] for i in create_indices]
+    n = len(creates)
+    prompt = _build_rejoin_prompt(creates)
+    budget = _estimate_rejoin_budget(prompt, n)
+    request = {
+        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
+        "capabilities": [],
+        "max_tokens": budget,
+    }
+
+    try:
+        response = infer(request)
+    except Exception as exc:
+        return _b4_fail_open(
+            action_items, cluster_id,
+            f"compose inference backend unavailable, exception: {exc!r}",
+        )
+
+    parsed = _parse_llm_response(response)
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("groups"), list):
+        return _b4_fail_open(
+            action_items, cluster_id,
+            "compose response unparseable or wrong group shape/schema",
+        )
+
+    # Guard 1: build the valid-membership candidate groups. A group with ANY out-of-range or
+    # non-int index is dropped WHOLE — its real members are not partially trusted under text
+    # written for a fabricated/different membership set (per-group degradation).
+    candidate_groups: list[tuple[list[int], str]] = []
+    for g in parsed["groups"]:
+        if not isinstance(g, dict):
+            continue
+        idxs = g.get("indices")
+        content = g.get("content")
+        if not isinstance(idxs, list) or not idxs or not isinstance(content, str):
+            continue
+        if any(not isinstance(i, int) or isinstance(i, bool) or not (0 <= i < n) for i in idxs):
+            continue
+        candidate_groups.append((idxs, content))
+
+    # Duplicate membership ACROSS groups is a stronger violation than one bad group — the
+    # model's own bookkeeping is incoherent — so it invalidates the ENTIRE response.
+    seen: set[int] = set()
+    duplicate = False
+    for idxs, _ in candidate_groups:
+        for i in idxs:
+            if i in seen:
+                duplicate = True
+            seen.add(i)
+    if duplicate:
+        return _b4_fail_open(action_items, cluster_id, "duplicate membership across groups")
+
+    # Guard 4 + composition: singleton groups (len 1) are pass-through, never rewritten, even
+    # if the model proposed text for them. Multi-member groups compose only if their bounds
+    # don't conflict (guard 4); a conflicting-bounds group is per-group-degraded, not the
+    # whole cluster.
+    successful_by_first_pos: dict[int, dict] = {}
+    composed_member_positions: set[int] = set()
+    for idxs, content in candidate_groups:
+        if len(idxs) < 2:
+            continue
+        members = [creates[i] for i in idxs]
+        bound = _group_temporal_bound(members)
+        if bound is None:
+            continue  # guard 4 conflict: this group's members fall back to pass-through
+        categories = [m["category"] for m in members]
+        category = Counter(categories).most_common(1)[0][0]
+        tags = sorted({t for m in members for t in (m.get("tags") or [])})
+        composed = {
+            "action": "create",
+            "existing_id": None,
+            "content": content,
+            "category": category,
+            "tags": tags,
+            "source_turns": [],
+            "contradiction_note": "",
+            "valid_from": bound[0],
+            "valid_until": bound[1],
+        }
+        first_original_pos = create_indices[idxs[0]]
+        successful_by_first_pos[first_original_pos] = composed
+        for i in idxs:
+            composed_member_positions.add(create_indices[i])
+        if decision_log_path:
+            _log_b4_compose_decision(decision_log_path, cluster_id, idxs, members, content)
+
+    output: list[dict] = []
+    for pos, item in enumerate(action_items):
+        if item.get("action") != "create":
+            output.append(item)
+        elif pos in successful_by_first_pos:
+            output.append(successful_by_first_pos[pos])
+        elif pos in composed_member_positions:
+            continue  # a non-first member of a successful group — already emitted
+        else:
+            output.append(item)  # unaddressed / singleton / rejected-group member
+    return output
 
 
 def consolidate(
