@@ -477,13 +477,16 @@ def test_decide_actions_output_matches_apply_consolidation_result_shape():
     """Explicit contract-shape check: output keys are EXACTLY what
     _apply_consolidation_result's parsed['nodes'] item reads (consolidate.py ~1044-1076),
     INCLUDING valid_from/valid_until (added in the review-fix round — reconcile has no
-    fallback for valid_until, so it must be supplied when derivable, not omitted)."""
+    fallback for valid_until, so it must be supplied when derivable, not omitted), PLUS
+    source_unit_id (B4 rejoin-stage contract-answer 2026-07-15: a pass-through key reconcile
+    ignores, carried for B4's decision-log provenance — see recall-B4-rejoin-stage-2026-07-15.md
+    guard 3)."""
     cluster = [_entry(done=["a"])]
     envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "a", "category": "fact"}])]
     out = _decide_actions(cluster, "clu", envs, [], lambda req: "{}")
     assert set(out[0].keys()) == {
         "action", "existing_id", "content", "category", "tags", "source_turns",
-        "contradiction_note", "valid_from", "valid_until",
+        "contradiction_note", "valid_from", "valid_until", "source_unit_id",
     }
 
 
