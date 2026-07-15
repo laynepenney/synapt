@@ -742,6 +742,7 @@ def test_run_extract_path_inserts_b4_between_real_b2_output_and_b3(
     monkeypatch.setattr(consolidate, "_rejoin_create_actions", rejoin_spy, raising=False)
     monkeypatch.setattr(consolidate, "_apply_consolidation_result", apply_spy)
 
+    real_profile = ContentProfile(_type="mixed")
     result = consolidate._run_extract_path(
         cluster,
         "b4-wiring-real",
@@ -751,6 +752,7 @@ def test_run_extract_path_inserts_b4_between_real_b2_output_and_b3(
         [],
         tmp_path / "knowledge.jsonl",
         decision_log_path=decision_path,
+        content_profile=real_profile,
     )
 
     assert result is not None
@@ -758,6 +760,12 @@ def test_run_extract_path_inserts_b4_between_real_b2_output_and_b3(
     assert len(seen["b2_items"]) == 2
     assert all(item["source_unit_id"].startswith("b4-wiring-real:") for item in seen["b2_items"])
     assert seen["decision_log_path"] == decision_path
+    # Identity, not just equality — proves _run_extract_path threads the SAME content_profile
+    # object into _rejoin_create_actions, not a coincidentally-equal one (Opus, recall#884
+    # reviewer-1 re-verify: the spy already captured this field but nothing asserted on it —
+    # deleting the content_profile=content_profile kwarg at the real call site left the whole
+    # suite green).
+    assert seen["content_profile"] is real_profile
     assert seen["b3_nodes"] == rejoined
 
 
