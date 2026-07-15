@@ -1028,6 +1028,33 @@ def _parse_llm_response(response: str) -> dict | None:
     return parse_llm_json(response)
 
 
+def _corroborate_bound_fill(target: KnowledgeNode, raw_node: dict) -> dict:
+    """BLOCKER 2 fix (Sentinel, 2026-07-15): the FILL-MISSING-bounds-only update-dict fragment
+    shared by every corroborate-shaped path — the explicit ``action == "corroborate"`` branch AND
+    the create branch's own similarity-triggered auto-corroborate (a THIRD path found in
+    self-review, structurally identical: a create-action candidate silently becomes a corroborate
+    via Jaccard/cosine match, never touching ``raw_node["action"]``, so it needs the exact same
+    fix or the defect just reappears under a different name).
+
+    Each bound filled INDEPENDENTLY, only when *target*'s persisted value is missing (``None``)
+    — a conflicting persisted bound is NEVER overwritten. Returns only the keys that should
+    change, so the caller's ``update_node`` (a targeted ``dict.update()``) leaves everything else
+    — including a conflicting bound — untouched.
+    """
+    updates: dict = {}
+    if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
+        return updates
+    if target.valid_from is None:
+        candidate_valid_from = _validate_iso_date(raw_node.get("valid_from"))
+        if candidate_valid_from:
+            updates["valid_from"] = candidate_valid_from
+    if target.valid_until is None:
+        candidate_valid_until = _validate_iso_date(raw_node.get("valid_until"))
+        if candidate_valid_until:
+            updates["valid_until"] = candidate_valid_until
+    return updates
+
+
 def _apply_consolidation_result(
     parsed: dict,
     existing_nodes: list[KnowledgeNode],
@@ -1120,14 +1147,12 @@ def _apply_consolidation_result(
                 # Add new source sessions, bump confidence
                 new_sources = list(set(target.source_sessions + cluster_sessions))
                 new_confidence = compute_confidence(len(new_sources))
-                update_node(
-                    target.id,
-                    {
-                        "source_sessions": new_sources,
-                        "confidence": new_confidence,
-                    },
-                    knowledge_path,
-                )
+                updates: dict = {
+                    "source_sessions": new_sources,
+                    "confidence": new_confidence,
+                }
+                updates.update(_corroborate_bound_fill(target, raw_node))
+                update_node(target.id, updates, knowledge_path)
                 result.nodes_corroborated += 1
                 if decision_log_path:
                     _log_dedup_decision(
@@ -1158,8 +1183,19 @@ def _apply_consolidation_result(
                 logger.info("Rejected generic contradict node: %s", content[:80])
                 continue
             target = existing_by_id.get(existing_id)
+            # BLOCKER 2 fix (Sentinel, 2026-07-15): contradict CARRIES candidate bounds onto the
+            # replacement node + the queued-contradiction payload — validated once, shared by
+            # both sub-paths below. Disabled uniformly by the same flag create/corroborate use.
+            if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
+                candidate_valid_from = None
+                candidate_valid_until = None
+            else:
+                candidate_valid_from = _validate_iso_date(raw_node.get("valid_from"))
+                candidate_valid_until = _validate_iso_date(raw_node.get("valid_until"))
             if target and db is not None:
-                # Queue for user review instead of auto-applying
+                # Queue for user review instead of auto-applying. Bounds carried into the
+                # payload so a confirm-time materialization (server.py's _apply_supersession)
+                # can apply them — they would otherwise be lost the moment this is queued.
                 db.add_pending_contradiction(
                     old_node_id=target.id,
                     new_content=content,
@@ -1167,6 +1203,8 @@ def _apply_consolidation_result(
                     reason=contradiction_note,
                     source_sessions=cluster_sessions,
                     detected_by="consolidation",
+                    valid_from=candidate_valid_from,
+                    valid_until=candidate_valid_until,
                 )
                 result.nodes_contradicted += 1
                 logger.info(
@@ -1190,7 +1228,11 @@ def _apply_consolidation_result(
                     confidence=compute_confidence(len(cluster_sessions)),
                     tags=tags,
                 )
-                new_node.valid_from = cluster_valid_from or now
+                # Candidate's bound preferred (mirrors the create branch's exact logic); falls
+                # back to cluster_valid_from/now only when the candidate supplies nothing.
+                new_node.valid_from = candidate_valid_from or cluster_valid_from or now
+                if candidate_valid_until:
+                    new_node.valid_until = candidate_valid_until
                 update_node(target.id, {"superseded_by": new_node.id}, knowledge_path)
                 append_node(new_node, knowledge_path)
                 result.nodes_created += 1
@@ -1251,11 +1293,13 @@ def _apply_consolidation_result(
                 )
                 new_sources = list(set(best_match.source_sessions + cluster_sessions))
                 new_confidence = compute_confidence(len(new_sources))
-                update_node(
-                    best_match.id,
-                    {"source_sessions": new_sources, "confidence": new_confidence},
-                    knowledge_path,
-                )
+                auto_updates: dict = {"source_sessions": new_sources, "confidence": new_confidence}
+                # BLOCKER 2 fix (Sentinel, 2026-07-15, third path found in self-review): this
+                # create-action candidate just got silently converted to corroborate by
+                # similarity — needs the SAME fill-missing-bound treatment as the explicit
+                # corroborate branch (_corroborate_bound_fill), or the fix doesn't reach here.
+                auto_updates.update(_corroborate_bound_fill(best_match, raw_node))
+                update_node(best_match.id, auto_updates, knowledge_path)
                 result.nodes_corroborated += 1
                 if decision_log_path:
                     _log_dedup_decision(
@@ -1713,6 +1757,23 @@ def _run_extract_path(
 # old unconditional placeholder. Budget (#1, _estimate_action_decision_budget) and dedup (#2,
 # _normalize_for_dedup) are UNAFFECTED — independent of temporal, already fruit-confirmed by two
 # reviewers, stay exactly as they are.
+#
+# FULL-PATH REVIEW FIXES (2026-07-15, Sentinel REQUEST CHANGES, both real, ratified by Opus after
+# withdrawing his own approve on these two surfaces):
+#   1. FAN-OUT FABRICATION: the first cut shared one unit-level bound onto every fact/decision the
+#      unit emitted. Sentinel's real full-eb.json fruit killed the "rare" premise: 61/62 compound
+#      units emit >1 output (mean 5.0) — compounds are preserved BY DESIGN so extract can atomize
+#      them. Fixed in _flatten_envelope_facts: bounds SUPPRESS entirely once a unit yields >1
+#      usable output — losing the one true bound beats fabricating it onto N-1 siblings.
+#   2. RECONCILE SILENTLY DROPS BOUNDS ON CORROBORATE/CONTRADICT: bounds only ever reached
+#      _apply_consolidation_result's create branch. The exact-match dedup guard MECHANICALLY
+#      converts many creates to corroborate, so a real temporal fact routinely lost its bound one
+#      layer past where the B2 tests stopped looking (dict, not persisted node). Fixed: corroborate
+#      fills only MISSING persisted bounds (never overwrites a conflicting one); contradict carries
+#      candidate bounds onto the replacement node AND the queued-contradiction payload — which
+#      required a pending_contradictions schema migration (storage.py) and a fix to
+#      server.py's _apply_supersession (previously hardcoded valid_from=now/valid_until=None on
+#      confirm), so the round trip survives to the actually-persisted node, not just the queue row.
 # ---------------------------------------------------------------------------
 
 ACTION_DECISION_PROMPT = """\
@@ -1793,35 +1854,44 @@ def _flatten_envelope_facts(envelopes) -> list[dict]:
     TEMPORAL: each fact/decision carries the ``valid_from``/``valid_until`` mapped
     DETERMINISTICALLY from its unit's ``temporal_refs`` by role (``_map_temporal_refs_to_bounds``,
     module TEMPORAL — ROLE note). ``temporal_refs`` are extraction(unit)-level (siblings of
-    ``facts[]``, confirmed against real extract_batch output), so the mapping is computed ONCE per
-    envelope and shared by every fact flattened from that unit — the common recall case is one
-    atomic candidate per unit. No LLM re-judgment; the ref-less unit falls back to null bounds.
+    ``facts[]``, confirmed against real extract_batch output) — the IL has NO fact<->ref
+    attribution, so assigning a ref to one output out of several is a guess, not a derivation.
+
+    FAN-OUT SUPPRESSION (Sentinel, 2026-07-15, real full-eb.json fruit: of 62 OK compound units,
+    61 emitted >1 durable output, mean 5.0 — compounds are preserved BY DESIGN precisely so
+    extract can atomize them, so multi-output units are the NORM, not the rare case the original
+    bound-sharing design assumed): bounds are computed per envelope ONLY when that unit yields
+    exactly one usable output (facts + decisions combined). Once a unit yields >1 output, its
+    bound is SUPPRESSED entirely (null for every output from that unit) — sharing would fabricate
+    a boundary on N-1 unrelated memories; losing the one true bound is the safer failure. No LLM
+    re-judgment either way; a ref-less or suppressed unit falls back to null bounds.
     """
     out: list[dict] = []
     for env in envelopes:
         if env.status != "ok" or not env.extraction:
             continue
         extraction = env.extraction
-        # unit-level bounds: mapped once, shared by every fact/decision from this envelope.
-        valid_from, valid_until = _map_temporal_refs_to_bounds(extraction.get("temporal_refs"))
+        # Usable outputs FIRST — the suppression decision needs the TRUE combined count before
+        # any bound is computed, so it can't be decided while iterating facts alone.
+        unit_items: list[dict] = []
         for fact in extraction.get("facts") or []:
             text = fact.get("text") if isinstance(fact, dict) else None
-            if not text:
-                continue
-            out.append({
-                "text": text,
-                "category": fact.get("category") or "fact",
-                "source_unit_id": env.source_unit_id,
-                "valid_from": valid_from,
-                "valid_until": valid_until,
-            })
+            if text:
+                unit_items.append({"text": text, "category": fact.get("category") or "fact"})
         for dec in extraction.get("decisions") or []:
             text = dec.get("text") if isinstance(dec, dict) else None
-            if not text:
-                continue
+            if text:
+                unit_items.append({"text": text, "category": "decision"})
+
+        if len(unit_items) > 1:
+            valid_from, valid_until = None, None  # fan-out: suppress, never fabricate
+        else:
+            valid_from, valid_until = _map_temporal_refs_to_bounds(extraction.get("temporal_refs"))
+
+        for item in unit_items:
             out.append({
-                "text": text,
-                "category": "decision",
+                "text": item["text"],
+                "category": item["category"],
                 "source_unit_id": env.source_unit_id,
                 "valid_from": valid_from,
                 "valid_until": valid_until,

@@ -252,16 +252,64 @@ def test_flatten_without_temporal_refs_gives_null_bounds():
     assert flat[0]["valid_from"] is None and flat[0]["valid_until"] is None
 
 
-def test_flatten_unit_temporal_refs_apply_to_all_facts_of_that_unit():
-    # temporal_refs are unit-level (siblings of facts[] in the extraction, confirmed from real
-    # extract_batch output); every fact flattened from that unit shares the unit's bounds.
+def test_flatten_suppresses_bounds_when_unit_yields_multiple_outputs_real_path():
+    """BLOCKER 1 fix (Sentinel, 2026-07-15, real full-eb.json fruit: of 62 OK compound units,
+    61 emitted >1 durable output, mean 5.0 — compounds are preserved BY DESIGN precisely so
+    extract can atomize them, so multi-output units are the NORM, not the rare case the old
+    bound-SHARING design assumed). REPLACES the old sharing test, which locked in the harmful
+    behavior it exercised. Sentinel's own repro, through REAL extract_batch (not the hand-built
+    fixture): one unit-level expiry ref + two facts, only one of which the expiry actually
+    describes. Without fact<->ref attribution in the IL, ANY assignment is a guess — v1
+    precision-first SUPPRESSES bounds entirely for the whole unit once it yields >1 usable
+    output. Losing the one true bound beats fabricating it onto an unrelated sibling."""
+    def infer(request):
+        return json.dumps({
+            "extracted_at": "2025-03-01T09:00:00Z",
+            "facts": [
+                {"text": "the API key expires April 30", "category": "fact"},
+                {"text": "dashboard stores state in SQLite", "category": "fact"},
+            ],
+            "decisions": [],
+            "temporal_refs": [{"raw": "April 30", "resolved": "2025-04-30", "role": "expiry"}],
+        })
+    cluster = [_entry(done=["the API key expires April 30. dashboard stores state in SQLite"], ts="2025-03-01T09:00:00Z")]
+    ok = _real_ok_envelopes(cluster, "clu", infer)
+    assert len(ok) == 1
+    assert len(ok[0].extraction["facts"]) == 2  # confirms the multi-output shape actually occurred
+
+    flat = _flatten_envelope_facts(ok)
+    assert len(flat) == 2
+    # SUPPRESSED for BOTH — including the API-key fact the expiry obviously describes. Not
+    # "assign to the first" or "assign to the longest match": no attribution data exists, so no
+    # guess is made, for either fact.
+    assert all(f["valid_from"] is None and f["valid_until"] is None for f in flat)
+
+
+def test_flatten_single_output_unit_still_gets_bound():
+    # The normal case (exactly one usable output) is UNAFFECTED by the suppression threshold —
+    # this is what keeps the fix precision-first rather than a blanket regression to null.
     env = _envelope_ok(
         "c:0:done:0",
-        facts=[{"text": "fact one"}, {"text": "fact two"}],
+        facts=[{"text": "the API key expires April 30"}],
+        temporal_refs=[_ref("expiry", "2025-04-30")],
+    )
+    flat = _flatten_envelope_facts([env])
+    assert len(flat) == 1
+    assert flat[0]["valid_until"] == "2025-04-30"
+
+
+def test_flatten_facts_plus_decisions_together_count_toward_suppression_threshold():
+    # the threshold is TOTAL usable output (facts + decisions combined), not facts alone — one
+    # fact + one decision from the SAME unit is still a 2-output unit and must suppress.
+    env = _envelope_ok(
+        "c:0:done:0",
+        facts=[{"text": "a fact"}],
+        decisions=[{"text": "a decision"}],
         temporal_refs=[_ref("effective", "2026-03-01")],
     )
     flat = _flatten_envelope_facts([env])
-    assert all(f["valid_from"] == "2026-03-01" for f in flat)
+    assert len(flat) == 2
+    assert all(f["valid_from"] is None for f in flat)
 
 
 def test_flatten_bounds_are_per_envelope_not_bled_across_units():

@@ -100,7 +100,9 @@ CREATE TABLE IF NOT EXISTS pending_contradictions (
     detected_by TEXT NOT NULL DEFAULT 'co-retrieval',  -- 'co-retrieval', 'consolidation', 'manual'
     status TEXT NOT NULL DEFAULT 'pending',             -- 'pending', 'confirmed', 'dismissed'
     resolved_at TEXT,
-    claim_text TEXT                                      -- free-text claim for manual contradictions
+    claim_text TEXT,                                     -- free-text claim for manual contradictions
+    valid_from TEXT,            -- ISO 8601: candidate's temporal bound, carried through to confirm
+    valid_until TEXT            -- ISO 8601: candidate's temporal bound, carried through to confirm
 );
 
 CREATE INDEX IF NOT EXISTS idx_knowledge_status ON knowledge(status);
@@ -668,12 +670,13 @@ class RecallDB:
         col_map = {r[1]: r for r in col_info}
         needs_recreate = col_map.get("old_node_id", (None,) * 6)[3] == 1  # notnull flag
         has_claim_text = "claim_text" in col_map
+        has_temporal = "valid_from" in col_map and "valid_until" in col_map
 
-        if not needs_recreate and has_claim_text:
+        if not needs_recreate and has_claim_text and has_temporal:
             return  # Already migrated
 
         if needs_recreate:
-            # Recreate table: old_node_id NOT NULL → nullable, add claim_text
+            # Recreate table: old_node_id NOT NULL → nullable, add claim_text + temporal columns
             self._conn.executescript("""
                 CREATE TABLE IF NOT EXISTS _pc_new (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -686,7 +689,9 @@ class RecallDB:
                     detected_by TEXT NOT NULL DEFAULT 'co-retrieval',
                     status TEXT NOT NULL DEFAULT 'pending',
                     resolved_at TEXT,
-                    claim_text TEXT
+                    claim_text TEXT,
+                    valid_from TEXT,
+                    valid_until TEXT
                 );
                 INSERT INTO _pc_new (id, old_node_id, new_content, category, reason,
                     source_sessions, detected_at, detected_by, status, resolved_at)
@@ -697,10 +702,27 @@ class RecallDB:
                 ALTER TABLE _pc_new RENAME TO pending_contradictions;
             """)
             self._conn.commit()
-        elif not has_claim_text:
-            self._conn.execute(
-                "ALTER TABLE pending_contradictions ADD COLUMN claim_text TEXT"
-            )
+        else:
+            if not has_claim_text:
+                self._conn.execute(
+                    "ALTER TABLE pending_contradictions ADD COLUMN claim_text TEXT"
+                )
+            # Per-column, NOT gated behind the combined has_temporal check (adversarial
+            # verification finding, 2026-07-15): a process interrupted between two sequential
+            # ALTER TABLE calls (OOM kill, kill -9, forced restart) can leave exactly one of the
+            # two columns present. A combined check would then unconditionally re-add the column
+            # that already exists -> sqlite3.OperationalError: duplicate column name -> a
+            # PERMANENT poison-pill (every future open of that DB file crashes identically).
+            # Matches the per-column idiom already used by _migrate_knowledge_table /
+            # _migrate_access_stats_table in this same file.
+            if "valid_from" not in col_map:
+                self._conn.execute(
+                    "ALTER TABLE pending_contradictions ADD COLUMN valid_from TEXT"
+                )
+            if "valid_until" not in col_map:
+                self._conn.execute(
+                    "ALTER TABLE pending_contradictions ADD COLUMN valid_until TEXT"
+                )
             self._conn.commit()
 
     def _migrate_chunk_links_table(self) -> None:
@@ -1495,6 +1517,8 @@ class RecallDB:
         source_sessions: list[str] | None = None,
         detected_by: str = "co-retrieval",
         claim_text: str | None = None,
+        valid_from: str | None = None,
+        valid_until: str | None = None,
     ) -> int:
         """Queue a potential contradiction for user review.
 
@@ -1503,18 +1527,24 @@ class RecallDB:
         *old_node_id* may be ``None`` and *claim_text* contains the
         user's description of the conflicting information.
 
+        *valid_from*/*valid_until* carry the candidate's temporal bounds (if
+        any) so they survive to the eventual replacement node when this
+        contradiction is confirmed — otherwise they would be lost the moment
+        the contradiction is queued.
+
         Returns the ID of the new pending contradiction.
         """
         now = datetime.now(timezone.utc).isoformat()
         cur = self._conn.execute(
             "INSERT INTO pending_contradictions "
             "(old_node_id, new_content, category, reason, "
-            " source_sessions, detected_at, detected_by, claim_text) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " source_sessions, detected_at, detected_by, claim_text, "
+            " valid_from, valid_until) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 old_node_id, new_content, category, reason,
                 json.dumps(source_sessions or []), now, detected_by,
-                claim_text,
+                claim_text, valid_from, valid_until,
             ),
         )
         self._conn.commit()
@@ -1539,6 +1569,8 @@ class RecallDB:
                 "detected_at": r["detected_at"],
                 "detected_by": r["detected_by"],
                 "claim_text": r["claim_text"] if "claim_text" in keys else None,
+                "valid_from": r["valid_from"] if "valid_from" in keys else None,
+                "valid_until": r["valid_until"] if "valid_until" in keys else None,
             })
         return result
 

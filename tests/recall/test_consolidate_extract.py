@@ -480,6 +480,101 @@ def test_run_extract_path_contradicts_and_auto_applies_without_db(tmp_path):
     assert persisted["kn_old"].status == "contradicted"
 
 
+# --- BLOCKER 2 fix (Sentinel, 2026-07-15): FULL B1->B2->B3 fruit for the temporal bound, all
+# three actions, read from the PERSISTED node (not the _decide_actions dict — Opus's own P1
+# probe stopped one layer short of this: "fruit-to-the-dict is not fruit-to-the-database").
+# Mirrors Sentinel's exact reproduction technique (single-fact unit, one expiry ref, so B1fix's
+# fan-out suppression does not apply and the bound genuinely flows).
+
+def _ok_envelope_with_temporal(fact_text: str, *, role: str, resolved: str) -> str:
+    """A single-fact, single-ref Stage-1 completion — deliberately ONE output so B1fix's
+    fan-out suppression (>1 usable output -> null) does not mask the bound-flow this covers."""
+    return json.dumps({
+        "extracted_at": _EXTRACTED_AT,
+        "facts": [{"text": fact_text, "category": "fact"}],
+        "decisions": [],
+        "temporal_refs": [{"raw": "temporal-expr", "resolved": resolved, "role": role}],
+    })
+
+
+def test_run_extract_path_create_persists_role_mapped_bound(tmp_path):
+    """Pin the CREATE case as a permanent full-path regression guard — Sentinel's own fruit
+    confirmed this already works; this test is the guard against it silently regressing."""
+    fact = "the API key expires April 30 in the production_env config"  # specificity signal
+    cluster = [_entry(session_id="s1", done=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope_with_temporal(fact, role="expiry", resolved="2025-04-30"),
+        action_completion='{"actions": [{"index": 0, "action": "create"}]}',
+    )
+    kn_path = tmp_path / "knowledge.jsonl"
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+    assert result is not None
+    assert result.nodes_created == 1
+    persisted = read_nodes(kn_path)
+    assert persisted[0].valid_until == "2025-04-30"  # the anchored bound, persisted
+
+
+def test_run_extract_path_corroborate_persists_role_mapped_bound(tmp_path):
+    """BLOCKER 2, corroborate sub-case: full path, real _decide_actions + real reconcile,
+    persisted-node read. Before the fix: bound reaches _decide_actions's dict but reconcile's
+    corroborate branch never reads it -> persisted node stays valid_until=None forever."""
+    kn_path = tmp_path / "knowledge.jsonl"
+    existing_node = KnowledgeNode.create(
+        content="the API key expires soon in the production_env config",
+        category="fact", node_id="kn_abc123",
+    )
+    from synapt.recall.knowledge import append_node
+    append_node(existing_node, kn_path)
+    existing = [existing_node]
+
+    fact = "the API key expires April 30 in the production_env config"
+    cluster = [_entry(session_id="s2", done=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope_with_temporal(fact, role="expiry", resolved="2025-04-30"),
+        action_completion='{"actions": [{"index": 0, "action": "corroborate", "existing_id": "kn_abc123"}]}',
+    )
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, existing, kn_path)
+    assert result is not None
+    assert result.nodes_corroborated == 1
+    persisted = {n.id: n for n in read_nodes(kn_path)}
+    assert persisted["kn_abc123"].valid_until == "2025-04-30"  # filled, was missing
+
+
+def test_run_extract_path_contradict_legacy_persists_candidate_bound_on_replacement(tmp_path):
+    """BLOCKER 2, contradict sub-case (legacy no-db path): full path, persisted-node read.
+    Before the fix: the replacement node's valid_from is cluster-derived (ignores the candidate
+    entirely) and valid_until is never set at all -- Sentinel's fruit: "replacement had
+    valid_until=None"."""
+    kn_path = tmp_path / "knowledge.jsonl"
+    existing_node = KnowledgeNode.create(
+        content="extract_batch: production model is Ministral-3B",
+        category="decision", node_id="kn_old",
+    )
+    from synapt.recall.knowledge import append_node
+    append_node(existing_node, kn_path)
+    existing = [existing_node]
+
+    fact = "the API key expires April 30 in the production_env config"
+    cluster = [_entry(session_id="s1", decisions=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    client = _RoutingFakeClient(
+        extract_completion=_ok_envelope_with_temporal(fact, role="expiry", resolved="2025-04-30"),
+        action_completion=(
+            '{"actions": [{"index": 0, "action": "contradict", "existing_id": "kn_old", '
+            '"contradiction_note": "reversed"}]}'
+        ),
+    )
+    result = _run_extract_path(cluster, "clu", client, "m", failures_path, existing, kn_path)
+    assert result is not None
+    assert result.nodes_contradicted == 1
+    assert result.nodes_created == 1
+    persisted = {n.id: n for n in read_nodes(kn_path)}
+    replacement = [n for n in persisted.values() if n.status == "active"][0]
+    assert replacement.valid_until == "2025-04-30"  # candidate's bound, persisted
+
+
 def test_run_extract_path_all_failed_extraction_yields_zero_result_not_none(tmp_path):
     """A fully-failed EXTRACT batch (every unit fails B1) is still a PROCESSED cluster — the
     same semantics as the monolith's own "no durable patterns" empty-nodes-list outcome. Only an
