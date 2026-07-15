@@ -386,6 +386,230 @@ class TestApplyConsolidation(unittest.TestCase):
         self.assertEqual(len(contradicted), 1)
         self.assertEqual(contradicted[0].id, old_node.id)
 
+    # --- BLOCKER 2 fix (Sentinel, 2026-07-15): corroborate FILLS MISSING bounds only, NEVER
+    # overwrites a conflicting persisted bound. Each bound (valid_from/valid_until) is filled
+    # INDEPENDENTLY — a node may have one set and the other missing. Before this fix, corroborate
+    # never touched bounds at all (Sentinel's fruit: "persisted existing node remained
+    # valid_from=None, valid_until=None" even when the candidate carried a real expiry).
+
+    def test_corroborate_fills_missing_valid_until(self):
+        existing = KnowledgeNode.create(
+            content="the API key expires April 30", category="fact", source_sessions=["s0"],
+        )
+        self.assertIsNone(existing.valid_until)
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "corroborate", "existing_id": existing.id,
+            "content": "the API key expires April 30", "category": "fact",
+            "valid_from": None, "valid_until": "2025-04-30",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(nodes[0].valid_until, "2025-04-30")  # filled, was missing
+
+    def test_corroborate_fills_missing_valid_from(self):
+        existing = KnowledgeNode.create(
+            content="we migrated to Postgres", category="fact", source_sessions=["s0"],
+        )
+        existing.valid_from = None  # override KnowledgeNode.create's own now()-default
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "corroborate", "existing_id": existing.id,
+            "content": "we migrated to Postgres", "category": "fact",
+            "valid_from": "2026-03-01", "valid_until": None,
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(nodes[0].valid_from, "2026-03-01")  # filled, was missing
+
+    def test_corroborate_never_overwrites_conflicting_valid_until(self):
+        existing = KnowledgeNode.create(
+            content="the API key expires soon", category="fact", source_sessions=["s0"],
+        )
+        existing.valid_until = "2024-01-01"  # a REAL persisted bound already
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "corroborate", "existing_id": existing.id,
+            "content": "the API key expires soon", "category": "fact",
+            "valid_from": None, "valid_until": "2025-04-30",  # candidate DISAGREES
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(nodes[0].valid_until, "2024-01-01")  # UNCHANGED — never overwritten
+
+    def test_corroborate_never_overwrites_conflicting_valid_from(self):
+        existing = KnowledgeNode.create(
+            content="we use A100 for training", category="fact", source_sessions=["s0"],
+        )
+        existing.valid_from = "2026-01-01"  # a REAL persisted bound already
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "corroborate", "existing_id": existing.id,
+            "content": "we use A100 for training", "category": "fact",
+            "valid_from": "2026-06-15", "valid_until": None,  # candidate DISAGREES
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(nodes[0].valid_from, "2026-01-01")  # UNCHANGED — never overwritten
+
+    def test_corroborate_malformed_candidate_bound_never_fills(self):
+        existing = KnowledgeNode.create(
+            content="a temporal fact", category="fact", source_sessions=["s0"],
+        )
+        existing.valid_until = None
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "corroborate", "existing_id": existing.id,
+            "content": "a temporal fact", "category": "fact",
+            "valid_from": None, "valid_until": "not-a-real-date",  # hallucinated/malformed
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertIsNone(nodes[0].valid_until)  # malformed candidate bound never fills
+
+    def test_corroborate_bound_fill_coexists_with_confidence_and_session_bump(self):
+        # the pre-existing corroborate behavior (source_sessions grow, confidence bumps) must
+        # keep working unchanged alongside the new bound-fill logic.
+        existing = KnowledgeNode.create(
+            content="Use A100 for training", category="infrastructure",
+            source_sessions=["s0"], confidence=0.45,
+        )
+        existing.valid_until = None
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "corroborate", "existing_id": existing.id,
+            "content": "Use A100 for training", "category": "infrastructure",
+            "valid_from": None, "valid_until": "2026-12-31",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertIn("s0", nodes[0].source_sessions)
+        self.assertIn("s1", nodes[0].source_sessions)
+        self.assertGreater(nodes[0].confidence, 0.45)
+        self.assertEqual(nodes[0].valid_until, "2026-12-31")
+
+    def test_apply_corroborate_update_does_not_mutate_memory_when_persist_fails(self):
+        # Sentinel's explicit requirement, verbatim (re-clear on 296879d, 2026-07-15): "Do not
+        # mutate memory if persistence failed." If update_node reports failure (the target isn't
+        # actually found on disk), the in-memory node must stay EXACTLY as it was -- no phantom
+        # state where memory claims a bound was filled but nothing was ever persisted.
+        from synapt.recall.consolidate import _apply_corroborate_update
+
+        missing_kn_path = Path(self.tmpdir) / "does-not-exist.jsonl"  # update_node returns False
+        target = KnowledgeNode.create(content="orphaned in-memory node", category="fact")
+        original_valid_from = target.valid_from
+        original_valid_until = target.valid_until
+        original_confidence = target.confidence
+
+        ok = _apply_corroborate_update(
+            target,
+            {"valid_from": "2025-01-01", "valid_until": "2025-12-31", "confidence": 0.99},
+            missing_kn_path,
+        )
+        self.assertFalse(ok)  # update_node correctly reports failure
+        # In-memory target UNCHANGED -- no phantom fill despite the attempted updates dict
+        self.assertEqual(target.valid_from, original_valid_from)
+        self.assertEqual(target.valid_until, original_valid_until)
+        self.assertEqual(target.confidence, original_confidence)
+
+    # --- BLOCKER 2 fix: LEGACY contradict (no db) CARRIES candidate bounds onto the replacement
+    # node — before this fix, the replacement always got a cluster-derived valid_from and NEVER
+    # got a valid_until at all (Sentinel's fruit: "contradict (legacy) -> replacement had
+    # valid_until=None" even when the candidate carried a real expiry).
+
+    def test_contradict_legacy_carries_candidate_bounds_onto_replacement(self):
+        old_node = KnowledgeNode.create(
+            content="Use MLX for all inference", category="tooling", source_sessions=["s0"],
+        )
+        append_node(old_node, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "contradict", "existing_id": old_node.id,
+            "content": "Use Ollama for inference starting 2026-05-01",
+            "category": "tooling", "contradiction_note": "switched",
+            "valid_from": "2026-05-01", "valid_until": "2026-12-31",
+        }]}
+        result = _apply_consolidation_result(parsed, [old_node], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_contradicted, 1)
+        self.assertEqual(result.nodes_created, 1)
+        all_nodes = read_nodes(self.kn_path)
+        active = [n for n in all_nodes if n.status == "active"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].valid_from, "2026-05-01")   # candidate's bound, not cluster-derived
+        self.assertEqual(active[0].valid_until, "2026-12-31")  # was NEVER set before this fix
+
+    def test_contradict_legacy_falls_back_to_cluster_valid_from_when_candidate_has_none(self):
+        # regression guard: the EXISTING fallback (cluster_valid_from/now when the candidate
+        # supplies nothing) must survive this fix unchanged.
+        old_node = KnowledgeNode.create(
+            content="Use MLX for all inference", category="tooling", source_sessions=["s0"],
+        )
+        append_node(old_node, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "contradict", "existing_id": old_node.id,
+            "content": "Use Ollama for inference", "category": "tooling",
+            "contradiction_note": "switched", "valid_from": None, "valid_until": None,
+        }]}
+        result = _apply_consolidation_result(parsed, [old_node], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_created, 1)
+        active = [n for n in read_nodes(self.kn_path) if n.status == "active"]
+        self.assertIsNotNone(active[0].valid_from)  # fallback still fires (cluster_valid_from or now)
+        self.assertIsNone(active[0].valid_until)     # still None when candidate supplies nothing
+
+    def test_auto_corroborate_via_similarity_fills_missing_bound(self):
+        # THIRD path found via self-review (2026-07-15): the CREATE branch's OWN Jaccard/cosine
+        # similarity-triggered auto-corroborate (around "Auto-corroborate" in the source) has an
+        # update_node call structurally identical to the pre-fix explicit-corroborate branch —
+        # source_sessions/confidence only, bounds never touched. A create-action candidate that
+        # gets auto-converted to corroborate via similarity (never touching action="corroborate"
+        # at all) must ALSO fill a missing bound, or this is the same defect under a third name.
+        content = "the api_key_rotation_policy sets the API key to rotate every 90 days in production_env"
+        existing = KnowledgeNode.create(content=content, category="fact", source_sessions=["s0"])
+        existing.valid_until = None
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "create",  # NOT "corroborate" — similarity triggers the conversion
+            "content": content,  # identical -> Jaccard match well above threshold
+            "category": "fact",
+            "valid_from": None, "valid_until": "2025-04-30",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        self.assertEqual(result.nodes_created, 0)  # confirms it went through auto-corroborate
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(nodes[0].valid_until, "2025-04-30")  # filled here too
+
+    def test_auto_corroborate_via_similarity_never_overwrites_conflicting_bound(self):
+        content = "the api_key_rotation_policy sets the API key to rotate every 90 days in production_env"
+        existing = KnowledgeNode.create(content=content, category="fact", source_sessions=["s0"])
+        existing.valid_until = "2024-01-01"  # a REAL persisted bound already
+        append_node(existing, self.kn_path)
+
+        parsed = {"nodes": [{
+            "action": "create",
+            "content": content,
+            "category": "fact",
+            "valid_from": None, "valid_until": "2025-04-30",  # candidate DISAGREES
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(nodes[0].valid_until, "2024-01-01")  # UNCHANGED
+
     def test_corroborate_missing_id_becomes_create(self):
         parsed = {
             "nodes": [{

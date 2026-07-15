@@ -98,6 +98,103 @@ class TestSchemaSupersession:
         }
         assert expected <= cols
 
+    def test_pending_contradictions_has_temporal_columns(self, tmp_path):
+        # BLOCKER 2 fix (Sentinel, 2026-07-15): the queued-contradiction payload must be able to
+        # carry candidate bounds, or they are lost the moment a contradiction is queued.
+        db = _make_db(tmp_path)
+        cols = {
+            r[1] for r in db._conn.execute(
+                "PRAGMA table_info(pending_contradictions)"
+            ).fetchall()
+        }
+        assert "valid_from" in cols
+        assert "valid_until" in cols
+
+    def test_migration_handles_partial_temporal_column_state(self, tmp_path):
+        """Bug found by adversarial verification workflow (2026-07-15): a DB with ONE of the two
+        temporal columns already present (e.g. from a process interrupted mid-migration — OOM
+        kill, kill -9, forced container restart — landing between the two sequential ALTER TABLE
+        calls) must NOT crash on reopen. The prior combined ``has_temporal`` AND-check gated BOTH
+        ALTER statements together, so if only one column was missing it unconditionally tried to
+        re-add the one that already existed -> sqlite3.OperationalError: duplicate column name
+        -> a PERMANENT poison-pill (every future RecallDB(path) on that file crashes the same
+        way). Fixed per-column, matching the existing idiom in _migrate_knowledge_table /
+        _migrate_access_stats_table in this same file."""
+        import sqlite3
+
+        for missing_col, present_col in [("valid_until", "valid_from"), ("valid_from", "valid_until")]:
+            db_path = tmp_path / f"partial_{present_col}.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                "CREATE TABLE pending_contradictions ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT, old_node_id TEXT,"
+                "  new_content TEXT NOT NULL, category TEXT NOT NULL DEFAULT '',"
+                "  reason TEXT NOT NULL DEFAULT '', source_sessions TEXT NOT NULL DEFAULT '[]',"
+                "  detected_at TEXT NOT NULL, detected_by TEXT NOT NULL DEFAULT 'co-retrieval',"
+                "  status TEXT NOT NULL DEFAULT 'pending', resolved_at TEXT, claim_text TEXT,"
+                f"  {present_col} TEXT"
+                ")"
+            )
+            conn.commit()
+            conn.close()
+
+            db = RecallDB(db_path)  # must NOT raise
+            cols = {
+                r[1] for r in db._conn.execute(
+                    "PRAGMA table_info(pending_contradictions)"
+                ).fetchall()
+            }
+            assert missing_col in cols
+            assert present_col in cols
+
+    def test_migration_reopen_after_partial_state_is_idempotent(self, tmp_path):
+        """The fix must also be idempotent — opening the same partially-migrated (now fully
+        migrated after the first open) DB a second time must not raise either."""
+        import sqlite3
+
+        db_path = tmp_path / "partial_reopen.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE pending_contradictions ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT, old_node_id TEXT,"
+            "  new_content TEXT NOT NULL, category TEXT NOT NULL DEFAULT '',"
+            "  reason TEXT NOT NULL DEFAULT '', source_sessions TEXT NOT NULL DEFAULT '[]',"
+            "  detected_at TEXT NOT NULL, detected_by TEXT NOT NULL DEFAULT 'co-retrieval',"
+            "  status TEXT NOT NULL DEFAULT 'pending', resolved_at TEXT, claim_text TEXT,"
+            "  valid_from TEXT"
+            ")"
+        )
+        conn.commit()
+        conn.close()
+
+        RecallDB(db_path)  # first open: migrates valid_until in
+        RecallDB(db_path)  # second open: must no-op, not raise
+
+    def test_migration_adds_temporal_columns_to_pending_contradictions(self, tmp_path):
+        """Simulate an old DB whose pending_contradictions predates the temporal columns."""
+        db_path = tmp_path / "old_pending.db"
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE pending_contradictions ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT, old_node_id TEXT,"
+            "  new_content TEXT NOT NULL, category TEXT NOT NULL DEFAULT '',"
+            "  reason TEXT NOT NULL DEFAULT '', source_sessions TEXT NOT NULL DEFAULT '[]',"
+            "  detected_at TEXT NOT NULL, detected_by TEXT NOT NULL DEFAULT 'co-retrieval',"
+            "  status TEXT NOT NULL DEFAULT 'pending', resolved_at TEXT, claim_text TEXT"
+            ")"
+        )
+        conn.commit()
+        conn.close()
+        db = RecallDB(db_path)  # opening runs migrations
+        cols = {
+            r[1] for r in db._conn.execute(
+                "PRAGMA table_info(pending_contradictions)"
+            ).fetchall()
+        }
+        assert "valid_from" in cols
+        assert "valid_until" in cols
+
     def test_migration_adds_temporal_columns(self, tmp_path):
         """Simulate an old DB missing temporal columns, then migrate."""
         db_path = tmp_path / "old.db"
@@ -1159,6 +1256,165 @@ class TestConsolidationContradictQueuing:
         assert len(nodes) == 1
         assert nodes[0].content == "new approach to training"
         assert nodes[0].valid_from is not None
+
+    def test_queued_contradiction_carries_candidate_bounds(self, tmp_path):
+        """BLOCKER 2 fix: the DB-queued contradict branch must pass the candidate's temporal
+        bounds into add_pending_contradiction -- before this fix, they were dropped entirely
+        (add_pending_contradiction was called with no temporal args at all)."""
+        from synapt.recall.consolidate import _apply_consolidation_result
+        from synapt.recall.knowledge import KnowledgeNode, append_node
+        from synapt.recall.journal import JournalEntry
+
+        kn_path = tmp_path / "knowledge.jsonl"
+        db = _make_db(tmp_path)
+
+        old_node = KnowledgeNode.create("API key policy unclear", "tooling")
+        append_node(old_node, kn_path)
+        db.save_knowledge_nodes([old_node.to_dict()])
+
+        parsed = {
+            "nodes": [{
+                "action": "contradict",
+                "existing_id": old_node.id,
+                "content": "the API key expires 2025-04-30",
+                "category": "tooling",
+                "contradiction_note": "expiry clarified",
+                "tags": [],
+                "valid_from": None,
+                "valid_until": "2025-04-30",
+            }]
+        }
+        cluster = [JournalEntry(session_id="s1", timestamp="2026-03-01", focus="keys")]
+
+        _apply_consolidation_result(parsed, [old_node], cluster, kn_path, db=db)
+
+        pending = db.list_pending_contradictions()
+        assert len(pending) == 1
+        assert pending[0]["valid_from"] is None
+        assert pending[0]["valid_until"] == "2025-04-30"  # candidate's bound, in the payload
+
+    def test_confirm_carries_queued_bound_onto_materialized_node(self, tmp_path):
+        """BLOCKER 2 fix, the FULL round trip: queue (with a bound) -> confirm -> materialize,
+        through the REAL recall_contradict MCP tool (not a hand-duplicated resolve). Before this
+        fix, _apply_supersession hardcoded valid_from=now/valid_until=None on confirm, so even a
+        bound that survived the queue was lost the moment the contradiction was materialized --
+        "fruit-to-the-dict is not fruit-to-the-database" one layer further than the queue row."""
+        from synapt.recall.consolidate import _apply_consolidation_result
+        from synapt.recall.knowledge import KnowledgeNode, append_node
+        from synapt.recall.journal import JournalEntry
+        from synapt.recall.server import recall_contradict
+
+        kn_path = tmp_path / "knowledge.jsonl"
+        db = _make_db(tmp_path)
+
+        old_node = KnowledgeNode.create("API key policy unclear", "tooling")
+        append_node(old_node, kn_path)
+        db.save_knowledge_nodes([old_node.to_dict()])
+
+        parsed = {
+            "nodes": [{
+                "action": "contradict",
+                "existing_id": old_node.id,
+                "content": "the API key expires 2025-04-30",
+                "category": "tooling",
+                "contradiction_note": "expiry clarified",
+                "tags": [],
+                "valid_from": None,
+                "valid_until": "2025-04-30",
+            }]
+        }
+        cluster = [JournalEntry(session_id="s1", timestamp="2026-03-01", focus="keys")]
+        _apply_consolidation_result(parsed, [old_node], cluster, kn_path, db=db)
+        cid = db.list_pending_contradictions()[0]["id"]
+
+        index = TranscriptIndex.__new__(TranscriptIndex)
+        index._db = db
+        index.chunks = []
+        index.sessions = {}
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="confirmed",
+                )
+        assert "confirmed" in result
+
+        nodes = db.load_knowledge_nodes()
+        active = [n for n in nodes if n["status"] == "active"]
+        assert len(active) == 1
+        assert active[0]["content"] == "the API key expires 2025-04-30"
+        assert active[0]["valid_until"] == "2025-04-30"  # candidate's bound survived to the DB
+
+    def test_apply_supersession_rejects_malformed_bounds_defensively(self, tmp_path):
+        """Bug found by adversarial verification workflow (2026-07-15): _apply_supersession is
+        the ONE bound-consuming site in this feature with no _validate_iso_date guard of its own
+        — every other site (consolidate.py's corroborate/contradict branches) validates before
+        ever reaching a dict-update or DB-write. Feeding a list/dict straight through (bypassing
+        the DB round trip, which today always validates upstream — this is a DEFENSE-IN-DEPTH
+        gate, not a currently-reachable exploit) previously raised sqlite3.ProgrammingError AND
+        left a non-atomic PARTIAL WRITE: the old node marked contradicted with superseded_by
+        pointing at a replacement that was NEVER created (the second upsert crashed), with no
+        retry path since resolve_contradiction's status flip to 'confirmed' already committed.
+        Must now behave exactly like every other bound-consuming site: malformed input -> None,
+        never a crash, never a corrupted half-applied supersession."""
+        from synapt.recall.server import _apply_supersession
+
+        for i, bad in enumerate([["2025-04-30"], {"a": 1}, 20250430, 20250430.0, "not-a-date", "   "]):
+            iter_dir = tmp_path / f"iter{i}"
+            iter_dir.mkdir()
+            db = _make_db(iter_dir)  # a FRESH, isolated DB per iteration — no cross-iteration bleed
+            old_node = _make_knowledge_node(node_id="old-1", content="old fact")
+            db.save_knowledge_nodes([old_node])
+
+            _apply_supersession(
+                db, old_node_id=old_node["id"], new_content="new fact",
+                category="tooling", reason="test", source_sessions=["s1"],
+                valid_from=bad, valid_until=bad,
+            )  # must NOT raise
+
+            nodes = db.load_knowledge_nodes()
+            active = [n for n in nodes if n["status"] == "active"]
+            assert len(active) == 1  # the replacement WAS created — no partial write
+            assert active[0]["valid_until"] is None  # malformed input never persists verbatim
+
+    def test_apply_supersession_still_carries_a_valid_bound(self, tmp_path):
+        # regression guard: the defensive validation must not break the real, valid-bound path.
+        from synapt.recall.server import _apply_supersession
+
+        db = _make_db(tmp_path)
+        old_node = _make_knowledge_node(node_id="old-1", content="old fact")
+        db.save_knowledge_nodes([old_node])
+
+        _apply_supersession(
+            db, old_node_id="old-1", new_content="new fact", category="tooling",
+            reason="test", source_sessions=["s1"],
+            valid_from=None, valid_until="2025-04-30",
+        )
+
+        active = [n for n in db.load_knowledge_nodes() if n["status"] == "active"]
+        assert active[0]["valid_until"] == "2025-04-30"
+
+    def test_confirm_falls_back_to_now_when_queued_bound_is_none(self, tmp_path):
+        # regression guard: the EXISTING fallback (valid_from=now when nothing was queued) must
+        # survive this fix unchanged, for contradictions that carry no temporal information.
+        from synapt.recall.knowledge import KnowledgeNode
+        from synapt.recall.server import recall_contradict
+
+        db = _make_db(tmp_path)
+        node = _make_knowledge_node(node_id="old-1", content="use unittest")
+        db.save_knowledge_nodes([node])
+        cid = db.add_pending_contradiction("old-1", "use pytest instead")
+
+        index = TranscriptIndex.__new__(TranscriptIndex)
+        index._db = db
+        index.chunks = []
+        index.sessions = {}
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                recall_contradict(action="resolve", contradiction_id=cid, resolution="confirmed")
+
+        active = [n for n in db.load_knowledge_nodes() if n["status"] == "active"]
+        assert active[0]["valid_from"] is not None  # fallback still fires
+        assert active[0]["valid_until"] is None
 
     def test_queued_contradiction_source_sessions(self, tmp_path):
         """Queued contradictions include the cluster's session IDs."""
