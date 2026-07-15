@@ -85,6 +85,57 @@ def _mixed_infer_for(bad_markers):
 
 # --- COUNT-INVARIANCE ----------------------------------------------------------------------
 
+# --- source-date resolution anchor (BatchUnit.date, recall's half of the wrong-year fix) -----
+# A relative date ("April 30") only resolves to the right YEAR against the fact's source date.
+# recall threads each candidate's OWN journal-entry timestamp into BatchUnit.date, which
+# extract_batch renders into the Stage-1 prompt ("Resolve relative dates using: <date>."). This
+# is the recall-side seam of the fix Sentinel's real-path finding opened (a 2025-sourced "expires
+# April 30" resolving to 2026 under the old, anchor-less path). We assert the date REACHES the
+# prompt (the deterministic seam recall owns); whether the model then resolves correctly is
+# extract#31's contract, proven there.
+
+def _capturing_infer():
+    """A fake infer that records every request prompt, then returns a valid envelope."""
+    seen = []
+    def infer(request):
+        seen.append(request["prompt"])
+        return _ok_envelope(request["prompt"])
+    return infer, seen
+
+
+def test_source_date_threaded_into_extraction_prompt():
+    cluster = [_entry(done=["the API key expires April 30"], ts="2025-03-01T09:00:00Z")]
+    infer, seen = _capturing_infer()
+    _run_coro_blocking(_extract_cluster_units(cluster, "clu", infer))
+    assert len(seen) == 1
+    assert "2025-03-01" in seen[0]  # the source date rode into the Stage-1 prompt
+
+
+def test_per_candidate_source_date_from_its_own_entry():
+    # two entries with DIFFERENT dates -> each candidate's prompt carries ITS entry's date, not a
+    # single cluster-wide date (entry_index maps each candidate back to its own JournalEntry).
+    cluster = [
+        _entry(session_id="s1", done=["first thing"], ts="2025-01-01T00:00:00Z"),
+        _entry(session_id="s2", done=["second thing"], ts="2026-12-31T00:00:00Z"),
+    ]
+    infer, seen = _capturing_infer()
+    _run_coro_blocking(_extract_cluster_units(cluster, "clu", infer))
+    first = next(p for p in seen if "first thing" in p)
+    second = next(p for p in seen if "second thing" in p)
+    assert "2025-01-01" in first and "2026-12-31" not in first
+    assert "2026-12-31" in second and "2025-01-01" not in second
+
+
+def test_missing_source_timestamp_does_not_crash_and_omits_anchor():
+    # fail-safe: an entry with no timestamp -> unit still built (count-invariant), the prompt
+    # simply carries no resolution anchor (no crash, no fabricated date).
+    cluster = [_entry(done=["undated fact"], ts="")]
+    infer, seen = _capturing_infer()
+    results = _run_coro_blocking(_extract_cluster_units(cluster, "clu", infer))
+    assert len(results) == 1  # never dropped
+    assert "Resolve relative dates using:" not in seen[0]  # no anchor line, no "None" literal
+
+
 def test_count_invariant_one_result_per_candidate():
     cluster = [_entry(done=["a", "b", "c"], decisions=["d", "e"])]
     n_candidates = len(identify(cluster))

@@ -1392,14 +1392,15 @@ def score_cluster_chunks(cluster: list[JournalEntry]):
 # as the producer, stable across the pluggable model (which model ran is known out-of-band).
 _EXTRACT_PRODUCED_BY = "recall://consolidate"
 # The capability set recall requests from extract_batch (exact Stage-1 schema keys).
-# "temporal_refs" deliberately excluded (review-fix round, 2026-07-14): B2 no longer derives
-# valid_from/valid_until from it (see the module's TEMPORAL — REVISED note) — B2's own LLM
-# pass now judges temporal bounds from fact content directly, so requesting temporal_refs at
-# the extract_batch stage would just generate a field nothing reads. Also VERIFIED that
-# temporal_refs's base capability schema (without the separate "temporal_classes" capability)
-# only allows {raw, resolved} anyway — resolved_end/type/context were never reachable through
-# this capability alone, which is what made the original derivation silently non-functional.
-_EXTRACT_CAPABILITIES = ["facts", "decisions"]
+# "temporal_refs" INCLUDED (2026-07-15, extract#31 landed the role field): extraction now emits a
+# validity ROLE (effective/expiry/range/superseded/point) + resolved date at the BASE temporal_refs
+# capability — no separate "temporal_classes" needed. That base-tier reachability is the exact fix
+# extract#31 shipped; the original derivation was silently non-functional because role/resolved_end
+# used to sit behind temporal_classes (which recall never requested). recall now maps role ->
+# valid_from/valid_until DETERMINISTICALLY in _flatten_envelope_facts (_map_temporal_refs_to_bounds),
+# with ZERO LLM re-judgment — direction is read once, at extraction, where the source sentence and
+# source date live. See the module's TEMPORAL — ROLE note.
+_EXTRACT_CAPABILITIES = ["facts", "decisions", "temporal_refs"]
 
 
 def _get_consolidation_client(max_tokens: int = MIN_RESPONSE_TOKENS):
@@ -1493,6 +1494,21 @@ def _run_coro_blocking(coro):
     return box["result"]
 
 
+def _candidate_source_date(cluster: list[JournalEntry], candidate) -> str | None:
+    """The source date to anchor a candidate's relative-date resolution: its OWN journal entry's
+    timestamp, date-only (``YYYY-MM-DD``). ``candidate.attr["entry_index"]`` indexes back into
+    *cluster* — both come from the same prefilter pass, so the index is in range in the normal
+    path. FAIL-SAFE: returns None when the index is missing/out-of-range or the entry has no
+    timestamp, so the unit is still built with no anchor rather than crashing or fabricating a
+    date (an absent anchor renders no ``Resolve relative dates using:`` line — never the literal
+    string "None")."""
+    ei = candidate.attr.get("entry_index")
+    if not isinstance(ei, int) or not (0 <= ei < len(cluster)):
+        return None
+    ts = cluster[ei].timestamp
+    return ts[:10] if ts else None
+
+
 async def _extract_cluster_units(
     cluster: list[JournalEntry],
     cluster_id: str,
@@ -1522,8 +1538,16 @@ async def _extract_cluster_units(
     candidates = identify(cluster)
     if not candidates:
         return []
+    # Source-date resolution anchor: each candidate's OWN journal-entry timestamp (date-only)
+    # threads into BatchUnit.date, which extract_batch renders into the Stage-1 prompt so a
+    # relative date ("April 30") resolves against the SOURCE year, not the extraction year —
+    # recall's half of the wrong-year fix (Sentinel's real-path finding). Fail-safe to None.
     units = [
-        BatchUnit(id=batch_unit_id(cluster_id, cand), text=cand.text)
+        BatchUnit(
+            id=batch_unit_id(cluster_id, cand),
+            text=cand.text,
+            date=_candidate_source_date(cluster, cand),
+        )
         for cand in candidates
     ]
     caps = _EXTRACT_CAPABILITIES if capabilities is None else capabilities
@@ -1674,18 +1698,21 @@ def _run_extract_path(
 #      hand-built envelope, not the REAL extract_batch contract; abandoned in favor of a
 #      content-based per-fact approach once that was fruit-checked, see next block).
 #
-# TEMPORAL — HELD, NULL PLACEHOLDER (2026-07-15, Layne layer-redirect via Opus): the B2-LLM-
-# judges-temporal approach (2026-07-14, replaced the equally-abandoned temporal_refs-derivation
-# attempt before it) is ITSELF duct tape — recall re-deriving via a second LLM pass what
-# extraction already read once and should capture directly at the source. Right fix lives in
-# extract: emit a validity ROLE (effective/expiry/range/superseded/point) alongside each
-# resolved date; recall maps role -> valid_from/valid_until DETERMINISTICALLY, no LLM
-# re-judgment (spec: config/design/extract-temporal-role-2026-07-14.md). Until that lands,
-# temporal is a NULL PLACEHOLDER here — B2 does not attempt to judge it at all (not even via
-# LLM instruction), matching "null is better than guessing" honestly rather than duct-taping a
-# second mechanism on top of the first. Budget (#1, _estimate_action_decision_budget) and
-# dedup (#2, _normalize_for_dedup) are UNAFFECTED — independent of temporal, already fruit-
-# confirmed by two reviewers, stay exactly as they are.
+# TEMPORAL — ROLE, LANDED (2026-07-15, extract#31 merged to extract sprint-39): the two prior
+# attempts were both duct tape — the temporal_refs-derivation cut (built against a hand-built
+# envelope; role/resolved_end were unreachable at the base capability) and the B2-LLM-judges-
+# temporal cut (recall re-deriving via a SECOND LLM pass what extraction already read once). The
+# right fix lives in extract and now ships: extraction emits a validity ROLE (effective/expiry/
+# range/superseded/point) + resolved date at the BASE temporal_refs capability, and threads each
+# unit's SOURCE date as the relative-date resolution anchor (spec: config/design/extract-temporal-
+# role-2026-07-14.md). recall consumes it DETERMINISTICALLY, no LLM re-judgment: _EXTRACT_-
+# CAPABILITIES requests temporal_refs; _extract_cluster_units threads BatchUnit.date
+# (_candidate_source_date); _flatten_envelope_facts maps role -> valid_from/valid_until
+# (_map_temporal_refs_to_bounds); _decide_actions PASSES THE BOUND THROUGH without judging it (the
+# action LLM never touches temporal). A ref-less fact falls back to null — honest fallback, not the
+# old unconditional placeholder. Budget (#1, _estimate_action_decision_budget) and dedup (#2,
+# _normalize_for_dedup) are UNAFFECTED — independent of temporal, already fruit-confirmed by two
+# reviewers, stay exactly as they are.
 # ---------------------------------------------------------------------------
 
 ACTION_DECISION_PROMPT = """\
@@ -1719,6 +1746,42 @@ matched by "index" (not by list position):
 _VALID_ACTIONS = ("create", "corroborate", "contradict")
 
 
+# Role -> bound routing. Direction rides in extract's ROLE field (extract#31); recall never
+# re-judges it. ``point`` defaults to a start (a bare instant with no start/end direction).
+_ROLE_TO_VALID_FROM = frozenset({"effective", "point"})
+_ROLE_TO_VALID_UNTIL = frozenset({"expiry", "superseded"})
+
+
+def _map_temporal_refs_to_bounds(temporal_refs) -> tuple[str | None, str | None]:
+    """Map a unit's extract_batch ``temporal_refs`` to ``(valid_from, valid_until)`` by ROLE,
+    DETERMINISTICALLY — the recall-side replacement for both the abandoned second-LLM judgment
+    and the held null placeholder (module TEMPORAL — ROLE note).
+
+    Role -> bound: ``effective`` -> valid_from; ``expiry``/``superseded`` -> valid_until;
+    ``range`` -> both (resolved, resolved_end); ``point`` -> valid_from. A ref with no role (or
+    an unknown one) cannot encode direction and contributes nothing — null is the honest
+    FALLBACK, now scoped to exactly that case rather than unconditional. First-non-null-wins per
+    bound in list order (deterministic; no min/max heuristic that could reorder under ties).
+    Dates pass ``_validate_iso_date`` — a malformed date yields no bound. Non-dict refs are
+    skipped so a single bad element never crashes a cluster's consolidation."""
+    valid_from: str | None = None
+    valid_until: str | None = None
+    for ref in temporal_refs or []:
+        if not isinstance(ref, dict):
+            continue
+        role = ref.get("role")
+        resolved = _validate_iso_date(ref.get("resolved"))
+        if role in _ROLE_TO_VALID_FROM:
+            valid_from = valid_from or resolved
+        elif role in _ROLE_TO_VALID_UNTIL:
+            valid_until = valid_until or resolved
+        elif role == "range":
+            valid_from = valid_from or resolved
+            valid_until = valid_until or _validate_iso_date(ref.get("resolved_end"))
+        # role absent/unknown -> no contribution (direction is unknowable)
+    return valid_from, valid_until
+
+
 def _flatten_envelope_facts(envelopes) -> list[dict]:
     """Flatten B1's per-unit envelopes into a flat, ordered list of candidate facts for the
     action-decision pass. Only ``status == "ok"`` envelopes contribute — failed units were
@@ -1727,15 +1790,20 @@ def _flatten_envelope_facts(envelopes) -> list[dict]:
     carrying its source envelope's ``source_unit_id`` for traceability (not threaded onto the
     KnowledgeNode itself — see ``_decide_actions``'s ``source_turns`` note).
 
-    No temporal handling here — see the module's TEMPORAL — REVISED note. ``valid_from``/
-    ``valid_until`` are judged by B2's OWN LLM pass directly from each fact's content
-    (``_decide_actions``), not derived from extract_batch's ``temporal_refs``.
+    TEMPORAL: each fact/decision carries the ``valid_from``/``valid_until`` mapped
+    DETERMINISTICALLY from its unit's ``temporal_refs`` by role (``_map_temporal_refs_to_bounds``,
+    module TEMPORAL — ROLE note). ``temporal_refs`` are extraction(unit)-level (siblings of
+    ``facts[]``, confirmed against real extract_batch output), so the mapping is computed ONCE per
+    envelope and shared by every fact flattened from that unit — the common recall case is one
+    atomic candidate per unit. No LLM re-judgment; the ref-less unit falls back to null bounds.
     """
     out: list[dict] = []
     for env in envelopes:
         if env.status != "ok" or not env.extraction:
             continue
         extraction = env.extraction
+        # unit-level bounds: mapped once, shared by every fact/decision from this envelope.
+        valid_from, valid_until = _map_temporal_refs_to_bounds(extraction.get("temporal_refs"))
         for fact in extraction.get("facts") or []:
             text = fact.get("text") if isinstance(fact, dict) else None
             if not text:
@@ -1744,6 +1812,8 @@ def _flatten_envelope_facts(envelopes) -> list[dict]:
                 "text": text,
                 "category": fact.get("category") or "fact",
                 "source_unit_id": env.source_unit_id,
+                "valid_from": valid_from,
+                "valid_until": valid_until,
             })
         for dec in extraction.get("decisions") or []:
             text = dec.get("text") if isinstance(dec, dict) else None
@@ -1753,6 +1823,8 @@ def _flatten_envelope_facts(envelopes) -> list[dict]:
                 "text": text,
                 "category": "decision",
                 "source_unit_id": env.source_unit_id,
+                "valid_from": valid_from,
+                "valid_until": valid_until,
             })
     return out
 
@@ -1847,12 +1919,12 @@ def _decide_actions(
     ``contradiction_note``, ``valid_from``, ``valid_until``). ``confidence`` is NOT included —
     reconcile computes it itself (B1 contract-read Finding 3) with no fallback gap.
 
-    ``valid_from``/``valid_until`` are ALWAYS ``None`` here — a deliberate NULL PLACEHOLDER, not
-    an oversight. See the module's TEMPORAL — HELD note: neither extract_batch's temporal_refs
-    (dead for its purpose — resolved_end unreachable at this capability, and even reachable a
-    bare date has no start-vs-end direction) NOR a second recall-side LLM judgment (duct tape —
-    re-deriving what extraction already read once) are the right mechanism. Temporal returns
-    once extract emits a validity role and recall maps it deterministically — not before.
+    ``valid_from``/``valid_until`` come from each fact's unit-level ``temporal_refs``, mapped
+    DETERMINISTICALLY by role in ``_flatten_envelope_facts`` (module TEMPORAL — ROLE note) — this
+    pass PASSES THEM THROUGH, it does not judge them. Direction is read once at extraction
+    (extract#31's role field), never re-derived by a second recall-side LLM pass. A ref-less fact
+    carries null (the honest fallback), and a garbage action response fail-closes the ACTION to
+    create while the bound rides through unchanged — temporal is decoupled from the action.
 
     FAIL-CLOSED, never drops a fact: an unparseable/malformed response, an infer exception, an
     invalid action value, or any fact index the response didn't address all degrade that fact's
@@ -1931,8 +2003,13 @@ def _decide_actions(
             "tags": tags,
             "source_turns": [],
             "contradiction_note": contradiction_note,
-            "valid_from": None,   # NULL PLACEHOLDER — see TEMPORAL — HELD module note
-            "valid_until": None,  # temporal returns via extract's role field, not LLM re-judgment
+            # Temporal bounds are mapped from the ENVELOPE's role in _flatten_envelope_facts
+            # (module TEMPORAL — ROLE note), NOT judged by this action pass — a ref-less fact
+            # carries null (honest fallback), and the action LLM's response never supplies these
+            # (it is not even asked to; see the action-decision prompt). Decoupling the bound from
+            # the action means it survives the fail-closed-to-create path unchanged.
+            "valid_from": fact.get("valid_from"),
+            "valid_until": fact.get("valid_until"),
         })
     return results
 

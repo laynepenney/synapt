@@ -32,15 +32,16 @@ from synapt.recall.consolidate import (
     _decide_actions,
     _estimate_action_decision_budget,
     _flatten_envelope_facts,
+    _map_temporal_refs_to_bounds,
     _normalize_for_dedup,
     _run_coro_blocking,
     _extract_cluster_units,
 )
 
 
-def _entry(session_id="s1", *, done=None, decisions=None) -> JournalEntry:
+def _entry(session_id="s1", *, done=None, decisions=None, ts="2026-07-13T10:00:00Z") -> JournalEntry:
     return JournalEntry(
-        timestamp="2026-07-13T10:00:00Z", session_id=session_id,
+        timestamp=ts, session_id=session_id,
         done=list(done or []), decisions=list(decisions or []),
     )
 
@@ -49,12 +50,15 @@ def _node(content, category="fact", node_id=None) -> KnowledgeNode:
     return KnowledgeNode.create(content=content, category=category, node_id=node_id)
 
 
-def _envelope_ok(source_unit_id: str, *, facts=None, decisions=None):
+def _envelope_ok(source_unit_id: str, *, facts=None, decisions=None, temporal_refs=None):
     """A minimal fake BatchUnitResult-shaped object (status='ok') carrying a SynaptExtraction
     envelope, without needing a real extract_batch round trip — _flatten_envelope_facts /
-    _decide_actions only read .status/.extraction/.source_unit_id. No temporal_refs field —
-    B2 no longer requests or reads it (see consolidate.py's TEMPORAL — REVISED note); temporal
-    bounds are judged by B2's own LLM pass directly from fact content."""
+    _decide_actions read .status/.extraction/.source_unit_id. ``temporal_refs`` is the
+    extraction(unit)-level list extract_batch now emits (see consolidate.py's TEMPORAL — ROLE
+    note): each ref carries {raw, resolved, resolved_end?, role, version} exactly as pinned from
+    real extract_batch output. Defaults to [] so the many non-temporal fixtures below are
+    unaffected. _flatten_envelope_facts maps these to per-fact valid_from/valid_until
+    DETERMINISTICALLY by role — no LLM re-judgment."""
     from types import SimpleNamespace
     return SimpleNamespace(
         source_unit_id=source_unit_id,
@@ -62,6 +66,7 @@ def _envelope_ok(source_unit_id: str, *, facts=None, decisions=None):
         extraction={
             "facts": facts or [],
             "decisions": decisions or [],
+            "temporal_refs": temporal_refs or [],
         },
         reason=None,
     )
@@ -87,6 +92,99 @@ def _ok_envelope_infer(request):
         "decisions": [],
         "temporal_refs": [],
     })
+
+
+# --- _map_temporal_refs_to_bounds: the deterministic role -> (valid_from, valid_until) map ----
+# Direction now rides in extract's ROLE field (extract#31); recall maps it with ZERO LLM
+# re-judgment. Every ref shape below matches real extract_batch output (pinned: {raw, resolved,
+# resolved_end?, role, version}). The mapper is pure + fail-safe: unknown/absent role or
+# unparseable date contributes nothing (honest None), never a crash.
+
+def _ref(role, resolved=None, *, resolved_end=None, raw="some date"):
+    """A temporal_ref shaped exactly like real extract_batch output (incl. the harmless
+    ``version`` stamp the mapper must ignore)."""
+    r = {"raw": raw, "role": role, "version": "1"}
+    if resolved is not None:
+        r["resolved"] = resolved
+    if resolved_end is not None:
+        r["resolved_end"] = resolved_end
+    return r
+
+
+def test_map_effective_role_sets_valid_from_only():
+    assert _map_temporal_refs_to_bounds([_ref("effective", "2026-03-01")]) == ("2026-03-01", None)
+
+
+def test_map_expiry_role_sets_valid_until_only():
+    assert _map_temporal_refs_to_bounds([_ref("expiry", "2026-04-30")]) == (None, "2026-04-30")
+
+
+def test_map_superseded_role_sets_valid_until():
+    # superseded == the fact stopped being true when the newer one arrived -> an upper bound.
+    assert _map_temporal_refs_to_bounds([_ref("superseded", "2026-05-15")]) == (None, "2026-05-15")
+
+
+def test_map_range_role_sets_both_bounds():
+    got = _map_temporal_refs_to_bounds([_ref("range", "2026-01-01", resolved_end="2026-06-30")])
+    assert got == ("2026-01-01", "2026-06-30")
+
+
+def test_map_point_role_defaults_to_valid_from():
+    # a bare point-in-time with no start/end direction -> valid_from by spec default.
+    assert _map_temporal_refs_to_bounds([_ref("point", "2026-07-04")]) == ("2026-07-04", None)
+
+
+def test_map_combines_effective_and_expiry_across_refs():
+    # THE multi-ref case: one unit's text yields both an effective and an expiry ref; the fact
+    # gets BOTH bounds. _derive_temporal_bounds's combine, now driven by role not LLM output.
+    refs = [_ref("effective", "2026-03-01"), _ref("expiry", "2026-04-30")]
+    assert _map_temporal_refs_to_bounds(refs) == ("2026-03-01", "2026-04-30")
+
+
+def test_map_absent_role_contributes_nothing():
+    # a ref WITHOUT a role can't encode direction -> honest None (the old placeholder behavior,
+    # now scoped to exactly the role-less case rather than being unconditional).
+    assert _map_temporal_refs_to_bounds([{"raw": "April 30", "resolved": "2026-04-30", "version": "1"}]) == (None, None)
+
+
+def test_map_unknown_role_contributes_nothing():
+    assert _map_temporal_refs_to_bounds([_ref("whenever", "2026-04-30")]) == (None, None)
+
+
+def test_map_missing_resolved_yields_none_bound():
+    # role present but the model gave no resolved date -> no bound to assign, no crash.
+    assert _map_temporal_refs_to_bounds([_ref("expiry", None)]) == (None, None)
+
+
+def test_map_malformed_resolved_date_rejected():
+    # _validate_iso_date guards: a non-ISO 'resolved' does not become a bound.
+    assert _map_temporal_refs_to_bounds([_ref("expiry", "not-a-date")]) == (None, None)
+
+
+def test_map_range_missing_resolved_end_sets_only_start():
+    # defensive: validate.py enforces range->resolved_end, but if it's absent the start still maps.
+    assert _map_temporal_refs_to_bounds([_ref("range", "2026-01-01")]) == ("2026-01-01", None)
+
+
+def test_map_first_non_null_wins_per_bound_deterministic():
+    # two effective refs -> the FIRST resolved wins (order-preserving, deterministic; no min/max
+    # heuristic that could reorder under equal inputs).
+    refs = [_ref("effective", "2026-03-01"), _ref("effective", "2026-09-09")]
+    assert _map_temporal_refs_to_bounds(refs) == ("2026-03-01", None)
+
+
+def test_map_empty_list_is_null_bounds():
+    assert _map_temporal_refs_to_bounds([]) == (None, None)
+
+
+def test_map_none_input_is_null_bounds():
+    assert _map_temporal_refs_to_bounds(None) == (None, None)
+
+
+def test_map_non_dict_ref_skipped_fail_safe():
+    # a malformed (non-dict) element must not crash the whole cluster's consolidation.
+    refs = ["garbage", None, _ref("expiry", "2026-04-30")]
+    assert _map_temporal_refs_to_bounds(refs) == (None, "2026-04-30")
 
 
 # --- _flatten_envelope_facts -----------------------------------------------------------------
@@ -131,6 +229,52 @@ def test_flatten_multiple_envelopes_preserve_order_and_attribution():
     flat = _flatten_envelope_facts(envs)
     assert [f["text"] for f in flat] == ["first", "second"]
     assert [f["source_unit_id"] for f in flat] == ["c:0:done:0", "c:0:done:1"]
+
+
+# --- _flatten_envelope_facts: temporal wiring (envelope role -> per-fact bounds) -------------
+
+def test_flatten_attaches_role_mapped_bounds_to_facts():
+    env = _envelope_ok(
+        "c:0:done:0",
+        facts=[{"text": "the API key expires April 30"}],
+        temporal_refs=[_ref("expiry", "2025-04-30")],
+    )
+    flat = _flatten_envelope_facts([env])
+    assert flat[0]["valid_from"] is None
+    assert flat[0]["valid_until"] == "2025-04-30"
+
+
+def test_flatten_without_temporal_refs_gives_null_bounds():
+    # backward-compat: the common case (no temporal expression in the unit) stays null — the
+    # honest placeholder, now the fallback rather than the unconditional rule.
+    env = _envelope_ok("c:0:done:0", facts=[{"text": "no dates here"}])
+    flat = _flatten_envelope_facts([env])
+    assert flat[0]["valid_from"] is None and flat[0]["valid_until"] is None
+
+
+def test_flatten_unit_temporal_refs_apply_to_all_facts_of_that_unit():
+    # temporal_refs are unit-level (siblings of facts[] in the extraction, confirmed from real
+    # extract_batch output); every fact flattened from that unit shares the unit's bounds.
+    env = _envelope_ok(
+        "c:0:done:0",
+        facts=[{"text": "fact one"}, {"text": "fact two"}],
+        temporal_refs=[_ref("effective", "2026-03-01")],
+    )
+    flat = _flatten_envelope_facts([env])
+    assert all(f["valid_from"] == "2026-03-01" for f in flat)
+
+
+def test_flatten_bounds_are_per_envelope_not_bled_across_units():
+    # two units, only the first carries a temporal ref -> the second stays null (no cross-unit
+    # bleed from the shared out[] accumulator).
+    envs = [
+        _envelope_ok("c:0:done:0", facts=[{"text": "dated"}], temporal_refs=[_ref("expiry", "2026-04-30")]),
+        _envelope_ok("c:0:done:1", facts=[{"text": "undated"}]),
+    ]
+    flat = _flatten_envelope_facts(envs)
+    by_text = {f["text"]: f for f in flat}
+    assert by_text["dated"]["valid_until"] == "2026-04-30"
+    assert by_text["undated"]["valid_until"] is None
 
 
 # --- _decide_actions: MECHANISM tests (synthetic, fake infer) --------------------------------
@@ -518,31 +662,38 @@ def test_decide_actions_exact_match_dedup_does_not_override_model_chosen_corrobo
     assert out[0]["existing_id"] == "kn_target"  # the model's own choice, NOT overridden
 
 
-# --- TEMPORAL — HELD, NULL PLACEHOLDER (2026-07-15, Layne layer-redirect via Opus) -----------
+# --- TEMPORAL — ROLE MAPPING (2026-07-15, extract#31 landed the role field) ------------------
 #
-# The B2-LLM-judges-temporal mechanism (2026-07-14) was ITSELF duct tape — recall re-deriving
-# via a second LLM pass what extraction already read once and should capture directly. Pulled
-# entirely; valid_from/valid_until are now an HONEST NULL PLACEHOLDER (not even an LLM attempt)
-# until extract emits a validity role and recall maps it deterministically
-# (config/design/extract-temporal-role-2026-07-14.md). These tests confirm the placeholder is
-# unconditional — a model that TRIES to supply temporal fields (however it's prompted, however
-# it responds) has zero effect, since _decide_actions no longer reads those keys at all.
+# The temporal loop is now closed the RIGHT way (config/design/extract-temporal-role-2026-07-14.
+# md): extraction reads direction ONCE and emits a validity ROLE; recall maps role -> valid_from/
+# valid_until DETERMINISTICALLY in _flatten_envelope_facts (see the _map_temporal_refs_to_bounds
+# tests above). Two invariants survive from the held-placeholder era and are STRONGER now, not
+# obsolete: (1) the action-decision LLM never supplies temporal — bounds come only from the
+# envelope's role, so a model that emits valid_from/valid_until in its ACTION response is still
+# ignored; (2) the action-decision PROMPT carries no temporal instructions. What changed: a fact
+# whose unit carried a role-bearing temporal_ref now gets a REAL bound instead of unconditional
+# null. Null is now the honest FALLBACK (no role / no resolved date), not the rule.
 
-def test_decide_actions_temporal_is_always_null_placeholder():
-    """The baseline: even a genuinely new, temporally-loaded fact gets null bounds — no
-    attempt at judgment, honest placeholder rather than a guess."""
+def test_decide_actions_maps_envelope_role_to_node_bounds():
+    """The positive case: a genuinely new fact whose unit carried an expiry role lands on the
+    node dict with valid_until set — deterministically, from the envelope, no LLM judgment."""
     cluster = [_entry(done=["the API key expires April 30"])]
-    envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "the API key expires April 30"}])]
+    envs = [_envelope_ok(
+        "clu:0:done:0",
+        facts=[{"text": "the API key expires April 30"}],
+        temporal_refs=[_ref("expiry", "2025-04-30")],
+    )]
     out = _decide_actions(cluster, "clu", envs, [], lambda req: '{"actions": [{"index": 0, "action": "create"}]}')
     assert out[0]["valid_from"] is None
-    assert out[0]["valid_until"] is None
+    assert out[0]["valid_until"] == "2025-04-30"
 
 
-def test_decide_actions_temporal_placeholder_ignores_model_supplied_values():
-    """Even if a model UNPROMPTED tries to supply valid_from/valid_until (e.g. from residual
-    training-time habit, or a future prompt regression that re-adds the instruction by
-    accident), the wiring must not read them — this is the regression guard against the
-    duct-tape mechanism silently creeping back in."""
+def test_decide_actions_ignores_action_response_temporal_values():
+    """Bounds come ONLY from the envelope's role, never from the action-decision response. Even
+    if the model emits valid_from/valid_until in its ACTION json (residual habit, or a prompt
+    regression re-adding the instruction), _decide_actions must not read them — the envelope
+    here has no temporal_refs, so the bounds stay null despite the model's attempt. Regression
+    guard against a second temporal mechanism creeping back into the action pass."""
     cluster = [_entry(done=["we migrated to PostgreSQL in March 2026"])]
     envs = [_envelope_ok("clu:0:done:0", facts=[{"text": "we migrated to PostgreSQL in March 2026"}])]
 
@@ -550,18 +701,18 @@ def test_decide_actions_temporal_placeholder_ignores_model_supplied_values():
         return '{"actions": [{"index": 0, "action": "create", "valid_from": "2026-03-01", "valid_until": "2026-04-30"}]}'
 
     out = _decide_actions(cluster, "clu", envs, [], infer)
-    assert out[0]["valid_from"] is None  # NOT "2026-03-01" — the model's attempt is ignored
-    assert out[0]["valid_until"] is None  # NOT "2026-04-30"
+    assert out[0]["valid_from"] is None  # NOT the model's "2026-03-01" — action response ignored
+    assert out[0]["valid_until"] is None  # NOT the model's "2026-04-30"
 
 
-def test_decide_actions_temporal_placeholder_holds_across_all_actions():
-    """Null placeholder applies regardless of the resolved action (create/corroborate/
-    contradict) — temporal is orthogonal to the action decision."""
+def test_decide_actions_bounds_orthogonal_to_action():
+    """A role-mapped bound rides through regardless of the resolved action (create/corroborate/
+    contradict) — temporal is decided at extraction, independent of the action decision."""
     existing = [_node("some existing fact", node_id="kn_1")]
     cluster = [_entry(done=["a"], decisions=["reversed: b"])]
     envs = [
-        _envelope_ok("clu:0:done:0", facts=[{"text": "a"}]),
-        _envelope_ok("clu:0:decisions:0", decisions=[{"text": "reversed: b"}]),
+        _envelope_ok("clu:0:done:0", facts=[{"text": "a"}], temporal_refs=[_ref("effective", "2026-01-01")]),
+        _envelope_ok("clu:0:decisions:0", decisions=[{"text": "reversed: b"}], temporal_refs=[_ref("expiry", "2026-02-02")]),
     ]
 
     def infer(request):
@@ -573,27 +724,72 @@ def test_decide_actions_temporal_placeholder_holds_across_all_actions():
         )
 
     out = _decide_actions(cluster, "clu", envs, existing, infer)
-    assert out[0]["action"] == "corroborate" and out[0]["valid_from"] is None and out[0]["valid_until"] is None
-    assert out[1]["action"] == "contradict" and out[1]["valid_from"] is None and out[1]["valid_until"] is None
+    assert out[0]["action"] == "corroborate" and out[0]["valid_from"] == "2026-01-01"
+    assert out[1]["action"] == "contradict" and out[1]["valid_until"] == "2026-02-02"
 
 
-def test_decide_actions_temporal_placeholder_holds_under_malformed_response():
-    """The fail-closed path (garbage response) also carries the null placeholder — no
-    fabrication anywhere, matching the honest "we don't judge this yet" posture."""
+def test_decide_actions_bound_survives_fail_closed_action():
+    """DECOUPLING proof: a garbage action response fail-closes the ACTION to create, but the
+    envelope-role bound still lands — because temporal comes from the envelope, not the action
+    LLM. The fail-closed path fabricates nothing AND loses nothing that extraction already read."""
     cluster = [_entry(done=["a", "b"])]
     envs = [
-        _envelope_ok("clu:0:done:0", facts=[{"text": "a"}]),
-        _envelope_ok("clu:0:done:1", facts=[{"text": "b"}]),
+        _envelope_ok("clu:0:done:0", facts=[{"text": "a"}], temporal_refs=[_ref("expiry", "2026-04-30")]),
+        _envelope_ok("clu:0:done:1", facts=[{"text": "b"}]),  # no ref -> honest null fallback
     ]
     out = _decide_actions(cluster, "clu", envs, [], lambda req: "not json")
-    assert all(o["action"] == "create" for o in out)
-    assert all(o["valid_from"] is None and o["valid_until"] is None for o in out)
+    assert all(o["action"] == "create" for o in out)  # action fail-closed
+    assert out[0]["valid_until"] == "2026-04-30"       # ...but the bound survived
+    assert out[1]["valid_until"] is None               # ...and the ref-less fact stays null
 
 
-def test_build_action_decision_prompt_does_not_mention_temporal():
-    """Sanity check the prompt itself carries NO temporal instructions — confirms the pull-back
-    is complete at the prompt layer, not just the parsing layer."""
+def test_build_action_decision_prompt_does_not_leak_temporal():
+    """The action-decision prompt carries no temporal — decided at extraction (role), never
+    re-judged by the action pass. STRONG guard: the facts fed here carry real valid_from/
+    valid_until exactly as production facts now do (mapped by _flatten_envelope_facts), and
+    NEITHER the keys NOR their values may reach the prompt — leaking them would re-expose
+    temporal to the action LLM, the coupling the deterministic role-map exists to remove."""
     from synapt.recall.consolidate import _build_action_decision_prompt
-    facts = [{"text": "a fact", "category": "fact"}]
+    facts = [{"text": "a fact", "category": "fact", "valid_from": "2026-03-01", "valid_until": "2026-04-30"}]
     prompt = _build_action_decision_prompt(facts, [], [_entry(done=["a fact"])])
     assert "valid_from" not in prompt and "valid_until" not in prompt
+    assert "2026-03-01" not in prompt and "2026-04-30" not in prompt
+
+
+# --- CAPSTONE: Sentinel's wrong-year scenario, end-to-end through recall's consumption --------
+
+def test_capstone_wrong_year_scenario_end_to_end_through_recall_consumption():
+    """Sentinel's exact real-path scenario, end-to-end through recall's WHOLE consumption path:
+    a 2025-sourced 'the API key expires April 30' becomes a node with valid_until='2025-04-30'
+    (NOT 2026). Exercises the REAL extract_batch — whose coercion preserves role at base tier,
+    the exact behavior extract#31 fixed — via _real_ok_envelopes (default _EXTRACT_CAPABILITIES,
+    so this also proves recall actually REQUESTS temporal_refs now), then the deterministic
+    mapper + decide_actions node build.
+
+    Policy-compliant: the model output is a FAKE infer seam (never a live/Fable call); resolved
+    is pinned to 2025-04-30 as what the source-date-anchored model WOULD emit. The model's actual
+    year-resolution against the threaded source date is extract#31's contract, proven there — here
+    we prove recall (a) requests the role, (b) preserves it through real coercion, (c) maps it
+    deterministically to the node's valid_until."""
+    cluster = [_entry(done=["the API key expires April 30"], ts="2025-03-01T09:00:00Z")]
+
+    def infer(request):
+        # a role-bearing Stage-1 extraction, resolved to the SOURCE year (2025), as a source-date-
+        # anchored model would produce. The unit text + source date are in request["prompt"].
+        return json.dumps({
+            "extracted_at": "2025-03-01T09:00:00Z",
+            "facts": [{"text": "the API key expires April 30", "category": "fact"}],
+            "decisions": [],
+            "temporal_refs": [{"raw": "April 30", "resolved": "2025-04-30", "role": "expiry"}],
+        })
+
+    ok = _real_ok_envelopes(cluster, "clu", infer)
+    assert len(ok) == 1
+    # real extract_batch preserved role at base tier (extract#31 in recall's default cap set):
+    assert ok[0].extraction["temporal_refs"][0]["role"] == "expiry"
+    assert ok[0].extraction["temporal_refs"][0]["resolved"] == "2025-04-30"
+
+    # ...and recall maps it deterministically onto the reconcile-ready node dict:
+    out = _decide_actions(cluster, "clu", ok, [], lambda req: '{"actions": [{"index": 0, "action": "create"}]}')
+    assert out[0]["valid_until"] == "2025-04-30"  # the anchored year, NOT 2026
+    assert out[0]["valid_from"] is None
