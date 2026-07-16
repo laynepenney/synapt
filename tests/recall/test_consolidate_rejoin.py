@@ -1061,3 +1061,237 @@ def test_decision_log_write_failure_rejects_the_composition_not_an_untraceable_p
 
     assert output == fruit.action_items
     assert not unwritable_log.exists()
+
+
+# B4 compose: bounded retry + rejection telemetry (A4, grouping-contract tighten). Not a new
+# numbered guard — guard-6 is reserved for A3's supersession guard (A1 contract, config
+# f552875 section 4). A schema/duplicate-invalid response gets ONE bounded, corrective retry
+# before the whole cluster fails open. Recovers exactly the two
+# failure shapes that caused all 3 whole-cluster fail-opens in the 2026-07-15 dogfood packet
+# (dogfood-00/dogfood-08: duplicate membership; atlas-journal-038: malformed schema) — see
+# config/design/recall-supersession-guard-detection-contract-2026-07-16.md's sibling A4 scope
+# note. Retry does NOT apply to a well-formed response that a later per-group guard rejects
+# (content-unsafe / temporal-conflict) — those are correct, deliberate degradations of valid
+# model output, not malformed output worth re-asking for (pinned by the existing
+# len(requests) == 1 assertions on those paths, unchanged below).
+
+
+def test_bounded_retry_recovers_from_duplicate_membership_on_second_attempt(truth_fruit):
+    calls = {"n": 0}
+    valid_composed = (
+        "The report uses LOW as a severity convention, and Recall stores append-versioned "
+        "knowledge.jsonl revisions."
+    )
+
+    def completion(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _response(
+                ([0, 1], "first invalid composition"),
+                ([1, 2], "second invalid composition"),
+            )
+        return _response(([2, 3], valid_composed))
+
+    output, requests = _invoke_rejoin(truth_fruit, completion)
+
+    assert len(requests) == 2
+    assert _by_content(output, valid_composed)["content"] == valid_composed
+    assert truth_fruit.action_items[0] in output
+    assert truth_fruit.action_items[1] in output
+
+
+def test_bounded_retry_recovers_from_malformed_schema_on_second_attempt(truth_fruit):
+    calls = {"n": 0}
+    valid_composed = (
+        "The report uses LOW as a severity convention, and Recall stores append-versioned "
+        "knowledge.jsonl revisions."
+    )
+
+    def completion(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"groups": [{"indices": "0,1", "content": "wrong type for indices"}]}
+        return _response(([2, 3], valid_composed))
+
+    output, requests = _invoke_rejoin(truth_fruit, completion)
+
+    assert len(requests) == 2
+    assert _by_content(output, valid_composed)["content"] == valid_composed
+
+
+def test_bounded_retry_recovers_from_unparseable_response_on_second_attempt(truth_fruit):
+    calls = {"n": 0}
+    valid_composed = (
+        "The report uses LOW as a severity convention, and Recall stores append-versioned "
+        "knowledge.jsonl revisions."
+    )
+
+    def completion(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return "not-json"
+        return _response(([2, 3], valid_composed))
+
+    output, requests = _invoke_rejoin(truth_fruit, completion)
+
+    assert len(requests) == 2
+    assert _by_content(output, valid_composed)["content"] == valid_composed
+
+
+def test_retry_is_bounded_and_still_fails_open_after_exhausting_attempts(truth_fruit, caplog):
+    caplog.set_level(logging.WARNING)
+    output, requests = _invoke_rejoin(
+        truth_fruit,
+        _response(([0, 1], "first invalid composition"), ([1, 2], "second invalid composition")),
+    )
+
+    assert output == truth_fruit.action_items
+    assert len(requests) == consolidate._B4_COMPOSE_MAX_ATTEMPTS
+    messages = _warning_messages(caplog)
+    assert any("B4_COMPOSE_FAIL_OPEN" in message for message in messages)
+    assert any(
+        f"exhausted {consolidate._B4_COMPOSE_MAX_ATTEMPTS} attempt" in message
+        for message in messages
+    )
+
+
+def test_retry_correction_prompt_names_the_specific_rejection_reason(truth_fruit):
+    calls = {"n": 0}
+    valid_composed = (
+        "The report uses LOW as a severity convention, and Recall stores append-versioned "
+        "knowledge.jsonl revisions."
+    )
+
+    def completion(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _response(
+                ([0, 1], "first invalid composition"),
+                ([1, 2], "second invalid composition"),
+            )
+        return _response(([2, 3], valid_composed))
+
+    _output, requests = _invoke_rejoin(truth_fruit, completion)
+
+    assert "duplicate" in requests[1]["prompt"].lower()
+    # attempt 0's prompt is byte-identical to the no-retry path — never mutated by the guard.
+    assert requests[0]["prompt"] == requests[1]["prompt"].split("\n\nYour previous")[0]
+
+
+# B4 compose rejection telemetry (A4): per-group rejections are loud and distinguishable by
+# stage, closing the exact
+# gap RESULTS.md named in the 2026-07-15 dogfood packet: "it does not record which per-group
+# guard rejected each proposal... A content-versus-temporal breakdown therefore cannot be
+# claimed from this run."
+
+
+def test_invalid_index_group_rejection_is_logged_with_reason_and_indices(truth_fruit, caplog):
+    caplog.set_level(logging.INFO)
+    valid_composed = (
+        "The report uses LOW as a severity convention, and Recall stores append-versioned "
+        "knowledge.jsonl revisions."
+    )
+    _invoke_rejoin(
+        truth_fruit,
+        _response(
+            ([0, 1, 999], "This composition was written for a fabricated membership set."),
+            ([2, 3], valid_composed),
+        ),
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "B4_GROUP_REJECTED" in message and "invalid-index" in message
+        for message in messages
+    )
+
+
+def test_content_unsafe_group_rejection_is_logged_with_reason(truth_fruit, tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    decision_path = tmp_path / "decisions.jsonl"
+    _invoke_rejoin(
+        truth_fruit, _response(([0, 1], "   ")), decision_log_path=decision_path,
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "B4_GROUP_REJECTED" in message and "content-unsafe" in message
+        for message in messages
+    )
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    rejections = [e for e in entries if e["action"] == "b4-group-rejected"]
+    assert len(rejections) == 1
+    assert rejections[0]["stage"] == "content-unsafe"
+    assert rejections[0]["cluster_id"] == truth_fruit.cluster_id
+    assert rejections[0]["member_indices"] == [0, 1]
+
+
+def test_temporal_conflict_group_rejection_is_logged_with_reason(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The 2025 signing key expires April 30.",
+            temporal_role="expiry", resolved="2025-04-30",
+        ),
+        _FactSpec(
+            "The 2026 signing key expires April 30.",
+            temporal_role="expiry", resolved="2026-04-30",
+        ),
+    ], cluster_id="b4-temporal-telemetry")
+    decision_path = tmp_path / "decisions.jsonl"
+    _invoke_rejoin(
+        fruit,
+        _response(([0, 1], "Both signing keys expire April 30.")),
+        decision_log_path=decision_path,
+    )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "B4_GROUP_REJECTED" in message and "temporal-conflict" in message
+        for message in messages
+    )
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    rejections = [e for e in entries if e["action"] == "b4-group-rejected"]
+    assert len(rejections) == 1
+    assert rejections[0]["stage"] == "temporal-conflict"
+
+
+def test_group_rejection_reasons_distinguish_content_from_temporal_in_one_decision_log(
+    tmp_path,
+):
+    """The exact claim RESULTS.md said the 2026-07-15 packet could not make: a
+    content-versus-temporal breakdown, queryable from the durable decision log rather than
+    scraped from logger output."""
+    fruit = _real_pipeline([
+        _FactSpec(
+            "The adapter failures reported in this cluster are unrelated to SQLite "
+            "locking behavior observed during the retry-boundary investigation.",
+        ),
+        _FactSpec(
+            "Recall stores durable node revisions in an append-versioned "
+            "knowledge.jsonl file that survives process restarts without data loss.",
+        ),
+        _FactSpec(
+            "The 2025 signing key expires April 30.",
+            temporal_role="expiry", resolved="2025-04-30",
+        ),
+        _FactSpec(
+            "The 2026 signing key expires April 30.",
+            temporal_role="expiry", resolved="2026-04-30",
+        ),
+    ], cluster_id="b4-mixed-rejection-telemetry")
+    decision_path = tmp_path / "decisions.jsonl"
+    _invoke_rejoin(
+        fruit,
+        _response(
+            ([0, 1], "   "),
+            ([2, 3], "Both signing keys expire April 30."),
+        ),
+        decision_log_path=decision_path,
+    )
+
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    rejections = {e["stage"]: e for e in entries if e["action"] == "b4-group-rejected"}
+    assert set(rejections) == {"content-unsafe", "temporal-conflict"}
+    assert rejections["content-unsafe"]["member_indices"] == [0, 1]
+    assert rejections["temporal-conflict"]["member_indices"] == [2, 3]
