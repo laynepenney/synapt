@@ -2412,13 +2412,19 @@ def _b4_fail_open(action_items: list[dict], cluster_id: str, reason: str) -> lis
     return action_items
 
 
-# Guard 6 (A4, grouping-contract tighten, sprint-41): the 2026-07-15 dogfood packet's 3 whole-
-# cluster fail-opens were ALL caused by a response failing guard-3 schema validation or the
-# duplicate-membership scan — never by an infer-backend exception. A single bounded retry with
-# a prompt naming exactly what was wrong gives the model one real chance to self-correct before
-# the cluster degrades to full atomization. Deliberately does NOT retry a well-formed response
-# that a later PER-GROUP guard rejects (content-unsafe / temporal-conflict) — those are correct,
-# deliberate degradations of valid model output, not malformed output worth re-asking for.
+# B4 compose: bounded retry + rejection telemetry (A4, grouping-contract tighten, sprint-41).
+# Not a new numbered guard — guard-6 is reserved for A3's supersession guard (A1 contract,
+# config f552875 section 4). This is a tightening of guards 1/3/4's existing failure paths: a
+# bounded retry on the response-level validation those guards already perform, plus loud
+# telemetry on the per-group rejections guard 4 and the content-safety check already make.
+#
+# The 2026-07-15 dogfood packet's 3 whole-cluster fail-opens were ALL caused by a response
+# failing guard-3 schema validation or the duplicate-membership scan — never by an infer-
+# backend exception. A single bounded retry with a prompt naming exactly what was wrong gives
+# the model one real chance to self-correct before the cluster degrades to full atomization.
+# Deliberately does NOT retry a well-formed response that a later PER-GROUP guard rejects
+# (content-unsafe / temporal-conflict) — those are correct, deliberate degradations of valid
+# model output, not malformed output worth re-asking for.
 _B4_COMPOSE_MAX_ATTEMPTS = 2  # 1 initial + 1 corrective retry — bounded, never unbounded
 
 
@@ -2429,7 +2435,8 @@ def _b4_validate_compose_response(
 
     Returns ``(raw_groups, group_real_members, None)`` on success or ``(None, None, reason)``
     on failure. ``reason`` feeds both the eventual ``B4_COMPOSE_FAIL_OPEN`` marker (attempts
-    exhausted) and the next attempt's corrective prompt (attempts remain) — see guard 6.
+    exhausted) and the next attempt's corrective prompt (attempts remain) — see the bounded-
+    retry module note above.
     """
     raw_groups: list[tuple[list, str]] = []
     for g in parsed["groups"]:
@@ -2472,7 +2479,8 @@ def _log_b4_group_rejection(
     stage: str,
     reason: str,
 ) -> None:
-    """Guard 6: best-effort per-group rejection telemetry, distinguishable by ``stage``.
+    """B4 compose rejection telemetry (A4): best-effort per-group rejection telemetry,
+    distinguishable by ``stage``.
 
     Closes the exact gap the 2026-07-15 dogfood packet named (B4-FRUIT.md): "production
     telemetry exposes that these groups degraded to member pass-through, but it does not
@@ -2545,7 +2553,7 @@ def _rejoin_create_actions(
     prompt = _build_rejoin_prompt(creates)
     budget = _estimate_rejoin_budget(prompt, n)
 
-    # Guard 6 (A4): bounded retry — see _B4_COMPOSE_MAX_ATTEMPTS docstring. Attempt 0's prompt
+    # B4 compose bounded retry (A4) — see _B4_COMPOSE_MAX_ATTEMPTS docstring. Attempt 0's prompt
     # is byte-identical to the pre-retry single-shot prompt; only a failed attempt mutates it.
     raw_groups: list[tuple[list, str]] | None = None
     group_real_members: list[list[int]] | None = None

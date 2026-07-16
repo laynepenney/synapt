@@ -1063,8 +1063,10 @@ def test_decision_log_write_failure_rejects_the_composition_not_an_untraceable_p
     assert not unwritable_log.exists()
 
 
-# Guard 6 (A4, grouping-contract tighten): a schema/duplicate-invalid response gets ONE
-# bounded, corrective retry before the whole cluster fails open. Recovers exactly the two
+# B4 compose: bounded retry + rejection telemetry (A4, grouping-contract tighten). Not a new
+# numbered guard — guard-6 is reserved for A3's supersession guard (A1 contract, config
+# f552875 section 4). A schema/duplicate-invalid response gets ONE bounded, corrective retry
+# before the whole cluster fails open. Recovers exactly the two
 # failure shapes that caused all 3 whole-cluster fail-opens in the 2026-07-15 dogfood packet
 # (dogfood-00/dogfood-08: duplicate membership; atlas-journal-038: malformed schema) — see
 # config/design/recall-supersession-guard-detection-contract-2026-07-16.md's sibling A4 scope
@@ -1176,7 +1178,8 @@ def test_retry_correction_prompt_names_the_specific_rejection_reason(truth_fruit
     assert requests[0]["prompt"] == requests[1]["prompt"].split("\n\nYour previous")[0]
 
 
-# Guard 6 (A4): per-group rejections are loud and distinguishable by stage, closing the exact
+# B4 compose rejection telemetry (A4): per-group rejections are loud and distinguishable by
+# stage, closing the exact
 # gap RESULTS.md named in the 2026-07-15 dogfood packet: "it does not record which per-group
 # guard rejected each proposal... A content-versus-temporal breakdown therefore cannot be
 # claimed from this run."
