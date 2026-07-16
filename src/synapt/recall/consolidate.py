@@ -2589,8 +2589,10 @@ def _source_unit_id_order(a: "str | None", b: "str | None") -> int:
     boolean-only ``_source_unit_id_is_earlier`` returned ``False`` for BOTH ``is_earlier(a, b)``
     and ``is_earlier(b, a)`` on a tie, and the caller's if/else treated "not earlier" as
     "definitely later," silently suppressing whichever side happened to be the loop's `target`.
-    A1 §7 explicitly names same-entry-same-field siblings as "no usable direction signal from
-    source_unit_id alone" — the caller must preserve both sides on ``0``, never suppress).
+    A1 §7 explicitly names same-entry siblings — the tie is on ``entry_index`` itself, which
+    spans across fields (a ``decisions`` item and a ``done`` item from the same entry tie just
+    as much as two items from the same field) — as "no usable direction signal from
+    source_unit_id alone"; the caller must preserve both sides on ``0``, never suppress).
 
     Parses the real 4-segment format's ``entry_index`` numerically when BOTH sides match it —
     robust to any future ``_split_large_cluster`` ``max_size`` change; there is no hidden
@@ -2712,7 +2714,7 @@ def _rejoin_create_actions(
 
     # B4 compose bounded retry (A4) — see _B4_COMPOSE_MAX_ATTEMPTS docstring. Attempt 0's prompt
     # is byte-identical to the pre-retry single-shot prompt; only a failed attempt mutates it.
-    raw_groups: list[tuple[list, str]] | None = None
+    raw_groups: "list[tuple[list, str, list, str | None]] | None" = None
     group_real_members: list[list[int]] | None = None
     last_reason = ""
     for attempt in range(_B4_COMPOSE_MAX_ATTEMPTS):
@@ -2944,7 +2946,7 @@ def _rejoin_create_actions(
             target_source = creates[target].get("source_unit_id")
             order = _source_unit_id_order(rep_source, target_source)
             if order == 0:
-                # A1 §7: same-entry-same-field siblings carry "no usable direction signal from
+                # A1 §7: same-entry siblings carry "no usable direction signal from
                 # source_unit_id alone." A tie is not a coin flip — preserve both candidates and
                 # record that a claim existed but couldn't be resolved (Sentinel, A3 re-review).
                 _log_b4_group_rejection(

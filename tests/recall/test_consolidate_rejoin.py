@@ -974,8 +974,8 @@ def test_guard6_out_of_range_supersedes_target_is_filtered_not_a_wrong_suppressi
     of this docstring claimed removing the upstream `0 <= i < n` range filter would NOT turn
     this test red, reasoning that _surviving_position's member_to_group_first lookup
     independently no-ops on 999 regardless. That was true for suppression-avoidance alone, but
-    is now STALE now that this test also asserts the malformed-supersedes telemetry entry —
-    which depends directly on the range filter (without it, len(supersedes) == len(raw_supersedes)
+    is STALE now that this test also asserts the malformed-supersedes telemetry entry — which
+    depends directly on the range filter (without it, len(supersedes) == len(raw_supersedes)
     and no malformed_reason is produced). Re-verified directly: removing the filter now DOES
     turn this test red."""
     stale = "extract path does not share the legacy response_cache"
