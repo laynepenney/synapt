@@ -671,31 +671,25 @@ def test_guard6_real_cache_suffix_supersession_suppresses_stale_create_and_logs_
 ):
     """Mutation intent: sever guard 6 and the packet-real stale create survives.
 
-    The stale side is the exact Qwen composition from packet c985f76. Its source identity is
-    from Apollo's verified decision-log reconstruction. The current singleton identity is from
-    Atlas's frozen-B2 replay at config d130716. Config 8dcb818 closes the composed-vs-singleton
-    ordering invariant structurally, so this fixture consumes that guarantee without re-deriving
-    or treating it as an open risk.
+    Both facts and source identities are the exact same-cluster pair from Atlas's frozen-B2
+    replay, joined and locked by Apollo at config d7fa883. Config 8dcb818 closes chronological
+    candidate ordering structurally, so this fixture consumes that guarantee without treating
+    it as an open risk.
     """
-    stale = (
-        "on validation failure, fail closed (skip+log the cluster, same shape as "
-        "today's unparseable-response handling) rather than falling back to the "
-        "legacy path mid-flag-on, extract path does not share the legacy "
-        "response_cache, and different prompt shapes."
-    )
+    stale = "extract path does not share the legacy response_cache"
     current = (
         'writing extract-path results to response_cache under a distinct ":extract" '
         "key suffix"
     )
     fruit = _real_pipeline(
         [
-            _FactSpec(stale, category="behavioral_rule"),
+            _FactSpec(stale, category="configuration"),
             _FactSpec(current, category="solution"),
         ],
-        cluster_id="35ba5d07a1d4ff4c",
+        cluster_id="986d09c3e8bb2ae5",
     )
     action_items = deepcopy(fruit.action_items)
-    stale_source = "35ba5d07a1d4ff4c:3:decisions:4"
+    stale_source = "986d09c3e8bb2ae5:0:decisions:5"
     current_source = "986d09c3e8bb2ae5:2:done:6"
     action_items[0]["source_unit_id"] = stale_source
     action_items[1]["source_unit_id"] = current_source
