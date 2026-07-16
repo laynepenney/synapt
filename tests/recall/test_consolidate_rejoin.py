@@ -176,6 +176,15 @@ def _response(*groups: tuple[list[int], str]) -> dict:
     }
 
 
+def _supersession_response(*groups: tuple[list[int], str, list[int]]) -> dict:
+    return {
+        "groups": [
+            {"indices": indices, "content": content, "supersedes": supersedes}
+            for indices, content, supersedes in groups
+        ]
+    }
+
+
 def _by_content(items: list[dict], content: str) -> dict:
     return next(item for item in items if item["content"] == content)
 
@@ -652,6 +661,208 @@ def test_failed_compose_response_fails_open_whole_cluster_with_loud_marker(
         any(fragment in message.lower() for fragment in reason_fragments)
         for message in messages
     )
+
+
+# Guard 6: same-batch supersession suppresses the older create and logs the decision.
+
+
+def test_guard6_real_cache_suffix_supersession_suppresses_stale_create_and_logs_pair(
+    tmp_path,
+):
+    """Mutation intent: sever guard 6 and the packet-real stale create survives.
+
+    The stale side is the exact Qwen composition from packet c985f76. Its source identity is
+    from Apollo's verified decision-log reconstruction. The current singleton identity is from
+    Atlas's frozen-B2 replay at config d130716. Config 8dcb818 closes the composed-vs-singleton
+    ordering invariant structurally, so this fixture consumes that guarantee without re-deriving
+    or treating it as an open risk.
+    """
+    stale = (
+        "on validation failure, fail closed (skip+log the cluster, same shape as "
+        "today's unparseable-response handling) rather than falling back to the "
+        "legacy path mid-flag-on, extract path does not share the legacy "
+        "response_cache, and different prompt shapes."
+    )
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="behavioral_rule"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="35ba5d07a1d4ff4c",
+    )
+    action_items = deepcopy(fruit.action_items)
+    stale_source = "35ba5d07a1d4ff4c:3:decisions:4"
+    current_source = "986d09c3e8bb2ae5:2:done:6"
+    action_items[0]["source_unit_id"] = stale_source
+    action_items[1]["source_unit_id"] = current_source
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, requests = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1], current, [0]),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert [item["content"] for item in output] == [current]
+    assert output[0]["source_unit_id"] == current_source
+
+    entries = [
+        json.loads(line) for line in decision_path.read_text().splitlines() if line
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["action"] == "b4-supersede"
+    assert entry["cluster_id"] == fruit.cluster_id
+    assert entry["superseded_index"] == 0
+    assert entry["superseding_index"] == 1
+    assert entry["superseded_source_unit_id"] == stale_source
+    assert entry["superseding_source_unit_id"] == current_source
+    assert (
+        entry["superseded_content_digest"]
+        == hashlib.sha256(stale.encode("utf-8")).hexdigest()
+    )
+    assert (
+        entry["superseding_content_digest"]
+        == hashlib.sha256(current.encode("utf-8")).hexdigest()
+    )
+
+    knowledge_path = tmp_path / "knowledge.jsonl"
+    result = consolidate._apply_consolidation_result(
+        {"nodes": output}, [], fruit.cluster, knowledge_path,
+    )
+    persisted = read_nodes(knowledge_path)
+    assert result.nodes_created == 1
+    assert [node.content for node in persisted if node.status == "active"] == [current]
+
+    prompt = requests[0]["prompt"].lower()
+    assert '"supersedes"' in prompt
+    assert "same subject" in prompt
+    assert all(root in prompt for root in ("updat", "correct", "contradict"))
+
+
+def test_guard6_negation_flip_suppresses_earlier_ungrouped_singleton(tmp_path):
+    """Mutation intent: trust model direction and the newer correction is suppressed.
+
+    The fake deliberately reports the semantic pair from the earlier group's side. Guard 6
+    must use the chronologically ordered candidate positions guaranteed by config 8dcb818,
+    not the model's direction, and still suppress the earlier claim.
+    """
+    earlier = "the four attribution test failures are unrelated to the consolidate/extract change."
+    later = "root-caused the four attribution test failures to the extract-path change after all."
+    fruit = _real_pipeline(
+        [
+            _FactSpec(earlier, category="debugging"),
+            _FactSpec(later, category="debugging"),
+        ],
+        cluster_id="guard6-negation-flip",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "s020c00:0"
+    action_items[1]["source_unit_id"] = "s088c00:0"
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], earlier, [1]),
+            ([1], later, []),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert [item["content"] for item in output] == [later]
+    entries = [
+        json.loads(line) for line in decision_path.read_text().splitlines() if line
+    ]
+    assert len(entries) == 1
+    assert entries[0]["action"] == "b4-supersede"
+    assert entries[0]["superseded_source_unit_id"] == "s020c00:0"
+    assert entries[0]["superseding_source_unit_id"] == "s088c00:0"
+
+
+def test_guard6_status_change_suppresses_open_state_and_keeps_closed_state(tmp_path):
+    """Mutation intent: sever status-change suppression and both open and closed stay live."""
+    opened = (
+        "opened recall#900 to track the flat-budget truncation on the collection pass."
+    )
+    closed = "closed recall#900 \u2014 the dynamic-budget fix landed in the same PR."
+    fruit = _real_pipeline(
+        [
+            _FactSpec(opened, category="action"),
+            _FactSpec(closed, category="action"),
+        ],
+        cluster_id="guard6-status-change",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "s030c00:0"
+    action_items[1]["source_unit_id"] = "s095c00:0"
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], opened, []),
+            ([1], closed, [0]),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert [item["content"] for item in output] == [closed]
+    entries = [
+        json.loads(line) for line in decision_path.read_text().splitlines() if line
+    ]
+    assert len(entries) == 1
+    assert entries[0]["action"] == "b4-supersede"
+    assert entries[0]["superseded_index"] == 0
+    assert entries[0]["superseding_index"] == 1
+
+
+def test_guard6_shared_vocabulary_without_conflict_keeps_both_creates(tmp_path):
+    """Mutation intent: replace the semantic edge with vocabulary matching and this turns RED."""
+    derivation = (
+        "the response_cache key is a sha256 of sorted session_id|timestamp pairs."
+    )
+    suffix = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(derivation, category="architecture"),
+            _FactSpec(suffix, category="solution"),
+        ],
+        cluster_id="guard6-shared-vocabulary-control",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "s060c00:0"
+    action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:2:done:6"
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, requests = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], derivation, []),
+            ([1], suffix, []),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert output == action_items
+    assert not decision_path.exists()
+    prompt = requests[0]["prompt"].lower()
+    assert "shared vocabulary" in prompt
+    assert "supersedes" in prompt
 
 
 # Stage mechanics: one scaled inference call, then B4's result enters B3.
