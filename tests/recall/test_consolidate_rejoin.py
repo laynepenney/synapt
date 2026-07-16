@@ -859,9 +859,97 @@ def test_guard6_shared_vocabulary_without_conflict_keeps_both_creates(tmp_path):
     assert "supersedes" in prompt
 
 
-# Guard 6 (A3) supplemental coverage: two real behaviors the 4 A2-pinned fixtures don't
-# exercise (all 4 use single-digit entry_index values and always-surviving singletons), but
-# that are load-bearing for the implementation itself.
+# Guard 6 (A3) supplemental coverage: real behaviors the 4 A2-pinned fixtures don't exercise
+# (all 4 use single-digit entry_index values, always-surviving singletons, and well-formed
+# supersedes fields), but that are load-bearing for the implementation itself.
+
+
+def test_guard6_malformed_supersedes_field_type_degrades_to_no_claim(tmp_path):
+    """Mutation intent, two distinct guards in _b4_validate_compose_response, verified
+    separately rather than assumed:
+
+    The OUTER isinstance(raw_supersedes, list) check protects against a non-list
+    supersedes value. Both a string ("0,1", Opus's A3-review example) and a bare int (5) hit
+    this guard — checked directly: a Python str is NOT a list instance, so the string case
+    never even reaches the inner per-element loop; disproved my own first-draft assumption
+    that it would "iterate as characters" before writing this final version.
+
+    The INNER isinstance(i, int)/not-bool/range check protects against a well-formed LIST
+    whose ELEMENTS are the wrong shape (["not-an-int"]) — the only case that actually reaches
+    that line; the outer guard alone does not cover it.
+
+    This is the A2 contract-read question's own resolution, previously untested."""
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+
+    for case_index, malformed_value in enumerate(("0,1", 5, ["not-an-int"])):
+        fruit = _real_pipeline(
+            [
+                _FactSpec(stale, category="configuration"),
+                _FactSpec(current, category="solution"),
+            ],
+            cluster_id=f"guard6-malformed-supersedes-{case_index}",
+        )
+        decision_path = tmp_path / f"decisions-{case_index}.jsonl"
+
+        malformed_response = {
+            "groups": [
+                {"indices": [0], "content": stale, "supersedes": malformed_value},
+                {"indices": [1], "content": current, "supersedes": []},
+            ],
+        }
+
+        output, _ = _invoke_rejoin(fruit, malformed_response, decision_log_path=decision_path)
+
+        assert len(output) == 2, f"case {case_index} ({malformed_value!r}) dropped an item"
+        assert {item["content"] for item in output} == {stale, current}
+        assert not decision_path.exists()
+
+        knowledge_path = tmp_path / f"knowledge-{case_index}.jsonl"
+        result = consolidate._apply_consolidation_result(
+            {"nodes": output}, [], fruit.cluster, knowledge_path,
+        )
+        assert result.nodes_created == 2
+
+
+def test_guard6_out_of_range_supersedes_target_is_filtered_not_a_wrong_suppression(tmp_path):
+    """A hallucinated target index (999, out of range for a 2-item cluster) must not crash
+    creates[target] or silently suppress the wrong thing. Defense in depth, checked directly
+    rather than assumed: mutating away _b4_validate_compose_response's own `0 <= i < n` range
+    filter does NOT turn this test red on its own — _surviving_position's member_to_group_first
+    lookup independently no-ops on any index that was never a real group member (its dict
+    .get() returns None for an absent key), so creates[target] is never reached regardless of
+    the upstream filter. Both protections are real and independently sufficient; the system-
+    level behavior this test pins (no crash, no wrong suppression) is what actually matters."""
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="guard6-out-of-range-supersedes-target",
+    )
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1], current, [999]),  # hallucinated target, out of range for n=2
+        ),
+        decision_log_path=decision_path,
+    )
+
+    assert len(output) == 2
+    assert {item["content"] for item in output} == {stale, current}
+    assert not decision_path.exists()
 
 
 def test_source_unit_id_direction_uses_numeric_not_lexicographic_comparison():
