@@ -2256,6 +2256,14 @@ together into one compound entry. A fact that stands alone should be its own sin
 For EACH fact index above, put it in exactly one group. Give each group's member indices and \
 ONE composed content string for that group.
 
+Also decide, for each group, whether it "supersedes" any OTHER index — meaning that OTHER \
+index describes the SAME subject at an earlier point in time, and this group's content \
+updates, corrects, or contradicts it (not merely relates to it or shares its vocabulary). \
+List those other indices in a "supersedes" array (empty if none). Two facts about the same \
+subject that are simply complementary, not in conflict, are NOT a supersession — shared \
+vocabulary alone is never enough; only flag a genuine same-subject update, correction, or \
+contradiction.
+
 Rules:
 1. Compose ONLY from the given MEMBER facts — never assert a relation, cause, or qualifier \
 that is not directly present in a member's own text. Do not flip a negation (a fact stating \
@@ -2264,7 +2272,8 @@ convention or definition (e.g. what a label means) when restating it.
 2. Every index above must appear in EXACTLY ONE group.
 3. Output ONLY valid JSON, no markdown fences, no explanation.
 
-{{"groups": [{{"indices": [0, 1], "content": "..."}}, {{"indices": [2], "content": "..."}}]}}
+{{"groups": [{{"indices": [0, 1], "content": "...", "supersedes": []}}, \
+{{"indices": [2], "content": "...", "supersedes": [0]}}]}}
 """
 
 
@@ -2430,15 +2439,22 @@ _B4_COMPOSE_MAX_ATTEMPTS = 2  # 1 initial + 1 corrective retry — bounded, neve
 
 def _b4_validate_compose_response(
     parsed: dict, n: int,
-) -> "tuple[list[tuple[list, str]], list[list[int]], None] | tuple[None, None, str]":
+) -> "tuple[list[tuple[list, str, list]], list[list[int]], None] | tuple[None, None, str]":
     """Guard 3 (schema) + duplicate-membership validation for ONE compose attempt.
 
     Returns ``(raw_groups, group_real_members, None)`` on success or ``(None, None, reason)``
     on failure. ``reason`` feeds both the eventual ``B4_COMPOSE_FAIL_OPEN`` marker (attempts
     exhausted) and the next attempt's corrective prompt (attempts remain) — see the bounded-
     retry module note above.
+
+    Each ``raw_groups`` entry is ``(indices, content, supersedes)``. ``supersedes`` (guard 6,
+    A3) is OPTIONAL and non-fatal when malformed: a missing field, a wrong-typed field, or an
+    out-of-range/hallucinated target index degrades to "no supersession claim" for that entry
+    rather than failing the whole cluster open — the base composition contract (indices/content)
+    is guard 3's concern; a broken supersession hint on top of an otherwise-valid group is not
+    the same class of failure as a broken group itself (Sentinel, A2 review).
     """
-    raw_groups: list[tuple[list, str]] = []
+    raw_groups: list[tuple[list, str, list]] = []
     for g in parsed["groups"]:
         if not isinstance(g, dict):
             return None, None, (
@@ -2451,12 +2467,21 @@ def _b4_validate_compose_response(
                 "compose response contains a structurally malformed group entry "
                 "(indices/content wrong type — schema violation)"
             )
-        raw_groups.append((idxs, content))
+        raw_supersedes = g.get("supersedes", [])
+        supersedes = (
+            [
+                i for i in raw_supersedes
+                if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
+            ]
+            if isinstance(raw_supersedes, list)
+            else []
+        )
+        raw_groups.append((idxs, content, supersedes))
 
     group_real_members: list[list[int]] = []
     seen: set[int] = set()
     duplicate = False
-    for idxs, _content in raw_groups:
+    for idxs, _content, _supersedes in raw_groups:
         real = [
             i for i in idxs
             if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
@@ -2513,6 +2538,84 @@ def _log_b4_group_rejection(
             f.flush()
     except OSError:
         logger.debug("Failed to write B4 group-rejection decision log")
+
+
+def _entry_index_if_parseable(source_unit_id: "str | None") -> "int | None":
+    """Parse the real ``{cluster}:{entry_index}:{field}:{item}`` format's ``entry_index``
+    numerically when the shape matches (exactly 4 colon-segments, second segment a plain int).
+    Returns ``None`` for any other shape — an honest degradation the caller falls back on,
+    never a crash on an unexpected ``source_unit_id``."""
+    parts = (source_unit_id or "").split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _source_unit_id_is_earlier(a: "str | None", b: "str | None") -> bool:
+    """Whether *a* is chronologically earlier than *b*, for guard 6's direction resolution.
+
+    Parses the real 4-segment format's ``entry_index`` numerically when BOTH sides match it —
+    robust to any future ``_split_large_cluster`` ``max_size`` change; there is no hidden
+    lexicographic-vs-numeric equivalence here to silently invert if that bound ever climbs past
+    9 (Opus, 2026-07-16 — a single-digit-only assumption would have been an implicit, undocumented
+    dependency on today's default). Falls back to full-string comparison for any other shape,
+    which is exactly what A2's synthetic test fixtures use (e.g. ``"s020c00:0"`` — 2 segments,
+    not 4) and remains correct there: the differing digits sit early enough in the string that
+    plain lexicographic ordering already gives the right answer for those values.
+    """
+    a_idx = _entry_index_if_parseable(a)
+    b_idx = _entry_index_if_parseable(b)
+    if a_idx is not None and b_idx is not None:
+        return a_idx < b_idx
+    return (a or "") < (b or "")
+
+
+def _log_b4_supersede_decision(
+    decision_log_path: "Path | None",
+    cluster_id: str,
+    superseded_index: int,
+    superseding_index: int,
+    superseded_source_unit_id: "str | None",
+    superseding_source_unit_id: "str | None",
+    superseded_content: str,
+    superseding_content: str,
+) -> None:
+    """Guard 6 (A3, supersession suppression): durable traceability for a suppressed same-batch
+    supersession, symmetric in shape to guard 3's ``b4-compose`` entries. Best-effort — a lost
+    supersede-telemetry entry doesn't corrupt persisted data (the suppression already happened
+    in memory either way), so this follows ``_log_b4_group_rejection``'s fire-and-forget
+    pattern, not guard 3's reject-on-failure one. Never called when nothing was superseded —
+    the caller only invokes this on an actual detected-and-resolved conflict, so the absence of
+    ANY supersession in a cluster means this file is never even created."""
+    if decision_log_path is None:
+        return
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "b4-supersede",
+        "cluster_id": cluster_id,
+        "superseded_index": superseded_index,
+        "superseding_index": superseding_index,
+        "superseded_source_unit_id": superseded_source_unit_id,
+        "superseding_source_unit_id": superseding_source_unit_id,
+        "superseded_content_digest": hashlib.sha256(
+            superseded_content.encode("utf-8")
+        ).hexdigest(),
+        "superseding_content_digest": hashlib.sha256(
+            superseding_content.encode("utf-8")
+        ).hexdigest(),
+    }
+    try:
+        from synapt.recall._filelock import lock_exclusive
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(decision_log_path, "a", encoding="utf-8") as f:
+            lock_exclusive(f)
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except OSError:
+        logger.debug("Failed to write B4 supersede decision log")
 
 
 def _rejoin_create_actions(
@@ -2605,15 +2708,15 @@ def _rejoin_create_actions(
     # NOW drop any group that contained an invalid/hallucinated index (per-group degradation —
     # its real members are not partially trusted under text written for a fabricated/different
     # membership set) or was empty to begin with.
-    candidate_groups: list[tuple[list[int], str]] = []
-    for (idxs, content), real in zip(raw_groups, group_real_members):
+    candidate_groups: list[tuple[list[int], str, list[int]]] = []
+    for (idxs, content, supersedes), real in zip(raw_groups, group_real_members):
         if not real or len(real) != len(idxs):
             _log_b4_group_rejection(
                 decision_log_path, cluster_id, real or idxs, "invalid-index",
                 "group contained an invalid or hallucinated member index",
             )
             continue
-        candidate_groups.append((real, content))
+        candidate_groups.append((real, content, supersedes))
 
     # Guard 4 + composition: singleton groups (len 1) are pass-through, never rewritten, even
     # if the model proposed text for them. Multi-member groups compose only if their bounds
@@ -2623,7 +2726,7 @@ def _rejoin_create_actions(
     # not the whole cluster.
     successful_by_first_pos: dict[int, dict] = {}
     composed_member_positions: set[int] = set()
-    for idxs, content in candidate_groups:
+    for idxs, content, _supersedes in candidate_groups:
         if len(idxs) < 2:
             continue
 
@@ -2690,8 +2793,102 @@ def _rejoin_create_actions(
         for i in idxs:
             composed_member_positions.add(create_indices[i])
 
+    # Guard 6 (A3, supersession suppression — NOT a new numbered guard for THIS module note's
+    # own counting scheme; "guard 6" is the A1 contract's name for this specific mechanism,
+    # config f552875 section 4). A group's `supersedes` claim marks a candidate index this
+    # group's content updates, corrects, or contradicts — same subject, different point in
+    # time. Direction is NEVER trusted from the model: source_unit_id chronology
+    # (_source_unit_id_is_earlier) is the sole arbiter, because the model can and does
+    # attribute the claim to the wrong side (fruit: A2's negation-flip fixture flags the
+    # relationship from the chronologically-earlier group's own entry). A claim only fires
+    # when BOTH sides of the pair actually produced real output — a group already rejected by
+    # an earlier guard, or a non-first member folded into someone else's successful
+    # composition, cannot be the superseding OR superseded side; suppressing one side of a
+    # claim that never really resolved to independent output would either violate never-drop
+    # or corrupt an already-fixed composed string.
+    member_to_group_first: dict[int, int] = {}
+    group_supersedes_by_first: dict[int, list[int]] = {}
+    group_is_singleton_by_first: dict[int, bool] = {}
+    for idxs, _content, supersedes in candidate_groups:
+        first = idxs[0]
+        for i in idxs:
+            member_to_group_first[i] = first
+        group_supersedes_by_first[first] = supersedes
+        group_is_singleton_by_first[first] = len(idxs) < 2
+
+    def _surviving_position(creates_index: int) -> "int | None":
+        """The original action_items position *creates_index*'s content actually appears at
+        in the final output, or None if it never independently resolves to real output
+        (a non-first member of a successful multi-member composition — its content is folded
+        into that group's single composed node, not separately removable)."""
+        first = member_to_group_first.get(creates_index)
+        if first is None:
+            return None
+        if group_is_singleton_by_first[first]:
+            return create_indices[creates_index]  # singletons always survive at their own pos
+        if create_indices[first] in successful_by_first_pos:
+            # composed successfully — only the group's OWN first member has an independent
+            # position; any other member's content is inside the fixed composed string.
+            return create_indices[first] if creates_index == first else None
+        # composed group was rejected by an earlier guard — every member reverts to its own
+        # original, unmodified pass-through position.
+        return create_indices[creates_index]
+
+    def _group_claim_is_valid(first: int) -> bool:
+        """Whether the group whose first member is *first* actually produced the composed
+        content its `supersedes` claim was attached to. A claim from a REJECTED multi-member
+        group must never fire, even though its individual members revert to pass-through —
+        the composed sentence that CARRIED the claim never became real output; reverted
+        members are unrelated atomic facts with no claim of their own (fruit-confirmed:
+        without this check, a content-unsafe-rejected group's supersedes target was wrongly
+        suppressed even though the rejected group itself fully vanished)."""
+        if group_is_singleton_by_first[first]:
+            return True  # a singleton's own fact IS its claim — nothing to have failed
+        return create_indices[first] in successful_by_first_pos
+
+    suppressed_positions: set[int] = set()
+    seen_pairs: set[frozenset] = set()
+    for idxs, _content, supersedes in candidate_groups:
+        if not supersedes:
+            continue
+        representative = idxs[0]
+        if not _group_claim_is_valid(representative):
+            continue  # the claiming group's own composition never succeeded
+        for target in supersedes:
+            if target == representative:
+                continue
+            pair = frozenset((representative, target))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            rep_pos = _surviving_position(representative)
+            target_pos = _surviving_position(target)
+            if rep_pos is None or target_pos is None:
+                continue  # one side never independently resolved to real output
+
+            rep_source = creates[representative].get("source_unit_id")
+            target_source = creates[target].get("source_unit_id")
+            if _source_unit_id_is_earlier(rep_source, target_source):
+                superseded, superseding = representative, target
+            else:
+                superseded, superseding = target, representative
+
+            superseded_pos = _surviving_position(superseded)
+            if superseded_pos is None or superseded_pos in suppressed_positions:
+                continue
+            suppressed_positions.add(superseded_pos)
+            _log_b4_supersede_decision(
+                decision_log_path, cluster_id, superseded, superseding,
+                creates[superseded].get("source_unit_id"),
+                creates[superseding].get("source_unit_id"),
+                creates[superseded]["content"], creates[superseding]["content"],
+            )
+
     output: list[dict] = []
     for pos, item in enumerate(action_items):
+        if pos in suppressed_positions:
+            continue  # guard 6: suppressed at creation, never enters output
         if item.get("action") != "create":
             output.append(item)
         elif pos in successful_by_first_pos:

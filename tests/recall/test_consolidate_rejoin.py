@@ -859,6 +859,72 @@ def test_guard6_shared_vocabulary_without_conflict_keeps_both_creates(tmp_path):
     assert "supersedes" in prompt
 
 
+# Guard 6 (A3) supplemental coverage: two real behaviors the 4 A2-pinned fixtures don't
+# exercise (all 4 use single-digit entry_index values and always-surviving singletons), but
+# that are load-bearing for the implementation itself.
+
+
+def test_source_unit_id_direction_uses_numeric_not_lexicographic_comparison():
+    """Real-format entry_index parses as an int, not a lexicographically-sorted string —
+    protects against inversion if _split_large_cluster's max_size default ever climbs past 9
+    (Opus, 2026-07-16): "10" sorts before "2" lexicographically but is chronologically later.
+    None of A2's 4 pinned fixtures reach double-digit entry_index (today's real max_size=4
+    caps it at a single digit), so this is the only test that actually exercises the numeric
+    branch rather than the lexicographic fallback."""
+    earlier = "some-cluster-hash:2:decisions:0"
+    later = "some-cluster-hash:10:decisions:0"
+    assert consolidate._source_unit_id_is_earlier(earlier, later) is True
+    assert consolidate._source_unit_id_is_earlier(later, earlier) is False
+
+
+def test_source_unit_id_direction_falls_back_to_lexicographic_for_non_real_format():
+    """A2's own fixtures (s020c00:0-style, 2 segments not 4) — and any other non-conforming
+    source_unit_id shape — degrade to full-string comparison rather than crashing."""
+    assert consolidate._source_unit_id_is_earlier("s020c00:0", "s088c00:0") is True
+    assert consolidate._source_unit_id_is_earlier("s088c00:0", "s020c00:0") is False
+
+
+def test_guard6_claim_does_not_apply_when_the_superseding_side_is_itself_rejected(tmp_path):
+    """The superseding side must independently survive to real output before its claim can
+    suppress anything — a multi-member group's content-safety rejection must not ALSO take
+    down the singleton it claimed to supersede (never-drop applies to guard 6 too)."""
+    stale = "extract path does not share the legacy response_cache"
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(
+                "Recall stores durable node revisions in an append-versioned "
+                "knowledge.jsonl file that survives process restarts without data loss.",
+            ),
+            _FactSpec(
+                "The adapter failures reported in this cluster are unrelated to SQLite "
+                "locking behavior observed during the retry-boundary investigation.",
+            ),
+        ],
+        cluster_id="guard6-superseding-side-rejected",
+    )
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1, 2], "   ", [0]),  # whitespace-only -> content-unsafe rejection
+        ),
+        decision_log_path=decision_path,
+    )
+
+    # The rejected group's members revert to individual pass-through, AND the claim they
+    # carried never fires — stale must still be present, not suppressed on a claim that
+    # never independently resolved to real output. The whitespace group's OWN content-unsafe
+    # rejection is still logged (A4's existing guard-4 telemetry) — that's a different,
+    # legitimate entry; the check here is that no b4-supersede entry exists alongside it.
+    assert len(output) == 3
+    assert any(item["content"] == stale for item in output)
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    assert not any(e["action"] == "b4-supersede" for e in entries)
+
+
 # Stage mechanics: one scaled inference call, then B4's result enters B3.
 
 
