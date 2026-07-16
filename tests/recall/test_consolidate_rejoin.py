@@ -176,6 +176,15 @@ def _response(*groups: tuple[list[int], str]) -> dict:
     }
 
 
+def _supersession_response(*groups: tuple[list[int], str, list[int]]) -> dict:
+    return {
+        "groups": [
+            {"indices": indices, "content": content, "supersedes": supersedes}
+            for indices, content, supersedes in groups
+        ]
+    }
+
+
 def _by_content(items: list[dict], content: str) -> dict:
     return next(item for item in items if item["content"] == content)
 
@@ -652,6 +661,711 @@ def test_failed_compose_response_fails_open_whole_cluster_with_loud_marker(
         any(fragment in message.lower() for fragment in reason_fragments)
         for message in messages
     )
+
+
+# Guard 6: same-batch supersession suppresses the older create and logs the decision.
+
+
+def test_guard6_real_cache_suffix_supersession_suppresses_stale_create_and_logs_pair(
+    tmp_path,
+):
+    """Mutation intent: sever guard 6 and the packet-real stale create survives.
+
+    Both facts and source identities are the exact same-cluster pair from Atlas's frozen-B2
+    replay, joined and locked by Apollo at config d7fa883. Config 8dcb818 closes chronological
+    candidate ordering structurally, so this fixture consumes that guarantee without treating
+    it as an open risk.
+    """
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="986d09c3e8bb2ae5",
+    )
+    action_items = deepcopy(fruit.action_items)
+    stale_source = "986d09c3e8bb2ae5:0:decisions:5"
+    current_source = "986d09c3e8bb2ae5:2:done:6"
+    action_items[0]["source_unit_id"] = stale_source
+    action_items[1]["source_unit_id"] = current_source
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, requests = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1], current, [0]),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert [item["content"] for item in output] == [current]
+    assert output[0]["source_unit_id"] == current_source
+
+    entries = [
+        json.loads(line) for line in decision_path.read_text().splitlines() if line
+    ]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["action"] == "b4-supersede"
+    assert entry["cluster_id"] == fruit.cluster_id
+    assert entry["superseded_index"] == 0
+    assert entry["superseding_index"] == 1
+    assert entry["superseded_source_unit_id"] == stale_source
+    assert entry["superseding_source_unit_id"] == current_source
+    assert (
+        entry["superseded_content_digest"]
+        == hashlib.sha256(stale.encode("utf-8")).hexdigest()
+    )
+    assert (
+        entry["superseding_content_digest"]
+        == hashlib.sha256(current.encode("utf-8")).hexdigest()
+    )
+
+    knowledge_path = tmp_path / "knowledge.jsonl"
+    result = consolidate._apply_consolidation_result(
+        {"nodes": output}, [], fruit.cluster, knowledge_path,
+    )
+    persisted = read_nodes(knowledge_path)
+    assert result.nodes_created == 1
+    assert [node.content for node in persisted if node.status == "active"] == [current]
+
+    prompt = requests[0]["prompt"].lower()
+    assert '"supersedes"' in prompt
+    assert "same subject" in prompt
+    assert all(root in prompt for root in ("updat", "correct", "contradict"))
+
+
+def test_guard6_negation_flip_suppresses_earlier_ungrouped_singleton(tmp_path):
+    """Mutation intent: trust model direction and the newer correction is suppressed.
+
+    The fake deliberately reports the semantic pair from the earlier group's side. Guard 6
+    must use the chronologically ordered candidate positions guaranteed by config 8dcb818,
+    not the model's direction, and still suppress the earlier claim.
+    """
+    earlier = "the four attribution test failures are unrelated to the consolidate/extract change."
+    later = "root-caused the four attribution test failures to the extract-path change after all."
+    fruit = _real_pipeline(
+        [
+            _FactSpec(earlier, category="debugging"),
+            _FactSpec(later, category="debugging"),
+        ],
+        cluster_id="guard6-negation-flip",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "s020c00:0"
+    action_items[1]["source_unit_id"] = "s088c00:0"
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], earlier, [1]),
+            ([1], later, []),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert [item["content"] for item in output] == [later]
+    entries = [
+        json.loads(line) for line in decision_path.read_text().splitlines() if line
+    ]
+    assert len(entries) == 1
+    assert entries[0]["action"] == "b4-supersede"
+    assert entries[0]["superseded_source_unit_id"] == "s020c00:0"
+    assert entries[0]["superseding_source_unit_id"] == "s088c00:0"
+
+
+def test_guard6_status_change_suppresses_open_state_and_keeps_closed_state(tmp_path):
+    """Mutation intent: sever status-change suppression and both open and closed stay live."""
+    opened = (
+        "opened recall#900 to track the flat-budget truncation on the collection pass."
+    )
+    closed = "closed recall#900 \u2014 the dynamic-budget fix landed in the same PR."
+    fruit = _real_pipeline(
+        [
+            _FactSpec(opened, category="action"),
+            _FactSpec(closed, category="action"),
+        ],
+        cluster_id="guard6-status-change",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "s030c00:0"
+    action_items[1]["source_unit_id"] = "s095c00:0"
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], opened, []),
+            ([1], closed, [0]),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert [item["content"] for item in output] == [closed]
+    entries = [
+        json.loads(line) for line in decision_path.read_text().splitlines() if line
+    ]
+    assert len(entries) == 1
+    assert entries[0]["action"] == "b4-supersede"
+    assert entries[0]["superseded_index"] == 0
+    assert entries[0]["superseding_index"] == 1
+
+
+def test_guard6_shared_vocabulary_without_conflict_keeps_both_creates(tmp_path):
+    """Mutation intent: replace the semantic edge with vocabulary matching and this turns RED."""
+    derivation = (
+        "the response_cache key is a sha256 of sorted session_id|timestamp pairs."
+    )
+    suffix = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(derivation, category="architecture"),
+            _FactSpec(suffix, category="solution"),
+        ],
+        cluster_id="guard6-shared-vocabulary-control",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "s060c00:0"
+    action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:2:done:6"
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, requests = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], derivation, []),
+            ([1], suffix, []),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert output == action_items
+    assert not decision_path.exists()
+    prompt = requests[0]["prompt"].lower()
+    assert "shared vocabulary" in prompt
+    assert "supersedes" in prompt
+
+
+# Guard 6 (A3) supplemental coverage: real behaviors the 4 A2-pinned fixtures don't exercise
+# (all 4 use single-digit entry_index values, always-surviving singletons, and well-formed
+# supersedes fields), but that are load-bearing for the implementation itself.
+
+
+def test_guard6_malformed_supersedes_field_type_degrades_to_no_claim(tmp_path):
+    """Mutation intent, two distinct guards in _b4_validate_compose_response, verified
+    separately rather than assumed:
+
+    The OUTER isinstance(raw_supersedes, list) check protects against a non-list
+    supersedes value. Both a string ("0,1", Opus's A3-review example) and a bare int (5) hit
+    this guard — checked directly: a Python str is NOT a list instance, so the string case
+    never even reaches the inner per-element loop; disproved my own first-draft assumption
+    that it would "iterate as characters" before writing this final version.
+
+    The INNER isinstance(i, int)/not-bool/range check protects against a well-formed LIST
+    whose ELEMENTS are the wrong shape (["not-an-int"]) — the only case that actually reaches
+    that line; the outer guard alone does not cover it.
+
+    Composition is preserved in every case (never costs data) — but per Sentinel's spec-author
+    ruling (m_4adb43c0), a PRESENT-but-malformed field is a real detection-signal failure, not
+    a benign absence, and must emit exactly one b4-group-rejected/malformed-supersedes entry.
+    """
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+
+    for case_index, malformed_value in enumerate(("0,1", 5, ["not-an-int"])):
+        fruit = _real_pipeline(
+            [
+                _FactSpec(stale, category="configuration"),
+                _FactSpec(current, category="solution"),
+            ],
+            cluster_id=f"guard6-malformed-supersedes-{case_index}",
+        )
+        decision_path = tmp_path / f"decisions-{case_index}.jsonl"
+
+        malformed_response = {
+            "groups": [
+                {"indices": [0], "content": stale, "supersedes": malformed_value},
+                {"indices": [1], "content": current, "supersedes": []},
+            ],
+        }
+
+        output, _ = _invoke_rejoin(fruit, malformed_response, decision_log_path=decision_path)
+
+        assert len(output) == 2, f"case {case_index} ({malformed_value!r}) dropped an item"
+        assert {item["content"] for item in output} == {stale, current}
+
+        entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+        rejections = [e for e in entries if e["action"] == "b4-group-rejected"]
+        assert len(rejections) == 1, f"case {case_index} ({malformed_value!r})"
+        assert rejections[0]["stage"] == "malformed-supersedes"
+        assert rejections[0]["member_indices"] == [0]
+
+        reason = rejections[0]["reason"].lower()
+        if isinstance(malformed_value, list):
+            # ["not-an-int"] IS a list — it hits the per-element filter, not the outer
+            # not-a-list guard, so it carries the partial-invalid reason contract.
+            assert "filtered" in reason, f"case {case_index}: {reason!r}"
+            assert "valid targets retained" in reason, f"case {case_index}: {reason!r}"
+        else:
+            assert "ignored" in reason, f"case {case_index}: {reason!r}"
+        assert "composition preserved" in reason, f"case {case_index}: {reason!r}"
+
+        knowledge_path = tmp_path / f"knowledge-{case_index}.jsonl"
+        result = consolidate._apply_consolidation_result(
+            {"nodes": output}, [], fruit.cluster, knowledge_path,
+        )
+        assert result.nodes_created == 2
+
+
+def test_guard6_missing_supersedes_field_is_silent_no_telemetry(tmp_path):
+    """A MISSING supersedes field (vs. a present-but-malformed one) degrades silently — no
+    telemetry — for backward compatibility, per Sentinel's spec-author ruling: the field didn't
+    exist before this sprint, so its absence is not a detection-signal failure."""
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="guard6-missing-supersedes-field",
+    )
+    decision_path = tmp_path / "decisions.jsonl"
+
+    response_without_supersedes_key = {
+        "groups": [
+            {"indices": [0], "content": stale},
+            {"indices": [1], "content": current},
+        ],
+    }
+
+    output, _ = _invoke_rejoin(
+        fruit, response_without_supersedes_key, decision_log_path=decision_path,
+    )
+
+    assert len(output) == 2
+    assert {item["content"] for item in output} == {stale, current}
+    assert not decision_path.exists()
+
+
+def test_guard6_out_of_range_supersedes_target_is_filtered_not_a_wrong_suppression(tmp_path):
+    """A hallucinated target index (999, out of range for a 2-item cluster) must not crash
+    creates[target] or silently suppress the wrong thing, AND must emit malformed-supersedes
+    telemetry. Mutation-verified, corrected after Sentinel's live-diff note: an earlier version
+    of this docstring claimed removing the upstream `0 <= i < n` range filter would NOT turn
+    this test red, reasoning that _surviving_position's member_to_group_first lookup
+    independently no-ops on 999 regardless. That was true for suppression-avoidance alone, but
+    is STALE now that this test also asserts the malformed-supersedes telemetry entry — which
+    depends directly on the range filter (without it, len(supersedes) == len(raw_supersedes)
+    and no malformed_reason is produced). Re-verified directly: removing the filter now DOES
+    turn this test red."""
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="guard6-out-of-range-supersedes-target",
+    )
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1], current, [999]),  # hallucinated target, out of range for n=2
+        ),
+        decision_log_path=decision_path,
+    )
+
+    assert len(output) == 2
+    assert {item["content"] for item in output} == {stale, current}
+
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    rejections = [e for e in entries if e["action"] == "b4-group-rejected"]
+    assert len(rejections) == 1
+    assert rejections[0]["stage"] == "malformed-supersedes"
+    assert rejections[0]["member_indices"] == [1]
+    reason = rejections[0]["reason"].lower()
+    assert "filtered" in reason
+    assert "valid targets retained" in reason
+    assert "composition preserved" in reason
+
+
+def test_guard6_mixed_valid_and_out_of_range_supersedes_targets_retains_the_valid_one(tmp_path):
+    """A supersedes list with BOTH a valid target and a hallucinated one must not be discarded
+    wholesale — the valid target's claim still fires (Sentinel: "malformed optional detection
+    metadata must never cost data"), AND the malformed-supersedes telemetry still records that
+    the list was partially invalid."""
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="guard6-mixed-valid-and-out-of-range",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:5"
+    action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:2:done:6"
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1], current, [0, 999]),  # 0 is a real, valid target; 999 is hallucinated
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    # The valid target (0) still fires: stale is suppressed, current survives.
+    assert [item["content"] for item in output] == [current]
+
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    supersede_entries = [e for e in entries if e["action"] == "b4-supersede"]
+    malformed_entries = [e for e in entries if e["action"] == "b4-group-rejected"]
+    assert len(supersede_entries) == 1
+    assert supersede_entries[0]["superseded_index"] == 0
+    assert supersede_entries[0]["superseding_index"] == 1
+    assert len(malformed_entries) == 1
+    assert malformed_entries[0]["stage"] == "malformed-supersedes"
+    assert malformed_entries[0]["member_indices"] == [1]
+    reason = malformed_entries[0]["reason"].lower()
+    assert "filtered" in reason
+    assert "valid targets retained" in reason
+    assert "composition preserved" in reason
+
+
+def test_guard6_same_entry_chronology_tie_preserves_both_and_logs_ambiguous_order(tmp_path):
+    """A1 §7's documented caveat, pinned end-to-end (Sentinel, A3 re-review blocker 1): two
+    facts sharing the SAME source_unit_id entry_index carry no usable direction signal. The
+    original boolean-only comparison returned False for BOTH directions on a tie, and the
+    caller's if/else silently treated "not earlier" as "later" — suppressing whichever side
+    happened to be the loop's `target`. Both candidates must survive; the claim is recorded as
+    unresolved, not silently discarded."""
+    earlier_field = "extract path does not share the legacy response_cache"
+    later_field = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(earlier_field, category="configuration"),
+            _FactSpec(later_field, category="solution"),
+        ],
+        cluster_id="guard6-same-entry-tie",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:4"
+    action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:5"  # same entry_index
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], earlier_field, []),
+            ([1], later_field, [0]),
+        ),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert {item["content"] for item in output} == {earlier_field, later_field}
+
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    assert not any(e["action"] == "b4-supersede" for e in entries)
+    rejections = [e for e in entries if e["action"] == "b4-group-rejected"]
+    assert len(rejections) == 1
+    assert rejections[0]["stage"] == "ambiguous-supersession-order"
+    assert set(rejections[0]["member_indices"]) == {0, 1}
+
+
+def test_guard6_decision_log_write_failure_keeps_both_candidates(tmp_path):
+    """Sentinel, A3 re-review blocker 2: suppression is only truth-preserving when the audit
+    record is durable. A write failure must NOT suppress — both candidates stay in output,
+    exactly as if no supersession claim had ever been made."""
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="guard6-decision-log-write-failure",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:5"
+    action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:2:done:6"
+
+    # decision_log_path's PARENT already exists as a FILE (not a directory), so the real
+    # mkdir(parents=True) inside _log_b4_supersede_decision raises OSError — a genuine write
+    # failure, not a mocked one (same technique as guard 3's own write-failure test).
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    unwritable_log = blocker / "decisions.jsonl"
+
+    direct_logged_ok = consolidate._log_b4_supersede_decision(
+        unwritable_log, "guard6-decision-log-write-failure", 0, 1,
+        "986d09c3e8bb2ae5:0:decisions:5", "986d09c3e8bb2ae5:2:done:6",
+        stale, current,
+    )
+    assert direct_logged_ok is False
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1], current, [0]),
+        ),
+        action_items=action_items,
+        decision_log_path=unwritable_log,
+    )
+
+    assert {item["content"] for item in output} == {stale, current}
+    assert not unwritable_log.exists()
+
+
+def test_guard6_decision_log_path_none_keeps_both_candidates(tmp_path):
+    """Sentinel, A3 audit clarification: decision_log_path=None is NOT a free pass for
+    suppression, unlike guard 3's compose-provenance opt-out — supersession deletes a claim, so
+    with no path to record why, both candidates must stay."""
+    stale = "extract path does not share the legacy response_cache"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(current, category="solution"),
+        ],
+        cluster_id="guard6-decision-log-path-none",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:5"
+    action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:2:done:6"
+
+    assert consolidate._log_b4_supersede_decision(
+        None, "x", 0, 1, "a", "b", stale, current,
+    ) is False
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1], current, [0]),
+        ),
+        action_items=action_items,
+        decision_log_path=None,
+    )
+
+    assert {item["content"] for item in output} == {stale, current}
+
+
+def test_guard6_accepted_composition_member_mapping_is_consistent_by_index(tmp_path):
+    """Sentinel, A3 re-review blocker 3 + test-correction: for accepted composition [0,1], the
+    real current/suffix singleton targeting EITHER member's index must produce the SAME
+    verdict — supersedes is defined over any candidate index, and both members now refer to one
+    logical memory. The original implementation silently no-op'd when the target was the
+    non-first member but suppressed the whole composed output when the target was the first
+    member, purely because of an implementation artifact (only the first member had a mapped
+    position).
+
+    Uses the REAL stale cache-claim plus its real prompt-shape sibling context as the composed
+    group (genuinely related content — Sentinel's correction: a fabricated edge between
+    semantically UNRELATED facts, as an earlier draft of this test used, violates A2's truth
+    contract even for a position-mechanics test), with member ORDER swapped across the two
+    cases so the stale claim sits at position 0 in one and position 1 in the other. The real
+    current/suffix singleton's supersedes claim always targets the stale claim's OWN index,
+    whichever position it lands in — asserting exactly one b4-supersede entry with
+    superseded_index equal to that same index."""
+    stale = "extract path does not share the legacy response_cache"
+    prompt_shape_context = "different prompt shapes"
+    current = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        "key suffix"
+    )
+    composed_content = (
+        "The extract path does not share the legacy response_cache, and the extract and "
+        "legacy paths use different prompt shapes."
+    )
+
+    for stale_index in (0, 1):
+        member_order = (
+            [stale, prompt_shape_context] if stale_index == 0
+            else [prompt_shape_context, stale]
+        )
+        fruit = _real_pipeline(
+            [
+                _FactSpec(member_order[0], category="configuration"),
+                _FactSpec(member_order[1], category="reason"),
+                _FactSpec(current, category="solution"),
+            ],
+            cluster_id=f"guard6-composed-member-mapping-stale-at-{stale_index}",
+        )
+        action_items = deepcopy(fruit.action_items)
+        action_items[0]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:4"
+        action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:5"
+        action_items[2]["source_unit_id"] = "986d09c3e8bb2ae5:2:done:6"
+        decision_path = tmp_path / f"decisions-stale-at-{stale_index}.jsonl"
+
+        output, _ = _invoke_rejoin(
+            fruit,
+            _supersession_response(
+                ([0, 1], composed_content, []),
+                ([2], current, [stale_index]),  # always targets the stale claim's own index
+            ),
+            action_items=action_items,
+            decision_log_path=decision_path,
+        )
+
+        # The current/suffix singleton is chronologically LATER than the composed group
+        # (entry_index 2 > 0), so it supersedes the composition regardless of which original
+        # member index held the stale claim.
+        assert [item["content"] for item in output] == [current], f"stale_index={stale_index}"
+
+        entries = [
+            json.loads(line) for line in decision_path.read_text().splitlines() if line
+        ]
+        supersede_entries = [e for e in entries if e["action"] == "b4-supersede"]
+        assert len(supersede_entries) == 1, f"stale_index={stale_index}"
+        assert supersede_entries[0]["superseded_index"] == stale_index
+        assert supersede_entries[0]["superseding_index"] == 2
+
+    # The self-reference case: the composed group's OWN claim against its own sibling member.
+    # DISTINCT entry_index values on the two members (Sentinel, mutation-mask catch): with the
+    # default _real_pipeline source_unit_ids, both members share entry_index 0, so the tie
+    # guard (order == 0) would ALSO independently preserve both candidates — masking whether
+    # the same-output guard (rep_pos == target_pos) is doing anything at all. Distinct indices
+    # here mean the tie guard can't fire, isolating the same-output guard genuinely.
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(prompt_shape_context, category="reason"),
+        ],
+        cluster_id="guard6-composed-self-reference",
+    )
+    action_items = deepcopy(fruit.action_items)
+    action_items[0]["source_unit_id"] = "986d09c3e8bb2ae5:0:decisions:4"
+    action_items[1]["source_unit_id"] = "986d09c3e8bb2ae5:1:decisions:5"
+    decision_path = tmp_path / "decisions-self-reference.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(([0, 1], composed_content, [1])),
+        action_items=action_items,
+        decision_log_path=decision_path,
+    )
+
+    assert [item["content"] for item in output] == [composed_content]
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    compose_entries = [e for e in entries if e["action"] == "b4-compose"]
+    supersede_entries = [e for e in entries if e["action"] == "b4-supersede"]
+    assert len(compose_entries) == 1
+    assert len(supersede_entries) == 0
+
+
+def test_source_unit_id_direction_uses_numeric_not_lexicographic_comparison():
+    """Real-format entry_index parses as an int, not a lexicographically-sorted string —
+    protects against inversion if _split_large_cluster's max_size default ever climbs past 9
+    (Opus, 2026-07-16): "10" sorts before "2" lexicographically but is chronologically later.
+    None of A2's 4 pinned fixtures reach double-digit entry_index (today's real max_size=4
+    caps it at a single digit), so this is the only test that actually exercises the numeric
+    branch rather than the lexicographic fallback."""
+    earlier = "some-cluster-hash:2:decisions:0"
+    later = "some-cluster-hash:10:decisions:0"
+    assert consolidate._source_unit_id_order(earlier, later) == -1
+    assert consolidate._source_unit_id_order(later, earlier) == 1
+
+
+def test_source_unit_id_direction_falls_back_to_lexicographic_for_non_real_format():
+    """A2's own fixtures (s020c00:0-style, 2 segments not 4) — and any other non-conforming
+    source_unit_id shape — degrade to full-string comparison rather than crashing."""
+    assert consolidate._source_unit_id_order("s020c00:0", "s088c00:0") == -1
+    assert consolidate._source_unit_id_order("s088c00:0", "s020c00:0") == 1
+
+
+def test_source_unit_id_direction_returns_tie_for_identical_or_same_entry_index():
+    """A genuine tie (Sentinel, A3 re-review blocker 1) is a distinct outcome, 0, never
+    silently resolved to a direction — same entry_index in the real format, or identical
+    strings in the fallback shape."""
+    assert consolidate._source_unit_id_order(
+        "cluster:0:decisions:4", "cluster:0:decisions:5",
+    ) == 0
+    assert consolidate._source_unit_id_order("s020c00:0", "s020c00:0") == 0
+
+
+def test_guard6_claim_does_not_apply_when_the_superseding_side_is_itself_rejected(tmp_path):
+    """The superseding side must independently survive to real output before its claim can
+    suppress anything — a multi-member group's content-safety rejection must not ALSO take
+    down the singleton it claimed to supersede (never-drop applies to guard 6 too)."""
+    stale = "extract path does not share the legacy response_cache"
+    fruit = _real_pipeline(
+        [
+            _FactSpec(stale, category="configuration"),
+            _FactSpec(
+                "Recall stores durable node revisions in an append-versioned "
+                "knowledge.jsonl file that survives process restarts without data loss.",
+            ),
+            _FactSpec(
+                "The adapter failures reported in this cluster are unrelated to SQLite "
+                "locking behavior observed during the retry-boundary investigation.",
+            ),
+        ],
+        cluster_id="guard6-superseding-side-rejected",
+    )
+    decision_path = tmp_path / "decisions.jsonl"
+
+    output, _ = _invoke_rejoin(
+        fruit,
+        _supersession_response(
+            ([0], stale, []),
+            ([1, 2], "   ", [0]),  # whitespace-only -> content-unsafe rejection
+        ),
+        decision_log_path=decision_path,
+    )
+
+    # The rejected group's members revert to individual pass-through, AND the claim they
+    # carried never fires — stale must still be present, not suppressed on a claim that
+    # never independently resolved to real output. The whitespace group's OWN content-unsafe
+    # rejection is still logged (A4's existing guard-4 telemetry) — that's a different,
+    # legitimate entry; the check here is that no b4-supersede entry exists alongside it.
+    assert len(output) == 3
+    assert any(item["content"] == stale for item in output)
+    entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+    assert not any(e["action"] == "b4-supersede" for e in entries)
 
 
 # Stage mechanics: one scaled inference call, then B4's result enters B3.

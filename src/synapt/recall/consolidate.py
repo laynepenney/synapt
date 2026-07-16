@@ -2256,6 +2256,14 @@ together into one compound entry. A fact that stands alone should be its own sin
 For EACH fact index above, put it in exactly one group. Give each group's member indices and \
 ONE composed content string for that group.
 
+Also decide, for each group, whether it "supersedes" any OTHER index — meaning that OTHER \
+index describes the SAME subject at an earlier point in time, and this group's content \
+updates, corrects, or contradicts it (not merely relates to it or shares its vocabulary). \
+List those other indices in a "supersedes" array (empty if none). Two facts about the same \
+subject that are simply complementary, not in conflict, are NOT a supersession — shared \
+vocabulary alone is never enough; only flag a genuine same-subject update, correction, or \
+contradiction.
+
 Rules:
 1. Compose ONLY from the given MEMBER facts — never assert a relation, cause, or qualifier \
 that is not directly present in a member's own text. Do not flip a negation (a fact stating \
@@ -2264,7 +2272,8 @@ convention or definition (e.g. what a label means) when restating it.
 2. Every index above must appear in EXACTLY ONE group.
 3. Output ONLY valid JSON, no markdown fences, no explanation.
 
-{{"groups": [{{"indices": [0, 1], "content": "..."}}, {{"indices": [2], "content": "..."}}]}}
+{{"groups": [{{"indices": [0, 1], "content": "...", "supersedes": []}}, \
+{{"indices": [2], "content": "...", "supersedes": [0]}}]}}
 """
 
 
@@ -2430,15 +2439,34 @@ _B4_COMPOSE_MAX_ATTEMPTS = 2  # 1 initial + 1 corrective retry — bounded, neve
 
 def _b4_validate_compose_response(
     parsed: dict, n: int,
-) -> "tuple[list[tuple[list, str]], list[list[int]], None] | tuple[None, None, str]":
+) -> (
+    "tuple[list[tuple[list, str, list, str | None]], list[list[int]], None] "
+    "| tuple[None, None, str]"
+):
     """Guard 3 (schema) + duplicate-membership validation for ONE compose attempt.
 
     Returns ``(raw_groups, group_real_members, None)`` on success or ``(None, None, reason)``
     on failure. ``reason`` feeds both the eventual ``B4_COMPOSE_FAIL_OPEN`` marker (attempts
     exhausted) and the next attempt's corrective prompt (attempts remain) — see the bounded-
     retry module note above.
+
+    Each ``raw_groups`` entry is ``(indices, content, supersedes, malformed_supersedes_reason)``.
+    ``supersedes`` (guard 6, A3) is OPTIONAL; the base composition contract (indices/content) is
+    guard 3's concern, and a broken supersession hint on top of an otherwise-valid group is
+    never the same class of failure as a broken group itself. Malformed handling follows
+    Sentinel's spec-author ruling (A3 re-review, m_4adb43c0):
+
+    - A MISSING ``supersedes`` field degrades silently to no claim — backward compatible, no
+      telemetry, since the field didn't exist before this sprint.
+    - A PRESENT-but-wrong-typed field, or a list containing invalid/out-of-range targets, is a
+      real detection-signal failure, not a benign absence: ``malformed_supersedes_reason`` names
+      why, and the caller emits exactly one ``b4-group-rejected`` telemetry entry (stage
+      ``malformed-supersedes``) per such group — "malformed optional detection metadata must
+      never cost data, but silently dropping it erases the model-quality signal A6 needs."
+    - Valid targets inside an otherwise-partially-invalid list are KEPT, not discarded
+      wholesale, matching that same "never cost data" rule.
     """
-    raw_groups: list[tuple[list, str]] = []
+    raw_groups: list[tuple[list, str, list, "str | None"]] = []
     for g in parsed["groups"]:
         if not isinstance(g, dict):
             return None, None, (
@@ -2451,12 +2479,34 @@ def _b4_validate_compose_response(
                 "compose response contains a structurally malformed group entry "
                 "(indices/content wrong type — schema violation)"
             )
-        raw_groups.append((idxs, content))
+
+        malformed_reason: "str | None" = None
+        if "supersedes" not in g:
+            supersedes: list[int] = []
+        else:
+            raw_supersedes = g["supersedes"]
+            if not isinstance(raw_supersedes, list):
+                supersedes = []
+                malformed_reason = (
+                    "supersedes field was present but not a list — supersession signal "
+                    "ignored, composition preserved"
+                )
+            else:
+                supersedes = [
+                    i for i in raw_supersedes
+                    if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
+                ]
+                if len(supersedes) != len(raw_supersedes):
+                    malformed_reason = (
+                        "supersedes list contained invalid or out-of-range targets — "
+                        "filtered, valid targets retained, composition preserved"
+                    )
+        raw_groups.append((idxs, content, supersedes, malformed_reason))
 
     group_real_members: list[list[int]] = []
     seen: set[int] = set()
     duplicate = False
-    for idxs, _content in raw_groups:
+    for idxs, _content, _supersedes, _malformed in raw_groups:
         real = [
             i for i in idxs
             if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
@@ -2515,6 +2565,115 @@ def _log_b4_group_rejection(
         logger.debug("Failed to write B4 group-rejection decision log")
 
 
+def _entry_index_if_parseable(source_unit_id: "str | None") -> "int | None":
+    """Parse the real ``{cluster}:{entry_index}:{field}:{item}`` format's ``entry_index``
+    numerically when the shape matches (exactly 4 colon-segments, second segment a plain int).
+    Returns ``None`` for any other shape — an honest degradation the caller falls back on,
+    never a crash on an unexpected ``source_unit_id``."""
+    parts = (source_unit_id or "").split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _source_unit_id_order(a: "str | None", b: "str | None") -> int:
+    """Chronological order of *a* relative to *b*, for guard 6's direction resolution: ``-1`` if
+    *a* is earlier, ``1`` if *b* is earlier, ``0`` if they are TIED — same ``entry_index`` (or,
+    for a non-real-format shape, byte-identical strings).
+
+    A tie is a real, distinct outcome, not a coin flip resolved by whichever side the boolean
+    comparison's ``else`` branch happens to favor (Sentinel, A3 re-review — the original
+    boolean-only ``_source_unit_id_is_earlier`` returned ``False`` for BOTH ``is_earlier(a, b)``
+    and ``is_earlier(b, a)`` on a tie, and the caller's if/else treated "not earlier" as
+    "definitely later," silently suppressing whichever side happened to be the loop's `target`.
+    A1 §7 explicitly names same-entry siblings — the tie is on ``entry_index`` itself, which
+    spans across fields (a ``decisions`` item and a ``done`` item from the same entry tie just
+    as much as two items from the same field) — as "no usable direction signal from
+    source_unit_id alone"; the caller must preserve both sides on ``0``, never suppress).
+
+    Parses the real 4-segment format's ``entry_index`` numerically when BOTH sides match it —
+    robust to any future ``_split_large_cluster`` ``max_size`` change; there is no hidden
+    lexicographic-vs-numeric equivalence here to silently invert if that bound ever climbs past
+    9 (Opus, 2026-07-16). Falls back to full-string comparison for any other shape, which is
+    exactly what A2's synthetic test fixtures use (e.g. ``"s020c00:0"`` — 2 segments, not 4).
+    """
+    a_idx = _entry_index_if_parseable(a)
+    b_idx = _entry_index_if_parseable(b)
+    if a_idx is not None and b_idx is not None:
+        if a_idx == b_idx:
+            return 0
+        return -1 if a_idx < b_idx else 1
+    a_str, b_str = (a or ""), (b or "")
+    if a_str == b_str:
+        return 0
+    return -1 if a_str < b_str else 1
+
+
+def _log_b4_supersede_decision(
+    decision_log_path: "Path | None",
+    cluster_id: str,
+    superseded_index: int,
+    superseding_index: int,
+    superseded_source_unit_id: "str | None",
+    superseding_source_unit_id: "str | None",
+    superseded_content: str,
+    superseding_content: str,
+) -> bool:
+    """Guard 6 (A3, supersession suppression): durable traceability for a suppressed same-batch
+    supersession — and REJECT-ON-FAILURE, not fire-and-forget (Sentinel, A3 re-review:
+    "suppression is only truth-preserving when the audit record is durable" — a lost
+    supersede-telemetry entry means the suppressed candidate is gone with zero trace of why).
+    Returns whether the entry was actually persisted; the caller must NOT add the superseded
+    position to ``suppressed_positions`` unless this returns ``True`` — on any failure to
+    persist, both candidates stay in output instead.
+
+    ``decision_log_path is None`` ALSO returns ``False`` here (Sentinel, A3 audit clarification)
+    — guard 3's compose path treats a ``None`` path as a legitimate silent opt-out, but not
+    because composition merely "adds a node" (it can replace several member creates with one
+    compound, same as here). The true boundary: compose-from-members PRESERVES every member's
+    content by contract — the atoms are still there, just folded together — while supersession
+    INTENTIONALLY DISCARDS one claim entirely. A skipped compose-provenance breadcrumb loses a
+    trace of how content was folded; a skipped supersede breadcrumb loses the only record that a
+    claim ever existed before it vanished. That is the same risk class as a write failure, not a
+    lesser one. Every real production call site (``_run_extract_path``) always supplies a
+    concrete path regardless."""
+    if decision_log_path is None:
+        return False
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "b4-supersede",
+        "cluster_id": cluster_id,
+        "superseded_index": superseded_index,
+        "superseding_index": superseding_index,
+        "superseded_source_unit_id": superseded_source_unit_id,
+        "superseding_source_unit_id": superseding_source_unit_id,
+        "superseded_content_digest": hashlib.sha256(
+            superseded_content.encode("utf-8")
+        ).hexdigest(),
+        "superseding_content_digest": hashlib.sha256(
+            superseding_content.encode("utf-8")
+        ).hexdigest(),
+    }
+    try:
+        from synapt.recall._filelock import lock_exclusive
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(decision_log_path, "a", encoding="utf-8") as f:
+            lock_exclusive(f)
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+        return True
+    except OSError:
+        logger.warning(
+            "B4_SUPERSEDE_LOG_FAILED cluster=%s superseded_index=%s — "
+            "suppression NOT applied, both candidates retained",
+            cluster_id, superseded_index,
+        )
+        return False
+
+
 def _rejoin_create_actions(
     action_items: list[dict],
     cluster_id: str,
@@ -2555,7 +2714,7 @@ def _rejoin_create_actions(
 
     # B4 compose bounded retry (A4) — see _B4_COMPOSE_MAX_ATTEMPTS docstring. Attempt 0's prompt
     # is byte-identical to the pre-retry single-shot prompt; only a failed attempt mutates it.
-    raw_groups: list[tuple[list, str]] | None = None
+    raw_groups: "list[tuple[list, str, list, str | None]] | None" = None
     group_real_members: list[list[int]] | None = None
     last_reason = ""
     for attempt in range(_B4_COMPOSE_MAX_ATTEMPTS):
@@ -2602,18 +2761,29 @@ def _rejoin_create_actions(
             f"exhausted {_B4_COMPOSE_MAX_ATTEMPTS} attempts, last reason: {last_reason}",
         )
 
+    # Malformed-supersedes telemetry (Sentinel, A3 re-review spec-author ruling, m_4adb43c0):
+    # fires for EVERY group whose supersedes field was malformed, independent of what else
+    # happens to that group (invalid-index drop, content-unsafe rejection, etc.) — the
+    # detection-signal failure is worth recording on its own, before any other guard's fate is
+    # decided for the group.
+    for idxs, _content, _supersedes, malformed_reason in raw_groups:
+        if malformed_reason is not None:
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, idxs, "malformed-supersedes", malformed_reason,
+            )
+
     # NOW drop any group that contained an invalid/hallucinated index (per-group degradation —
     # its real members are not partially trusted under text written for a fabricated/different
     # membership set) or was empty to begin with.
-    candidate_groups: list[tuple[list[int], str]] = []
-    for (idxs, content), real in zip(raw_groups, group_real_members):
+    candidate_groups: list[tuple[list[int], str, list[int]]] = []
+    for (idxs, content, supersedes, _malformed), real in zip(raw_groups, group_real_members):
         if not real or len(real) != len(idxs):
             _log_b4_group_rejection(
                 decision_log_path, cluster_id, real or idxs, "invalid-index",
                 "group contained an invalid or hallucinated member index",
             )
             continue
-        candidate_groups.append((real, content))
+        candidate_groups.append((real, content, supersedes))
 
     # Guard 4 + composition: singleton groups (len 1) are pass-through, never rewritten, even
     # if the model proposed text for them. Multi-member groups compose only if their bounds
@@ -2623,7 +2793,7 @@ def _rejoin_create_actions(
     # not the whole cluster.
     successful_by_first_pos: dict[int, dict] = {}
     composed_member_positions: set[int] = set()
-    for idxs, content in candidate_groups:
+    for idxs, content, _supersedes in candidate_groups:
         if len(idxs) < 2:
             continue
 
@@ -2690,8 +2860,126 @@ def _rejoin_create_actions(
         for i in idxs:
             composed_member_positions.add(create_indices[i])
 
+    # Guard 6 (A3, supersession suppression — NOT a new numbered guard for THIS module note's
+    # own counting scheme; "guard 6" is the A1 contract's name for this specific mechanism,
+    # config f552875 section 4). A group's `supersedes` claim marks a candidate index this
+    # group's content updates, corrects, or contradicts — same subject, different point in
+    # time. Direction is NEVER trusted from the model: source_unit_id chronology
+    # (_source_unit_id_order) is the sole arbiter, because the model can and does attribute the
+    # claim to the wrong side (fruit: A2's negation-flip fixture flags the relationship from the
+    # chronologically-earlier group's own entry). A claim only fires when BOTH sides of the pair
+    # actually produced real output — a group already rejected by an earlier guard cannot be the
+    # superseding OR superseded side; suppressing one side of a claim that never really resolved
+    # to independent output would violate never-drop.
+    member_to_group_first: dict[int, int] = {}
+    group_supersedes_by_first: dict[int, list[int]] = {}
+    group_is_singleton_by_first: dict[int, bool] = {}
+    for idxs, _content, supersedes in candidate_groups:
+        first = idxs[0]
+        for i in idxs:
+            member_to_group_first[i] = first
+        group_supersedes_by_first[first] = supersedes
+        group_is_singleton_by_first[first] = len(idxs) < 2
+
+    def _surviving_position(creates_index: int) -> "int | None":
+        """The original action_items position *creates_index*'s content actually appears at in
+        the final output, or None if it never independently resolves to real output. For a
+        SUCCESSFULLY composed multi-member group, EVERY member maps to the SAME composed output
+        position (Sentinel, A3 re-review: "supersedes is defined over any candidate index, so
+        first-member position cannot change the verdict" — a fix-confirmed bug: targeting a
+        non-first member of an accepted [0,1] composition used to silently no-op while targeting
+        member 0 suppressed the whole composed output, purely because of which original index
+        the claim happened to name, even though both indices now refer to ONE logical memory)."""
+        first = member_to_group_first.get(creates_index)
+        if first is None:
+            return None
+        if group_is_singleton_by_first[first]:
+            return create_indices[creates_index]  # singletons always survive at their own pos
+        if create_indices[first] in successful_by_first_pos:
+            # composed successfully — ALL members map to the ONE composed output position.
+            return create_indices[first]
+        # composed group was rejected by an earlier guard — every member reverts to its own
+        # original, unmodified pass-through position.
+        return create_indices[creates_index]
+
+    def _group_claim_is_valid(first: int) -> bool:
+        """Whether the group whose first member is *first* actually produced the composed
+        content its `supersedes` claim was attached to. A claim from a REJECTED multi-member
+        group must never fire, even though its individual members revert to pass-through —
+        the composed sentence that CARRIED the claim never became real output; reverted
+        members are unrelated atomic facts with no claim of their own (fruit-confirmed:
+        without this check, a content-unsafe-rejected group's supersedes target was wrongly
+        suppressed even though the rejected group itself fully vanished)."""
+        if group_is_singleton_by_first[first]:
+            return True  # a singleton's own fact IS its claim — nothing to have failed
+        return create_indices[first] in successful_by_first_pos
+
+    suppressed_positions: set[int] = set()
+    seen_pairs: set[frozenset] = set()
+    for idxs, _content, supersedes in candidate_groups:
+        if not supersedes:
+            continue
+        representative = idxs[0]
+        if not _group_claim_is_valid(representative):
+            continue  # the claiming group's own composition never succeeded
+        for target in supersedes:
+            if target == representative:
+                continue
+            pair = frozenset((representative, target))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            rep_pos = _surviving_position(representative)
+            target_pos = _surviving_position(target)
+            if rep_pos is None or target_pos is None:
+                continue  # one side never independently resolved to real output
+            if rep_pos == target_pos:
+                # Sentinel, A3 addendum: with every accepted-group member now mapping to the
+                # SAME output position, a group's OWN supersedes claim against its own sibling
+                # member (e.g. successful [0,1] with supersedes=[1] on member 0) would otherwise
+                # try to suppress its sole composed output with itself — a self-reference, not a
+                # genuine cross-entity supersession. Never-drop: skip it.
+                continue
+
+            rep_source = creates[representative].get("source_unit_id")
+            target_source = creates[target].get("source_unit_id")
+            order = _source_unit_id_order(rep_source, target_source)
+            if order == 0:
+                # A1 §7: same-entry siblings carry "no usable direction signal from
+                # source_unit_id alone." A tie is not a coin flip — preserve both candidates and
+                # record that a claim existed but couldn't be resolved (Sentinel, A3 re-review).
+                _log_b4_group_rejection(
+                    decision_log_path, cluster_id, [representative, target],
+                    "ambiguous-supersession-order",
+                    "supersedes claim between same-entry source_unit_ids has no usable "
+                    "chronological direction — both candidates preserved",
+                )
+                continue
+            superseded, superseding = (
+                (representative, target) if order == -1 else (target, representative)
+            )
+
+            superseded_pos = _surviving_position(superseded)
+            if superseded_pos is None or superseded_pos in suppressed_positions:
+                continue
+            logged_ok = _log_b4_supersede_decision(
+                decision_log_path, cluster_id, superseded, superseding,
+                creates[superseded].get("source_unit_id"),
+                creates[superseding].get("source_unit_id"),
+                creates[superseded]["content"], creates[superseding]["content"],
+            )
+            if not logged_ok:
+                # Sentinel, A3 re-review + audit clarification: suppression is only truth-
+                # preserving when the audit record is durable. A failed (or opted-out) write
+                # means both candidates stay — never suppress on an untraceable decision.
+                continue
+            suppressed_positions.add(superseded_pos)
+
     output: list[dict] = []
     for pos, item in enumerate(action_items):
+        if pos in suppressed_positions:
+            continue  # guard 6: suppressed at creation, never enters output
         if item.get("action") != "create":
             output.append(item)
         elif pos in successful_by_first_pos:
