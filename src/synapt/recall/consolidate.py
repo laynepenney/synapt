@@ -2412,6 +2412,101 @@ def _b4_fail_open(action_items: list[dict], cluster_id: str, reason: str) -> lis
     return action_items
 
 
+# Guard 6 (A4, grouping-contract tighten, sprint-41): the 2026-07-15 dogfood packet's 3 whole-
+# cluster fail-opens were ALL caused by a response failing guard-3 schema validation or the
+# duplicate-membership scan — never by an infer-backend exception. A single bounded retry with
+# a prompt naming exactly what was wrong gives the model one real chance to self-correct before
+# the cluster degrades to full atomization. Deliberately does NOT retry a well-formed response
+# that a later PER-GROUP guard rejects (content-unsafe / temporal-conflict) — those are correct,
+# deliberate degradations of valid model output, not malformed output worth re-asking for.
+_B4_COMPOSE_MAX_ATTEMPTS = 2  # 1 initial + 1 corrective retry — bounded, never unbounded
+
+
+def _b4_validate_compose_response(
+    parsed: dict, n: int,
+) -> "tuple[list[tuple[list, str]], list[list[int]], None] | tuple[None, None, str]":
+    """Guard 3 (schema) + duplicate-membership validation for ONE compose attempt.
+
+    Returns ``(raw_groups, group_real_members, None)`` on success or ``(None, None, reason)``
+    on failure. ``reason`` feeds both the eventual ``B4_COMPOSE_FAIL_OPEN`` marker (attempts
+    exhausted) and the next attempt's corrective prompt (attempts remain) — see guard 6.
+    """
+    raw_groups: list[tuple[list, str]] = []
+    for g in parsed["groups"]:
+        if not isinstance(g, dict):
+            return None, None, (
+                "compose response contains a structurally malformed group entry (not an object)"
+            )
+        idxs = g.get("indices")
+        content = g.get("content")
+        if not isinstance(idxs, list) or not isinstance(content, str):
+            return None, None, (
+                "compose response contains a structurally malformed group entry "
+                "(indices/content wrong type — schema violation)"
+            )
+        raw_groups.append((idxs, content))
+
+    group_real_members: list[list[int]] = []
+    seen: set[int] = set()
+    duplicate = False
+    for idxs, _content in raw_groups:
+        real = [
+            i for i in idxs
+            if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
+        ]
+        group_real_members.append(real)
+        for i in real:
+            if i in seen:
+                duplicate = True
+            seen.add(i)
+    if duplicate:
+        return None, None, "duplicate membership across groups"
+
+    return raw_groups, group_real_members, None
+
+
+def _log_b4_group_rejection(
+    decision_log_path: Path | None,
+    cluster_id: str,
+    member_indices: list[int],
+    stage: str,
+    reason: str,
+) -> None:
+    """Guard 6: best-effort per-group rejection telemetry, distinguishable by ``stage``.
+
+    Closes the exact gap the 2026-07-15 dogfood packet named (B4-FRUIT.md): "production
+    telemetry exposes that these groups degraded to member pass-through, but it does not
+    record which per-group guard rejected each proposal... A content-versus-temporal
+    breakdown therefore cannot be claimed from this run." Unlike guard 3's compose-SUCCESS
+    provenance (whose loss means an untraceable persist — reject the composition), a lost
+    REJECTION-telemetry entry loses nothing that was ever persisted, so this is pure
+    best-effort logging, same shape as ``_log_dedup_decision``: never disrupts consolidation.
+    """
+    logger.info(
+        "B4_GROUP_REJECTED cluster=%s stage=%s reason=%s member_indices=%s",
+        cluster_id, stage, reason, member_indices,
+    )
+    if decision_log_path is None:
+        return
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "b4-group-rejected",
+        "cluster_id": cluster_id,
+        "member_indices": list(member_indices),
+        "stage": stage,
+        "reason": reason,
+    }
+    try:
+        from synapt.recall._filelock import lock_exclusive
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(decision_log_path, "a", encoding="utf-8") as f:
+            lock_exclusive(f)
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except OSError:
+        logger.debug("Failed to write B4 group-rejection decision log")
+
+
 def _rejoin_create_actions(
     action_items: list[dict],
     cluster_id: str,
@@ -2449,75 +2544,55 @@ def _rejoin_create_actions(
     n = len(creates)
     prompt = _build_rejoin_prompt(creates)
     budget = _estimate_rejoin_budget(prompt, n)
-    request = {
-        "prompt": prompt,
-        "messages": [{"role": "user", "content": prompt}],
-        "capabilities": [],
-        "max_tokens": budget,
-    }
 
-    try:
-        response = infer(request)
-    except Exception as exc:
+    # Guard 6 (A4): bounded retry — see _B4_COMPOSE_MAX_ATTEMPTS docstring. Attempt 0's prompt
+    # is byte-identical to the pre-retry single-shot prompt; only a failed attempt mutates it.
+    raw_groups: list[tuple[list, str]] | None = None
+    group_real_members: list[list[int]] | None = None
+    last_reason = ""
+    for attempt in range(_B4_COMPOSE_MAX_ATTEMPTS):
+        attempt_prompt = prompt if attempt == 0 else (
+            f"{prompt}\n\nYour previous response was rejected: {last_reason}. "
+            "Fix this and respond again with valid JSON only."
+        )
+        request = {
+            "prompt": attempt_prompt,
+            "messages": [{"role": "user", "content": attempt_prompt}],
+            "capabilities": [],
+            "max_tokens": budget,
+        }
+
+        try:
+            response = infer(request)
+        except Exception as exc:
+            last_reason = f"compose inference backend unavailable, exception: {exc!r}"
+            continue
+
+        parsed = _parse_llm_response(response)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("groups"), list):
+            last_reason = "compose response unparseable or wrong group shape/schema"
+            continue
+
+        # Guard 3 (schema): a group entry with the WRONG TYPE for indices/content (e.g. a
+        # string "0,1" instead of a list) is not an intentional unaddressed response — it
+        # means the model's response as a whole doesn't conform to the contract. Guard 1
+        # (never-drop) + duplicate detection: real (in-range, non-bool int) member indices are
+        # computed for every group BEFORE deciding whether to drop any for containing an
+        # invalid one — duplicate membership is scanned across every group's real members
+        # regardless of whether that specific group later gets dropped, since a real index
+        # appearing in two DIFFERENT proposed groups means the model's own bookkeeping is
+        # incoherent even if one of those groups also happens to contain a hallucinated index
+        # (fruit-confirmed, Sentinel: [0,1,999] + [0,2] let index 0's cross-group collision
+        # through when the first group was filtered BEFORE the duplicate scan ran).
+        raw_groups, group_real_members, reason = _b4_validate_compose_response(parsed, n)
+        if reason is None:
+            break
+        last_reason = reason
+    else:
         return _b4_fail_open(
             action_items, cluster_id,
-            f"compose inference backend unavailable, exception: {exc!r}",
+            f"exhausted {_B4_COMPOSE_MAX_ATTEMPTS} attempts, last reason: {last_reason}",
         )
-
-    parsed = _parse_llm_response(response)
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("groups"), list):
-        return _b4_fail_open(
-            action_items, cluster_id,
-            "compose response unparseable or wrong group shape/schema",
-        )
-
-    # Guard 3 (schema): a group entry with the WRONG TYPE for indices/content (e.g. a string
-    # "0,1" instead of a list) is not an intentional unaddressed response — it means the
-    # model's response as a whole doesn't conform to the contract, so it fails open the ENTIRE
-    # cluster (fruit-confirmed, Sentinel: {"indices": "0,1", ...} silently produced zero
-    # B4_COMPOSE_FAIL_OPEN marker under the old per-element ``continue``). An empty indices
-    # list is structurally valid but vacuous — that group simply contributes nothing, no
-    # schema violation.
-    raw_groups: list[tuple[list, str]] = []
-    for g in parsed["groups"]:
-        if not isinstance(g, dict):
-            return _b4_fail_open(
-                action_items, cluster_id,
-                "compose response contains a structurally malformed group entry (not an object)",
-            )
-        idxs = g.get("indices")
-        content = g.get("content")
-        if not isinstance(idxs, list) or not isinstance(content, str):
-            return _b4_fail_open(
-                action_items, cluster_id,
-                "compose response contains a structurally malformed group entry "
-                "(indices/content wrong type — schema violation)",
-            )
-        raw_groups.append((idxs, content))
-
-    # Guard 1 (never-drop) + duplicate detection: compute each group's REAL (in-range, non-bool
-    # int) member indices BEFORE deciding whether to drop any group for containing an invalid
-    # one. Duplicate membership must be scanned across every group's real members regardless of
-    # whether that specific group later gets dropped — a real index appearing in two DIFFERENT
-    # proposed groups means the model's own bookkeeping is incoherent even if one of those
-    # groups also happens to contain a hallucinated index (fruit-confirmed, Sentinel: [0,1,999]
-    # + [0,2] let index 0's cross-group collision through when the first group was filtered
-    # BEFORE the duplicate scan ran). Scanning real members up front closes that ordering gap.
-    group_real_members: list[list[int]] = []
-    seen: set[int] = set()
-    duplicate = False
-    for idxs, _content in raw_groups:
-        real = [
-            i for i in idxs
-            if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
-        ]
-        group_real_members.append(real)
-        for i in real:
-            if i in seen:
-                duplicate = True
-            seen.add(i)
-    if duplicate:
-        return _b4_fail_open(action_items, cluster_id, "duplicate membership across groups")
 
     # NOW drop any group that contained an invalid/hallucinated index (per-group degradation —
     # its real members are not partially trusted under text written for a fabricated/different
@@ -2525,6 +2600,10 @@ def _rejoin_create_actions(
     candidate_groups: list[tuple[list[int], str]] = []
     for (idxs, content), real in zip(raw_groups, group_real_members):
         if not real or len(real) != len(idxs):
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, real or idxs, "invalid-index",
+                "group contained an invalid or hallucinated member index",
+            )
             continue
         candidate_groups.append((real, content))
 
@@ -2545,12 +2624,21 @@ def _rejoin_create_actions(
         # _b4_composed_content_is_safe for the full list of checks reused from B3. Members
         # fall back to individual pass-through.
         if not _b4_composed_content_is_safe(content, content_profile):
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, idxs, "content-unsafe",
+                "composed content failed B3's shared create-content gate",
+            )
             continue
 
         members = [creates[i] for i in idxs]
         bound = _group_temporal_bound(members)
         if bound is None:
-            continue  # guard 4 conflict: this group's members fall back to pass-through
+            # guard 4 conflict: this group's members fall back to pass-through
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, idxs, "temporal-conflict",
+                "members carry conflicting non-null valid_from/valid_until bounds",
+            )
+            continue
         categories = [m["category"] for m in members]
         category = Counter(categories).most_common(1)[0][0]
         # Sanitize member-supplied tag elements the SAME way _apply_consolidation_result's own
