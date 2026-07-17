@@ -1213,6 +1213,419 @@ class TestGenericFilterInApply(unittest.TestCase):
         )
         self.assertEqual(result.nodes_corroborated, 1)
 
+    # --- A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md,
+    # config main @ ea7b52f): the create branch's auto-corroborate never writes `content` on
+    # the existing node -- when best_sim crosses threshold, the fresh candidate's actual text
+    # is silently discarded forever (recoverable only in dedup_decisions.jsonl, never in
+    # kn_path). A6's dogfood re-measure found this fired 17 of 31 auto-corroborate decisions
+    # in one run, live in the shipping legacy path (not extract-path-only, not flag-gated).
+    # All content below is REAL production content from the A6 log (recall branch
+    # results/a6-dogfood-2026-07-16 @ 64b472f, dedup_decisions.jsonl sha256
+    # abe27001afb91ef19f8df034fbb07b701c367f9e8488f84e65bc57311310f189), independently
+    # re-verified this session against all 31 real auto-corroborate rows in that log, not just
+    # the 5 individually pinned here (design doc estimated ~13 byte-identical rows; the precise
+    # recount this session is 14 of 31).
+    #
+    # The fix replaces the unconditional best_sim>=threshold->corroborate branch with a
+    # containment check on `_normalize_for_dedup` output: exact match, or candidate contained
+    # in existing -> KEEP EXISTING; existing contained in candidate -> SUPERSEDE (mark existing
+    # superseded, persist fresh content as a new node -- same shape guard 6 already uses, never
+    # a bare overwrite); neither contains the other -> KEEP_BOTH (skip the auto-corroborate
+    # branch, fall through to the untouched create path).
+    #
+    # KNOWN OPEN GAP (see test_a7_1c_... below): literal substring containment does not detect
+    # every real containment relationship. A trailing-punctuation mismatch (1d) is resolved by
+    # a verified, zero-side-effect rstrip across all 31 real rows; a mid-string
+    # punctuation-class mismatch (1c) is NOT, and a naive implementation of section 2 would
+    # REGRESS 1c from correct (today, by accident) to duplicate-creating. Flagged to Opus, not
+    # resolved unilaterally here.
+
+    def test_a7_1a_cosine_near_opposite_facts_keep_both(self):
+        """Fixture 1a -- Opus's original A6 dogfood trigger. Real pair, cosine=0.8298 crosses
+        the mixed-profile cosine threshold (0.80); today's code silently discards the fresh
+        content via auto-corroborate. Real jaccard for this pair is only 0.1818 (below the 0.5
+        jaccard threshold), so the mocked cosine fallback -- same pattern as
+        test_embedding_auto_corroborate_semantic_duplicate above -- is required to reach the
+        create branch's dedup decision at all, matching how the real run actually reached it
+        (source="auto-cosine" in the live log, not auto-jaccard)."""
+        import synapt.recall.consolidate as mod
+
+        existing = KnowledgeNode.create(
+            content="extract path does not share the legacy response_cache",
+            category="configuration",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.8298)  # real production cosine score
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": (
+                    'writing extract-path results to response_cache under a distinct '
+                    '":extract" key suffix'
+                ),
+                "category": "solution",
+            }]}
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        # KEEP_BOTH: neither normalized text contains the other, so the fresh fact must survive
+        # as its own node rather than being silently absorbed into the stale one.
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("extract path does not share the legacy response_cache", contents)
+        self.assertIn(
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+            contents,
+        )
+
+    def test_a7_1b_perfect_jaccard_different_prs_keep_both(self):
+        """Fixture 1b -- real jaccard is a PERFECT 1.0 for these two distinct real PR-opening
+        events, because _extract_keywords's regex requires a lowercase-letter start and drops
+        both "PR" (2 chars, filtered) and "#867"/"#866" (leading digit, never matches) entirely
+        -- keywords reduce to {"opened"} on both sides. This is decisive real evidence that
+        similarity score ALONE, even at its maximum, cannot imply "same fact" at any threshold
+        -- the fix must be content-aware, not threshold-aware. No mock needed: real jaccard
+        crosses the 0.5 threshold on its own."""
+        existing = KnowledgeNode.create(
+            content="opened PR #866", category="action", source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        parsed = {"nodes": [{
+            "action": "create", "content": "opened PR #867", "category": "action",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("opened PR #866", contents)
+        self.assertIn("opened PR #867", contents)
+
+    def test_a7_1c_richer_existing_keeps_existing_pending_containment_gap(self):
+        """Fixture 1c -- pins the DESIGN INTENT (config main @ ea7b52f section 4: candidate's
+        claim is a strict subset of existing's; keeping existing loses nothing; "today's code
+        does this correctly, but for the wrong reason -- the new rule must keep this outcome
+        for the right reason"). Real jaccard=0.75 crosses threshold on its own, no mock needed.
+
+        REGRESSION RISK, verified this session against all 31 real A6 rows, not just this one
+        fixture: literal `_normalize_for_dedup` containment (lowercase+whitespace-collapse
+        only, per its own docstring) does NOT detect this real pair as a containment
+        relationship -- candidate says "...hold; 11/11 CI passed." (semicolon before the shared
+        clause, period at candidate's own end); existing continues the SAME clause with a comma
+        instead ("...hold, 11/11 CI passed, and 186/186 tests passed."). Unlike 1d below (a
+        pure trailing-edge mismatch that rstrip(" .,;:") resolves cleanly, verified against all
+        31 rows with zero side effects), this mismatch sits mid-string at "hold[;,]" -- well
+        before either string ends -- so trailing-strip cannot reach it.
+
+        THIS TEST IS ALREADY GREEN TODAY, by accident, via the unconditional blind-threshold
+        auto-corroborate that never touches `content` -- the existing node's text survives
+        untouched simply because nothing overwrites it. A literal, unrefined implementation of
+        section 2's containment rule would flip this test RED: strict substring containment
+        misses this pair, falls through to KEEP_BOTH, and creates an unwanted duplicate node --
+        a genuine regression on a case today's code already gets right, introduced BY the fix.
+        Closing this gap needs a punctuation-tolerant (not just punctuation-stripped)
+        comparison, which needs its own false-positive re-verification against the required
+        guard test below before it can be trusted -- flagged to Opus rather than resolved
+        unilaterally, same discipline as section 2.1's chronology question."""
+        existing = KnowledgeNode.create(
+            content=(
+                "Sentinel independently verified all Opus-fixes hold, 11/11 CI passed, "
+                "and 186/186 tests passed."
+            ),
+            category="fact",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        parsed = {"nodes": [{
+            "action": "create",
+            "content": "Sentinel independently verified all Opus-fixes hold; 11/11 CI passed.",
+            "category": "fact",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+
+        self.assertEqual(result.nodes_created, 0)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(
+            nodes[0].content,
+            "Sentinel independently verified all Opus-fixes hold, 11/11 CI passed, "
+            "and 186/186 tests passed.",
+        )
+
+    def test_a7_1d_richer_fresh_supersedes_with_fuller_content(self):
+        """Fixture 1d -- real jaccard=0.7143 crosses threshold on its own, no mock needed.
+        `existing`'s normalized text IS contained in `candidate`'s (existing contained in
+        candidate) once trailing punctuation is stripped from both sides before the containment
+        check -- candidate continues past existing's own terminal period ("...three lines of
+        python." vs "...three lines of python; Set up..."). Verified this session:
+        rstrip(" .,;:") on both normalized strings resolves this real pair cleanly and, checked
+        against all 31 real A6 rows, changes the classification of exactly this one row and no
+        other -- a narrowly targeted, zero-side-effect refinement, distinct from 1c's deeper
+        mid-string gap above. SUPERSEDE reuses guard 6's exact persistence shape (mark existing
+        status="superseded"/superseded_by=<new_id>, create a new node with the fresh content)
+        -- never a bare in-place overwrite, so the existing node's own history stays
+        inspectable."""
+        existing = KnowledgeNode.create(
+            content=(
+                "Verify a reviewer's exact repro claims against the real dependency before "
+                "writing the fix or the regression tests; Verify step costs three lines "
+                "of Python."
+            ),
+            category="convention",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        fresh_content = (
+            "Verify a reviewer's exact repro claims against the real dependency before "
+            "writing the fix or the regression tests; Verify step costs three lines "
+            "of Python; Set up fully isolated proof."
+        )
+        parsed = {"nodes": [{
+            "action": "create", "content": fresh_content, "category": "convention",
+        }]}
+        decision_path = Path(self.tmpdir) / "decisions.jsonl"
+        result = _apply_consolidation_result(
+            parsed, [existing], self.cluster, self.kn_path, decision_log_path=decision_path,
+        )
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        all_nodes = read_nodes(self.kn_path)  # all statuses, matches test_contradict_action
+        superseded = [n for n in all_nodes if n.id == existing.id]
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(superseded[0].status, "superseded")
+        active = [n for n in all_nodes if n.status == "active"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0].content, fresh_content)
+        self.assertEqual(superseded[0].superseded_by, active[0].id)
+
+        import json
+        entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+        supersede_entries = [e for e in entries if e["action"] == "auto-supersede"]
+        self.assertEqual(len(supersede_entries), 1)
+        self.assertEqual(supersede_entries[0]["existing_id"], existing.id)
+        self.assertEqual(supersede_entries[0]["candidate_content"], fresh_content)
+
+    def test_a7_1e_related_but_noncontaining_facts_keep_both(self):
+        """Fixture 1e -- real jaccard=0.0 (zero keyword overlap), real production cosine=0.8422
+        crosses the mixed cosine threshold. Same shape as 1a: related (same dependency, same
+        topic) but neither contains the other -- one says the dependency was added, the other
+        says three repro cases were verified against it. Both true, both worth keeping;
+        today's code keeps only the terser one and discards the three verified repro cases
+        outright."""
+        import synapt.recall.consolidate as mod
+
+        existing = KnowledgeNode.create(
+            content="added synapt-extract>=0.5.0 dependency",
+            category="decision",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.8422)  # real production cosine score
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": (
+                    "against real synapt_extract 0.5.0; verified all 3 exact repro cases "
+                    "directly against the installed package before fixing; confirmed "
+                    "exactly as reported."
+                ),
+                "category": "action",
+            }]}
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("added synapt-extract>=0.5.0 dependency", contents)
+        self.assertIn(
+            "against real synapt_extract 0.5.0; verified all 3 exact repro cases directly "
+            "against the installed package before fixing; confirmed exactly as reported.",
+            contents,
+        )
+
+    def test_a7_byte_identical_content_keeps_existing_unchanged(self):
+        """Representative of the 14 of 31 real A6 rows (design doc estimated ~13; the precise
+        recount this session is 14) where candidate is byte-identical to existing modulo
+        case/whitespace -- the degenerate norm_c == norm_e case. Zero regression risk: this is
+        today's correct behavior, now for the correct, most direct reason.
+
+        Specificity signal deliberately comes from the version number and file path (both
+        case-insensitive), not from capitalization -- an earlier draft of this fixture reused
+        1c's content lowercased and was rejected by `_lacks_specificity` before ever reaching
+        the dedup logic, because that content's ONLY specificity signal was the "CI"/
+        "Opus-fixes" capitalization pattern, which disappears exactly when case is varied to
+        exercise this test's own case-insensitivity claim. Verified directly against
+        `_create_content_passes_filters` before relying on it here."""
+        existing = KnowledgeNode.create(
+            content="Bumped requests to 2.32.4 in requirements.txt for the CVE fix",
+            category="dependency",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        parsed = {"nodes": [{
+            "action": "create",
+            "content": "bumped  requests to 2.32.4 in requirements.txt   for the cve fix",
+            "category": "dependency",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+
+        self.assertEqual(result.nodes_created, 0)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(len(nodes), 1)
+
+    def test_a7_false_containment_numeric_prefix_does_not_manufacture_supersede(self):
+        """Opus's required addition #1 (approval bubble, config main @ ea7b52f): prove whether
+        _normalize_for_dedup's narrow (lowercase+whitespace-collapse-only, no punctuation
+        removal) behavior can manufacture a FALSE containment. Verified this session:
+        whitespace-collapse/case-folding alone cannot merge or strip meaningful characters, so
+        it cannot manufacture false containment on its own -- BUT raw Python substring `in` on
+        any two strings has an inherent, unrelated trap: a short numeric/version identifier is
+        always a literal character-prefix of a longer one that starts the same way ("v1.3" is
+        a substring of "v1.35"). This is NOT a _normalize_for_dedup defect -- it would exist
+        even with zero normalization -- but it IS exactly the false-positive class the
+        containment check must not fall into: v1.3 and v1.35 are DIFFERENT, CONTRADICTORY
+        facts, not a non-lossy extension of each other. A naive read of section 2's pseudocode
+        (raw `in` on normalized text) WOULD wrongly classify this as existing contained in
+        candidate -> SUPERSEDE. Pinning KEEP_BOTH as the required outcome; the implementer
+        needs a word/token-boundary-aware containment check, not a raw substring test, to pass
+        this."""
+        import synapt.recall.consolidate as mod
+
+        existing = KnowledgeNode.create(
+            content=(
+                "Pinned croniter to v1.35 after the CVE patch, verified against the full "
+                "regression suite"
+            ),
+            category="dependency",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.85)
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create", "content": "Pinned croniter to v1.3",
+                "category": "dependency",
+            }]}
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        # v1.3 and v1.35 are different versions -- a literal substring match must not collapse
+        # them. Both facts must survive as distinct nodes.
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn(
+            "Pinned croniter to v1.35 after the CVE patch, verified against the full "
+            "regression suite",
+            contents,
+        )
+        self.assertIn("Pinned croniter to v1.3", contents)
+
+    def test_a7_best_match_selection_can_miss_a_true_container_produces_documented_duplicate(
+        self,
+    ):
+        """Opus's required addition #2 (approval bubble, config main @ ea7b52f): the create
+        branch's dedup loop selects ONE best_match (highest jaccard, or cosine fallback) and
+        the containment check (once implemented) only ever compares the candidate against THAT
+        node -- never against every existing node. Constructed so best_match (node_a,
+        jaccard=0.4286, the highest of the two, confirmed via real _jaccard) genuinely does NOT
+        contain the candidate, while a DIFFERENT existing node (node_b, jaccard=0.2941, ranked
+        lower because its extra unrelated content dilutes the ratio) DOES literally contain the
+        candidate's full text verbatim. Neither node crosses the jaccard threshold on its own
+        (0.4286 and 0.2941 both < 0.5), so the cosine fallback is mocked to confirm node_a as
+        best_match deterministically, mirroring how the real code would behave if
+        embedding-cosine ranked node_a closer even though node_b is the literal container --
+        entirely plausible, since cosine and literal-substring are different signals that can
+        disagree.
+
+        Pinning the documented, ACCEPTABLE tradeoff: this produces a duplicate node (the
+        candidate's own text, near-identical to node_b's) rather than data loss -- known,
+        watched, not an oversight. Revisit only if duplicate accumulation becomes a real
+        problem later (Opus's own framing)."""
+        import synapt.recall.consolidate as mod
+
+        node_a = KnowledgeNode.create(
+            content="the retry_handler backs off using a fixed 500ms delay, not exponential",
+            category="architecture",
+            source_sessions=["s0"],
+        )
+        node_b = KnowledgeNode.create(
+            content=(
+                "During the incident postmortem we noted the retry_handler backs off "
+                "exponentially starting at 200ms, which matches the documented SLA for "
+                "downstream retries and was reviewed by two engineers before merge"
+            ),
+            category="architecture",
+            source_sessions=["s0"],
+        )
+        append_node(node_a, self.kn_path)
+        append_node(node_b, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            # Simulates cosine ranking node_a closer even though node_b is the true container
+            # -- existing_nodes[0] is node_a, matching the list order passed below.
+            if existing_nodes:
+                return (existing_nodes[0], 0.85)
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": "the retry_handler backs off exponentially starting at 200ms",
+                "category": "architecture",
+            }]}
+            result = _apply_consolidation_result(
+                parsed, [node_a, node_b], self.cluster, self.kn_path,
+            )
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        # Documented tradeoff: KEEP_BOTH against best_match (node_a) produces a new node that
+        # duplicates node_b's already-persisted content -- missed dedup, not data loss. All
+        # three nodes must be present; nothing was silently discarded or overwritten.
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertEqual(len(contents), 3)
+        self.assertIn("the retry_handler backs off exponentially starting at 200ms", contents)
+
 
 class TestProjectContext(unittest.TestCase):
     """Test project context extraction for prompt grounding."""
