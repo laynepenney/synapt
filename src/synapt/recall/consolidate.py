@@ -650,14 +650,24 @@ def _get_dedup_thresholds(content_profile=None) -> tuple[float, float]:
 # EXCLUDED from the strip set: a trailing question mark changes the speech act (an assertion
 # and a question about the same words are not the same claim), so "?" is preserved as part of
 # its token rather than stripped -- see test_a7_question_form_never_merges_with_assertion.
+# "!" stays IN the strip set (Opus's reviewer-1 nit, 2026-07-17, pinned rather than changed):
+# unlike "?", an exclamation mark does not change what KIND of utterance a sentence is (still
+# an assertion, not a question) -- it marks emphasis/register on an otherwise identical claim.
+# "the deploy failed" and "the deploy failed!" are the same claim at different volume, not two
+# different claims the way an assertion and a question are. No fixture in this repo's real A6
+# data motivates treating it otherwise; revisit if one turns up.
 _TOKEN_BOUNDARY_STRIP = ".,;:"
 
 
 def _tokenize_for_containment(text: str) -> list[str]:
     """Lowercase + whitespace-split, then strip only `_TOKEN_BOUNDARY_STRIP` characters from
     each token's own leading/trailing edge. Intra-token characters (decimals, hyphens,
-    underscores, slashes, question marks) are never touched."""
-    return [tok.strip(_TOKEN_BOUNDARY_STRIP) for tok in text.lower().split()]
+    underscores, slashes, question marks) are never touched. A punctuation-only "word" (a
+    spaced ellipsis, a lone dash) strips to an empty string and is dropped rather than kept as
+    a positional placeholder -- an empty token would otherwise pollute a contiguous-subsequence
+    match with a stray gap that has no counterpart in the other text, turning a genuine
+    containment relationship into a false keep_both (Opus's reviewer-1 nit, 2026-07-17)."""
+    return [tok for raw in text.lower().split() if (tok := raw.strip(_TOKEN_BOUNDARY_STRIP))]
 
 
 def _token_sequence_contains(shorter: list[str], longer: list[str]) -> bool:
