@@ -640,6 +640,52 @@ def _get_dedup_thresholds(content_profile=None) -> tuple[float, float]:
     return _DEDUP_THRESHOLDS.get(ct, _DEDUP_THRESHOLDS["mixed"])
 
 
+# A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md, Opus's
+# 2026-07-17 ruling on the PR #892 1c finding): containment for the create-branch dedup
+# decision is a contiguous TOKEN-subsequence match, not a raw character substring match.
+# Punctuation is stripped ONLY at token boundaries (leading/trailing); punctuation INSIDE a
+# token is preserved, so "v1.3" and "v1.35" stay distinct atomic tokens (never collapse into
+# each other via a shared numeric prefix) while "hold;" and "hold," reduce to the same token
+# "hold" (a clause-boundary separator carries no content of its own). "?" is deliberately
+# EXCLUDED from the strip set: a trailing question mark changes the speech act (an assertion
+# and a question about the same words are not the same claim), so "?" is preserved as part of
+# its token rather than stripped -- see test_a7_question_form_never_merges_with_assertion.
+_TOKEN_BOUNDARY_STRIP = ".,;:"
+
+
+def _tokenize_for_containment(text: str) -> list[str]:
+    """Lowercase + whitespace-split, then strip only `_TOKEN_BOUNDARY_STRIP` characters from
+    each token's own leading/trailing edge. Intra-token characters (decimals, hyphens,
+    underscores, slashes, question marks) are never touched."""
+    return [tok.strip(_TOKEN_BOUNDARY_STRIP) for tok in text.lower().split()]
+
+
+def _token_sequence_contains(shorter: list[str], longer: list[str]) -> bool:
+    """True if `shorter` appears as a CONTIGUOUS run inside `longer`, token-for-token (not a
+    character substring). An empty `shorter` is trivially contained, mirroring `"" in s`."""
+    if not shorter:
+        return True
+    n = len(shorter)
+    return any(longer[i:i + n] == shorter for i in range(len(longer) - n + 1))
+
+
+def _b3_containment_decision(candidate_content: str, existing_content: str) -> str:
+    """The create-branch auto-corroborate decision rule, replacing the old unconditional
+    threshold-crossing convert-to-corroborate. Returns "keep_existing" (candidate's claim is
+    already fully covered by existing -- corroborate, never touching content), "supersede"
+    (existing's claim is fully covered by candidate, which says strictly more -- mark existing
+    superseded, persist the fuller content as a new node), or "keep_both" (neither contains the
+    other -- skip the auto-corroborate branch entirely, fall through to the ordinary create
+    path unchanged)."""
+    cand_tokens = _tokenize_for_containment(candidate_content)
+    exist_tokens = _tokenize_for_containment(existing_content)
+    if _token_sequence_contains(cand_tokens, exist_tokens):
+        return "keep_existing"
+    if _token_sequence_contains(exist_tokens, cand_tokens):
+        return "supersede"
+    return "keep_both"
+
+
 def _inline_embedding_dedup(
     candidate_content: str,
     existing_nodes: "list[KnowledgeNode]",
@@ -1372,33 +1418,104 @@ def _apply_consolidation_result(
                     best_method = "cosine"
 
             if best_match and best_sim >= jaccard_thresh:
-                logger.info(
-                    "Auto-corroborate (%s=%.2f): %s",
-                    best_method, best_sim, content[:80],
-                )
-                new_sources = list(set(best_match.source_sessions + cluster_sessions))
-                new_confidence = compute_confidence(len(new_sources))
-                auto_updates: dict = {"source_sessions": new_sources, "confidence": new_confidence}
-                # BLOCKER 2 fix (Sentinel, 2026-07-15, third path found in self-review): this
-                # create-action candidate just got silently converted to corroborate by
-                # similarity — needs the SAME fill-missing-bound treatment as the explicit
-                # corroborate branch (_corroborate_bound_fill), or the fix doesn't reach here.
-                auto_updates.update(_corroborate_bound_fill(best_match, raw_node))
-                _apply_corroborate_update(best_match, auto_updates, knowledge_path)
-                result.nodes_corroborated += 1
-                if decision_log_path:
-                    _log_dedup_decision(
-                        decision_log_path,
-                        action="auto-corroborate",
-                        candidate_content=content,
-                        candidate_category=category,
-                        existing_id=best_match.id,
-                        existing_content=best_match.content,
-                        similarity_score=best_sim,
-                        source=f"auto-{best_method}",
-                        session_ids=cluster_sessions,
+                # A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md,
+                # Opus's 2026-07-17 ruling): a similarity match no longer unconditionally
+                # converts to corroborate. Content containment decides the outcome — the old
+                # unconditional path silently discarded any candidate content that wasn't an
+                # exact restatement of `best_match`, a live production bug (17/31
+                # auto-corroborates in one A6 dogfood run).
+                b3_decision = _b3_containment_decision(content, best_match.content)
+
+                if b3_decision == "keep_existing":
+                    logger.info(
+                        "Auto-corroborate (%s=%.2f, keep_existing): %s",
+                        best_method, best_sim, content[:80],
                     )
-                continue
+                    new_sources = list(set(best_match.source_sessions + cluster_sessions))
+                    new_confidence = compute_confidence(len(new_sources))
+                    auto_updates: dict = {
+                        "source_sessions": new_sources, "confidence": new_confidence,
+                    }
+                    # BLOCKER 2 fix (Sentinel, 2026-07-15, third path found in self-review): this
+                    # create-action candidate just got silently converted to corroborate by
+                    # similarity — needs the SAME fill-missing-bound treatment as the explicit
+                    # corroborate branch (_corroborate_bound_fill), or the fix doesn't reach here.
+                    auto_updates.update(_corroborate_bound_fill(best_match, raw_node))
+                    _apply_corroborate_update(best_match, auto_updates, knowledge_path)
+                    result.nodes_corroborated += 1
+                    if decision_log_path:
+                        _log_dedup_decision(
+                            decision_log_path,
+                            action="auto-corroborate",
+                            candidate_content=content,
+                            candidate_category=category,
+                            existing_id=best_match.id,
+                            existing_content=best_match.content,
+                            similarity_score=best_sim,
+                            source=f"auto-{best_method}",
+                            session_ids=cluster_sessions,
+                        )
+                    continue
+
+                if b3_decision == "supersede":
+                    logger.info(
+                        "Auto-supersede (%s=%.2f): %s",
+                        best_method, best_sim, content[:80],
+                    )
+                    # Candidate strictly extends existing's claim (non-lossy gain) — persist the
+                    # fuller content as a NEW node and mark existing superseded. Never a bare
+                    # in-place overwrite: same persistence shape guard 6 already uses for
+                    # same-batch supersession, so the existing node's own history stays
+                    # inspectable rather than silently replaced.
+                    new_sources = list(set(best_match.source_sessions + cluster_sessions))
+                    new_tags = sorted(set(list(best_match.tags) + tags))
+                    superseding_node = KnowledgeNode.create(
+                        content=content,
+                        category=category,
+                        source_sessions=new_sources,
+                        confidence=compute_confidence(len(new_sources)),
+                        tags=new_tags,
+                        source_turns=source_turns,
+                    )
+                    if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
+                        llm_valid_from = None
+                        llm_valid_until = None
+                    else:
+                        llm_valid_from = _validate_iso_date(raw_node.get("valid_from"))
+                        llm_valid_until = _validate_iso_date(raw_node.get("valid_until"))
+                    cluster_valid_from = _cluster_valid_from(cluster)
+                    superseding_node.valid_from = (
+                        llm_valid_from
+                        or cluster_valid_from
+                        or datetime.now(timezone.utc).isoformat()
+                    )
+                    if llm_valid_until:
+                        superseding_node.valid_until = llm_valid_until
+                    update_node(
+                        best_match.id,
+                        {"status": "superseded", "superseded_by": superseding_node.id},
+                        knowledge_path,
+                    )
+                    append_node(superseding_node, knowledge_path)
+                    existing_nodes.append(superseding_node)  # track for intra-batch dedup
+                    result.nodes_created += 1
+                    if decision_log_path:
+                        _log_dedup_decision(
+                            decision_log_path,
+                            action="auto-supersede",
+                            candidate_content=content,
+                            candidate_category=category,
+                            existing_id=best_match.id,
+                            existing_content=best_match.content,
+                            similarity_score=best_sim,
+                            source=f"auto-{best_method}",
+                            session_ids=cluster_sessions,
+                        )
+                    continue
+
+                # b3_decision == "keep_both": neither contains the other. Deliberately no
+                # `continue` here — falls through to the ordinary create path below, exactly as
+                # if no similarity match had been found at all. Zero new node-creation logic.
 
             confidence = raw_node.get("confidence", 0.5)
             if not isinstance(confidence, (int, float)):

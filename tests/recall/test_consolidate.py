@@ -983,7 +983,14 @@ class TestGenericFilterInApply(unittest.TestCase):
         self.assertEqual(result.nodes_created, 1)
 
     def test_auto_corroborate_near_duplicate(self):
-        """Create with content similar to existing node should auto-corroborate."""
+        """UPDATED by A7 (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md):
+        similar-by-keyword-overlap is no longer sufficient to auto-corroborate on its own. This
+        fixture's candidate inserts a mid-sentence clarification ("(e.g., runtime errors)") and
+        drops the existing's trailing "loop" -- neither text is a contiguous token-subsequence of
+        the other, so under A7's containment rule this is content-genuinely-different, not a near
+        duplicate: both must survive rather than one silently absorbing (and losing) the other's
+        detail. Originally asserted the opposite (single corroborated node) under the pre-A7
+        unconditional threshold-based merge; that assertion described the bug this fix closes."""
         existing = KnowledgeNode.create(
             content="Use --phase-filter config options for phase filtering and custom prompts for L3 repair loop",
             category="architecture",
@@ -1002,11 +1009,20 @@ class TestGenericFilterInApply(unittest.TestCase):
         result = _apply_consolidation_result(
             parsed, [existing], self.cluster, self.kn_path,
         )
-        self.assertEqual(result.nodes_created, 0)
-        self.assertEqual(result.nodes_corroborated, 1)
-        # Original node should still be the only one
-        nodes = read_nodes(self.kn_path)
-        self.assertEqual(len(nodes), 1)
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertEqual(len(contents), 2)
+        self.assertIn(
+            "Use --phase-filter config options for phase filtering and custom prompts for "
+            "L3 repair loop",
+            contents,
+        )
+        self.assertIn(
+            "Use --phase-filter config options for phase filtering (e.g., runtime errors) "
+            "and custom prompts for L3 repair",
+            contents,
+        )
 
     def test_no_auto_corroborate_different_content(self):
         """Create with dissimilar content should not auto-corroborate."""
@@ -1032,10 +1048,16 @@ class TestGenericFilterInApply(unittest.TestCase):
         self.assertEqual(result.nodes_corroborated, 0)
 
     def test_auto_corroborate_at_exact_boundary(self):
-        """Jaccard of exactly 0.5 should trigger auto-corroborate (>= threshold)."""
+        """Jaccard of exactly 0.5 should still trigger the auto-corroborate BRANCH (>= threshold
+        finds best_match) -- UPDATED by A7: the branch no longer unconditionally corroborates.
+        This fixture's existing ("alpha bravo") is a genuine, contiguous token-prefix of
+        candidate ("alpha bravo --charlie delta"), so A7's containment rule correctly resolves
+        it as SUPERSEDE (existing's claim is fully covered by candidate, which says strictly
+        more) rather than a plain corroborate that would have discarded "--charlie delta"
+        forever. Originally asserted plain corroborate under the pre-A7 unconditional merge."""
         # keywords("alpha bravo") = {"alpha","bravo"}, |inter|=2
         # keywords("alpha bravo --charlie delta") = {"alpha","bravo","charlie","delta"}, |union|=4
-        # jaccard = 2/4 = 0.5 ✓
+        # jaccard = 2/4 = 0.5 ✓ -- still finds best_match at the exact threshold boundary.
         existing = KnowledgeNode.create(
             content="alpha bravo",
             category="convention",
@@ -1054,11 +1076,24 @@ class TestGenericFilterInApply(unittest.TestCase):
         result = _apply_consolidation_result(
             parsed, [existing], self.cluster, self.kn_path,
         )
-        self.assertEqual(result.nodes_corroborated, 1)
-        self.assertEqual(result.nodes_created, 0)
+        self.assertEqual(result.nodes_corroborated, 0)
+        self.assertEqual(result.nodes_created, 1)
+        all_nodes = read_nodes(self.kn_path)  # all statuses
+        superseded = [n for n in all_nodes if n.id == existing.id]
+        self.assertEqual(superseded[0].status, "superseded")
+        active = [n for n in all_nodes if n.status == "active"]
+        self.assertEqual(active[0].content, "alpha bravo --charlie delta")
 
     def test_intra_batch_dedup(self):
-        """Two creates in the same LLM response with similar content: second should auto-corroborate against first."""
+        """UPDATED by A7: two creates in the same LLM response, similar by keyword-overlap but
+        with DIFFERENT trailing clauses ("training runs" vs "training and evaluation") -- neither
+        is a contiguous token-subsequence of the other, so both survive as distinct nodes rather
+        than the second silently absorbing (and losing) the first's own trailing detail.
+        Originally asserted a single corroborated node under the pre-A7 unconditional merge;
+        that assertion described the bug this fix closes. Still exercises the mechanism this
+        test is named for: intra-batch dedup runs the SAME containment decision against nodes
+        created earlier in the SAME batch (existing_nodes.append at the create tail), not just
+        against nodes pre-existing on disk."""
         parsed = {
             "nodes": [
                 {
@@ -1080,18 +1115,29 @@ class TestGenericFilterInApply(unittest.TestCase):
         result = _apply_consolidation_result(
             parsed, [], self.cluster, self.kn_path,
         )
-        # First create succeeds, second auto-corroborates against it
-        self.assertEqual(result.nodes_created, 1)
-        self.assertEqual(result.nodes_corroborated, 1)
-        nodes = read_nodes(self.kn_path)
-        self.assertEqual(len(nodes), 1)
+        self.assertEqual(result.nodes_created, 2)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("Use Modal with --gpu a10g for cloud GPU training runs", contents)
+        self.assertIn(
+            "Use Modal with --gpu a10g for cloud GPU training and evaluation", contents,
+        )
 
     def test_embedding_auto_corroborate_semantic_duplicate(self):
-        """Semantic duplicate (different wording, same meaning) should auto-corroborate via embeddings."""
+        """UPDATED by A7: this fixture's whole premise -- "semantic duplicate (different
+        wording, same meaning) should auto-corroborate via embeddings" -- is exactly the claim
+        A7 exists to refute (real production evidence: fixtures 1a/1e in the A7 design doc, both
+        cosine matches at 0.83-0.84 pairing content that must NOT merge). A high cosine score
+        earns the candidate a look via best_match selection; it does not earn an automatic
+        merge. "KMP frameworks linked to Xcode for native iOS integration via CocoaPods" shares
+        no contiguous token run with "Kotlin Multiplatform projects are linked to Xcode via
+        build_phases for iOS builds" -- pure paraphrase, not containment -- so A7 correctly
+        declines to merge even though the mocked cosine crosses threshold. This test now
+        verifies the embedding-cosine PATH still gets exercised (best_match found, mock fires)
+        while the containment check still protects content from a paraphrase-triggered merge.
+        Originally asserted a single corroborated node under the pre-A7 unconditional merge."""
         import synapt.recall.consolidate as mod
 
-        # Mock the embedding dedup to simulate high cosine similarity
-        # for semantically similar but keyword-different content.
         original_fn = mod._inline_embedding_dedup
         existing = KnowledgeNode.create(
             content="Kotlin Multiplatform projects are linked to Xcode via build_phases for iOS builds",
@@ -1122,8 +1168,18 @@ class TestGenericFilterInApply(unittest.TestCase):
             result = _apply_consolidation_result(
                 parsed, [existing], self.cluster, self.kn_path,
             )
-            self.assertEqual(result.nodes_corroborated, 1)
-            self.assertEqual(result.nodes_created, 0)
+            self.assertEqual(result.nodes_corroborated, 0)
+            self.assertEqual(result.nodes_created, 1)
+            contents = {n.content for n in read_nodes(self.kn_path)}
+            self.assertIn(
+                "Kotlin Multiplatform projects are linked to Xcode via build_phases for "
+                "iOS builds",
+                contents,
+            )
+            self.assertIn(
+                "KMP frameworks linked to Xcode for native iOS integration via CocoaPods",
+                contents,
+            )
         finally:
             mod._inline_embedding_dedup = original_fn
 
@@ -1227,18 +1283,31 @@ class TestGenericFilterInApply(unittest.TestCase):
     # recount this session is 14 of 31).
     #
     # The fix replaces the unconditional best_sim>=threshold->corroborate branch with a
-    # containment check on `_normalize_for_dedup` output: exact match, or candidate contained
+    # containment check (`_b3_containment_decision`, using `_tokenize_for_containment` +
+    # `_token_sequence_contains`): containment is a CONTIGUOUS TOKEN-SUBSEQUENCE match, not a
+    # raw character substring match, after lowercase + whitespace-split + punctuation stripped
+    # ONLY at each token's own boundary (intra-token punctuation preserved -- Opus's
+    # 2026-07-17 ruling on the mechanism, resolving the 1c finding below). Candidate contained
     # in existing -> KEEP EXISTING; existing contained in candidate -> SUPERSEDE (mark existing
     # superseded, persist fresh content as a new node -- same shape guard 6 already uses, never
     # a bare overwrite); neither contains the other -> KEEP_BOTH (skip the auto-corroborate
     # branch, fall through to the untouched create path).
     #
-    # KNOWN OPEN GAP (see test_a7_1c_... below): literal substring containment does not detect
-    # every real containment relationship. A trailing-punctuation mismatch (1d) is resolved by
-    # a verified, zero-side-effect rstrip across all 31 real rows; a mid-string
-    # punctuation-class mismatch (1c) is NOT, and a naive implementation of section 2 would
-    # REGRESS 1c from correct (today, by accident) to duplicate-creating. Flagged to Opus, not
-    # resolved unilaterally here.
+    # RESOLVED (was flagged as an open gap; see test_a7_1c_... below): the original literal
+    # substring check on `_normalize_for_dedup`'s unstripped output missed 1c's real containment
+    # relationship (a mid-string punctuation-class mismatch, "hold;" vs "hold,") and a naive
+    # implementation would have regressed 1c from correct-by-accident to duplicate-creating.
+    # Opus's token-contiguous primitive resolves this by construction: boundary punctuation
+    # ("hold;"/"hold,") reduces to the same token, while intra-token punctuation ("v1.3"/"v1.35")
+    # never does -- closing the gap without reopening the false-positive risk the numeric-prefix
+    # guard exists to catch. Verified against all 31 real A6 rows: exactly 1 flip (1c, as
+    # predicted), zero other rows change class -- reported in the impl PR body.
+    #
+    # Sentinel's reviewer-2 mutation audit (2026-07-17) found the 9 base tests, while pinning
+    # every correct OUTCOME, do not distinguish the ruled primitive from at least two
+    # structurally different WRONG ones (token-prefix-only; unordered bag/subset) plus a
+    # punctuation-deleting variant the numeric-prefix guard alone doesn't catch. The 4 tests
+    # after test_a7_question_form_... isolate exactly those gaps.
 
     def test_a7_1a_cosine_near_opposite_facts_keep_both(self):
         """Fixture 1a -- Opus's original A6 dogfood trigger. Real pair, cosine=0.8298 crosses
@@ -1313,32 +1382,23 @@ class TestGenericFilterInApply(unittest.TestCase):
         self.assertIn("opened PR #866", contents)
         self.assertIn("opened PR #867", contents)
 
-    def test_a7_1c_richer_existing_keeps_existing_pending_containment_gap(self):
+    def test_a7_1c_richer_existing_keeps_existing_via_token_boundary_containment(self):
         """Fixture 1c -- pins the DESIGN INTENT (config main @ ea7b52f section 4: candidate's
         claim is a strict subset of existing's; keeping existing loses nothing; "today's code
         does this correctly, but for the wrong reason -- the new rule must keep this outcome
         for the right reason"). Real jaccard=0.75 crosses threshold on its own, no mock needed.
 
-        REGRESSION RISK, verified this session against all 31 real A6 rows, not just this one
-        fixture: literal `_normalize_for_dedup` containment (lowercase+whitespace-collapse
-        only, per its own docstring) does NOT detect this real pair as a containment
-        relationship -- candidate says "...hold; 11/11 CI passed." (semicolon before the shared
-        clause, period at candidate's own end); existing continues the SAME clause with a comma
-        instead ("...hold, 11/11 CI passed, and 186/186 tests passed."). Unlike 1d below (a
-        pure trailing-edge mismatch that rstrip(" .,;:") resolves cleanly, verified against all
-        31 rows with zero side effects), this mismatch sits mid-string at "hold[;,]" -- well
-        before either string ends -- so trailing-strip cannot reach it.
-
-        THIS TEST IS ALREADY GREEN TODAY, by accident, via the unconditional blind-threshold
-        auto-corroborate that never touches `content` -- the existing node's text survives
-        untouched simply because nothing overwrites it. A literal, unrefined implementation of
-        section 2's containment rule would flip this test RED: strict substring containment
-        misses this pair, falls through to KEEP_BOTH, and creates an unwanted duplicate node --
-        a genuine regression on a case today's code already gets right, introduced BY the fix.
-        Closing this gap needs a punctuation-tolerant (not just punctuation-stripped)
-        comparison, which needs its own false-positive re-verification against the required
-        guard test below before it can be trusted -- flagged to Opus rather than resolved
-        unilaterally, same discipline as section 2.1's chronology question."""
+        Resolved via Opus's token-contiguous ruling (2026-07-17): candidate says "...hold;
+        11/11 CI passed." (semicolon before the shared clause, period at candidate's own end);
+        existing continues the SAME clause with a comma instead ("...hold, 11/11 CI passed, and
+        186/186 tests passed."). Under `_tokenize_for_containment`, the boundary punctuation on
+        both sides of "hold" strips away (both reduce to the plain token "hold"), so candidate's
+        full token sequence IS a genuine contiguous prefix of existing's -- KEEP_EXISTING, for
+        the mechanism's own construction, not by accident. This differs from a raw-substring
+        approach only in WHERE punctuation gets stripped (token edges, not deleted everywhere),
+        which is exactly what keeps the numeric-prefix guard (test_a7_false_containment_...)
+        and the intra-token-punctuation guard (test_a7_intra_token_punctuation_deletion_...)
+        holding at the same time as this one resolves."""
         existing = KnowledgeNode.create(
             content=(
                 "Sentinel independently verified all Opus-fixes hold, 11/11 CI passed, "
@@ -1626,6 +1686,218 @@ class TestGenericFilterInApply(unittest.TestCase):
         self.assertEqual(len(contents), 3)
         self.assertIn("the retry_handler backs off exponentially starting at 200ms", contents)
 
+    def test_a7_question_form_never_merges_with_assertion(self):
+        """Opus's Requirement 3 (approval bubble, config main @ ea7b52f): "?" is deliberately
+        excluded from `_TOKEN_BOUNDARY_STRIP` -- a trailing question mark changes the speech act.
+        "Did the migration succeed?" and "The migration succeeded." share every word but assert
+        opposite epistemic states (uncertainty vs. confirmed fact); collapsing them would
+        recreate exactly the class of bug A7 exists to close, just via a different punctuation
+        mark than 1b's PR-number collision. Real jaccard=0.6667 crosses threshold on its own
+        (no mock needed). Proven load-bearing, not decorative: if "?" were included in the
+        strip set (verified directly against the tokenizer, not asserted from reasoning), these
+        two token sequences would become byte-for-byte equal and wrongly merge."""
+        existing = KnowledgeNode.create(
+            content="PR #91 confirms the migration to Postgres completed successfully.",
+            category="fact",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        parsed = {"nodes": [{
+            "action": "create",
+            "content": "PR #91 confirms the migration to Postgres completed successfully?",
+            "category": "fact",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("PR #91 confirms the migration to Postgres completed successfully.", contents)
+        self.assertIn("PR #91 confirms the migration to Postgres completed successfully?", contents)
+
+    # --- Sentinel's mutation audit on PR #892 (reviewer-2, 2026-07-17), approved by Opus as the
+    # mutation-lock for his token-contiguous ruling: the 9 tests above pin the CORRECT OUTCOME
+    # for every fixture, but two deliberately-wrong comparators -- token-PREFIX-only (ignores
+    # mid-string containment) and unordered BAG/SUBSET (ignores token order/position) -- pass
+    # all 9 without implementing the ruled primitive. A punctuation-DELETING comparator also
+    # survives the existing numeric-prefix guard, since "v1.3" vs "v1.35" still tokenize
+    # differently either way. The 4 tests below each isolate exactly one of these and would fail
+    # under the corresponding wrong comparator, verified directly against hand-built comparator
+    # functions before writing these assertions (not asserted from reasoning alone).
+
+    def test_a7_mid_string_containment_keeps_existing(self):
+        """Sentinel guard 1: candidate's tokens appear as a contiguous run INSIDE existing, but
+        NOT starting at position 0 (existing has real content both before and after candidate's
+        span) -- proves the containment check scans for containment anywhere, not just a
+        leading prefix. Every fixture in this test file up to now happened to place the shorter
+        text at existing's own start; a token-PREFIX-only comparator (checking only
+        `longer[:n] == shorter`) passes all of them while missing this case entirely. Verified
+        directly: a hand-built prefix-only comparator returns False here where the real
+        implementation correctly returns True. Real jaccard=0.4 stays below the mixed threshold
+        on its own, so the cosine fallback is mocked to reach the decision at all."""
+        import synapt.recall.consolidate as mod
+
+        existing = KnowledgeNode.create(
+            content=(
+                "per the incident review, the retry_handler backs off exponentially, "
+                "confirmed by two engineers"
+            ),
+            category="architecture",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.85)
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": "the retry_handler backs off exponentially",
+                "category": "architecture",
+            }]}
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        self.assertEqual(result.nodes_created, 0)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(
+            nodes[0].content,
+            "per the incident review, the retry_handler backs off exponentially, "
+            "confirmed by two engineers",
+        )
+
+    def test_a7_reverse_mid_string_containment_supersedes(self):
+        """Sentinel guard 2: the mirror of guard 1 -- existing's tokens are a contiguous run
+        INSIDE candidate, at a non-prefix position (candidate has real content both before and
+        after existing's span), so this must SUPERSEDE (not merely keep_existing) and exercise
+        the SUPERSEDE persistence shape at a non-prefix match position, not only the leading-edge
+        position every earlier SUPERSEDE fixture (1d) happened to use."""
+        import synapt.recall.consolidate as mod
+
+        existing = KnowledgeNode.create(
+            content="the retry_handler backs off exponentially",
+            category="architecture",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.85)
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            fresh_content = (
+                "per the incident review, the retry_handler backs off exponentially, "
+                "confirmed by two engineers"
+            )
+            parsed = {"nodes": [{
+                "action": "create", "content": fresh_content, "category": "architecture",
+            }]}
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        all_nodes = read_nodes(self.kn_path)  # all statuses
+        superseded = [n for n in all_nodes if n.id == existing.id]
+        self.assertEqual(superseded[0].status, "superseded")
+        active = [n for n in all_nodes if n.status == "active"]
+        self.assertEqual(active[0].content, fresh_content)
+
+    def test_a7_negation_insertion_defeats_bag_subset_merge(self):
+        """Sentinel guard 3: candidate inserts "not" between two of existing's own tokens
+        ("is" and "stable"). Every one of existing's tokens still appears SOMEWHERE in
+        candidate -- an unordered BAG/SUBSET comparator (Counter-based multiset subset, ignoring
+        position) would wrongly conclude existing is contained in candidate and SUPERSEDE "the
+        deploy is stable" with "the deploy is not stable", treating a hard contradiction as a
+        non-lossy extension. The real ordered, CONTIGUOUS check correctly refuses: "not" breaks
+        the run right where existing's last two tokens ("is", "stable") would need to sit
+        adjacent in candidate. Verified directly: a hand-built Counter-subset comparator returns
+        True (wrongly) where the real implementation returns keep_both. Real jaccard=1.0 crosses
+        threshold on its own -- no mock needed, same shape as guard-6's own negation-flip
+        precedent (test_guard6_negation_flip_suppresses_earlier_ungrouped_singleton) applied to
+        B3 instead of B4."""
+        existing = KnowledgeNode.create(
+            content="PR #92's deploy is stable",
+            category="fact",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        parsed = {"nodes": [{
+            "action": "create", "content": "PR #92's deploy is not stable", "category": "fact",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("PR #92's deploy is stable", contents)
+        self.assertIn("PR #92's deploy is not stable", contents)
+
+    def test_a7_intra_token_punctuation_deletion_would_falsely_collide(self):
+        """Sentinel guard 4: existing's real token "v13" and candidate's real token "v1.3" are
+        genuinely different version identifiers, but a comparator that DELETES intra-token
+        punctuation (instead of only stripping it at token BOUNDARIES, which is what section 2's
+        ruled primitive actually does) would rewrite "v1.3" to "v13" -- a byte-for-byte collision
+        with existing's own unrelated "v13" token, producing a false containment match this
+        existing numeric-prefix guard test does not catch (there, "v1.3" vs "v1.35" still
+        tokenize differently even after all punctuation is deleted, since the digit counts
+        differ -- it never isolated deletion from preservation). Verified directly: a hand-built
+        punctuation-deleting tokenizer produces a false containment match here where the real
+        (boundary-only-stripping) implementation correctly returns keep_both."""
+        import synapt.recall.consolidate as mod
+
+        existing = KnowledgeNode.create(
+            content=(
+                "Pinned croniter to v13 after the CVE patch, verified against the full "
+                "regression suite"
+            ),
+            category="dependency",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.85)
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create", "content": "Pinned croniter to v1.3",
+                "category": "dependency",
+            }]}
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn(
+            "Pinned croniter to v13 after the CVE patch, verified against the full "
+            "regression suite",
+            contents,
+        )
+        self.assertIn("Pinned croniter to v1.3", contents)
+
 
 class TestProjectContext(unittest.TestCase):
     """Test project context extraction for prompt grounding."""
@@ -1871,13 +2143,20 @@ class TestDedupDecisionLogging(unittest.TestCase):
         self.assertIn("contradiction_note", d)
 
     def test_auto_corroborate_logs_decision(self):
-        """Jaccard >= 0.5 auto-corroborate should log with similarity score."""
+        """UPDATED by A7: Jaccard >= 0.5 still finds best_match (the auto-corroborate BRANCH is
+        entered), but this fixture's single mid-sentence word substitution ("echo" vs
+        "foxtrot") is neither a prefix nor a suffix of the other -- no contiguous token
+        containment either direction, so A7 correctly declines to merge. The decision-log entry
+        is therefore the ordinary "create" entry (with this near-miss surfaced in its own
+        negative_pairs, not silently dropped), not "auto-corroborate". Originally asserted an
+        auto-corroborate log entry under the pre-A7 unconditional merge."""
         existing = KnowledgeNode.create(
             content="alpha bravo charlie delta echo --verbose",
             category="convention", source_sessions=["s0"],
         )
         append_node(existing, self.kn_path)
-        # Content shares enough keywords to trigger Jaccard >= 0.5
+        # Content shares enough keywords to cross the jaccard threshold and reach the
+        # containment decision, but is not a containment relationship.
         parsed = {"nodes": [{
             "action": "create",
             "content": "alpha bravo charlie delta foxtrot --verbose",
@@ -1891,10 +2170,10 @@ class TestDedupDecisionLogging(unittest.TestCase):
         decisions = self._read_decisions()
         self.assertEqual(len(decisions), 1)
         d = decisions[0]
-        self.assertEqual(d["action"], "auto-corroborate")
-        self.assertEqual(d["source"], "auto-jaccard")
-        self.assertGreaterEqual(d["similarity_score"], 0.5)
-        self.assertEqual(d["existing_id"], existing.id)
+        self.assertEqual(d["action"], "create")
+        self.assertIn("negative_pairs", d)
+        self.assertEqual(d["negative_pairs"][0]["existing_id"], existing.id)
+        self.assertGreaterEqual(d["negative_pairs"][0]["similarity_score"], 0.5)
 
     def test_create_logs_negative_pairs(self):
         """Create with existing nodes logs top-3 negative pairs by Jaccard."""
