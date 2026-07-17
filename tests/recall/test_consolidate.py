@@ -1826,11 +1826,20 @@ class TestGenericFilterInApply(unittest.TestCase):
         deploy is stable" with "the deploy is not stable", treating a hard contradiction as a
         non-lossy extension. The real ordered, CONTIGUOUS check correctly refuses: "not" breaks
         the run right where existing's last two tokens ("is", "stable") would need to sit
-        adjacent in candidate. Verified directly: a hand-built Counter-subset comparator returns
-        True (wrongly) where the real implementation returns keep_both. Real jaccard=1.0 crosses
-        threshold on its own -- no mock needed, same shape as guard-6's own negation-flip
-        precedent (test_guard6_negation_flip_suppresses_earlier_ungrouped_singleton) applied to
-        B3 instead of B4."""
+        adjacent in candidate. Real jaccard=1.0 crosses threshold on its own -- no mock needed,
+        same shape as guard-6's own negation-flip precedent
+        (test_guard6_negation_flip_suppresses_earlier_ungrouped_singleton) applied to B3
+        instead of B4.
+
+        Sentinel's reviewer-2 mutation re-audit (2026-07-17) found the FIRST version of this
+        test asserted `nodes_created == 1` + both contents present -- properties ALSO true
+        under the wrong bag/subset comparator's outcome (mark-old/create-new SUPERSEDE also
+        creates one node and both contents survive somewhere in all-status history), so the
+        original assertions did not actually distinguish KEEP_BOTH from SUPERSEDE and the
+        mutant stayed GREEN. Corrected to assert what only KEEP_BOTH produces: existing stays
+        `status="active"` with no `superseded_by`, and the decision log has exactly one
+        `create` entry and zero `auto-supersede` entries for this pair. Verified directly
+        against the bag/subset mutant: these corrected assertions turn it RED."""
         existing = KnowledgeNode.create(
             content="PR #92's deploy is stable",
             category="fact",
@@ -1840,13 +1849,28 @@ class TestGenericFilterInApply(unittest.TestCase):
         parsed = {"nodes": [{
             "action": "create", "content": "PR #92's deploy is not stable", "category": "fact",
         }]}
-        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        decision_path = Path(self.tmpdir) / "decisions.jsonl"
+        result = _apply_consolidation_result(
+            parsed, [existing], self.cluster, self.kn_path, decision_log_path=decision_path,
+        )
 
         self.assertEqual(result.nodes_created, 1)
         self.assertEqual(result.nodes_corroborated, 0)
-        contents = {n.content for n in read_nodes(self.kn_path)}
+        all_nodes = read_nodes(self.kn_path)  # all statuses
+        contents = {n.content for n in all_nodes}
         self.assertIn("PR #92's deploy is stable", contents)
         self.assertIn("PR #92's deploy is not stable", contents)
+
+        # Persistence shape is the property that actually distinguishes KEEP_BOTH from
+        # SUPERSEDE -- creation count and content presence do not.
+        existing_persisted = next(n for n in all_nodes if n.id == existing.id)
+        self.assertEqual(existing_persisted.status, "active")
+        self.assertFalse(existing_persisted.superseded_by)  # default "", never set
+
+        import json
+        entries = [json.loads(line) for line in decision_path.read_text().splitlines() if line]
+        self.assertEqual(len([e for e in entries if e["action"] == "create"]), 1)
+        self.assertEqual(len([e for e in entries if e["action"] == "auto-supersede"]), 0)
 
     def test_a7_intra_token_punctuation_deletion_would_falsely_collide(self):
         """Sentinel guard 4: existing's real token "v13" and candidate's real token "v1.3" are
@@ -1897,6 +1921,62 @@ class TestGenericFilterInApply(unittest.TestCase):
             contents,
         )
         self.assertIn("Pinned croniter to v1.3", contents)
+
+    def test_a7_exclamation_is_boundary_noise_not_a_new_claim(self):
+        """Opus's ruling on Sentinel's reviewer-2 record/code mismatch (2026-07-17): "!" joins
+        `_TOKEN_BOUNDARY_STRIP` so the constant matches the documented rationale -- unlike "?",
+        an exclamation mark does not change what KIND of utterance a sentence is (still an
+        assertion), only its register. "PR #93's rollback finished" and "PR #93's rollback
+        finished!" are the same claim at different volume, and must merge exactly like a
+        trailing-period/no-period pair would. Real jaccard=1.0, no mock needed."""
+        existing = KnowledgeNode.create(
+            content="PR #93's rollback finished",
+            category="fact",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        parsed = {"nodes": [{
+            "action": "create", "content": "PR #93's rollback finished!", "category": "fact",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+
+        self.assertEqual(result.nodes_created, 0)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(len(nodes), 1)
+
+    def test_a7_standalone_dash_separator_is_not_content(self):
+        """Sentinel's reviewer-2 record/code mismatch (2026-07-17): the tokenizer's own
+        docstring claimed a lone dash strips to empty and is dropped, but `_TOKEN_BOUNDARY_STRIP`
+        never included "-" (adding it there would also strip a real CLI-flag prefix like
+        "--verbose" or "-x" -- Sentinel's explicit caution: never broadly strip meaningful
+        punctuation while fixing a standalone separator). Fixed by catching ONLY tokens that
+        reduce to nothing but dash characters, a narrower rule than the boundary-strip set.
+        "PR #94's retry logic - after the incident review - now backs off exponentially" and
+        the same sentence with no dash separators must tokenize identically. Real jaccard=1.0
+        crosses threshold on its own -- no mock needed."""
+        existing = KnowledgeNode.create(
+            content=(
+                "PR #94's retry logic after the incident review now backs off exponentially"
+            ),
+            category="architecture",
+            source_sessions=["s0"],
+        )
+        append_node(existing, self.kn_path)
+        parsed = {"nodes": [{
+            "action": "create",
+            "content": (
+                "PR #94's retry logic - after the incident review - now backs off "
+                "exponentially"
+            ),
+            "category": "architecture",
+        }]}
+        result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+
+        self.assertEqual(result.nodes_created, 0)
+        self.assertEqual(result.nodes_corroborated, 1)
+        nodes = read_nodes(self.kn_path)
+        self.assertEqual(len(nodes), 1)
 
 
 class TestProjectContext(unittest.TestCase):

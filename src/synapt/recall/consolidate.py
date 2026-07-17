@@ -650,24 +650,36 @@ def _get_dedup_thresholds(content_profile=None) -> tuple[float, float]:
 # EXCLUDED from the strip set: a trailing question mark changes the speech act (an assertion
 # and a question about the same words are not the same claim), so "?" is preserved as part of
 # its token rather than stripped -- see test_a7_question_form_never_merges_with_assertion.
-# "!" stays IN the strip set (Opus's reviewer-1 nit, 2026-07-17, pinned rather than changed):
+#
+# "!" IS included (Opus's ruling on Sentinel's reviewer-2 record/code mismatch, 2026-07-17):
 # unlike "?", an exclamation mark does not change what KIND of utterance a sentence is (still
-# an assertion, not a question) -- it marks emphasis/register on an otherwise identical claim.
-# "the deploy failed" and "the deploy failed!" are the same claim at different volume, not two
-# different claims the way an assertion and a question are. No fixture in this repo's real A6
-# data motivates treating it otherwise; revisit if one turns up.
-_TOKEN_BOUNDARY_STRIP = ".,;:"
+# an assertion, not a question) -- it marks emphasis/register on an otherwise identical claim,
+# boundary noise the same way ";" is. "the deploy failed" and "the deploy failed!" are the
+# same claim at different volume -- see test_a7_exclamation_is_boundary_noise_not_a_new_claim.
+_TOKEN_BOUNDARY_STRIP = ".,;:!"
 
 
 def _tokenize_for_containment(text: str) -> list[str]:
     """Lowercase + whitespace-split, then strip only `_TOKEN_BOUNDARY_STRIP` characters from
     each token's own leading/trailing edge. Intra-token characters (decimals, hyphens,
-    underscores, slashes, question marks) are never touched. A punctuation-only "word" (a
-    spaced ellipsis, a lone dash) strips to an empty string and is dropped rather than kept as
-    a positional placeholder -- an empty token would otherwise pollute a contiguous-subsequence
-    match with a stray gap that has no counterpart in the other text, turning a genuine
-    containment relationship into a false keep_both (Opus's reviewer-1 nit, 2026-07-17)."""
-    return [tok for raw in text.lower().split() if (tok := raw.strip(_TOKEN_BOUNDARY_STRIP))]
+    underscores, slashes, question marks) are never touched, so a real prefix like "--verbose"
+    or "-x" is preserved whole -- `_TOKEN_BOUNDARY_STRIP` deliberately excludes "-" for exactly
+    this reason (Sentinel's reviewer-2 caution, 2026-07-17: never strip a meaningful CLI-flag
+    prefix while fixing standalone separators).
+    A punctuation-only "word" strips to an empty string via the normal boundary strip (a spaced
+    ellipsis: "landed . . . eventually" -> the isolated "." tokens vanish) and is dropped rather
+    than kept as a positional placeholder that would pollute a contiguous-subsequence match with
+    a stray gap the other text has no counterpart for. A STANDALONE dash/em-dash token ("a - b")
+    is caught separately: it never touches `_TOKEN_BOUNDARY_STRIP` (would strip "--verbose"),
+    so a token that strips to something made ENTIRELY of "-" characters is treated as empty too
+    -- see test_a7_standalone_dash_separator_is_not_content."""
+    tokens: list[str] = []
+    for raw in text.lower().split():
+        tok = raw.strip(_TOKEN_BOUNDARY_STRIP)
+        if not tok or set(tok) <= {"-"}:
+            continue
+        tokens.append(tok)
+    return tokens
 
 
 def _token_sequence_contains(shorter: list[str], longer: list[str]) -> bool:
