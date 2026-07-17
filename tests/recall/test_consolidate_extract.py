@@ -686,21 +686,37 @@ def test_run_extract_path_mixed_auto_then_explicit_corroborate_same_node_first_b
     never exercised, mutated or not. Fixed by SWAPPING the order: the AUTO candidate now runs
     FIRST and is the one that actually WRITES the bound, so the test's outcome genuinely depends
     on whether ITS call site syncs memory on success. Verified: reverting only the auto call site
-    now makes this test fail (confirmed via targeted mutation before landing this fix)."""
+    now makes this test fail (confirmed via targeted mutation before landing this fix).
+
+    UPDATED by A7 (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md):
+    fact_auto was originally a pure REORDERING of existing_content's own tokens (same keyword
+    SET, Jaccard=1.0, different word order) -- deliberately chosen so it would NOT be caught by
+    _decide_actions's exact-match guard, only by the create branch's own Jaccard-similarity
+    conversion. A7 now runs a content-CONTAINMENT check inside that same conversion, and a full
+    token reordering is neither a prefix nor a suffix of the original (no contiguous token run
+    survives), so it correctly stopped merging -- exactly the class of fix A7 exists to make
+    (identical keyword SETS are not sufficient grounds to merge; fixture 1b in the A7 design doc
+    is the same finding from real production data, via a different mechanism). Reconstructed as
+    a genuine token-PREFIX of existing_content instead (drops the trailing "in production_env"
+    clause) so it still (a) is not byte-identical, (b) does not trip _decide_actions's exact-
+    match guard, (c) still crosses the create branch's Jaccard threshold on its own, and NOW
+    ALSO (d) genuinely satisfies A7's containment check -- restoring the auto-corroborate route
+    this test needs to exercise its real subject: the same-batch bound-fill sync ordering."""
     kn_path = tmp_path / "knowledge.jsonl"
     existing_content = "the api_key_rotation_policy governs when API keys expire in production_env"
     existing = KnowledgeNode.create(content=existing_content, category="fact", node_id="kn-policy")
     from synapt.recall.knowledge import append_node
     append_node(existing, kn_path)
 
-    # Same keyword SET as existing_content (Jaccard=1.0), different literal STRING (exact-match
-    # dedup, which is order-sensitive, must NOT fire) -- genuinely routes through the create
-    # branch's own Jaccard-similarity auto-corroborate, not _decide_actions's exact-match guard.
-    fact_auto = "when API keys expire in production_env, the api_key_rotation_policy governs"
+    # A genuine token-prefix of existing_content (drops the trailing "in production_env" clause):
+    # not exact-match (guard won't fire in _decide_actions), still crosses the create branch's
+    # own Jaccard threshold, and satisfies A7's containment check so it genuinely routes through
+    # auto-corroborate rather than falling through to create.
+    fact_auto = "the api_key_rotation_policy governs when API keys expire"
     fact_explicit = "reminder to review the api_key_rotation_policy before the next audit"
     assert fact_auto != existing_content  # sanity: genuinely non-exact
     assert _normalize_for_dedup(fact_auto) != _normalize_for_dedup(existing_content)  # exact-match won't fire
-    assert _jaccard(_extract_keywords(fact_auto), _extract_keywords(existing_content)) == 1.0  # but still Jaccard-identical
+    assert _jaccard(_extract_keywords(fact_auto), _extract_keywords(existing_content)) >= 0.5  # crosses threshold
 
     # Auto candidate FIRST (index 0) -- it is the one that WRITES the bound, so the test's
     # pass/fail genuinely depends on its call site's sync-on-success, not the explicit branch's.
