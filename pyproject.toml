@@ -24,7 +24,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "mcp[cli]>=1.0",
+    "mcp[cli]==1.28.1",
     "sentence-transformers>=2.0",
     "mlx-lm>=0.10; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "anthropic>=0.70",
