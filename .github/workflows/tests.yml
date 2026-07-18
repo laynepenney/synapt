@@ -20,3 +20,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[test,dashboard]"
       - run: pytest tests/ -v
+
+  # requirements-mcp.lock is a hand-maintained, scoped lock (see requirements-mcp.in)
+  # pinning the mcp SDK across recall's full supported Python range. The unit-tests
+  # matrix above never installs it -- it installs directly from pyproject.toml -- so
+  # a lock regenerated on a host that silently narrows its own version floor (e.g.
+  # a `uv pip compile` run without --python-version/--universal picking a transitive
+  # dependency release that requires a newer Python than recall's floor) would not be
+  # caught there. This job makes the lock's own installability claim executable.
+  mcp-lock-floor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: pip install --require-hashes -r requirements-mcp.lock
