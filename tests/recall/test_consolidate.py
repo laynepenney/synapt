@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import synapt.recall.consolidate as consolidate
 from synapt.recall.journal import JournalEntry
 from synapt.recall.knowledge import KnowledgeNode, append_node, read_nodes
 from synapt.recall.consolidate import (
@@ -1359,6 +1360,114 @@ class TestGenericFilterInApply(unittest.TestCase):
             contents,
         )
 
+    def test_fix_b_1a_with_conflict_judge_and_source_unit_ids_resolves_via_chronology(self):
+        """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md):
+        the SAME founding pair as test_a7_1a above, but wired the way the extract path
+        actually calls _apply_consolidation_result post-fix -- conflict_judge provided, both
+        sides carry a real source_unit_id. The stale node must now be marked superseded and
+        the fresh content persisted as the sole live node, instead of both surviving. This is
+        the end-to-end wiring proof; TestB3TemporalConflictEscalation below tests the pure
+        escalation function in isolation."""
+        import synapt.recall.consolidate as mod
+
+        existing = KnowledgeNode.create(
+            content="extract path does not share the legacy response_cache",
+            category="configuration",
+            source_sessions=["s0"],
+            source_unit_id="986d09c3e8bb2ae5:0:decisions:5",
+        )
+        append_node(existing, self.kn_path)
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.8298)  # real production cosine score
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": (
+                    'writing extract-path results to response_cache under a distinct '
+                    '":extract" key suffix'
+                ),
+                "category": "solution",
+                "source_unit_id": "986d09c3e8bb2ae5:2:done:6",
+            }]}
+            result = _apply_consolidation_result(
+                parsed, [existing], self.cluster, self.kn_path,
+                conflict_judge=lambda candidate, existing_text: True,
+            )
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        # SUPERSEDE: the escalation fired -- exactly one live node, the fresh content, not two.
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        nodes = read_nodes(self.kn_path)
+        active = [n for n in nodes if n.status == "active"]
+        superseded = [n for n in nodes if n.status == "superseded"]
+        self.assertEqual(len(active), 1)
+        self.assertEqual(
+            active[0].content,
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+        )
+        self.assertEqual(len(superseded), 1)
+        self.assertEqual(
+            superseded[0].content, "extract path does not share the legacy response_cache",
+        )
+        self.assertEqual(superseded[0].superseded_by, active[0].id)
+
+    def test_fix_b_no_conflict_judge_matches_a7_unchanged_keep_both(self):
+        """conflict_judge defaults to None -- the legacy path (this exact call site, no new
+        kwarg) and the collection pass must be byte-identical to pre-Fix-B behavior. Proves
+        the new parameter is genuinely opt-in, not a silent behavior change for existing
+        callers."""
+        existing = KnowledgeNode.create(
+            content="extract path does not share the legacy response_cache",
+            category="configuration",
+            source_sessions=["s0"],
+            source_unit_id="986d09c3e8bb2ae5:0:decisions:5",  # present, but no judge -> irrelevant
+        )
+        append_node(existing, self.kn_path)
+
+        import synapt.recall.consolidate as mod
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.8298)
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": (
+                    'writing extract-path results to response_cache under a distinct '
+                    '":extract" key suffix'
+                ),
+                "category": "solution",
+                "source_unit_id": "986d09c3e8bb2ae5:2:done:6",
+            }]}
+            # No conflict_judge kwarg at all -- exactly today's legacy-path call shape.
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("extract path does not share the legacy response_cache", contents)
+        self.assertIn(
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+            contents,
+        )
+
     def test_a7_1b_perfect_jaccard_different_prs_keep_both(self):
         """Fixture 1b -- real jaccard is a PERFECT 1.0 for these two distinct real PR-opening
         events, because _extract_keywords's regex requires a lowercase-letter start and drops
@@ -1977,6 +2086,392 @@ class TestGenericFilterInApply(unittest.TestCase):
         self.assertEqual(result.nodes_corroborated, 1)
         nodes = read_nodes(self.kn_path)
         self.assertEqual(len(nodes), 1)
+
+
+class TestRepresentativeSourceUnitId(unittest.TestCase):
+    """_representative_source_unit_id (Fix B spec section 3): reads a B4 action-item dict's
+    chronology signal -- singular source_unit_id (singleton pass-through) or plural
+    source_unit_ids (composed group, latest member wins per Opus's r1 decision, section 9.2).
+    Pure function, no pipeline needed."""
+
+    def test_singleton_reads_the_singular_field_directly(self):
+        raw_node = {"source_unit_id": "986d09c3e8bb2ae5:2:done:6"}
+        self.assertEqual(
+            consolidate._representative_source_unit_id(raw_node),
+            "986d09c3e8bb2ae5:2:done:6",
+        )
+
+    def test_composed_group_picks_the_latest_member(self):
+        """entry_index 2 is chronologically later than 0 and 1 -- the composed node's
+        representative must be the LATEST contributing member, not the first-listed one."""
+        raw_node = {
+            "source_unit_ids": [
+                "986d09c3e8bb2ae5:0:decisions:5",
+                "986d09c3e8bb2ae5:2:done:6",
+                "986d09c3e8bb2ae5:1:done:3",
+            ],
+        }
+        self.assertEqual(
+            consolidate._representative_source_unit_id(raw_node),
+            "986d09c3e8bb2ae5:2:done:6",
+        )
+
+    def test_missing_both_keys_returns_none(self):
+        """The legacy path's raw_node dicts never carry either key -- must not raise, must
+        not fabricate a value."""
+        self.assertIsNone(consolidate._representative_source_unit_id({}))
+
+    def test_empty_source_unit_ids_list_returns_none(self):
+        self.assertIsNone(consolidate._representative_source_unit_id({"source_unit_ids": []}))
+
+    def test_source_unit_ids_containing_none_entries_are_skipped(self):
+        """A member whose own source_unit_id is missing must not crash the max-selection or
+        be silently treated as comparable."""
+        raw_node = {"source_unit_ids": [None, "986d09c3e8bb2ae5:1:done:3", None]}
+        self.assertEqual(
+            consolidate._representative_source_unit_id(raw_node),
+            "986d09c3e8bb2ae5:1:done:3",
+        )
+
+
+class TestB3TemporalConflictEscalation(unittest.TestCase):
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md):
+    _b3_temporal_conflict_escalation extends A7's containment-only "keep_both" outcome with a
+    chronology-resolved escalation, gated behind an injected conflict_judge seam. Direct unit
+    tests of the pure escalation function -- no pipeline, no model, matching
+    _b3_containment_decision's own test style (test_a7_* above, TestGenericFilterInApply).
+    Real fixtures reused from A1's own pinned dogfood-06/07 case, cluster 986d09c3e8bb2ae5."""
+
+    STALE_CONTENT = "extract path does not share the legacy response_cache"
+    STALE_SOURCE = "986d09c3e8bb2ae5:0:decisions:5"
+    CURRENT_CONTENT = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        'key suffix'
+    )
+    CURRENT_SOURCE = "986d09c3e8bb2ae5:2:done:6"
+
+    @staticmethod
+    def _judge(verdict):
+        """Fake conflict_judge that always returns *verdict* regardless of content -- the
+        judge's OWN correctness (does the REAL local model actually discriminate) is a
+        separate, required check: TestLocalConflictJudge, below."""
+        def judge(candidate_content, existing_content):
+            return verdict
+        return judge
+
+    def test_fixture_a_founding_case_resolves_supersede_current_wins(self):
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=self.CURRENT_SOURCE,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=self.STALE_SOURCE,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "supersede")
+
+    def test_fixture_a_founding_case_reverse_argument_order_resolves_keep_existing(self):
+        """Same real pair, arguments swapped -- direction must come from source_unit_id
+        chronology, not which side the caller happened to label 'candidate' (Opus's explicit
+        both-argument-orders acceptance criterion)."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.STALE_CONTENT,
+            candidate_source_unit_id=self.STALE_SOURCE,
+            existing_content=self.CURRENT_CONTENT,
+            existing_source_unit_id=self.CURRENT_SOURCE,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "keep_existing")
+
+    def test_fixture_b_genuinely_complementary_pair_stays_keep_both(self):
+        """Proves the asymmetric guard discriminates INSIDE the risky band -- a judge that
+        correctly reports no conflict must still yield keep_both, not an assumed supersede
+        just because chronology happens to resolve a direction."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                "the response_cache key is a sha256 of sorted session_id|timestamp pairs"
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:1:done:3",
+            existing_content=self.CURRENT_CONTENT,
+            existing_source_unit_id=self.CURRENT_SOURCE,
+            conflict_judge=self._judge(False),
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_fixture_b_judge_uncertainty_also_stays_keep_both(self):
+        """None (uncertain) must be treated identically to False -- constraint 2's asymmetric
+        conservatism applies to judge uncertainty, not just an explicit judge-says-no."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                "the response_cache key is a sha256 of sorted session_id|timestamp pairs"
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:1:done:3",
+            existing_content=self.CURRENT_CONTENT,
+            existing_source_unit_id=self.CURRENT_SOURCE,
+            conflict_judge=self._judge(None),
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_fixture_c_late_arriving_older_candidate_does_not_supersede_newer_persisted(self):
+        """Opus's named edge case (section 4c/9): chronological order, not processing/arrival
+        order, decides the winner. The 'candidate' here reaches B4/B3 in THIS pass, but its
+        source_unit_id is chronologically EARLIER than the already-persisted node's."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content="the deploy pipeline retries once before failing open",
+            candidate_source_unit_id="986d09c3e8bb2ae5:0:decisions:1",
+            existing_content="the deploy pipeline retries twice before failing open",
+            existing_source_unit_id="986d09c3e8bb2ae5:3:done:2",
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "keep_existing")
+
+    def test_fixture_d_negation_flip_generalizes_beyond_the_founding_wording(self):
+        """Mirrors A2's own negation-flip detection target (config/design/recall-supersession-
+        guard-detection-contract-2026-07-16.md section 2, fixture 2) -- now proven reachable on
+        the corroborate branch too, since guard-6 cannot reach cross-batch/already-persisted
+        pairs at all."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                "root-caused the four attribution test failures to the extract-path "
+                "change after all"
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:2:done:4",
+            existing_content=(
+                "the four attribution test failures are unrelated to the "
+                "consolidate/extract change"
+            ),
+            existing_source_unit_id="986d09c3e8bb2ae5:0:decisions:2",
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "supersede")
+
+    # --- Mutation guards: every early-return path must independently prove it lands on
+    # "keep_both" -- constraint 2's asymmetric-conservatism contract, section 5.2. ---
+
+    def test_mutation_guard_no_judge_provided_stays_keep_both(self):
+        """conflict_judge=None (the default -- legacy/collection paths, or any caller that
+        hasn't wired the seam) must never escalate, regardless of how similar or how
+        resolvable the chronology is."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=self.CURRENT_SOURCE,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=self.STALE_SOURCE,
+            conflict_judge=None,
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_mutation_guard_missing_existing_source_unit_id_stays_keep_both(self):
+        """A node persisted before this fix ships has source_unit_id=None -- must fall back
+        to keep_both, never guess a winner from content alone."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=self.CURRENT_SOURCE,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=None,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_mutation_guard_missing_candidate_source_unit_id_stays_keep_both(self):
+        """The legacy/collection paths never set source_unit_id on the candidate side --
+        must also fall back, symmetric with the existing-side guard above."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=None,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=self.STALE_SOURCE,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_mutation_guard_same_entry_tie_has_no_usable_direction_stays_keep_both(self):
+        """A1 section 7's precedent applies identically here: same entry_index siblings carry
+        no usable direction signal from source_unit_id alone -- a tie is not a coin flip."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id="986d09c3e8bb2ae5:0:decisions:6",
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id="986d09c3e8bb2ae5:0:decisions:5",
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "keep_both")
+
+
+class TestGateDestructiveConflictJudgment(unittest.TestCase):
+    """_gate_destructive_conflict_judgment (Opus's 2026-07-21 decision, config/design/recall-
+    b3-temporal-conflict-escalation-spec-2026-07-21.md section 9.5): the safety boundary that
+    keeps today's known-unreliable local judge from ever driving a destructive escalation.
+    Pure logic, no model needed -- fast, deterministic."""
+
+    def test_gate_forces_none_even_when_wrapped_judge_says_true(self):
+        """The core safety property: while _CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION is
+        False, the gate returns None regardless of what the wrapped judge says -- this is
+        what makes the destructive path unreachable in production today."""
+        always_true = lambda candidate, existing: True  # noqa: E731
+        gated = consolidate._gate_destructive_conflict_judgment(always_true)
+        self.assertIsNone(gated("any content", "any other content"))
+
+    def test_gate_forces_none_even_when_wrapped_judge_says_false(self):
+        """False also becomes None through the gate -- the gate doesn't selectively pass
+        through 'safe-looking' answers, it blocks ALL destructive-capable signal uniformly
+        while untrusted, which is the simplest property to reason about and verify."""
+        always_false = lambda candidate, existing: False  # noqa: E731
+        gated = consolidate._gate_destructive_conflict_judgment(always_false)
+        self.assertIsNone(gated("any content", "any other content"))
+
+    def test_trust_flag_is_false_by_default(self):
+        """The flag itself, checked directly -- if this ever flips without an explicit,
+        reviewed decision, this test catches it immediately."""
+        self.assertFalse(consolidate._CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION)
+
+    def test_gate_passes_through_when_trusted(self):
+        """Proves the gate is a genuine pass-through (not a permanent no-op) once trust is
+        established -- the escalation machinery is real substrate, not dead code, for when
+        _CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION eventually flips."""
+        import synapt.recall.consolidate as mod
+
+        always_true = lambda candidate, existing: True  # noqa: E731
+        gated = consolidate._gate_destructive_conflict_judgment(always_true)
+        original = mod._CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION
+        mod._CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION = True
+        try:
+            self.assertTrue(gated("any content", "any other content"))
+        finally:
+            mod._CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION = original
+
+
+class TestLocalConflictJudge(unittest.TestCase):
+    """Section 9.3 (Opus's r1 required addition): the escalation LOGIC above is tested with a
+    fake conflict_judge -- proves the logic is correct GIVEN a judge answer, not that the real
+    judge (local MLX infer + the CONFLICT/COMPATIBLE prompt, _local_conflict_judge) actually
+    discriminates fixture (a) from fixture (b). This is the production-frame check: real
+    _make_recall_infer, real local model, zero Modal cost. Skipped gracefully where MLX isn't
+    available (non-Apple-Silicon runners) -- same pattern as test_benchmarks_llm.py /
+    test_enrich.py's real-model tests.
+
+    Section 9.5 (Opus's 2026-07-21 decision): the real-judge check below found Ministral-3-3B
+    over-calls CONFLICT on same-entity-different-property pairs -- a real, reproducible
+    model-capacity limit (5 prompt designs, 2 precisions investigated). Per constraint 2, this
+    means the RAW judge cannot safely drive the destructive path, so production wires the
+    GATED judge (_gate_destructive_conflict_judgment), not the raw one. This class now tests
+    BOTH altitudes: the raw judge's own classification accuracy (honest, includes one
+    documented expectedFailure -- not silently weakened), and the gated/production chain's
+    safety property (the thing that actually matters for correctness today)."""
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    def test_real_judge_classifies_the_founding_pair_as_conflict(self):
+        """Raw judge accuracy, not the production behavior -- see the gated tests below for
+        what actually reaches production today. This one passes: the model correctly
+        classifies the founding case, every run."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+        judge = consolidate._local_conflict_judge(infer)
+
+        result = judge(
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+            "extract path does not share the legacy response_cache",
+        )
+        self.assertTrue(
+            result,
+            "real local judge must classify the founding dogfood-06/07 pair as CONFLICT "
+            f"-- got {result!r}",
+        )
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    @unittest.expectedFailure
+    def test_real_judge_classifies_a_complementary_pair_as_not_conflict(self):
+        """KNOWN, TRACKED, NOT SILENTLY HIDDEN: Ministral-3-3B reliably misclassifies this
+        genuinely-complementary pair as CONFLICT. Verified not a parsing issue (clean raw
+        "CONFLICT" response) and not a quantization artifact (identical failure on bf16 full
+        precision) across 5 different prompt designs -- config/design/recall-b3-temporal-
+        conflict-escalation-spec-2026-07-21.md section 9.4 has the full investigation.
+
+        expectedFailure, not deleted or weakened: if a future model/prompt ever fixes this,
+        the test framework reports it as an unexpected PASS (xpass), which is the signal that
+        it may be time to revisit _CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION (see
+        TestGateDestructiveConflictJudgment above, and the tracking issue in section 9.5).
+        This does NOT gate production -- see test_gated_judge_never_escalates_the_
+        complementary_pair below for the test that actually matters for correctness today."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+        judge = consolidate._local_conflict_judge(infer)
+
+        result = judge(
+            "the response_cache key is a sha256 of sorted session_id|timestamp pairs",
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+        )
+        self.assertIn(
+            result, (False, None),
+            "raw local judge must NOT classify a genuinely complementary pair as "
+            f"CONFLICT -- got {result!r}",
+        )
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    def test_gated_judge_never_escalates_the_complementary_pair(self):
+        """THE SAFETY TEST THAT MATTERS: the actual production chain (gate wrapping the real
+        local judge, exactly as wired in _run_extract_path) against the pair the raw judge
+        gets wrong. Must be None -- proving the known judge-accuracy gap above can NOT
+        produce a false-supersede in production today, regardless of what the raw model
+        says. This is the real green; the expectedFailure above documents the underlying
+        limitation without letting it become a production risk."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+        gated_judge = consolidate._gate_destructive_conflict_judgment(
+            consolidate._local_conflict_judge(infer)
+        )
+
+        result = gated_judge(
+            "the response_cache key is a sha256 of sorted session_id|timestamp pairs",
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+        )
+        self.assertIsNone(
+            result,
+            "the GATED production judge must never escalate this pair, regardless of the "
+            f"raw judge's own (known-wrong) verdict -- got {result!r}",
+        )
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    def test_gated_judge_never_escalates_the_founding_pair_either(self):
+        """Production is unchanged for EVERY case while the gate is closed, not just the
+        cases the raw judge gets wrong -- including the founding case, which the raw judge
+        classifies correctly. This is the "zero risk" claim (spec section 9.5,
+        Opus's decision item 2) verified directly, not assumed: even a CORRECT raw verdict
+        does not reach the escalation while untrusted."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+        gated_judge = consolidate._gate_destructive_conflict_judgment(
+            consolidate._local_conflict_judge(infer)
+        )
+
+        result = gated_judge(
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+            "extract path does not share the legacy response_cache",
+        )
+        self.assertIsNone(
+            result,
+            "the GATED production judge must not escalate ANY pair while untrusted, "
+            f"including the founding case the raw judge gets right -- got {result!r}",
+        )
 
 
 class TestProjectContext(unittest.TestCase):

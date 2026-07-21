@@ -708,6 +708,155 @@ def _b3_containment_decision(candidate_content: str, existing_content: str) -> s
     return "keep_both"
 
 
+def _representative_source_unit_id(raw_node: dict) -> "str | None":
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section
+    3): reads a B4 action-item dict's chronology signal. A singleton pass-through carries
+    ``source_unit_id`` (singular, threaded end-to-end from ``_decide_actions``). A composed
+    group carries ``source_unit_ids`` (plural, one per member — see the ``"source_unit_ids":
+    [m.get("source_unit_id") for m in members]`` shape at compose time). Returns the LATEST
+    member's value for a composed group (Opus's r1 decision, spec section 9.2): a composed
+    node represents the current synthesized understanding, so biasing its effective
+    chronology toward its most recent contributing fact makes it HARDER to supersede later —
+    fewer false-supersedes, the failure mode most worth avoiding under constraint 2's
+    asymmetric conservatism. ``None`` for any shape without a usable value (legacy/collection
+    paths never set either key) — never fabricated, never a proxy."""
+    singular = raw_node.get("source_unit_id")
+    if singular is not None:
+        return singular
+    plural = raw_node.get("source_unit_ids")
+    if not plural:
+        return None
+    candidates = [s for s in plural if s is not None]
+    if not candidates:
+        return None
+    latest = candidates[0]
+    for candidate in candidates[1:]:
+        if _source_unit_id_order(candidate, latest) == 1:
+            latest = candidate
+    return latest
+
+
+def _b3_temporal_conflict_escalation(
+    *,
+    candidate_content: str,
+    candidate_source_unit_id: "str | None",
+    existing_content: str,
+    existing_source_unit_id: "str | None",
+    conflict_judge,
+) -> str:
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md): only
+    called when ``_b3_containment_decision`` already returned ``"keep_both"`` — neither text
+    contains the other. Escalates to ``"supersede"`` or ``"keep_existing"`` ONLY when a
+    genuine, resolvable temporal conflict is detected; any missing signal, judge uncertainty,
+    or unresolvable chronology falls through to ``"keep_both"`` unchanged. Asymmetric-
+    conservative by construction (constraint 2): every early-return here is ``"keep_both"``,
+    never a guessed winner. Returns the SAME three strings ``_b3_containment_decision``
+    already returns — the caller's downstream persistence handling is untouched; this only
+    adds a second way to REACH those outcomes.
+
+    ``conflict_judge: Callable[[str, str], bool | None] | None`` — injected, not hardwired
+    (mirrors the ``infer`` seam B1/B2/B4 already use). ``None`` return from the judge means
+    genuinely uncertain and is treated identically to ``False``.
+    """
+    if conflict_judge is None:
+        return "keep_both"
+    if candidate_source_unit_id is None or existing_source_unit_id is None:
+        return "keep_both"
+    is_conflict = conflict_judge(candidate_content, existing_content)
+    if not is_conflict:  # False, or None (uncertain) -- both mean "not proven"
+        return "keep_both"
+    order = _source_unit_id_order(candidate_source_unit_id, existing_source_unit_id)
+    if order == 0:
+        return "keep_both"  # same-entry tie, no usable direction (A1 section 7 precedent)
+    return "supersede" if order == 1 else "keep_existing"
+
+
+def _local_conflict_judge(infer):
+    """Production default for ``_b3_temporal_conflict_escalation``'s ``conflict_judge``
+    parameter. Wraps the extract path's own already-injected ``infer`` seam
+    (``_make_recall_infer``) — local-first by construction, since ``infer`` IS the local
+    MLX/enrichment model this whole pipeline already runs on, never a new cloud dependency.
+    Only ever invoked from inside the caller's already-narrow high-similarity-non-containment
+    trigger band (constraint 1) — not on every ``keep_both``.
+
+    KNOWN, DOCUMENTED GAP (flagged for Opus, config/design/recall-b3-temporal-conflict-
+    escalation-spec-2026-07-21.md section 9.4): this exact wording — the best of 4 tried,
+    across both 4-bit and bf16 Ministral-3-3B — reliably classifies the founding case
+    (fixture a, REQUIRED) and a negation-flip (fixture d) correctly, but is NOT reliable on
+    same-entity-different-property pairs sharing strong lexical overlap without a genuine
+    logical conflict (fixture b) — it over-weights topical/lexical overlap as evidence of
+    conflict even when its own stated reasoning correctly identifies the two claims as
+    distinct properties. This is a real, reproducible model-capacity limit at this scale, not
+    a parsing or prompt-triviality issue; see the spec addendum for the full investigation.
+
+    Parsed strictly and conservatively: anything other than a response that starts with
+    exactly "CONFLICT" (case-insensitive, after stripping whitespace) returns ``None``
+    (uncertain), never ``True`` — a malformed response, an unexpected model utterance, or an
+    inference exception must never be silently treated as evidence of conflict.
+    """
+    def judge(candidate_content: str, existing_content: str) -> "bool | None":
+        prompt = (
+            "Two statements, possibly about the same general topic. Apply this exact "
+            "test: if Statement A is true, does that make Statement B FALSE (or vice "
+            "versa)? Sharing a topic is not enough -- they must actually contradict.\n\n"
+            f"Statement A: {candidate_content}\n"
+            f"Statement B: {existing_content}\n\n"
+            "If A being true would make B false (or B true would make A false): answer "
+            "CONFLICT.\n"
+            "If both statements can be true at the same time, even though they describe "
+            "different specific details of the same topic: answer COMPATIBLE.\n\n"
+            "Answer with exactly one word: CONFLICT or COMPATIBLE."
+        )
+        try:
+            response = infer({"messages": [{"role": "user", "content": prompt}]})
+        except Exception:
+            return None
+        answer = (response or "").strip().upper()
+        if answer.startswith("CONFLICT"):
+            return True
+        if answer.startswith("COMPATIBLE"):
+            return False
+        return None  # unparseable/malformed -- uncertain, not a guess
+    return judge
+
+
+# Fix B destructive-path gate (Opus's 2026-07-21 decision, config/design/recall-b3-temporal-
+# conflict-escalation-spec-2026-07-21.md section 9.4/9.5): the real-judge production check
+# required by section 9.3 found that Ministral-3-3B's raw CONFLICT/COMPATIBLE classification
+# over-calls CONFLICT on same-entity-different-property pairs sharing strong lexical overlap
+# without a genuine logical conflict -- reproduced across 5 prompt designs and 2 model
+# precisions, ruled out as a parsing or quantization artifact (see the spec's investigation).
+#
+# Per constraint 2 (asymmetric conservatism): false-supersede (silently discarding a true
+# complementary fact on an unreliable judgment) is the worse failure mode, worse than
+# false-keep-both. This is not merely the SAFE default -- keep_both is the
+# philosophy-aligned one (context accumulation over discarding; memory as continuity).
+# Forcing a resolution via a judge that over-calls conflict would be the real corruption,
+# not the conservative preservation of both claims.
+#
+# So the destructive supersede/keep_existing outcomes are gated OFF at this one flag, not
+# inside _b3_temporal_conflict_escalation or _local_conflict_judge themselves -- both stay
+# exactly as designed and tested, correct substrate for when a trustworthy local judge
+# exists. Flip this ONE flag when that judge joins the standing roster (tracked: recall
+# issue referenced in the spec's section 9.5); nothing else changes at any call site.
+_CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION = False
+
+
+def _gate_destructive_conflict_judgment(judge):
+    """Wraps any ``conflict_judge`` (fake or real) so its verdict can never drive
+    ``_b3_temporal_conflict_escalation`` to a destructive outcome while
+    ``_CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION`` is ``False`` — always returns
+    ``None`` (uncertain) in that state, regardless of what the wrapped judge actually says.
+    This is the safety boundary itself, kept separate from the judge's own classification
+    logic so the judge's raw accuracy stays independently visible and testable (it will
+    matter again the moment the flag flips) rather than silently entangled with the gate."""
+    def gated(candidate_content: str, existing_content: str) -> "bool | None":
+        if not _CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION:
+            return None
+        return judge(candidate_content, existing_content)
+    return gated
+
+
 def _inline_embedding_dedup(
     candidate_content: str,
     existing_nodes: "list[KnowledgeNode]",
@@ -836,10 +985,17 @@ def _log_dedup_decision(
     source: str = "",
     contradiction_note: str = "",
     negative_pairs: list[dict] | None = None,
+    reason: str = "",
 ) -> None:
     """Append one pairwise decision to the dedup decisions JSONL file.
 
     Pure logging — never disrupts consolidation.
+
+    *reason* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md):
+    for ``auto-corroborate``/``auto-supersede`` entries, distinguishes WHICH mechanism
+    produced the decision — ``"containment"`` (A7's token-subsequence rule) vs
+    ``"chronology_escalation"`` (Fix B's judge + source_unit_id direction resolution) —
+    matching guard 6's own precedent of logging *why*, not just *what*.
     """
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -859,6 +1015,8 @@ def _log_dedup_decision(
         entry["contradiction_note"] = contradiction_note
     if negative_pairs:
         entry["negative_pairs"] = negative_pairs
+    if reason:
+        entry["reason"] = reason
 
     try:
         from synapt.recall._filelock import lock_exclusive
@@ -1241,11 +1399,19 @@ def _apply_consolidation_result(
     decision_log_path: Path | None = None,
     db=None,
     content_profile=None,
+    conflict_judge=None,
 ) -> ConsolidationResult:
     """Apply parsed LLM output: create, corroborate, or contradict nodes.
 
     When *db* (RecallDB) is provided, contradictions are queued as
     pending_contradictions for user review instead of auto-applied.
+
+    *conflict_judge* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-
+    2026-07-21.md): optional, defaults to None. Only the extract path
+    (``_run_extract_path``) passes this — the legacy and collection-pass callers never do,
+    so ``_b3_temporal_conflict_escalation`` is always a no-op for them (falls through to
+    ``keep_both``, byte-identical to pre-Fix-B behavior). See ``_local_conflict_judge`` for
+    the production default.
     """
     result = ConsolidationResult()
     nodes_list = parsed.get("nodes", [])
@@ -1281,6 +1447,10 @@ def _apply_consolidation_result(
         if not isinstance(source_turns, list):
             source_turns = []
         source_turns = [str(t) for t in source_turns if t]
+
+        # Fix B (section 3): the candidate's true source chronology, singleton or composed —
+        # None on any path that doesn't thread it (legacy, collection pass).
+        candidate_source_unit_id = _representative_source_unit_id(raw_node)
 
         if not content:
             continue
@@ -1447,6 +1617,26 @@ def _apply_consolidation_result(
                 # exact restatement of `best_match`, a live production bug (17/31
                 # auto-corroborates in one A6 dogfood run).
                 b3_decision = _b3_containment_decision(content, best_match.content)
+                decision_reason = "containment"
+
+                if b3_decision == "keep_both":
+                    # Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-
+                    # 2026-07-21.md): containment found neither side contains the other, but
+                    # that alone doesn't mean the two are compatible -- escalate via
+                    # chronology when a genuine conflict is detected. No-op (stays
+                    # keep_both) whenever conflict_judge is None or either side lacks a
+                    # source_unit_id -- asymmetric-conservative by construction, see the
+                    # function's own docstring for every early-return path.
+                    escalated = _b3_temporal_conflict_escalation(
+                        candidate_content=content,
+                        candidate_source_unit_id=candidate_source_unit_id,
+                        existing_content=best_match.content,
+                        existing_source_unit_id=best_match.source_unit_id,
+                        conflict_judge=conflict_judge,
+                    )
+                    if escalated != "keep_both":
+                        b3_decision = escalated
+                        decision_reason = "chronology_escalation"
 
                 if b3_decision == "keep_existing":
                     logger.info(
@@ -1476,6 +1666,7 @@ def _apply_consolidation_result(
                             similarity_score=best_sim,
                             source=f"auto-{best_method}",
                             session_ids=cluster_sessions,
+                            reason=decision_reason,
                         )
                     continue
 
@@ -1498,6 +1689,7 @@ def _apply_consolidation_result(
                         confidence=compute_confidence(len(new_sources)),
                         tags=new_tags,
                         source_turns=source_turns,
+                        source_unit_id=candidate_source_unit_id,
                     )
                     if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
                         llm_valid_from = None
@@ -1532,6 +1724,7 @@ def _apply_consolidation_result(
                             similarity_score=best_sim,
                             source=f"auto-{best_method}",
                             session_ids=cluster_sessions,
+                            reason=decision_reason,
                         )
                     continue
 
@@ -1549,6 +1742,7 @@ def _apply_consolidation_result(
                 confidence=min(1.0, max(0.0, confidence)),
                 tags=tags,
                 source_turns=source_turns,
+                source_unit_id=candidate_source_unit_id,
             )
             # Use LLM-extracted temporal bounds if provided, else default.
             # Validate dates — LLMs can hallucinate non-ISO formats.
@@ -1941,9 +2135,17 @@ def _run_extract_path(
     )
 
     # B3: feed the SAME reconcile the monolithic path uses.
+    # conflict_judge (Fix B): only the extract path wires this -- the legacy and collection
+    # passes never pass it, so the escalation is always a no-op for them by construction,
+    # not by a separate check (spec section 2's explicit scope boundary). GATED (Opus's
+    # 2026-07-21 decision, spec section 9.5): the judge is wrapped in
+    # _gate_destructive_conflict_judgment, so today's known-unreliable local judge can never
+    # actually escalate to a destructive outcome -- production behavior is unchanged
+    # (keep_both stays keep_both) until _CONFLICT_JUDGE_TRUSTED_FOR_DESTRUCTIVE_ACTION flips.
     cluster_result = _apply_consolidation_result(
         {"nodes": action_items}, existing_nodes, cluster, kn_path,
         decision_log_path=decision_log_path, db=db, content_profile=content_profile,
+        conflict_judge=_gate_destructive_conflict_judgment(_local_conflict_judge(infer)),
     )
     logger.info(
         "extract-path cluster %s: reconcile -> %d created, %d corroborated, %d contradicted",
