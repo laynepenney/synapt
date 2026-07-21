@@ -1808,8 +1808,9 @@ async def _extract_cluster_units(
     than built here so the helper is testable with a fake infer and zero model dependency,
     mirroring extract_batch's own injected-seam design.
     """
-    # Lazy import: the published synapt-extract lacks extract_batch, so importing at module
-    # scope would break every existing consolidate caller. Only the flag-on path needs it.
+    # Lazy import: synapt-extract is an optional dependency (the `extract` extra) since
+    # SYNAPT_USE_EXTRACT is off-by-default; importing at module scope would break every
+    # existing consolidate caller that never installs it. Only the flag-on path needs it.
     from synapt.extract.batch import extract_batch, BatchUnit
     from synapt.recall.identify import identify, batch_unit_id
 
