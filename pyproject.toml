@@ -54,6 +54,7 @@ all-integrations = [
 hf = ["huggingface_hub>=0.20"]
 onnx = ["onnxruntime>=1.16", "optimum[onnxruntime]>=1.16"]
 transformers = ["transformers>=4.30", "peft>=0.7"]
+extract = ["synapt-extract>=0.6.0"]
 x = ["tweepy>=4.14"]
 dashboard = ["fastapi>=0.100", "uvicorn[standard]>=0.20", "sse-starlette>=1.0", "markdown>=3.4", "nh3>=0.2.14"]
 all = [
@@ -72,6 +73,7 @@ all = [
     "optimum[onnxruntime]>=1.16",
     "transformers>=4.30",
     "peft>=0.7",
+    "synapt-extract>=0.6.0",
 ]
 dev = ["watchfiles>=0.20"]
 test = [
@@ -84,6 +86,7 @@ test = [
     "sse-starlette>=1.0",
     "markdown>=3.4",
     "nh3>=0.2.14",
+    "synapt-extract>=0.6.0",
 ]
 
 [project.scripts]
