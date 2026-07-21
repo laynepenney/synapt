@@ -347,6 +347,52 @@ class TestKnowledgeFtsHistorical:
         assert "a1" in ids
         assert "c1" in ids
 
+    def test_default_excludes_contested(self, tmp_path):
+        """Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
+        conflict-escalation-spec-2026-07-21.md section 10.6, fixture d): a contested node is
+        hidden from default search by the SAME status != 'active' gate that already hides
+        contradicted/superseded/retracted nodes -- no new mechanism, the existing one just
+        gets a new status value."""
+        db = _make_db(tmp_path)
+        active = _make_knowledge_node(
+            node_id="a1", content="Python uses pytest for testing",
+            status="active",
+        )
+        contested = _make_knowledge_node(
+            node_id="k1", content="Python uses unittest for testing",
+            status="contested", confidence=0.3,
+        )
+        db.save_knowledge_nodes([active, contested])
+
+        results = db.knowledge_fts_search("Python testing")
+        ids = {db._knowledge_dict_from_row(
+            db._conn.execute("SELECT * FROM knowledge WHERE rowid = ?", (r,)).fetchone()
+        )["id"] for r, _ in results}
+        assert "a1" in ids
+        assert "k1" not in ids
+
+    def test_include_historical_returns_contested(self, tmp_path):
+        """The include_historical=True escape hatch (already MCP-exposed, server.py's
+        recall_search) surfaces contested nodes too -- "surfaced as disputed," not hidden
+        forever."""
+        db = _make_db(tmp_path)
+        active = _make_knowledge_node(
+            node_id="a1", content="Python uses pytest for testing",
+            status="active",
+        )
+        contested = _make_knowledge_node(
+            node_id="k1", content="Python uses unittest for testing",
+            status="contested", confidence=0.3,
+        )
+        db.save_knowledge_nodes([active, contested])
+
+        results = db.knowledge_fts_search("Python testing", include_historical=True)
+        ids = {db._knowledge_dict_from_row(
+            db._conn.execute("SELECT * FROM knowledge WHERE rowid = ?", (r,)).fetchone()
+        )["id"] for r, _ in results}
+        assert "a1" in ids
+        assert "k1" in ids
+
 
 # ---------------------------------------------------------------------------
 # Pending contradictions
@@ -515,6 +561,13 @@ class TestFormatKnowledgeBlock:
         block = TranscriptIndex._format_knowledge_block(node)
         assert "CONTRADICTED" in block
         assert "replaced by newer approach" in block
+
+    def test_contested_node_label(self):
+        """Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
+        conflict-escalation-spec-2026-07-21.md section 10.6, fixture d)."""
+        node = _make_knowledge_node(status="contested", confidence=0.3)
+        block = TranscriptIndex._format_knowledge_block(node)
+        assert "CONTESTED" in block
 
     def test_valid_from_only(self):
         node = _make_knowledge_node(valid_from="2026-01-15T00:00:00+00:00")
@@ -729,6 +782,146 @@ class TestRecallContradict:
         # Should succeed (contradiction resolved) even though supersession
         # couldn't find the old node — it silently skips
         assert "confirmed" in result
+
+
+# ---------------------------------------------------------------------------
+# recall_contradict: Fix B contest resolution (candidate_wins/existing_wins/false_positive)
+# ---------------------------------------------------------------------------
+
+class TestRecallContradictContestResolution:
+    """Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
+    escalation-spec-2026-07-21.md section 10.4/10.6 fixture c): the 3-way resolution vocabulary
+    for a contested pair (new_node_id set on the pending row), distinct from the ordinary
+    confirmed/dismissed path exercised by TestRecallContradict above. Same _make_index-style
+    setup as TestRecallContradict; a contested pair is two ALREADY-PERSISTED nodes plus one
+    pending_contradictions row carrying new_node_id, matching what the contest branch in
+    _apply_consolidation_result actually produces (test_fix_b_1a_with_conflict_judge_and_
+    source_unit_ids_resolves_via_contest in test_consolidate.py)."""
+
+    def _make_contested_pair(self, tmp_path):
+        db = _make_db(tmp_path)
+        existing = _make_knowledge_node(
+            node_id="existing-1", content="extract path does not share the legacy cache",
+            status="contested", confidence=0.3, source_sessions=["s0"],
+        )
+        candidate = _make_knowledge_node(
+            node_id="candidate-1", content="extract path writes to a distinct cache key",
+            status="contested", confidence=0.3, source_sessions=["s0", "s1"],
+        )
+        db.save_knowledge_nodes([existing, candidate])
+        cid = db.add_pending_contradiction(
+            old_node_id="existing-1",
+            new_content=candidate["content"],
+            new_node_id="candidate-1",
+            category="configuration",
+            reason="Chronology: candidate (newer) conflicts with existing (older).",
+            detected_by="b3-temporal-conflict-escalation",
+        )
+        index = TranscriptIndex.__new__(TranscriptIndex)
+        index._db = db
+        index.chunks = []
+        index.sessions = {}
+        return db, index, cid
+
+    def test_candidate_wins_promotes_candidate_supersedes_existing(self, tmp_path):
+        from synapt.recall.server import recall_contradict
+        db, index, cid = self._make_contested_pair(tmp_path)
+
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="candidate_wins",
+                )
+        assert "candidate wins" in result
+
+        candidate = db.get_knowledge_node("candidate-1")
+        existing = db.get_knowledge_node("existing-1")
+        assert candidate["status"] == "active"
+        assert candidate["confidence"] > 0.3  # recomputed, no longer capped
+        assert existing["status"] == "superseded"
+        assert existing["superseded_by"] == "candidate-1"
+        # Queue entry resolved, no longer pending
+        assert db.list_pending_contradictions() == []
+
+    def test_existing_wins_restores_existing_retires_candidate(self, tmp_path):
+        from synapt.recall.server import recall_contradict
+        db, index, cid = self._make_contested_pair(tmp_path)
+
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="existing_wins",
+                )
+        assert "existing node wins" in result
+
+        candidate = db.get_knowledge_node("candidate-1")
+        existing = db.get_knowledge_node("existing-1")
+        assert existing["status"] == "active"
+        assert existing["confidence"] > 0.3  # recomputed, no longer capped
+        # Contest, don't discard — retired, not deleted
+        assert candidate["status"] == "stale"
+        assert db.list_pending_contradictions() == []
+
+    def test_false_positive_restores_both_supersedes_neither(self, tmp_path):
+        from synapt.recall.server import recall_contradict
+        db, index, cid = self._make_contested_pair(tmp_path)
+
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="false_positive",
+                )
+        assert "false positive" in result
+
+        candidate = db.get_knowledge_node("candidate-1")
+        existing = db.get_knowledge_node("existing-1")
+        assert candidate["status"] == "active"
+        assert existing["status"] == "active"
+        assert candidate["confidence"] > 0.3
+        assert existing["confidence"] > 0.3
+        assert candidate["superseded_by"] == ""
+        assert existing["superseded_by"] == ""
+        assert db.list_pending_contradictions() == []
+
+    def test_invalid_resolution_on_contest_row_rejected_no_mutation(self, tmp_path):
+        """A contest row (new_node_id set) rejects the ORDINARY confirmed/dismissed
+        vocabulary -- the two vocabularies are deliberately not interchangeable (section
+        10.4). Nothing mutates and the row stays pending."""
+        from synapt.recall.server import recall_contradict
+        db, index, cid = self._make_contested_pair(tmp_path)
+
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="confirmed",
+                )
+        assert "Error" in result
+        assert db.get_knowledge_node("candidate-1")["status"] == "contested"
+        assert db.get_knowledge_node("existing-1")["status"] == "contested"
+        assert len(db.list_pending_contradictions()) == 1
+
+    def test_ordinary_contradiction_row_rejects_contest_vocabulary(self, tmp_path):
+        """The converse of the test above: an ORDINARY row (new_node_id unset) is untouched
+        by the new 3-way vocabulary -- passing 'candidate_wins' against a plain contradiction
+        just fails resolve_contradiction's own validation, exactly as any other invalid
+        resolution string would have before this reframe existed."""
+        from synapt.recall.server import recall_contradict
+        db = _make_db(tmp_path)
+        node = _make_knowledge_node(node_id="old-1", content="use unittest")
+        db.save_knowledge_nodes([node])
+        cid = db.add_pending_contradiction("old-1", "use pytest instead")
+        index = TranscriptIndex.__new__(TranscriptIndex)
+        index._db = db
+        index.chunks = []
+        index.sessions = {}
+
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="candidate_wins",
+                )
+        assert "not found or already resolved" in result
+        assert len(db.list_pending_contradictions()) == 1
 
 
 # ---------------------------------------------------------------------------

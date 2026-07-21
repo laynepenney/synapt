@@ -24,7 +24,7 @@ VALID_CATEGORIES = frozenset({
     "preference", "fact", "collection",
 })
 
-VALID_STATUSES = frozenset({"active", "stale", "contradicted"})
+VALID_STATUSES = frozenset({"active", "stale", "contradicted", "contested"})
 
 
 def _knowledge_path(project_dir: Path | None = None) -> Path:

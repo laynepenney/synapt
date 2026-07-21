@@ -3078,13 +3078,19 @@ class TranscriptIndex:
         node_id = node.get("id", "")
         id_tag = f" #{node_id}" if node_id else ""
 
-        # Historical/superseded/contradicted/retracted labels
+        # Historical/superseded/contradicted/retracted/contested labels
         if status == "contradicted":
             header = f"--- [knowledge{id_tag}, CONTRADICTED] {category} ---"
         elif status == "superseded":
             header = f"--- [knowledge{id_tag}, SUPERSEDED] {category} ---"
         elif status == "retracted":
             header = f"--- [knowledge{id_tag}, RETRACTED] {category} ---"
+        elif status == "contested":
+            # Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
+            # conflict-escalation-spec-2026-07-21.md section 10.6, fixture d): shown only when
+            # explicitly surfaced via include_historical=True -- hidden from default search by
+            # the status != 'active' FTS gate (storage.py's knowledge_fts_search).
+            header = f"--- [knowledge{id_tag}, CONTESTED] {category} ---"
         else:
             header = f"--- [knowledge{id_tag}] {category} ({conf_label}, {freshness or updated}) ---"
 

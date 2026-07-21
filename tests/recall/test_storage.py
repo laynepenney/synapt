@@ -440,6 +440,125 @@ class TestFTSMigration:
         db2.close()
 
 
+class TestPendingContradictionsNewNodeIdMigration:
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section
+    10.10 -- Opus's five-check #2, installed/DB path requirement): pending_contradictions.
+    new_node_id is a genuine schema change and needs a real migration for already-installed
+    DBs, not a bare CREATE TABLE IF NOT EXISTS assumption. No existing test covered
+    _migrate_contradictions_table directly before this one -- this is the first, not a
+    pattern deviation from TestFTSMigration above, which it mirrors."""
+
+    def test_migration_adds_new_node_id_to_pre_existing_db(self, tmp_path):
+        """Opening a DB with the post-claim_text-era schema (no new_node_id) triggers the
+        migration and the column exists afterward."""
+        db_path = tmp_path / "recall.db"
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS pending_contradictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                old_node_id TEXT,
+                new_content TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                source_sessions TEXT NOT NULL DEFAULT '[]',
+                detected_at TEXT NOT NULL,
+                detected_by TEXT NOT NULL DEFAULT 'co-retrieval',
+                status TEXT NOT NULL DEFAULT 'pending',
+                resolved_at TEXT,
+                claim_text TEXT,
+                valid_from TEXT,
+                valid_until TEXT
+            );
+        """)
+        conn.close()
+
+        db = RecallDB(db_path)
+        cols = {
+            r[1] for r in db._conn.execute(
+                "PRAGMA table_info(pending_contradictions)"
+            ).fetchall()
+        }
+        assert "new_node_id" in cols
+        db.close()
+
+    def test_migration_preserves_pre_existing_row_with_null_new_node_id(self, tmp_path):
+        """A row inserted BEFORE the migration survives it, with new_node_id defaulting to
+        NULL -- backward-compat, not just column-presence."""
+        db_path = tmp_path / "recall.db"
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS pending_contradictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                old_node_id TEXT,
+                new_content TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                source_sessions TEXT NOT NULL DEFAULT '[]',
+                detected_at TEXT NOT NULL,
+                detected_by TEXT NOT NULL DEFAULT 'co-retrieval',
+                status TEXT NOT NULL DEFAULT 'pending',
+                resolved_at TEXT,
+                claim_text TEXT,
+                valid_from TEXT,
+                valid_until TEXT
+            );
+        """)
+        conn.execute(
+            "INSERT INTO pending_contradictions "
+            "(old_node_id, new_content, source_sessions, detected_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("old-1", "pre-migration content", "[]", "2026-07-01T00:00:00Z"),
+        )
+        conn.commit()
+        conn.close()
+
+        db = RecallDB(db_path)
+        pending = db.list_pending_contradictions()
+        assert len(pending) == 1
+        assert pending[0]["new_content"] == "pre-migration content"
+        assert pending[0]["new_node_id"] is None
+        db.close()
+
+    def test_new_node_id_roundtrips_after_migration(self, tmp_path):
+        """After migration, a row inserted WITH a real new_node_id round-trips it -- the
+        migration doesn't just add the column, add_pending_contradiction actually uses it."""
+        db_path = tmp_path / "recall.db"
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS pending_contradictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                old_node_id TEXT,
+                new_content TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                source_sessions TEXT NOT NULL DEFAULT '[]',
+                detected_at TEXT NOT NULL,
+                detected_by TEXT NOT NULL DEFAULT 'co-retrieval',
+                status TEXT NOT NULL DEFAULT 'pending',
+                resolved_at TEXT,
+                claim_text TEXT,
+                valid_from TEXT,
+                valid_until TEXT
+            );
+        """)
+        conn.close()
+
+        db = RecallDB(db_path)
+        cid = db.add_pending_contradiction(
+            old_node_id="old-1",
+            new_content="contested candidate content",
+            new_node_id="candidate-node-id-1",
+            detected_by="b3-temporal-conflict-escalation",
+        )
+        pending = db.list_pending_contradictions()
+        row = next(p for p in pending if p["id"] == cid)
+        assert row["new_node_id"] == "candidate-node-id-1"
+        db.close()
+
+
 # -- FTS query escaping ---------------------------------------------------
 
 class TestFTSEscaping:
