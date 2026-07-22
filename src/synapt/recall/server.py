@@ -938,6 +938,29 @@ def recall_contradict(
                         "resolution must be 'candidate_wins', 'existing_wins', or "
                         f"'false_positive' (got {resolution!r})."
                     )
+                # recall#905 (0.17.0 blocker, Opus 2026-07-22, Part 2 -- CO-PRIMARY, not
+                # merely defense-in-depth): the node-level mutation must succeed BEFORE the
+                # pending row is marked resolved, never after. The dogfood-found bug: a
+                # freshly-created contest's candidate node genuinely doesn't exist in SQLite
+                # until some sync has run (Part 1 closes that gap at the source), so
+                # _apply_contest_resolution's db.get_knowledge_node silently returned None
+                # and no-opped -- but the OLD ordering here marked the row resolved first
+                # regardless, so the false no-op still reported "resolved". A resolution that
+                # cannot complete must FAIL LOUD, never report success, and must leave the
+                # pending row genuinely retryable (still 'pending'), not silently discarded.
+                applied = _apply_contest_resolution(
+                    index._db,
+                    old_node_id=pending_row["old_node_id"],
+                    new_node_id=pending_row["new_node_id"],
+                    resolution=resolution,
+                )
+                if not applied:
+                    return (
+                        f"Error: contradiction #{contradiction_id} could not be resolved -- "
+                        "the candidate or existing node was not found (not yet synced to "
+                        "the query index, or deleted). The pending review is UNCHANGED; "
+                        "retry once the node is available."
+                    )
                 # candidate_wins/existing_wins both "decide" (confirmed); false_positive
                 # decides nothing (dismissed) -- the shared pending_contradictions.status
                 # column and every other caller of resolve_contradiction/
@@ -948,12 +971,6 @@ def recall_contradict(
                 ok = index._db.resolve_contradiction(contradiction_id, underlying_status)
                 if not ok:
                     return f"Contradiction #{contradiction_id} not found or already resolved."
-                _apply_contest_resolution(
-                    index._db,
-                    old_node_id=pending_row["old_node_id"],
-                    new_node_id=pending_row["new_node_id"],
-                    resolution=resolution,
-                )
                 if resolution == "candidate_wins":
                     return (
                         f"Contradiction #{contradiction_id} resolved: candidate wins, "
@@ -1224,10 +1241,18 @@ def _apply_contest_resolution(
     old_node_id: str,
     new_node_id: str,
     resolution: str,
-) -> None:
+) -> bool:
     """Execute a resolved Fix B contest: promote/restore/retire the two ALREADY-MATERIALIZED
     nodes from a contested pair (config/design/recall-b3-temporal-conflict-escalation-spec-
     2026-07-21.md section 10.4).
+
+    Returns ``True`` if the mutation actually happened, ``False`` otherwise (recall#905,
+    0.17.0 blocker, Opus 2026-07-22 -- Part 2, co-primary). The caller MUST check this before
+    marking the pending row resolved: a resolution that cannot complete must fail loud, never
+    report success. ``None`` was the original return type — always, whether the mutation
+    happened or silently no-opped — which is exactly how the caller's old ordering (mark
+    resolved, then attempt the mutation) produced a false "resolved" success message for a
+    contest whose candidate node hadn't been synced to SQLite yet.
 
     Deliberately separate from ``_apply_supersession`` — that function always CREATES a fresh
     node from queued text; a contest row already has both nodes persisted (the candidate was
@@ -1247,8 +1272,12 @@ def _apply_contest_resolution(
     columns, matches how confidence is computed everywhere else a node returns to active
     (section 10.4's deliberate simplification, not an oversight).
 
-    Silently no-ops if either node is missing, matching ``_apply_supersession``'s own
-    "confirm a contradiction whose node was deleted" tolerance.
+    No-ops (mutates neither store, returns ``False``) if either node is missing -- but this
+    is no longer SILENT the way it originally was (recall#905): the caller surfaces the
+    ``False`` return as a loud, honest error and leaves the pending row unresolved, rather
+    than treating a missing node the way ``_apply_supersession`` treats a deleted one (quiet
+    tolerance is correct there because that path never claims a mutation succeeded when it
+    didn't; this path's caller used to make exactly that false claim).
 
     DUAL-STORE (Sentinel r2, PR#903 issuecomment-5037168639 -- blocking): persists to BOTH
     SQLite (``db.upsert_knowledge_node``, immediate query-path correctness) AND
@@ -1270,7 +1299,7 @@ def _apply_contest_resolution(
     candidate = db.get_knowledge_node(new_node_id)
     existing = db.get_knowledge_node(old_node_id)
     if candidate is None or existing is None:
-        return
+        return False
 
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1302,7 +1331,7 @@ def _apply_contest_resolution(
             "updated_at": now,
         }
     else:
-        return  # unknown resolution -- no-op, caller already validated before reaching here
+        return False  # unknown resolution -- caller already validated, defensive only
 
     candidate.update(candidate_updates)
     existing.update(existing_updates)
@@ -1312,6 +1341,7 @@ def _apply_contest_resolution(
     kn_path = _knowledge_path()
     update_node(new_node_id, candidate_updates, kn_path)
     update_node(old_node_id, existing_updates, kn_path)
+    return True
 
 
 def format_contradictions_for_session_start() -> str:

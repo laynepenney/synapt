@@ -1754,16 +1754,29 @@ def _apply_consolidation_result(
                     append_node(contested_node, knowledge_path)
                     existing_nodes.append(contested_node)  # track for intra-batch dedup
 
-                    update_node(
-                        best_match.id,
-                        {
-                            "status": "contested",
-                            "confidence": min(
-                                best_match.confidence, _CONTESTED_CONFIDENCE_CEILING
-                            ),
-                        },
-                        knowledge_path,
-                    )
+                    # recall#905 (0.17.0 blocker, Opus 2026-07-22, Part 1 -- root cause):
+                    # both nodes must ALSO be upserted into SQLite here, immediately, not
+                    # left to some later _sync_knowledge_to_db call. Without this, a fresh
+                    # contest's candidate node genuinely doesn't exist in SQLite until a sync
+                    # happens to run, and _apply_contest_resolution's db.get_knowledge_node
+                    # silently returns None the moment someone tries to resolve it before
+                    # that -- the dogfood-found false-success bug (Part 2, server.py, makes
+                    # that failure loud regardless; this closes the gap at its source so a
+                    # fresh contest is resolvable immediately, matching the real
+                    # conversation-memory flow where review can happen right after
+                    # detection).
+                    db.upsert_knowledge_node(contested_node.to_dict())
+
+                    existing_updates = {
+                        "status": "contested",
+                        "confidence": min(
+                            best_match.confidence, _CONTESTED_CONFIDENCE_CEILING
+                        ),
+                    }
+                    update_node(best_match.id, existing_updates, knowledge_path)
+                    existing_dict = best_match.to_dict()
+                    existing_dict.update(existing_updates)
+                    db.upsert_knowledge_node(existing_dict)
 
                     # Chronology direction is reviewer CONTEXT here, never a resolution --
                     # the escalation function itself no longer computes or uses it (section

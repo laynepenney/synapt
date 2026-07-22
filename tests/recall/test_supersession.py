@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+import synapt.recall.consolidate as consolidate
 from synapt.recall.storage import RecallDB
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 
@@ -920,6 +921,210 @@ class TestRecallContradictContestResolution:
         # already-cleared queue row would be WORSE than the original bug (stuck contested,
         # invisible, no way to re-resolve).
         assert db.list_pending_contradictions() == []
+
+    def test_resolve_fails_loud_when_candidate_missing_from_sqlite_not_false_success(
+        self, tmp_path,
+    ):
+        """recall#905 (0.17.0 blocker, Opus 2026-07-22, Part 2 -- CO-PRIMARY, not merely
+        defense-in-depth): the dogfood-found false-success bug. A freshly-created contest's
+        candidate node genuinely does not exist in SQLite until some sync has run (root
+        cause, closed separately by Part 1). Before this fix, the caller marked the pending
+        row resolved BEFORE attempting the node-level mutation, so a mutation that silently
+        no-opped (candidate not found) still reported "resolved" -- false success masking
+        real data corruption. This test proves Part 2 holds independent of Part 1: even with
+        a node genuinely missing from SQLite for ANY reason, resolve must fail loud (an
+        honest error, not a false "resolved" message) and leave the pending row untouched
+        (still pending, retryable) rather than silently discarding the review."""
+        from synapt.recall.server import recall_contradict
+
+        db = _make_db(tmp_path)
+        existing = _make_knowledge_node(
+            node_id="existing-1", content="extract path does not share the legacy cache",
+            status="contested", confidence=0.3,
+        )
+        # Candidate deliberately NEVER written to SQLite -- reproduces the exact "freshly
+        # created, not yet synced" condition, without depending on a real judge/model.
+        db.save_knowledge_nodes([existing])
+        cid = db.add_pending_contradiction(
+            old_node_id="existing-1",
+            new_content="extract path writes to a distinct cache key",
+            new_node_id="candidate-1",
+            category="configuration",
+            detected_by="b3-temporal-conflict-escalation",
+        )
+        index = TranscriptIndex.__new__(TranscriptIndex)
+        index._db = db
+        index.chunks = []
+        index.sessions = {}
+
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="candidate_wins",
+                )
+
+        # "resolved:" (with the colon) is the exact success-message shape this handler uses
+        # ("Contradiction #N resolved: <outcome>."); checking for that shape specifically,
+        # not the bare substring "resolved" -- an honest failure message legitimately says
+        # "could not be resolved", which must NOT trip this assertion.
+        assert "resolved:" not in result.lower(), (
+            f"FALSE SUCCESS: resolve reported success despite the candidate node not "
+            f"existing -- got {result!r}"
+        )
+        assert result.startswith("Error"), f"expected an honest error message, got {result!r}"
+        # The pending row must be UNCHANGED (still pending) -- retryable once the node is
+        # actually available, not silently discarded.
+        pending = db.list_pending_contradictions()
+        assert len(pending) == 1, (
+            "pending row was marked resolved despite the mutation failing -- the review is "
+            "now lost, unretryable"
+        )
+        assert pending[0]["id"] == cid
+        # And the existing node must be UNCHANGED too -- no partial mutation.
+        assert db.get_knowledge_node("existing-1")["status"] == "contested"
+
+    @pytest.mark.skipif(
+        not consolidate._MLX_AVAILABLE, reason="MLX not available (requires Apple Silicon)",
+    )
+    def test_real_contest_then_resolve_then_sync_end_to_end(self, tmp_path, monkeypatch):
+        """recall#905 (0.17.0 blocker, Opus 2026-07-22) -- Part 1's primary reproduction, and
+        the anti-masking lesson made permanent: this test goes through the REAL contest-
+        creation path (_apply_consolidation_result's contest branch, the REAL production
+        judge -- not a fake) and does NOT pre-seed either node into SQLite. That freshly-
+        created state (candidate absent from SQLite until Part 1's fix upserts it at creation
+        time) is the EXACT condition the recall#903 r2 unit tests masked by pre-seeding both
+        nodes directly. Found by the post-merge dogfood pass on the real founding dogfood-
+        06/07 cache-suffix pair; reproduced here permanently with the same real pair.
+
+        Full real flow: create (real judge flags CONFLICT, both nodes contested, queued) ->
+        resolve via recall_contradict (candidate_wins) -> the REAL _sync_knowledge_to_db ->
+        assert the resolution survived and the queue is empty."""
+        import os
+        from unittest.mock import patch as _patch
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+        from synapt.recall.consolidate import (
+            DEFAULT_MODEL,
+            _apply_consolidation_result,
+            _local_conflict_judge,
+            _make_recall_infer,
+            _sync_knowledge_to_db,
+        )
+        import synapt.recall.consolidate as consolidate_mod
+        from synapt.recall.core import project_data_dir, project_index_dir
+        from synapt.recall.journal import JournalEntry
+        from synapt.recall.knowledge import KnowledgeNode, append_node, read_nodes
+        from synapt.recall.server import recall_contradict
+
+        stale_content = "extract path does not share the legacy response_cache"
+        stale_source = "986d09c3e8bb2ae5:0:decisions:5"
+        current_content = (
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix'
+        )
+        current_source = "986d09c3e8bb2ae5:2:done:6"
+
+        monkeypatch.chdir(tmp_path)
+        kn_path = project_data_dir(tmp_path) / "knowledge.jsonl"
+        db_path = project_index_dir(tmp_path) / "recall.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Seed ONLY the existing node, as a real prior consolidation + sync cycle would have
+        # left it -- already active in both stores.
+        existing = KnowledgeNode.create(
+            content=stale_content, category="configuration", source_sessions=["s0"],
+            source_unit_id=stale_source,
+        )
+        append_node(existing, kn_path)
+        db = RecallDB(db_path)
+        db.save_knowledge_nodes([existing.to_dict()])
+
+        client = MLXClient(MLXOptions())
+        infer = _make_recall_infer(client, DEFAULT_MODEL)
+        conflict_judge = _local_conflict_judge(infer)
+
+        original_fn = consolidate_mod._inline_embedding_dedup
+
+        def _force_match(candidate, existing_nodes, threshold=0.80):
+            return (existing_nodes[0], 0.8298) if existing_nodes else (None, 0.0)
+
+        consolidate_mod._inline_embedding_dedup = _force_match
+        try:
+            parsed = {"nodes": [{
+                "action": "create", "content": current_content, "category": "solution",
+                "source_unit_id": current_source,
+            }]}
+            cluster = [JournalEntry(session_id="s1", timestamp="2026-07-13T10:00:00Z", focus="")]
+            result = _apply_consolidation_result(
+                parsed, [existing], cluster, kn_path, db=db, conflict_judge=conflict_judge,
+            )
+        finally:
+            consolidate_mod._inline_embedding_dedup = original_fn
+
+        assert result.nodes_contested == 1, "real judge did not flag the founding pair"
+        pending = db.list_pending_contradictions()
+        assert len(pending) == 1
+        cid = pending[0]["id"]
+        new_node_id = pending[0]["new_node_id"]
+        old_node_id = pending[0]["old_node_id"]
+
+        # Scenario-thinking check (Opus, 2026-07-22): Part 1 upserts both nodes into SQLite
+        # immediately at creation time -- confirm that does NOT accidentally surface them as
+        # active in default retrieval. Both nodes ARE now in SQLite (that's the fix), but
+        # both must still be status="contested" and therefore excluded by the existing
+        # status != 'active' FTS gate, exactly as they already were pre-fix when only JSONL
+        # (not SQLite) had them.
+        assert db.get_knowledge_node(new_node_id)["status"] == "contested"
+        assert db.get_knowledge_node(old_node_id)["status"] == "contested"
+        default_results = db.knowledge_fts_search("response_cache")
+        default_ids = {
+            db._knowledge_dict_from_row(
+                db._conn.execute("SELECT * FROM knowledge WHERE rowid = ?", (r,)).fetchone()
+            )["id"]
+            for r, _ in default_results
+        }
+        assert new_node_id not in default_ids, (
+            "contested candidate surfaced in DEFAULT search -- upserting to SQLite at "
+            "creation time must not bypass the status != 'active' exclusion gate"
+        )
+        assert old_node_id not in default_ids, (
+            "contested existing node surfaced in DEFAULT search -- same exclusion-gate "
+            "regression risk"
+        )
+        historical_results = db.knowledge_fts_search("response_cache", include_historical=True)
+        historical_ids = {
+            db._knowledge_dict_from_row(
+                db._conn.execute("SELECT * FROM knowledge WHERE rowid = ?", (r,)).fetchone()
+            )["id"]
+            for r, _ in historical_results
+        }
+        assert new_node_id in historical_ids and old_node_id in historical_ids, (
+            "contested nodes must still be reachable via include_historical=True -- "
+            "'excluded by default' is not the same as 'gone'"
+        )
+
+        index = TranscriptIndex.__new__(TranscriptIndex)
+        index._db = db
+        index.chunks = []
+        index.sessions = {}
+        with _patch("synapt.recall.server._get_index", return_value=index):
+            with _patch("synapt.recall.server._invalidate_cache"):
+                resolve_result = recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution="candidate_wins",
+                )
+        assert "resolved:" in resolve_result.lower(), resolve_result
+
+        _sync_knowledge_to_db(tmp_path, kn_path)
+
+        candidate = db.get_knowledge_node(new_node_id)
+        existing_after = db.get_knowledge_node(old_node_id)
+        assert candidate["status"] == "active", (
+            f"resolution did not survive the real sync -- candidate reverted to "
+            f"{candidate['status']!r}"
+        )
+        assert existing_after["status"] == "superseded"
+        assert existing_after["superseded_by"] == new_node_id
+        assert db.list_pending_contradictions() == []
+        db.close()
 
     def test_candidate_wins_promotes_candidate_supersedes_existing(self, tmp_path):
         from synapt.recall.server import recall_contradict
