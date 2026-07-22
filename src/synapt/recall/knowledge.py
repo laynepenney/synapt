@@ -24,7 +24,7 @@ VALID_CATEGORIES = frozenset({
     "preference", "fact", "collection",
 })
 
-VALID_STATUSES = frozenset({"active", "stale", "contradicted"})
+VALID_STATUSES = frozenset({"active", "stale", "contradicted", "contested"})
 
 
 def _knowledge_path(project_dir: Path | None = None) -> Path:
@@ -67,6 +67,12 @@ class KnowledgeNode:
     valid_until: str | None = None       # ISO 8601: when this stopped being true
     version: int = 1                     # Increments on supersession
     lineage_id: str = ""                 # Shared ID across versions of same fact
+    # Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section 3):
+    # the node's TRUE source chronology, distinct from created_at/updated_at (consolidation
+    # run-time, not event-time). None on any node persisted before this field existed, or any
+    # node from a path that doesn't thread source_unit_id (legacy, collection pass) -- callers
+    # must treat None as "chronology unknown," never fall back to created_at as a proxy.
+    source_unit_id: str | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -85,6 +91,7 @@ class KnowledgeNode:
         tags: list[str] | None = None,
         source_turns: list[str] | None = None,
         node_id: str | None = None,
+        source_unit_id: str | None = None,
     ) -> KnowledgeNode:
         """Create a new knowledge node with auto-generated ID and timestamps."""
         now = datetime.now(timezone.utc).isoformat()
@@ -98,6 +105,7 @@ class KnowledgeNode:
             created_at=now,
             updated_at=now,
             tags=tags or [],
+            source_unit_id=source_unit_id,
         )
 
 

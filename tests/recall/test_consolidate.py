@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import synapt.recall.consolidate as consolidate
 from synapt.recall.journal import JournalEntry
 from synapt.recall.knowledge import KnowledgeNode, append_node, read_nodes
 from synapt.recall.consolidate import (
@@ -1359,6 +1360,131 @@ class TestGenericFilterInApply(unittest.TestCase):
             contents,
         )
 
+    def test_fix_b_1a_with_conflict_judge_and_source_unit_ids_resolves_via_contest(self):
+        """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md,
+        section 10 -- Layne-ratified contested-memory-lifecycle reframe, 2026-07-21): the SAME
+        founding pair as test_a7_1a above, wired the way the extract path actually calls
+        _apply_consolidation_result post-reframe -- conflict_judge provided, both sides carry
+        a real source_unit_id, AND a real db (contest requires one -- section 10.5, no
+        meaningful legacy behavior otherwise). BOTH nodes must persist, BOTH marked
+        "contested" with confidence capped, and a pending_contradiction queued -- neither
+        auto-applied as a winner. This is the end-to-end wiring proof;
+        TestB3TemporalConflictEscalation tests the pure escalation function in isolation."""
+        import synapt.recall.consolidate as mod
+        from synapt.recall.storage import RecallDB
+
+        db = RecallDB(Path(self.tmpdir) / "recall.db")
+        self.addCleanup(db.close)
+
+        existing = KnowledgeNode.create(
+            content="extract path does not share the legacy response_cache",
+            category="configuration",
+            source_sessions=["s0"],
+            source_unit_id="986d09c3e8bb2ae5:0:decisions:5",
+        )
+        append_node(existing, self.kn_path)
+        db.save_knowledge_nodes([existing.to_dict()])
+
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.8298)  # real production cosine score
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": (
+                    'writing extract-path results to response_cache under a distinct '
+                    '":extract" key suffix'
+                ),
+                "category": "solution",
+                "source_unit_id": "986d09c3e8bb2ae5:2:done:6",
+            }]}
+            result = _apply_consolidation_result(
+                parsed, [existing], self.cluster, self.kn_path,
+                db=db,
+                conflict_judge=lambda candidate, existing_text: True,
+            )
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        # CONTEST: the escalation fired -- both nodes persist, both contested, nothing
+        # auto-applied as a winner.
+        self.assertEqual(result.nodes_created, 0)
+        self.assertEqual(result.nodes_corroborated, 0)
+        self.assertEqual(result.nodes_contested, 1)
+        nodes = read_nodes(self.kn_path)
+        contested = [n for n in nodes if n.status == "contested"]
+        self.assertEqual(len(contested), 2)
+        contested_contents = {n.content for n in contested}
+        self.assertIn("extract path does not share the legacy response_cache", contested_contents)
+        self.assertIn(
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+            contested_contents,
+        )
+        for n in contested:
+            self.assertLessEqual(n.confidence, consolidate._CONTESTED_CONFIDENCE_CEILING)
+
+        pending = db.list_pending_contradictions()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["old_node_id"], existing.id)
+        candidate_node = next(
+            n for n in contested if n.content != existing.content
+        )
+        self.assertEqual(pending[0]["new_node_id"], candidate_node.id)
+        self.assertEqual(pending[0]["detected_by"], "b3-temporal-conflict-escalation")
+
+    def test_fix_b_no_conflict_judge_matches_a7_unchanged_keep_both(self):
+        """conflict_judge defaults to None -- the legacy path (this exact call site, no new
+        kwarg) and the collection pass must be byte-identical to pre-Fix-B behavior. Proves
+        the new parameter is genuinely opt-in, not a silent behavior change for existing
+        callers."""
+        existing = KnowledgeNode.create(
+            content="extract path does not share the legacy response_cache",
+            category="configuration",
+            source_sessions=["s0"],
+            source_unit_id="986d09c3e8bb2ae5:0:decisions:5",  # present, but no judge -> irrelevant
+        )
+        append_node(existing, self.kn_path)
+
+        import synapt.recall.consolidate as mod
+        original_fn = mod._inline_embedding_dedup
+
+        def mock_emb_dedup(candidate, existing_nodes, threshold=0.80):
+            if existing_nodes:
+                return (existing_nodes[0], 0.8298)
+            return (None, 0.0)
+
+        mod._inline_embedding_dedup = mock_emb_dedup
+        try:
+            parsed = {"nodes": [{
+                "action": "create",
+                "content": (
+                    'writing extract-path results to response_cache under a distinct '
+                    '":extract" key suffix'
+                ),
+                "category": "solution",
+                "source_unit_id": "986d09c3e8bb2ae5:2:done:6",
+            }]}
+            # No conflict_judge kwarg at all -- exactly today's legacy-path call shape.
+            result = _apply_consolidation_result(parsed, [existing], self.cluster, self.kn_path)
+        finally:
+            mod._inline_embedding_dedup = original_fn
+
+        self.assertEqual(result.nodes_created, 1)
+        self.assertEqual(result.nodes_corroborated, 0)
+        contents = {n.content for n in read_nodes(self.kn_path)}
+        self.assertIn("extract path does not share the legacy response_cache", contents)
+        self.assertIn(
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+            contents,
+        )
+
     def test_a7_1b_perfect_jaccard_different_prs_keep_both(self):
         """Fixture 1b -- real jaccard is a PERFECT 1.0 for these two distinct real PR-opening
         events, because _extract_keywords's regex requires a lowercase-letter start and drops
@@ -1977,6 +2103,371 @@ class TestGenericFilterInApply(unittest.TestCase):
         self.assertEqual(result.nodes_corroborated, 1)
         nodes = read_nodes(self.kn_path)
         self.assertEqual(len(nodes), 1)
+
+
+class TestRepresentativeSourceUnitId(unittest.TestCase):
+    """_representative_source_unit_id (Fix B spec section 3): reads a B4 action-item dict's
+    chronology signal -- singular source_unit_id (singleton pass-through) or plural
+    source_unit_ids (composed group, latest member wins per Opus's r1 decision, section 9.2).
+    Pure function, no pipeline needed."""
+
+    def test_singleton_reads_the_singular_field_directly(self):
+        raw_node = {"source_unit_id": "986d09c3e8bb2ae5:2:done:6"}
+        self.assertEqual(
+            consolidate._representative_source_unit_id(raw_node),
+            "986d09c3e8bb2ae5:2:done:6",
+        )
+
+    def test_composed_group_picks_the_latest_member(self):
+        """entry_index 2 is chronologically later than 0 and 1 -- the composed node's
+        representative must be the LATEST contributing member, not the first-listed one."""
+        raw_node = {
+            "source_unit_ids": [
+                "986d09c3e8bb2ae5:0:decisions:5",
+                "986d09c3e8bb2ae5:2:done:6",
+                "986d09c3e8bb2ae5:1:done:3",
+            ],
+        }
+        self.assertEqual(
+            consolidate._representative_source_unit_id(raw_node),
+            "986d09c3e8bb2ae5:2:done:6",
+        )
+
+    def test_missing_both_keys_returns_none(self):
+        """The legacy path's raw_node dicts never carry either key -- must not raise, must
+        not fabricate a value."""
+        self.assertIsNone(consolidate._representative_source_unit_id({}))
+
+    def test_empty_source_unit_ids_list_returns_none(self):
+        self.assertIsNone(consolidate._representative_source_unit_id({"source_unit_ids": []}))
+
+    def test_source_unit_ids_containing_none_entries_are_skipped(self):
+        """A member whose own source_unit_id is missing must not crash the max-selection or
+        be silently treated as comparable."""
+        raw_node = {"source_unit_ids": [None, "986d09c3e8bb2ae5:1:done:3", None]}
+        self.assertEqual(
+            consolidate._representative_source_unit_id(raw_node),
+            "986d09c3e8bb2ae5:1:done:3",
+        )
+
+
+class TestB3TemporalConflictEscalation(unittest.TestCase):
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md, section
+    10 -- Layne-ratified contested-memory-lifecycle reframe, 2026-07-21):
+    _b3_temporal_conflict_escalation extends A7's containment-only "keep_both" outcome with a
+    "contest" escalation, gated behind an injected conflict_judge seam. The judge is a
+    FLAGGER, not a resolver -- "contest" is never an auto-applied winner; chronology direction
+    is reviewer context built by the CALLER (TestGenericFilterInApply's integration tests),
+    not a return value of this pure function. Direct unit tests of the pure escalation
+    function -- no pipeline, no model, matching _b3_containment_decision's own test style
+    (test_a7_* above, TestGenericFilterInApply). Real fixtures reused from A1's own pinned
+    dogfood-06/07 case, cluster 986d09c3e8bb2ae5."""
+
+    STALE_CONTENT = "extract path does not share the legacy response_cache"
+    STALE_SOURCE = "986d09c3e8bb2ae5:0:decisions:5"
+    CURRENT_CONTENT = (
+        'writing extract-path results to response_cache under a distinct ":extract" '
+        'key suffix'
+    )
+    CURRENT_SOURCE = "986d09c3e8bb2ae5:2:done:6"
+
+    @staticmethod
+    def _judge(verdict):
+        """Fake conflict_judge that always returns *verdict* regardless of content -- the
+        judge's OWN correctness (does the REAL local model actually discriminate) is a
+        separate, required check: TestLocalConflictJudge, below."""
+        def judge(candidate_content, existing_content):
+            return verdict
+        return judge
+
+    def test_fixture_a_founding_case_resolves_contest(self):
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=self.CURRENT_SOURCE,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=self.STALE_SOURCE,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "contest")
+
+    def test_fixture_a_founding_case_reverse_argument_order_also_resolves_contest(self):
+        """Same real pair, arguments swapped -- under the reframe BOTH orders resolve to the
+        SAME "contest" outcome, because this function no longer picks a winner from
+        chronology (section 10.5: direction moved to reviewer-context text built by the
+        caller, not this function's return value). Argument-order independence is still the
+        acceptance criterion; it just proves something different now."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.STALE_CONTENT,
+            candidate_source_unit_id=self.STALE_SOURCE,
+            existing_content=self.CURRENT_CONTENT,
+            existing_source_unit_id=self.CURRENT_SOURCE,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "contest")
+
+    def test_fixture_b_genuinely_complementary_pair_stays_keep_both(self):
+        """Proves the asymmetric guard discriminates INSIDE the risky band -- a judge that
+        correctly reports no conflict must still yield keep_both, never a contest (which
+        would still cost a confidence dip + a queue entry even though it's cheap -- no
+        conflict detected at all means no reason to touch either node)."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                "the response_cache key is a sha256 of sorted session_id|timestamp pairs"
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:1:done:3",
+            existing_content=self.CURRENT_CONTENT,
+            existing_source_unit_id=self.CURRENT_SOURCE,
+            conflict_judge=self._judge(False),
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_fixture_b_judge_uncertainty_also_stays_keep_both(self):
+        """None (uncertain) must be treated identically to False -- constraint 2's asymmetric
+        conservatism applies to judge uncertainty, not just an explicit judge-says-no."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                "the response_cache key is a sha256 of sorted session_id|timestamp pairs"
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:1:done:3",
+            existing_content=self.CURRENT_CONTENT,
+            existing_source_unit_id=self.CURRENT_SOURCE,
+            conflict_judge=self._judge(None),
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_fixture_c_late_arriving_older_candidate_still_contests_no_auto_winner(self):
+        """Opus's named edge case (section 4c/9): under the reframe, this function no longer
+        picks a winner by processing/arrival order OR by chronology -- it only decides
+        whether to contest. Chronological order still matters, but only as reviewer context
+        the CALLER attaches to the queued review (TestGenericFilterInApply), not as an
+        auto-resolved outcome here."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content="the deploy pipeline retries once before failing open",
+            candidate_source_unit_id="986d09c3e8bb2ae5:0:decisions:1",
+            existing_content="the deploy pipeline retries twice before failing open",
+            existing_source_unit_id="986d09c3e8bb2ae5:3:done:2",
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "contest")
+
+    def test_fixture_d_negation_flip_generalizes_beyond_the_founding_wording(self):
+        """Mirrors A2's own negation-flip detection target (config/design/recall-supersession-
+        guard-detection-contract-2026-07-16.md section 2, fixture 2) -- now proven reachable on
+        the corroborate branch too, since guard-6 cannot reach cross-batch/already-persisted
+        pairs at all."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                "root-caused the four attribution test failures to the extract-path "
+                "change after all"
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:2:done:4",
+            existing_content=(
+                "the four attribution test failures are unrelated to the "
+                "consolidate/extract change"
+            ),
+            existing_source_unit_id="986d09c3e8bb2ae5:0:decisions:2",
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "contest")
+
+    def test_fixture_tie_same_entry_conflict_still_contests_without_direction(self):
+        """Section 10.9/10.10 item 1 (r1-ratified): the same-entry-tie guard is DROPPED under
+        the reframe. A1 section 7's precedent (no usable direction signal from a tie) still
+        applies to the REASON TEXT the caller builds -- it just no longer blocks contesting
+        at all, because nothing here auto-applies a direction. This is a POSITIVE fixture now,
+        not a mutation guard: a tie is exactly as contestable as a resolved direction."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id="986d09c3e8bb2ae5:0:decisions:6",
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id="986d09c3e8bb2ae5:0:decisions:5",
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "contest")
+
+    # --- Mutation guards: every early-return path must independently prove it lands on
+    # "keep_both" -- constraint 2's asymmetric-conservatism contract, section 5.2. The
+    # same-entry-tie guard moved OUT of this section (10.10 item 1: it's no longer a guard,
+    # it's a positive fixture, above). The missing-source_unit_id guards STAY (10.10 item 2).
+
+    def test_mutation_guard_no_judge_provided_stays_keep_both(self):
+        """conflict_judge=None (the default -- legacy/collection paths, or any caller that
+        hasn't wired the seam) must never escalate, regardless of how similar or how
+        resolvable the chronology is."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=self.CURRENT_SOURCE,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=self.STALE_SOURCE,
+            conflict_judge=None,
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_mutation_guard_missing_existing_source_unit_id_stays_keep_both(self):
+        """A node persisted before this fix ships has source_unit_id=None -- must fall back
+        to keep_both, never guess a winner from content alone."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=self.CURRENT_SOURCE,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=None,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "keep_both")
+
+    def test_mutation_guard_missing_candidate_source_unit_id_stays_keep_both(self):
+        """The legacy/collection paths never set source_unit_id on the candidate side --
+        must also fall back, symmetric with the existing-side guard above."""
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=self.CURRENT_CONTENT,
+            candidate_source_unit_id=None,
+            existing_content=self.STALE_CONTENT,
+            existing_source_unit_id=self.STALE_SOURCE,
+            conflict_judge=self._judge(True),
+        )
+        self.assertEqual(result, "keep_both")
+
+
+class TestLocalConflictJudge(unittest.TestCase):
+    """Section 9.3 (Opus's r1 required addition), reframed by section 10 (Layne-ratified
+    contested-memory-lifecycle, 2026-07-21): the escalation LOGIC above is tested with a fake
+    conflict_judge -- proves the logic is correct GIVEN a judge answer, not that the real
+    judge (local MLX infer + the CONFLICT/COMPATIBLE prompt, _local_conflict_judge) actually
+    discriminates fixture (a) from fixture (b). This is the production-frame check: real
+    _make_recall_infer, real local model, zero Modal cost. Skipped gracefully where MLX isn't
+    available (non-Apple-Silicon runners) -- same pattern as test_benchmarks_llm.py /
+    test_enrich.py's real-model tests.
+
+    Section 9.4's finding stands (Ministral-3-3B over-calls CONFLICT on same-entity-different-
+    property pairs -- a real, reproducible model-capacity limit, 5 prompt designs / 2
+    precisions investigated) but section 10.10 item 4 reframes its STAKES: under contest-and-
+    queue, the judge is a flagger, not a resolver, so a false CONFLICT call costs a confidence
+    dip and a queue entry on both nodes, never a lost fact. There is no gate to test anymore
+    (the prior _gate_destructive_conflict_judgment machinery is gone -- section 10.5, no
+    destructive outcome remains for it to gate). This class now tests: the raw judge's own
+    classification accuracy (honest, includes one documented expectedFailure -- not silently
+    weakened), and the real safety property that actually matters today -- that even the raw
+    judge's known mistake only ever drives the escalation to "contest," never a silent
+    resolution."""
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    def test_real_judge_classifies_the_founding_pair_as_conflict(self):
+        """Raw judge accuracy. This one passes: the model correctly classifies the founding
+        case, every run."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+        judge = consolidate._local_conflict_judge(infer)
+
+        result = judge(
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+            "extract path does not share the legacy response_cache",
+        )
+        self.assertTrue(
+            result,
+            "real local judge must classify the founding dogfood-06/07 pair as CONFLICT "
+            f"-- got {result!r}",
+        )
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    @unittest.expectedFailure
+    def test_real_judge_classifies_a_complementary_pair_as_not_conflict(self):
+        """KNOWN, TRACKED, NOT SILENTLY HIDDEN: Ministral-3-3B reliably misclassifies this
+        genuinely-complementary pair as CONFLICT. Verified not a parsing issue (clean raw
+        "CONFLICT" response) and not a quantization artifact (identical failure on bf16 full
+        precision) across 5 different prompt designs -- config/design/recall-b3-temporal-
+        conflict-escalation-spec-2026-07-21.md section 9.4 has the full investigation.
+
+        expectedFailure, not deleted or weakened: if a future model/prompt ever fixes this,
+        the test framework reports it as an unexpected PASS (xpass), which is the signal to
+        revisit recall#900 (section 10.10 item 4 -- reframed from a safety trigger to a
+        review-queue-noise trigger, since there is no trust flag left to flip). See
+        test_real_judge_drives_escalation_to_contest_not_silent_resolution_complementary_pair
+        below for the test that actually matters for correctness today."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+        judge = consolidate._local_conflict_judge(infer)
+
+        result = judge(
+            "the response_cache key is a sha256 of sorted session_id|timestamp pairs",
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix',
+        )
+        self.assertIn(
+            result, (False, None),
+            "raw local judge must NOT classify a genuinely complementary pair as "
+            f"CONFLICT -- got {result!r}",
+        )
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    def test_real_judge_drives_escalation_to_contest_not_silent_resolution_founding_pair(self):
+        """Closes the loop between the fake-judge-tested logic above and production: the REAL
+        judge, wired directly (no gate -- section 10.5), driving the full escalation function
+        on the founding pair lands on "contest," matching TestB3TemporalConflictEscalation's
+        fake-judge fixture (a) exactly."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                'writing extract-path results to response_cache under a distinct ":extract" '
+                'key suffix'
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:2:done:6",
+            existing_content="extract path does not share the legacy response_cache",
+            existing_source_unit_id="986d09c3e8bb2ae5:0:decisions:5",
+            conflict_judge=consolidate._local_conflict_judge(infer),
+        )
+        self.assertEqual(result, "contest")
+
+    @unittest.skipUnless(
+        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
+    )
+    def test_real_judge_drives_escalation_to_contest_not_silent_resolution_complementary_pair(
+        self,
+    ):
+        """THE SAFETY TEST THAT MATTERS: the real judge's KNOWN mistake (classifies this
+        genuinely-complementary pair as CONFLICT -- see the expectedFailure above) driven
+        through the full, real, UNGATED escalation function still lands on "contest," never
+        an auto-applied winner. This is the central safety claim of the contested-memory-
+        lifecycle reframe (section 10.1), verified directly against the actual production
+        judge, not assumed: a false CONFLICT call costs a confidence dip and a queue entry,
+        never data loss -- there is no destructive outcome left for the judge's known
+        inaccuracy to reach."""
+        from synapt._models.mlx_client import MLXClient, MLXOptions
+
+        client = MLXClient(MLXOptions())
+        infer = consolidate._make_recall_infer(client, consolidate.DEFAULT_MODEL)
+
+        result = consolidate._b3_temporal_conflict_escalation(
+            candidate_content=(
+                "the response_cache key is a sha256 of sorted session_id|timestamp pairs"
+            ),
+            candidate_source_unit_id="986d09c3e8bb2ae5:1:done:3",
+            existing_content=(
+                'writing extract-path results to response_cache under a distinct ":extract" '
+                'key suffix'
+            ),
+            existing_source_unit_id="986d09c3e8bb2ae5:2:done:6",
+            conflict_judge=consolidate._local_conflict_judge(infer),
+        )
+        self.assertEqual(
+            result, "contest",
+            "even the raw judge's known-wrong verdict must only ever reach 'contest', "
+            f"never a silent resolution -- got {result!r}",
+        )
 
 
 class TestProjectContext(unittest.TestCase):

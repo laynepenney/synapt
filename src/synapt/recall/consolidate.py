@@ -356,6 +356,11 @@ class ConsolidationResult:
     nodes_created: int = 0
     nodes_corroborated: int = 0
     nodes_contradicted: int = 0
+    # Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
+    # escalation-spec-2026-07-21.md section 10.5): distinct from nodes_contradicted (the
+    # general contradict-action-item path) so the 0.17.0 dogfood fruit is countable cleanly --
+    # one increment per contested PAIR (two nodes touched, one queue entry), not per node.
+    nodes_contested: int = 0
     nodes_deduped: int = 0
     entries_processed: int = 0
     clusters_found: int = 0
@@ -621,6 +626,16 @@ _inline_emb_loaded = False
 
 _INLINE_COSINE_THRESHOLD = 0.80
 
+# Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
+# escalation-spec-2026-07-21.md section 10.5/10.10 item 5): confidence ceiling applied to both
+# nodes in a contested pair. Belt-and-suspenders, not the primary mechanism -- the primary
+# exclusion is the existing status != 'active' FTS gate (storage.py's knowledge_fts_search),
+# which hides contested nodes from default search entirely. This ceiling only matters when a
+# contested node is explicitly surfaced via include_historical=True: below the existing 0.4
+# no-boost gate (core.py's _search_knowledge), so a contested node never gets a ranking boost
+# regardless of its original confidence. Named constant so the dogfood run can tune it.
+_CONTESTED_CONFIDENCE_CEILING = 0.3
+
 # Content-type-aware dedup thresholds.
 # Personal content gets more permissive thresholds (preserve nuanced facts).
 # Code content gets more aggressive thresholds (filter generic tool output).
@@ -706,6 +721,129 @@ def _b3_containment_decision(candidate_content: str, existing_content: str) -> s
     if _token_sequence_contains(exist_tokens, cand_tokens):
         return "supersede"
     return "keep_both"
+
+
+def _representative_source_unit_id(raw_node: dict) -> "str | None":
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section
+    3): reads a B4 action-item dict's chronology signal. A singleton pass-through carries
+    ``source_unit_id`` (singular, threaded end-to-end from ``_decide_actions``). A composed
+    group carries ``source_unit_ids`` (plural, one per member — see the ``"source_unit_ids":
+    [m.get("source_unit_id") for m in members]`` shape at compose time). Returns the LATEST
+    member's value for a composed group (Opus's r1 decision, spec section 9.2): a composed
+    node represents the current synthesized understanding, so biasing its effective
+    chronology toward its most recent contributing fact makes it HARDER to supersede later —
+    fewer false-supersedes, the failure mode most worth avoiding under constraint 2's
+    asymmetric conservatism. ``None`` for any shape without a usable value (legacy/collection
+    paths never set either key) — never fabricated, never a proxy."""
+    singular = raw_node.get("source_unit_id")
+    if singular is not None:
+        return singular
+    plural = raw_node.get("source_unit_ids")
+    if not plural:
+        return None
+    candidates = [s for s in plural if s is not None]
+    if not candidates:
+        return None
+    latest = candidates[0]
+    for candidate in candidates[1:]:
+        if _source_unit_id_order(candidate, latest) == 1:
+            latest = candidate
+    return latest
+
+
+def _b3_temporal_conflict_escalation(
+    *,
+    candidate_content: str,
+    candidate_source_unit_id: "str | None",
+    existing_content: str,
+    existing_source_unit_id: "str | None",
+    conflict_judge,
+) -> str:
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md,
+    section 10 -- Layne-ratified contested-memory-lifecycle reframe, 2026-07-21): only called
+    when ``_b3_containment_decision`` already returned ``"keep_both"`` — neither text contains
+    the other. Escalates to ``"contest"`` ONLY when the judge reports a genuine conflict; any
+    missing signal or judge uncertainty falls through to ``"keep_both"`` unchanged.
+    Asymmetric-conservative by construction: every early-return here is ``"keep_both"``, never
+    a guessed winner.
+
+    The judge is a FLAGGER, not a resolver (section 10.1) — ``"contest"`` is never auto-applied
+    by the caller; it always routes to the contested-memory lifecycle (mark both nodes
+    contested, queue for human/agent review via ``add_pending_contradiction``). This is why
+    the contract no longer distinguishes ``"supersede"`` from ``"keep_existing"``: chronology
+    direction is no longer used to pick an automatic winner here, only to annotate the queued
+    review with reviewer context (built by the caller via ``_source_unit_id_order``, not by
+    this function). Section 10.9/10.10 item 1: the same-entry-tie guard is DROPPED for this
+    reason — under contest, a tie needs no resolvable direction to be worth flagging; the
+    reviewer decides on content. Item 2: the missing-``source_unit_id`` guard STAYS — without
+    any chronology signal at all, a reviewer gets no useful context, and a node from a path
+    that doesn't thread the field (legacy, collection pass) is a documented, deliberate
+    known-limitation exclusion, not an oversight.
+
+    ``conflict_judge: Callable[[str, str], bool | None] | None`` — injected, not hardwired
+    (mirrors the ``infer`` seam B1/B2/B4 already use). ``None`` return from the judge means
+    genuinely uncertain and is treated identically to ``False``.
+    """
+    if conflict_judge is None:
+        return "keep_both"
+    if candidate_source_unit_id is None or existing_source_unit_id is None:
+        return "keep_both"
+    is_conflict = conflict_judge(candidate_content, existing_content)
+    if not is_conflict:  # False, or None (uncertain) -- both mean "not proven"
+        return "keep_both"
+    return "contest"
+
+
+def _local_conflict_judge(infer):
+    """Production default for ``_b3_temporal_conflict_escalation``'s ``conflict_judge``
+    parameter. Wraps the extract path's own already-injected ``infer`` seam
+    (``_make_recall_infer``) — local-first by construction, since ``infer`` IS the local
+    MLX/enrichment model this whole pipeline already runs on, never a new cloud dependency.
+    Only ever invoked from inside the caller's already-narrow high-similarity-non-containment
+    trigger band (constraint 1) — not on every ``keep_both``.
+
+    KNOWN, DOCUMENTED, LOW-STAKES GAP (config/design/recall-b3-temporal-conflict-escalation-
+    spec-2026-07-21.md section 9.4, reframed section 10.10 item 4): this exact wording — the
+    best of 4 tried, across both 4-bit and bf16 Ministral-3-3B — reliably classifies the
+    founding case (fixture a, REQUIRED) and a negation-flip (fixture d) correctly, but is NOT
+    reliable on same-entity-different-property pairs sharing strong lexical overlap without a
+    genuine logical conflict (fixture b) — it over-weights topical/lexical overlap as evidence
+    of conflict even when its own stated reasoning correctly identifies the two claims as
+    distinct properties. This is a real, reproducible model-capacity limit at this scale, not
+    a parsing or prompt-triviality issue; see the spec addendum for the full investigation.
+    Under the contested-memory-lifecycle reframe this is a review-queue-noise issue, not a
+    safety issue (tracked: recall#900) — a false CONFLICT call here costs a confidence dip and
+    a queue entry on both nodes, never a lost fact; the judge is a flagger, not a resolver.
+
+    Parsed strictly and conservatively: anything other than a response that starts with
+    exactly "CONFLICT" (case-insensitive, after stripping whitespace) returns ``None``
+    (uncertain), never ``True`` — a malformed response, an unexpected model utterance, or an
+    inference exception must never be silently treated as evidence of conflict.
+    """
+    def judge(candidate_content: str, existing_content: str) -> "bool | None":
+        prompt = (
+            "Two statements, possibly about the same general topic. Apply this exact "
+            "test: if Statement A is true, does that make Statement B FALSE (or vice "
+            "versa)? Sharing a topic is not enough -- they must actually contradict.\n\n"
+            f"Statement A: {candidate_content}\n"
+            f"Statement B: {existing_content}\n\n"
+            "If A being true would make B false (or B true would make A false): answer "
+            "CONFLICT.\n"
+            "If both statements can be true at the same time, even though they describe "
+            "different specific details of the same topic: answer COMPATIBLE.\n\n"
+            "Answer with exactly one word: CONFLICT or COMPATIBLE."
+        )
+        try:
+            response = infer({"messages": [{"role": "user", "content": prompt}]})
+        except Exception:
+            return None
+        answer = (response or "").strip().upper()
+        if answer.startswith("CONFLICT"):
+            return True
+        if answer.startswith("COMPATIBLE"):
+            return False
+        return None  # unparseable/malformed -- uncertain, not a guess
+    return judge
 
 
 def _inline_embedding_dedup(
@@ -836,10 +974,18 @@ def _log_dedup_decision(
     source: str = "",
     contradiction_note: str = "",
     negative_pairs: list[dict] | None = None,
+    reason: str = "",
 ) -> None:
     """Append one pairwise decision to the dedup decisions JSONL file.
 
     Pure logging — never disrupts consolidation.
+
+    *reason* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md):
+    for ``auto-corroborate``/``auto-supersede``/``contest`` entries, distinguishes WHICH
+    mechanism produced the decision — ``"containment"`` (A7's token-subsequence rule) vs
+    ``"chronology_contest"`` (section 10's contested-memory-lifecycle escalation: judge
+    flags CONFLICT, no direction is auto-applied) — matching guard 6's own precedent of
+    logging *why*, not just *what*.
     """
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -859,6 +1005,8 @@ def _log_dedup_decision(
         entry["contradiction_note"] = contradiction_note
     if negative_pairs:
         entry["negative_pairs"] = negative_pairs
+    if reason:
+        entry["reason"] = reason
 
     try:
         from synapt.recall._filelock import lock_exclusive
@@ -1241,11 +1389,19 @@ def _apply_consolidation_result(
     decision_log_path: Path | None = None,
     db=None,
     content_profile=None,
+    conflict_judge=None,
 ) -> ConsolidationResult:
     """Apply parsed LLM output: create, corroborate, or contradict nodes.
 
     When *db* (RecallDB) is provided, contradictions are queued as
     pending_contradictions for user review instead of auto-applied.
+
+    *conflict_judge* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-
+    2026-07-21.md): optional, defaults to None. Only the extract path
+    (``_run_extract_path``) passes this — the legacy and collection-pass callers never do,
+    so ``_b3_temporal_conflict_escalation`` is always a no-op for them (falls through to
+    ``keep_both``, byte-identical to pre-Fix-B behavior). See ``_local_conflict_judge`` for
+    the production default.
     """
     result = ConsolidationResult()
     nodes_list = parsed.get("nodes", [])
@@ -1281,6 +1437,10 @@ def _apply_consolidation_result(
         if not isinstance(source_turns, list):
             source_turns = []
         source_turns = [str(t) for t in source_turns if t]
+
+        # Fix B (section 3): the candidate's true source chronology, singleton or composed —
+        # None on any path that doesn't thread it (legacy, collection pass).
+        candidate_source_unit_id = _representative_source_unit_id(raw_node)
 
         if not content:
             continue
@@ -1408,6 +1568,12 @@ def _apply_consolidation_result(
                 continue  # Skip to next node (queued or legacy-applied)
 
         if action == "create":
+            # Moved up from just before the ordinary-create call below (Fix B contest branch,
+            # section 10.5, needs it too -- computed once, used by both).
+            confidence = raw_node.get("confidence", 0.5)
+            if not isinstance(confidence, (int, float)):
+                confidence = 0.5
+
             # Dedup: if content is very similar to an existing node,
             # auto-convert to corroborate instead of creating a duplicate.
             # Two signals: (1) keyword Jaccard, (2) embedding cosine.
@@ -1447,6 +1613,27 @@ def _apply_consolidation_result(
                 # exact restatement of `best_match`, a live production bug (17/31
                 # auto-corroborates in one A6 dogfood run).
                 b3_decision = _b3_containment_decision(content, best_match.content)
+                decision_reason = "containment"
+
+                if b3_decision == "keep_both":
+                    # Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-
+                    # 2026-07-21.md, section 10 -- contested-memory-lifecycle reframe):
+                    # containment found neither side contains the other, but that alone
+                    # doesn't mean the two are compatible -- escalate to CONTEST (never an
+                    # auto-applied winner) when a genuine conflict is detected. No-op (stays
+                    # keep_both) whenever conflict_judge is None or either side lacks a
+                    # source_unit_id -- asymmetric-conservative by construction, see the
+                    # function's own docstring for every early-return path.
+                    escalated = _b3_temporal_conflict_escalation(
+                        candidate_content=content,
+                        candidate_source_unit_id=candidate_source_unit_id,
+                        existing_content=best_match.content,
+                        existing_source_unit_id=best_match.source_unit_id,
+                        conflict_judge=conflict_judge,
+                    )
+                    if escalated != "keep_both":
+                        b3_decision = escalated
+                        decision_reason = "chronology_contest"
 
                 if b3_decision == "keep_existing":
                     logger.info(
@@ -1476,6 +1663,7 @@ def _apply_consolidation_result(
                             similarity_score=best_sim,
                             source=f"auto-{best_method}",
                             session_ids=cluster_sessions,
+                            reason=decision_reason,
                         )
                     continue
 
@@ -1498,6 +1686,7 @@ def _apply_consolidation_result(
                         confidence=compute_confidence(len(new_sources)),
                         tags=new_tags,
                         source_turns=source_turns,
+                        source_unit_id=candidate_source_unit_id,
                     )
                     if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
                         llm_valid_from = None
@@ -1532,16 +1721,101 @@ def _apply_consolidation_result(
                             similarity_score=best_sim,
                             source=f"auto-{best_method}",
                             session_ids=cluster_sessions,
+                            reason=decision_reason,
                         )
                     continue
 
-                # b3_decision == "keep_both": neither contains the other. Deliberately no
+                if b3_decision == "contest" and db is not None:
+                    # Contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
+                    # conflict-escalation-spec-2026-07-21.md section 10.5, Layne-ratified
+                    # 2026-07-21): the judge is a FLAGGER, not a resolver. Neither side is
+                    # auto-applied as a winner -- both nodes persist, both marked contested
+                    # with confidence capped, and a pending_contradiction queues the pair for
+                    # human/agent review (_apply_contest_resolution, server.py, is the
+                    # resolution path). Requires db: without a review mechanism, "contest" has
+                    # no meaningful legacy behavior (unlike the "contradict" action-item's
+                    # legacy auto-apply, contest's whole point is deferring to a judge that
+                    # is NOT the model) -- falls through to the ordinary create path below,
+                    # same as keep_both, when db is None.
+                    logger.info(
+                        "Contest (%s=%.2f): %s",
+                        best_method, best_sim, content[:80],
+                    )
+                    contested_node = KnowledgeNode.create(
+                        content=content,
+                        category=category,
+                        source_sessions=cluster_sessions,
+                        confidence=min(confidence, _CONTESTED_CONFIDENCE_CEILING),
+                        tags=tags,
+                        source_turns=source_turns,
+                        source_unit_id=candidate_source_unit_id,
+                    )
+                    contested_node.status = "contested"
+                    append_node(contested_node, knowledge_path)
+                    existing_nodes.append(contested_node)  # track for intra-batch dedup
+
+                    update_node(
+                        best_match.id,
+                        {
+                            "status": "contested",
+                            "confidence": min(
+                                best_match.confidence, _CONTESTED_CONFIDENCE_CEILING
+                            ),
+                        },
+                        knowledge_path,
+                    )
+
+                    # Chronology direction is reviewer CONTEXT here, never a resolution --
+                    # the escalation function itself no longer computes or uses it (section
+                    # 10.5: direction moved from the pure function to this call site).
+                    order = _source_unit_id_order(
+                        candidate_source_unit_id, best_match.source_unit_id
+                    )
+                    if order == 1:
+                        contest_reason = (
+                            "Chronology: candidate (newer) conflicts with existing (older) "
+                            "-- judge flagged CONFLICT, escalation does not auto-resolve."
+                        )
+                    elif order == -1:
+                        contest_reason = (
+                            "Chronology: candidate (older) conflicts with existing (newer) "
+                            "-- judge flagged CONFLICT, escalation does not auto-resolve."
+                        )
+                    else:
+                        contest_reason = (
+                            "Same-entry conflict, no chronology tiebreaker available -- "
+                            "judge flagged CONFLICT, escalation does not auto-resolve."
+                        )
+                    db.add_pending_contradiction(
+                        old_node_id=best_match.id,
+                        new_content=content,
+                        new_node_id=contested_node.id,
+                        category=category,
+                        reason=contest_reason,
+                        source_sessions=cluster_sessions,
+                        detected_by="b3-temporal-conflict-escalation",
+                    )
+                    result.nodes_contested += 1
+                    if decision_log_path:
+                        _log_dedup_decision(
+                            decision_log_path,
+                            action="contest",
+                            candidate_content=content,
+                            candidate_category=category,
+                            existing_id=best_match.id,
+                            existing_content=best_match.content,
+                            similarity_score=best_sim,
+                            source=f"auto-{best_method}",
+                            session_ids=cluster_sessions,
+                            reason=decision_reason,
+                        )
+                    continue
+
+                # b3_decision == "keep_both" (or "contest" with no db to queue against):
+                # neither contains the other and nothing was auto-resolved. Deliberately no
                 # `continue` here — falls through to the ordinary create path below, exactly as
                 # if no similarity match had been found at all. Zero new node-creation logic.
 
-            confidence = raw_node.get("confidence", 0.5)
-            if not isinstance(confidence, (int, float)):
-                confidence = 0.5
             new_node = KnowledgeNode.create(
                 content=content,
                 category=category,
@@ -1549,6 +1823,7 @@ def _apply_consolidation_result(
                 confidence=min(1.0, max(0.0, confidence)),
                 tags=tags,
                 source_turns=source_turns,
+                source_unit_id=candidate_source_unit_id,
             )
             # Use LLM-extracted temporal bounds if provided, else default.
             # Validate dates — LLMs can hallucinate non-ISO formats.
@@ -1941,14 +2216,24 @@ def _run_extract_path(
     )
 
     # B3: feed the SAME reconcile the monolithic path uses.
+    # conflict_judge (Fix B): only the extract path wires this -- the legacy and collection
+    # passes never pass it, so the escalation is always a no-op for them by construction,
+    # not by a separate check (spec section 2's explicit scope boundary). UNGATED (contested-
+    # memory-lifecycle reframe, spec section 10.5, Layne-ratified 2026-07-21): the judge is a
+    # FLAGGER, not a resolver -- a detected conflict routes to contest+queue, never an
+    # auto-applied winner, so the judge's own accuracy no longer needs gating (a false
+    # CONFLICT call costs a confidence dip and a queue entry, never a lost fact). The prior
+    # _gate_destructive_conflict_judgment wrapper is gone; this wires the raw judge directly.
     cluster_result = _apply_consolidation_result(
         {"nodes": action_items}, existing_nodes, cluster, kn_path,
         decision_log_path=decision_log_path, db=db, content_profile=content_profile,
+        conflict_judge=_local_conflict_judge(infer),
     )
     logger.info(
-        "extract-path cluster %s: reconcile -> %d created, %d corroborated, %d contradicted",
+        "extract-path cluster %s: reconcile -> %d created, %d corroborated, "
+        "%d contradicted, %d contested",
         cluster_id, cluster_result.nodes_created, cluster_result.nodes_corroborated,
-        cluster_result.nodes_contradicted,
+        cluster_result.nodes_contradicted, cluster_result.nodes_contested,
     )
     return cluster_result
 
@@ -3287,6 +3572,7 @@ def consolidate(
             result.nodes_created += cluster_result.nodes_created
             result.nodes_corroborated += cluster_result.nodes_corroborated
             result.nodes_contradicted += cluster_result.nodes_contradicted
+            result.nodes_contested += cluster_result.nodes_contested
             return True
 
         cached_entry = response_cache.get(cache_key)
@@ -3354,6 +3640,7 @@ def consolidate(
         result.nodes_created += cluster_result.nodes_created
         result.nodes_corroborated += cluster_result.nodes_corroborated
         result.nodes_contradicted += cluster_result.nodes_contradicted
+        result.nodes_contested += cluster_result.nodes_contested
 
         # Cache successful response + prompt for future runs / adapter training
         _save_cached_response(cache_path, cache_key, response, prompt)
@@ -3372,9 +3659,9 @@ def consolidate(
                 # Reload existing nodes for subsequent clusters
                 existing_nodes = read_nodes(kn_path, status="active")
                 logger.info(
-                    "Cluster %d/%d done: %d nodes created, %d corroborated",
+                    "Cluster %d/%d done: %d nodes created, %d corroborated, %d contested",
                     ci + 1, n_clusters,
-                    result.nodes_created, result.nodes_corroborated,
+                    result.nodes_created, result.nodes_corroborated, result.nodes_contested,
                 )
                 continue
 
@@ -3402,7 +3689,10 @@ def consolidate(
         # Sync knowledge.jsonl → SQLite when nodes were modified OR when
         # the knowledge file has nodes that may not be in SQLite yet
         # (e.g. from a prior run that wrote to JSONL but crashed before sync).
-        if result.nodes_created or result.nodes_corroborated or result.nodes_contradicted:
+        if (
+            result.nodes_created or result.nodes_corroborated
+            or result.nodes_contradicted or result.nodes_contested
+        ):
             _set_last_consolidation_ts(project_dir)
 
             # Post-consolidation dedup — merges near-duplicates that the

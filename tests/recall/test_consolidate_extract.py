@@ -451,6 +451,70 @@ def test_run_extract_path_creates_a_node_when_action_is_create(tmp_path):
     assert persisted[0].source_sessions == ["s1"]  # cluster provenance still flows through
 
 
+def test_run_extract_path_wires_the_real_production_conflict_judge(tmp_path):
+    """Sentinel r2 coverage gap (PR#903 issuecomment-5037168639): removing
+    ``conflict_judge=_local_conflict_judge(infer)`` from this exact call site
+    (consolidate.py:2229) left all 578 existing tests green — every OTHER fixture injects a
+    ``conflict_judge`` directly into ``_apply_consolidation_result``/
+    ``_b3_temporal_conflict_escalation``, never exercising ``_run_extract_path``'s OWN wiring.
+
+    Captures the actual kwarg ``_run_extract_path`` passes and BEHAVIORALLY verifies it — not
+    just "is not None" — by calling the captured judge and confirming it round-trips through
+    the real ``client.chat`` seam with the judge's distinctive CONFLICT/COMPATIBLE prompt
+    shape, exactly as ``_local_conflict_judge(infer)`` would. Removing the kwarg entirely, or
+    wiring a wrong/placeholder judge, must make this fail."""
+    from unittest.mock import patch
+    from synapt.recall import consolidate as consolidate_mod
+
+    fact = "recall#875 wired extract_batch into consolidation"
+    cluster = [_entry(session_id="s1", done=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    kn_path = tmp_path / "knowledge.jsonl"
+
+    class _JudgeRoutingFakeClient:
+        """Routes THREE ways on distinctive prompt markers: B1 extract, B2 action-decision
+        (matches _RoutingFakeClient's own marker), and the conflict-judge prompt ("Statement
+        A:" — _local_conflict_judge's own distinctive text, never emitted by B1/B2)."""
+
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, *, model, messages, **kwargs):
+            self.calls.append({"model": model, "messages": messages})
+            content = messages[0].content if messages else ""
+            if "Statement A:" in content:
+                return "CONFLICT"
+            if "New Facts (indexed)" in content:
+                return '{"actions": [{"index": 0, "action": "create"}]}'
+            return _ok_envelope(fact)
+
+    client = _JudgeRoutingFakeClient()
+
+    captured = {}
+    real_apply = consolidate_mod._apply_consolidation_result
+
+    def _spy_apply(*args, **kwargs):
+        captured["conflict_judge"] = kwargs.get("conflict_judge")
+        return real_apply(*args, **kwargs)
+
+    with patch.object(consolidate_mod, "_apply_consolidation_result", side_effect=_spy_apply):
+        result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+
+    assert result is not None
+    judge = captured.get("conflict_judge")
+    assert judge is not None, "conflict_judge was not wired at this call site at all"
+
+    calls_before = len(client.calls)
+    verdict = judge("candidate content", "existing content")
+    assert verdict is True, (
+        "the captured conflict_judge did not classify a scripted CONFLICT response as "
+        f"True -- got {verdict!r} (wrong judge wired, or the wiring is severed)"
+    )
+    # Confirms the judge genuinely round-tripped through client.chat (the real infer seam),
+    # not a stub that happens to return True for unrelated reasons.
+    assert len(client.calls) == calls_before + 1
+
+
 def test_run_extract_path_corroborates_against_existing_node(tmp_path):
     kn_path = tmp_path / "knowledge.jsonl"
     existing_node = KnowledgeNode.create(

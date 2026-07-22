@@ -1532,6 +1532,8 @@ def cmd_consolidate(args: argparse.Namespace) -> None:
         parts.append(f"{result.nodes_corroborated} corroborated")
     if result.nodes_contradicted:
         parts.append(f"{result.nodes_contradicted} contradicted")
+    if result.nodes_contested:
+        parts.append(f"{result.nodes_contested} contested")
     if result.nodes_deduped:
         parts.append(f"{result.nodes_deduped} deduped")
 

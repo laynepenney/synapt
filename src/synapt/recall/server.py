@@ -816,6 +816,8 @@ def recall_consolidate(
             parts.append(f"{result.nodes_corroborated} corroborated")
         if result.nodes_contradicted:
             parts.append(f"{result.nodes_contradicted} contradicted")
+        if result.nodes_contested:
+            parts.append(f"{result.nodes_contested} contested")
         if result.nodes_deduped:
             parts.append(f"{result.nodes_deduped} deduped")
         if not parts:
@@ -854,7 +856,13 @@ def recall_contradict(
                 "forget" (archive a knowledge node — removes from search),
                 "correct" (supersede a knowledge node with updated content).
         contradiction_id: ID of the contradiction to resolve (required for "resolve").
-        resolution: "confirmed" (supersede old node) or "dismissed" (keep old node).
+        resolution: "confirmed" (supersede old node) or "dismissed" (keep old node) for
+                    ordinary contradictions. For a CONTESTED pair (Fix B, config/design/
+                    recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section 10.4 --
+                    both nodes already exist, both marked "contested"), use "candidate_wins"
+                    (candidate promoted, existing superseded), "existing_wins" (existing
+                    restored, candidate retired), or "false_positive" (both restored to
+                    active, nothing superseded -- the judge's conflict flag was wrong).
         claim: Free-text description of conflicting information (for "flag").
                The system will search for matching knowledge nodes automatically.
         new_content: The correct/updated information (for "flag"). If omitted,
@@ -905,19 +913,68 @@ def recall_contradict(
         if action == "resolve":
             if contradiction_id is None:
                 return "Error: contradiction_id is required for 'resolve' action."
+
+            # Fetch BEFORE resolving (Fix B, config/design/recall-b3-temporal-conflict-
+            # escalation-spec-2026-07-21.md section 10.4): contest-row detection (new_node_id
+            # set) determines how *resolution* maps onto the underlying confirmed/dismissed
+            # vocabulary, and that mapping must be known before resolve_contradiction runs.
+            # Filtering by status='pending' here is correct (unlike the single post-resolve
+            # fetch this replaces, which deliberately read without a status filter because it
+            # ran AFTER the row had already flipped away from 'pending').
+            pending_row = index._db._conn.execute(
+                "SELECT * FROM pending_contradictions WHERE id = ? AND status = 'pending'",
+                (contradiction_id,),
+            ).fetchone()
+            if pending_row is None:
+                return f"Contradiction #{contradiction_id} not found or already resolved."
+            is_contest = (
+                "new_node_id" in pending_row.keys() and bool(pending_row["new_node_id"])
+            )
+
+            if is_contest:
+                if resolution not in ("candidate_wins", "existing_wins", "false_positive"):
+                    return (
+                        f"Error: contradiction #{contradiction_id} is a contested pair -- "
+                        "resolution must be 'candidate_wins', 'existing_wins', or "
+                        f"'false_positive' (got {resolution!r})."
+                    )
+                # candidate_wins/existing_wins both "decide" (confirmed); false_positive
+                # decides nothing (dismissed) -- the shared pending_contradictions.status
+                # column and every other caller of resolve_contradiction/
+                # list_pending_contradictions/pending_contradiction_count stay untouched.
+                underlying_status = (
+                    "dismissed" if resolution == "false_positive" else "confirmed"
+                )
+                ok = index._db.resolve_contradiction(contradiction_id, underlying_status)
+                if not ok:
+                    return f"Contradiction #{contradiction_id} not found or already resolved."
+                _apply_contest_resolution(
+                    index._db,
+                    old_node_id=pending_row["old_node_id"],
+                    new_node_id=pending_row["new_node_id"],
+                    resolution=resolution,
+                )
+                if resolution == "candidate_wins":
+                    return (
+                        f"Contradiction #{contradiction_id} resolved: candidate wins, "
+                        "existing node superseded."
+                    )
+                if resolution == "existing_wins":
+                    return (
+                        f"Contradiction #{contradiction_id} resolved: existing node wins, "
+                        "candidate retired."
+                    )
+                return (
+                    f"Contradiction #{contradiction_id} resolved: false positive, both "
+                    "nodes restored to active."
+                )
+
             ok = index._db.resolve_contradiction(contradiction_id, resolution)
             if not ok:
                 return f"Contradiction #{contradiction_id} not found or already resolved."
 
             if resolution == "confirmed":
-                # Read the now-resolved row (status='confirmed', not 'pending')
-                # to extract fields for supersession. This intentionally reads
-                # by id regardless of status — do not add a status filter here.
-                pending_row = index._db._conn.execute(
-                    "SELECT * FROM pending_contradictions WHERE id = ?",
-                    (contradiction_id,),
-                ).fetchone()
-                if pending_row and pending_row["old_node_id"]:
+                if pending_row["old_node_id"]:
                     _apply_supersession(
                         index._db,
                         old_node_id=pending_row["old_node_id"],
@@ -931,11 +988,10 @@ def recall_contradict(
                         valid_from=pending_row["valid_from"],
                         valid_until=pending_row["valid_until"],
                     )
-                elif pending_row and not pending_row["old_node_id"]:
-                    # Free-text claim confirmed — create a new knowledge node
-                    _create_knowledge_from_claim(index._db, pending_row)
-                    return f"Contradiction #{contradiction_id} confirmed — new knowledge node created from claim."
-                return f"Contradiction #{contradiction_id} confirmed — old node superseded."
+                    return f"Contradiction #{contradiction_id} confirmed — old node superseded."
+                # Free-text claim confirmed — create a new knowledge node
+                _create_knowledge_from_claim(index._db, pending_row)
+                return f"Contradiction #{contradiction_id} confirmed — new knowledge node created from claim."
             return f"Contradiction #{contradiction_id} dismissed — old node retained."
 
         if action == "forget":
@@ -1161,6 +1217,101 @@ def _apply_supersession(
         "lineage_id": lineage_id,
     }
     db.upsert_knowledge_node(new_node)
+
+
+def _apply_contest_resolution(
+    db,
+    old_node_id: str,
+    new_node_id: str,
+    resolution: str,
+) -> None:
+    """Execute a resolved Fix B contest: promote/restore/retire the two ALREADY-MATERIALIZED
+    nodes from a contested pair (config/design/recall-b3-temporal-conflict-escalation-spec-
+    2026-07-21.md section 10.4).
+
+    Deliberately separate from ``_apply_supersession`` — that function always CREATES a fresh
+    node from queued text; a contest row already has both nodes persisted (the candidate was
+    materialized at contest time, section 10.5), so this function only PROMOTES, RESTORES, or
+    RETIRES existing rows. Entangling the two risked pulling this new mutation shape into
+    ``_apply_supersession``'s own hardened, already-subtle bound-carrying logic (its docstring
+    documents a real non-atomic-upsert landmine) that this shape doesn't need at all.
+
+    *resolution* is one of "candidate_wins" / "existing_wins" / "false_positive" — the 3-way
+    vocabulary contest resolution needs that the underlying confirmed/dismissed
+    ``pending_contradictions.status`` column does not carry (section 10.4's deliberate
+    layering: the caller maps this onto confirmed/dismissed for the shared column, and calls
+    this function separately for the node-level mutation).
+
+    Confidence is RECOMPUTED via ``compute_confidence`` on every node returning to active
+    status, not preserved from its pre-contest value — simpler, avoids two more schema
+    columns, matches how confidence is computed everywhere else a node returns to active
+    (section 10.4's deliberate simplification, not an oversight).
+
+    Silently no-ops if either node is missing, matching ``_apply_supersession``'s own
+    "confirm a contradiction whose node was deleted" tolerance.
+
+    DUAL-STORE (Sentinel r2, PR#903 issuecomment-5037168639 -- blocking): persists to BOTH
+    SQLite (``db.upsert_knowledge_node``, immediate query-path correctness) AND
+    ``knowledge.jsonl`` (``update_node``, the consolidation source-of-truth). The first
+    version of this function wrote SQLite only, matching ``_apply_supersession``'s own
+    SQLite-only shape -- but ``_apply_supersession`` isn't consolidation's own write path
+    the way contest resolution effectively is: ``_sync_knowledge_to_db`` treats
+    ``knowledge.jsonl`` as authoritative and does an unconditional ``INSERT OR REPLACE``
+    from it into SQLite for every node present. Writing SQLite alone meant the very next
+    sync silently reverted every valid resolution back to both-contested — deterministic,
+    not crash-dependent (Opus's r1 under-rated this as a rare crash-mid-sequence risk;
+    Sentinel's r2 found it fires on any ordinary sync). The update dicts below are computed
+    once per branch and applied identically to both stores so the two writes can't drift
+    apart from each other.
+    """
+    from synapt.recall.consolidate import compute_confidence
+    from synapt.recall.knowledge import update_node, _knowledge_path
+
+    candidate = db.get_knowledge_node(new_node_id)
+    existing = db.get_knowledge_node(old_node_id)
+    if candidate is None or existing is None:
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    if resolution == "candidate_wins":
+        candidate_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(candidate.get("source_sessions", []))),
+            "updated_at": now,
+        }
+        existing_updates = {
+            "status": "superseded", "superseded_by": new_node_id, "updated_at": now,
+        }
+    elif resolution == "existing_wins":
+        existing_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(existing.get("source_sessions", []))),
+            "updated_at": now,
+        }
+        candidate_updates = {"status": "stale", "updated_at": now}
+    elif resolution == "false_positive":
+        candidate_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(candidate.get("source_sessions", []))),
+            "updated_at": now,
+        }
+        existing_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(existing.get("source_sessions", []))),
+            "updated_at": now,
+        }
+    else:
+        return  # unknown resolution -- no-op, caller already validated before reaching here
+
+    candidate.update(candidate_updates)
+    existing.update(existing_updates)
+    db.upsert_knowledge_node(candidate)
+    db.upsert_knowledge_node(existing)
+
+    kn_path = _knowledge_path()
+    update_node(new_node_id, candidate_updates, kn_path)
+    update_node(old_node_id, existing_updates, kn_path)
 
 
 def format_contradictions_for_session_start() -> str:

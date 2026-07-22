@@ -61,6 +61,47 @@ class TestKnowledgeNode(unittest.TestCase):
         self.assertEqual(restored.content, node.content)
         self.assertEqual(restored.tags, node.tags)
 
+    # --- source_unit_id (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md
+    # section 3): a small, additive, backward-compatible field carrying the node's TRUE source
+    # chronology -- distinct from created_at/updated_at, which are consolidation-run-time, not
+    # event-time. Exists so Fix B's chronology escalation has a real value to compare on the
+    # already-persisted side, not a proxy. ---
+
+    def test_create_defaults_source_unit_id_to_none(self):
+        """The overwhelming majority of callers (legacy path, collection pass) never pass
+        this -- must default cleanly, never require it."""
+        node = KnowledgeNode.create(content="test", category="workflow")
+        self.assertIsNone(node.source_unit_id)
+
+    def test_create_accepts_explicit_source_unit_id(self):
+        node = KnowledgeNode.create(
+            content="test", category="workflow",
+            source_unit_id="986d09c3e8bb2ae5:2:done:6",
+        )
+        self.assertEqual(node.source_unit_id, "986d09c3e8bb2ae5:2:done:6")
+
+    def test_roundtrip_dict_preserves_source_unit_id(self):
+        node = KnowledgeNode.create(
+            content="test", category="workflow",
+            source_unit_id="986d09c3e8bb2ae5:2:done:6",
+        )
+        restored = KnowledgeNode.from_dict(node.to_dict())
+        self.assertEqual(restored.source_unit_id, "986d09c3e8bb2ae5:2:done:6")
+
+    def test_from_dict_on_a_pre_fix_row_without_the_key_defaults_to_none(self):
+        """Backward compatibility, verified not assumed: a real pre-fix persisted row (a
+        plain dict with no source_unit_id key at all, exactly what every JSONL row written
+        before this change looks like) must load cleanly with source_unit_id=None, not
+        KeyError or a silent wrong default."""
+        pre_fix_row = {
+            "id": "abc123def456",
+            "content": "a fact persisted before this field existed",
+            "category": "workflow",
+            "confidence": 0.5,
+        }
+        restored = KnowledgeNode.from_dict(pre_fix_row)
+        self.assertIsNone(restored.source_unit_id)
+
 
 class TestKnowledgeCRUD(unittest.TestCase):
     def setUp(self):
