@@ -19,6 +19,8 @@ import uuid
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+import pytest
+
 from synapt.recall.storage import RecallDB
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 
@@ -822,6 +824,102 @@ class TestRecallContradictContestResolution:
         index.chunks = []
         index.sessions = {}
         return db, index, cid
+
+    def _make_contested_pair_with_jsonl(self, tmp_path, monkeypatch):
+        """Same shape as _make_contested_pair, but ALSO writes both nodes into
+        knowledge.jsonl at the REAL project-resolved path (not an ad-hoc DB-only fixture) --
+        required to reproduce Sentinel's dual-store durability finding (PR#903
+        issuecomment-5037168639): _apply_contest_resolution only ever wrote SQLite, so the
+        next JSONL->SQLite sync (_sync_knowledge_to_db, consolidate.py) reads knowledge.jsonl
+        as authoritative and reverts a valid resolution back to both-contested. monkeypatch.
+        chdir pins Path.cwd() so _knowledge_path()'s bare (no-arg) default resolution inside
+        _apply_contest_resolution lands on the SAME file this fixture writes."""
+        from synapt.recall.knowledge import KnowledgeNode, append_node
+        from synapt.recall.core import project_index_dir, project_data_dir
+
+        monkeypatch.chdir(tmp_path)
+        kn_path = project_data_dir(tmp_path) / "knowledge.jsonl"
+
+        existing = KnowledgeNode.create(
+            content="extract path does not share the legacy cache",
+            category="configuration", source_sessions=["s0"], node_id="existing-1",
+        )
+        existing.status = "contested"
+        existing.confidence = 0.3
+        candidate = KnowledgeNode.create(
+            content="extract path writes to a distinct cache key",
+            category="configuration", source_sessions=["s0", "s1"], node_id="candidate-1",
+        )
+        candidate.status = "contested"
+        candidate.confidence = 0.3
+        append_node(existing, kn_path)
+        append_node(candidate, kn_path)
+
+        db_path = project_index_dir(tmp_path) / "recall.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = RecallDB(db_path)
+        db.save_knowledge_nodes([existing.to_dict(), candidate.to_dict()])
+        cid = db.add_pending_contradiction(
+            old_node_id="existing-1",
+            new_content=candidate.content,
+            new_node_id="candidate-1",
+            category="configuration",
+            reason="Chronology: candidate (newer) conflicts with existing (older).",
+            detected_by="b3-temporal-conflict-escalation",
+        )
+        index = TranscriptIndex.__new__(TranscriptIndex)
+        index._db = db
+        index.chunks = []
+        index.sessions = {}
+        return db, index, cid, kn_path
+
+    @pytest.mark.parametrize(
+        "resolution,candidate_status,existing_status",
+        [
+            ("candidate_wins", "active", "superseded"),
+            ("existing_wins", "stale", "active"),
+            ("false_positive", "active", "active"),
+        ],
+    )
+    def test_resolution_survives_the_next_jsonl_sqlite_sync(
+        self, tmp_path, monkeypatch, resolution, candidate_status, existing_status,
+    ):
+        """Sentinel r2 BLOCKING (PR#903 issuecomment-5037168639): a valid resolution must
+        survive the next REAL sync, not just look correct in SQLite until the next
+        consolidation run silently reverts it. Reproduces the exact mechanism: knowledge.jsonl
+        is the sync's authoritative source (_sync_knowledge_to_db does an unconditional
+        INSERT OR REPLACE from JSONL into SQLite for every node present), so if resolution
+        doesn't ALSO update JSONL, the sync blasts SQLite back to both-contested."""
+        from synapt.recall.consolidate import _sync_knowledge_to_db
+        from synapt.recall.server import recall_contradict
+
+        db, index, cid, kn_path = self._make_contested_pair_with_jsonl(tmp_path, monkeypatch)
+
+        with patch("synapt.recall.server._get_index", return_value=index):
+            with patch("synapt.recall.server._invalidate_cache"):
+                recall_contradict(
+                    action="resolve", contradiction_id=cid, resolution=resolution,
+                )
+
+        # The REAL sync -- not a mock. If _apply_contest_resolution didn't persist to JSONL,
+        # this overwrites SQLite's now-correct rows back to knowledge.jsonl's stale contested
+        # state, because knowledge.jsonl still says both nodes are contested.
+        _sync_knowledge_to_db(tmp_path, kn_path)
+
+        candidate = db.get_knowledge_node("candidate-1")
+        existing = db.get_knowledge_node("existing-1")
+        assert candidate["status"] == candidate_status, (
+            f"candidate reverted to {candidate['status']!r} after sync -- resolution "
+            f"{resolution!r} did not survive"
+        )
+        assert existing["status"] == existing_status, (
+            f"existing reverted to {existing['status']!r} after sync -- resolution "
+            f"{resolution!r} did not survive"
+        )
+        # The queue entry must also stay resolved -- a revert-to-contested with an
+        # already-cleared queue row would be WORSE than the original bug (stuck contested,
+        # invisible, no way to re-resolve).
+        assert db.list_pending_contradictions() == []
 
     def test_candidate_wins_promotes_candidate_supersedes_existing(self, tmp_path):
         from synapt.recall.server import recall_contradict

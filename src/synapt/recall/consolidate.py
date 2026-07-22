@@ -981,10 +981,11 @@ def _log_dedup_decision(
     Pure logging — never disrupts consolidation.
 
     *reason* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md):
-    for ``auto-corroborate``/``auto-supersede`` entries, distinguishes WHICH mechanism
-    produced the decision — ``"containment"`` (A7's token-subsequence rule) vs
-    ``"chronology_escalation"`` (Fix B's judge + source_unit_id direction resolution) —
-    matching guard 6's own precedent of logging *why*, not just *what*.
+    for ``auto-corroborate``/``auto-supersede``/``contest`` entries, distinguishes WHICH
+    mechanism produced the decision — ``"containment"`` (A7's token-subsequence rule) vs
+    ``"chronology_contest"`` (section 10's contested-memory-lifecycle escalation: judge
+    flags CONFLICT, no direction is auto-applied) — matching guard 6's own precedent of
+    logging *why*, not just *what*.
     """
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),

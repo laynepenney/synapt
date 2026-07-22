@@ -1249,8 +1249,23 @@ def _apply_contest_resolution(
 
     Silently no-ops if either node is missing, matching ``_apply_supersession``'s own
     "confirm a contradiction whose node was deleted" tolerance.
+
+    DUAL-STORE (Sentinel r2, PR#903 issuecomment-5037168639 -- blocking): persists to BOTH
+    SQLite (``db.upsert_knowledge_node``, immediate query-path correctness) AND
+    ``knowledge.jsonl`` (``update_node``, the consolidation source-of-truth). The first
+    version of this function wrote SQLite only, matching ``_apply_supersession``'s own
+    SQLite-only shape -- but ``_apply_supersession`` isn't consolidation's own write path
+    the way contest resolution effectively is: ``_sync_knowledge_to_db`` treats
+    ``knowledge.jsonl`` as authoritative and does an unconditional ``INSERT OR REPLACE``
+    from it into SQLite for every node present. Writing SQLite alone meant the very next
+    sync silently reverted every valid resolution back to both-contested — deterministic,
+    not crash-dependent (Opus's r1 under-rated this as a rare crash-mid-sequence risk;
+    Sentinel's r2 found it fires on any ordinary sync). The update dicts below are computed
+    once per branch and applied identically to both stores so the two writes can't drift
+    apart from each other.
     """
     from synapt.recall.consolidate import compute_confidence
+    from synapt.recall.knowledge import update_node, _knowledge_path
 
     candidate = db.get_knowledge_node(new_node_id)
     existing = db.get_knowledge_node(old_node_id)
@@ -1260,30 +1275,43 @@ def _apply_contest_resolution(
     now = datetime.now(timezone.utc).isoformat()
 
     if resolution == "candidate_wins":
-        candidate["status"] = "active"
-        candidate["confidence"] = compute_confidence(len(candidate.get("source_sessions", [])))
-        candidate["updated_at"] = now
-        existing["status"] = "superseded"
-        existing["superseded_by"] = new_node_id
-        existing["updated_at"] = now
+        candidate_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(candidate.get("source_sessions", []))),
+            "updated_at": now,
+        }
+        existing_updates = {
+            "status": "superseded", "superseded_by": new_node_id, "updated_at": now,
+        }
     elif resolution == "existing_wins":
-        existing["status"] = "active"
-        existing["confidence"] = compute_confidence(len(existing.get("source_sessions", [])))
-        existing["updated_at"] = now
-        candidate["status"] = "stale"
-        candidate["updated_at"] = now
+        existing_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(existing.get("source_sessions", []))),
+            "updated_at": now,
+        }
+        candidate_updates = {"status": "stale", "updated_at": now}
     elif resolution == "false_positive":
-        candidate["status"] = "active"
-        candidate["confidence"] = compute_confidence(len(candidate.get("source_sessions", [])))
-        candidate["updated_at"] = now
-        existing["status"] = "active"
-        existing["confidence"] = compute_confidence(len(existing.get("source_sessions", [])))
-        existing["updated_at"] = now
+        candidate_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(candidate.get("source_sessions", []))),
+            "updated_at": now,
+        }
+        existing_updates = {
+            "status": "active",
+            "confidence": compute_confidence(len(existing.get("source_sessions", []))),
+            "updated_at": now,
+        }
     else:
         return  # unknown resolution -- no-op, caller already validated before reaching here
 
+    candidate.update(candidate_updates)
+    existing.update(existing_updates)
     db.upsert_knowledge_node(candidate)
     db.upsert_knowledge_node(existing)
+
+    kn_path = _knowledge_path()
+    update_node(new_node_id, candidate_updates, kn_path)
+    update_node(old_node_id, existing_updates, kn_path)
 
 
 def format_contradictions_for_session_start() -> str:

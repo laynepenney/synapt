@@ -482,6 +482,27 @@ class TestPendingContradictionsNewNodeIdMigration:
         assert "new_node_id" in cols
         db.close()
 
+    def test_no_migration_on_second_open_of_already_current_schema(self, tmp_path):
+        """Opus r1 nit #2 (belt-and-suspenders, PR#903): the widened short-circuit
+        (``has_new_node_id`` added alongside ``has_claim_text``/``has_temporal``) must make
+        a SECOND open of an already-current-schema DB a genuine no-op, not just correctly
+        migrate on the FIRST open from an old schema (the 3 tests above). Mirrors
+        TestFTSMigration's own ``test_no_migration_when_schema_matches`` pattern."""
+        db_path = tmp_path / "recall.db"
+        db = RecallDB(db_path)  # fresh DB -- current schema, new_node_id from the base DDL
+        cid = db.add_pending_contradiction(
+            old_node_id="old-1", new_content="content", new_node_id="candidate-1",
+        )
+        db.close()
+
+        # Re-open -- should be a clean no-op migration-wise, data survives.
+        db2 = RecallDB(db_path)
+        pending = db2.list_pending_contradictions()
+        assert len(pending) == 1
+        assert pending[0]["id"] == cid
+        assert pending[0]["new_node_id"] == "candidate-1"
+        db2.close()
+
     def test_migration_preserves_pre_existing_row_with_null_new_node_id(self, tmp_path):
         """A row inserted BEFORE the migration survives it, with new_node_id defaulting to
         NULL -- backward-compat, not just column-presence."""
@@ -556,6 +577,69 @@ class TestPendingContradictionsNewNodeIdMigration:
         pending = db.list_pending_contradictions()
         row = next(p for p in pending if p["id"] == cid)
         assert row["new_node_id"] == "candidate-node-id-1"
+        db.close()
+
+    def test_migration_recreate_path_adds_new_node_id_and_relaxes_constraint(self, tmp_path):
+        """The ``needs_recreate`` branch (``old_node_id TEXT NOT NULL`` — the truly ancient
+        schema, predating claim_text/valid_from/valid_until/new_node_id entirely) is a
+        SEPARATE code path from the plain-ALTER-TABLE branch the 3 tests above exercise (they
+        all declare ``old_node_id`` already nullable, so ``needs_recreate`` is always False
+        for them). Sentinel r2 coverage gap (PR#903 issuecomment-5037168639): removing
+        ``new_node_id TEXT`` from the ``_pc_new`` DDL (storage.py's recreate branch) left all
+        182 storage tests green, because nothing exercised this branch at all."""
+        db_path = tmp_path / "recall.db"
+        import sqlite3
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS pending_contradictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                old_node_id TEXT NOT NULL,
+                new_content TEXT NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '',
+                source_sessions TEXT NOT NULL DEFAULT '[]',
+                detected_at TEXT NOT NULL,
+                detected_by TEXT NOT NULL DEFAULT 'co-retrieval',
+                status TEXT NOT NULL DEFAULT 'pending',
+                resolved_at TEXT
+            );
+        """)
+        conn.execute(
+            "INSERT INTO pending_contradictions "
+            "(old_node_id, new_content, source_sessions, detected_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("old-1", "ancient-schema content", "[]", "2026-01-01T00:00:00Z"),
+        )
+        conn.commit()
+        conn.close()
+
+        db = RecallDB(db_path)
+
+        # Constraint relaxed -- old_node_id is nullable now, via the recreate (SQLite has no
+        # ALTER COLUMN).
+        col_info = db._conn.execute("PRAGMA table_info(pending_contradictions)").fetchall()
+        col_map = {r[1]: r for r in col_info}
+        assert col_map["old_node_id"][3] == 0  # notnull flag cleared
+
+        # new_node_id exists post-recreate -- the exact bug this test guards: baked into
+        # _pc_new's own DDL directly, not left to a later ALTER TABLE call this branch never
+        # reaches within the same _migrate_contradictions_table() invocation.
+        assert "new_node_id" in col_map
+
+        # Old row survived the recreate, content intact.
+        pending = db.list_pending_contradictions()
+        assert len(pending) == 1
+        assert pending[0]["new_content"] == "ancient-schema content"
+        assert pending[0]["new_node_id"] is None
+
+        # A real new_node_id insert round-trips post-recreate.
+        cid = db.add_pending_contradiction(
+            old_node_id="old-2", new_content="post-recreate content",
+            new_node_id="candidate-post-recreate",
+        )
+        pending = db.list_pending_contradictions()
+        row = next(p for p in pending if p["id"] == cid)
+        assert row["new_node_id"] == "candidate-post-recreate"
         db.close()
 
 
