@@ -1126,6 +1126,100 @@ class TestRecallContradictContestResolution:
         assert db.list_pending_contradictions() == []
         db.close()
 
+    def test_contest_creation_upserts_candidate_to_sqlite_portable(self, tmp_path, monkeypatch):
+        """recall#906 Sentinel r2b (0.17.0 blocker): the SOLE guard for Part 1 (contest-
+        creation upserting both nodes into SQLite at creation time) was
+        test_real_contest_then_resolve_then_sync_end_to_end -- real-MLX-only, skipped on
+        every non-Apple-Silicon CI runner. Proven mutation-silent on CI: with ONLY Part 1's
+        db.upsert_knowledge_node(contested_node.to_dict()) removed, every non-MLX test
+        (including the existing judge-stubbed contest integration test in
+        test_consolidate.py, which never asserts SQLite presence/exclusion) stayed green.
+
+        This is the portable sibling: drives the REAL _apply_consolidation_result contest
+        branch with a deterministic fake conflict_judge (the injected-seam pattern #903 r2
+        already locked -- no MLX, no real model), does NOT pre-seed the candidate into
+        SQLite, and asserts exactly what the real-model test's scenario-thinking check
+        asserts: candidate genuinely in SQLite, status contested, excluded from default
+        search, reachable via include_historical=True. Must go RED with Part 1's upsert
+        removed -- verified live before this landed, per the day's rule (reproduce, don't
+        assume)."""
+        from synapt.recall.consolidate import _apply_consolidation_result
+        from synapt.recall.core import project_data_dir, project_index_dir
+        from synapt.recall.journal import JournalEntry
+        from synapt.recall.knowledge import KnowledgeNode, append_node
+
+        stale_content = "extract path does not share the legacy response_cache"
+        stale_source = "986d09c3e8bb2ae5:0:decisions:5"
+        current_content = (
+            'writing extract-path results to response_cache under a distinct ":extract" '
+            'key suffix'
+        )
+        current_source = "986d09c3e8bb2ae5:2:done:6"
+
+        monkeypatch.chdir(tmp_path)
+        kn_path = project_data_dir(tmp_path) / "knowledge.jsonl"
+        db_path = project_index_dir(tmp_path) / "recall.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        existing = KnowledgeNode.create(
+            content=stale_content, category="configuration", source_sessions=["s0"],
+            source_unit_id=stale_source,
+        )
+        append_node(existing, kn_path)
+        db = RecallDB(db_path)
+        db.save_knowledge_nodes([existing.to_dict()])
+
+        original_fn = consolidate._inline_embedding_dedup
+
+        def _force_match(candidate, existing_nodes, threshold=0.80):
+            return (existing_nodes[0], 0.8298) if existing_nodes else (None, 0.0)
+
+        consolidate._inline_embedding_dedup = _force_match
+        try:
+            parsed = {"nodes": [{
+                "action": "create", "content": current_content, "category": "solution",
+                "source_unit_id": current_source,
+            }]}
+            cluster = [JournalEntry(session_id="s1", timestamp="2026-07-13T10:00:00Z", focus="")]
+            result = _apply_consolidation_result(
+                parsed, [existing], cluster, kn_path, db=db,
+                conflict_judge=lambda candidate_text, existing_text: True,
+            )
+        finally:
+            consolidate._inline_embedding_dedup = original_fn
+
+        assert result.nodes_contested == 1
+        pending = db.list_pending_contradictions()
+        assert len(pending) == 1
+        candidate_id = pending[0]["new_node_id"]
+
+        # Part 1's own assertion: the candidate genuinely exists in SQLite right after
+        # creation -- not deferred to some later sync.
+        candidate_row = db.get_knowledge_node(candidate_id)
+        assert candidate_row is not None, (
+            "candidate node not found in SQLite immediately after contest-creation -- "
+            "Part 1's db.upsert_knowledge_node did not run (or was removed)"
+        )
+        assert candidate_row["status"] == "contested"
+
+        # Same exclusion property the real-model test's scenario-thinking check proves --
+        # upserting to SQLite at creation must not bypass the status != 'active' gate.
+        default_ids = {
+            db._knowledge_dict_from_row(
+                db._conn.execute("SELECT * FROM knowledge WHERE rowid = ?", (r,)).fetchone()
+            )["id"]
+            for r, _ in db.knowledge_fts_search("response_cache")
+        }
+        assert candidate_id not in default_ids
+        historical_ids = {
+            db._knowledge_dict_from_row(
+                db._conn.execute("SELECT * FROM knowledge WHERE rowid = ?", (r,)).fetchone()
+            )["id"]
+            for r, _ in db.knowledge_fts_search("response_cache", include_historical=True)
+        }
+        assert candidate_id in historical_ids
+        db.close()
+
     def test_candidate_wins_promotes_candidate_supersedes_existing(self, tmp_path):
         from synapt.recall.server import recall_contradict
         db, index, cid = self._make_contested_pair(tmp_path)
