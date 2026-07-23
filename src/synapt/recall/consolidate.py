@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import threading
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -355,6 +356,11 @@ class ConsolidationResult:
     nodes_created: int = 0
     nodes_corroborated: int = 0
     nodes_contradicted: int = 0
+    # Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
+    # escalation-spec-2026-07-21.md section 10.5): distinct from nodes_contradicted (the
+    # general contradict-action-item path) so the 0.17.0 dogfood fruit is countable cleanly --
+    # one increment per contested PAIR (two nodes touched, one queue entry), not per node.
+    nodes_contested: int = 0
     nodes_deduped: int = 0
     entries_processed: int = 0
     clusters_found: int = 0
@@ -464,6 +470,89 @@ def _strip_section_prefix(content: str) -> str:
     return content
 
 
+def _normalize_create_content(raw_content: str) -> str:
+    """The exact normalization ``_apply_consolidation_result``'s create branch runs before
+    any filter sees the content: truncate to 300 chars, scrub, strip markdown formatting,
+    strip section-header prefixes. Factored out so B4 (``_evaluate_create_content`` below)
+    can run the IDENTICAL sequence on its own composed candidates — a raw string that isn't
+    whitespace can still normalize down to empty or low-specificity (e.g. a pure markdown/
+    section-prefix wrapper), which only checking the raw string misses (Sentinel, recall#884
+    re-review, fruit 2: a 152-char "Operational Deployment Readiness: ..." composition strips
+    to a 118-char low-specificity remainder at real B3)."""
+    content = scrub_text(_tw(str(raw_content), 300))
+    content = strip_markdown_formatting(content)
+    content = _strip_section_prefix(content)
+    return content
+
+
+def _create_content_passes_filters(
+    content: str, content_profile=None, *, is_create: bool = True,
+) -> bool:
+    """The rejection filters ``_apply_consolidation_result``'s create branch runs, extracted
+    into the SAME function both B3's create branch and B4 call — parity by construction,
+    immune to drift (Sentinel, recall#884 re-review: B4's own hard-coded
+    ``threshold=120``/``content_type=None`` diverged from what B3 actually evaluates once
+    ``content_profile`` flows in — which it already does at B3, via ``_run_extract_path``,
+    just not at B4).
+
+    ``is_create`` matches the original inline code's own ``action == "create"`` gating: the
+    generic/specificity/garbled checks only ever applied to create-action nodes in B3, but
+    the few-shot contamination check ("[PersonA]"/"[PersonB]") is UNCONDITIONAL there — it
+    also protects corroborate/contradict content. B4 only ever evaluates create candidates,
+    so it always passes ``is_create=True`` (the default); B3 passes the real
+    ``action == "create"`` so corroborate/contradict keep their exact prior behavior
+    (contamination-checked, generic/specificity/garbled-exempt).
+
+    Assumes *content* is ALREADY normalized (``_normalize_create_content``) and non-empty —
+    callers run that + the empty check themselves (B3 already does, unconditionally, for
+    every action, not just create; see ``_evaluate_create_content`` for B4's full pipeline).
+    """
+    if is_create:
+        _ap = None
+        if content_profile is not None:
+            from synapt.recall.content_profile import adaptive_params
+            _ap = adaptive_params(content_profile)
+
+        if _ap is None or _ap.generic_filter_enabled:
+            if _is_generic_node(content):
+                logger.info("Rejected generic node (pattern): %s", content[:80])
+                return False
+        spec_threshold = _ap.specificity_threshold if _ap else 120
+        _ct = content_profile.content_type if content_profile is not None else None
+        if _lacks_specificity(content, threshold=spec_threshold, content_type=_ct):
+            logger.info("Rejected generic node (low specificity): %s", content[:80])
+            return False
+
+    if "[PersonA]" in content or "[PersonB]" in content:
+        logger.info("Rejected example-contaminated node: %s", content[:80])
+        return False
+
+    if is_create and _is_garbled_content(content):
+        logger.info("Rejected garbled node: %s", content[:80])
+        return False
+    return True
+
+
+def _evaluate_create_content(raw_content: str, content_profile=None) -> str | None:
+    """The single source of truth for whether ``_apply_consolidation_result``'s create
+    branch will accept *raw_content*, and what NORMALIZED string it will persist if so.
+    Normalizes (``_normalize_create_content``), rejects if empty, then runs the same 4
+    filters B3 runs (``_create_content_passes_filters``). Returns the normalized content on
+    acceptance, ``None`` on rejection.
+
+    This is B4's own entry point (it has no already-normalized ``content`` variable lying
+    around the way B3's loop body does) — B4 uses ONLY the verdict (whether this returns
+    ``None``), never the normalized string itself, so B3 remains the single writer/
+    normalizer of persisted content at apply time.
+    """
+    content = _normalize_create_content(raw_content)
+    if not content:
+        return None
+    if not _create_content_passes_filters(content, content_profile):
+        return None
+    return content
+
+
 # Default GOOD examples used when no existing knowledge nodes are available.
 # These are replaced dynamically by the project's own nodes when they exist.
 # IMPORTANT: These must be clearly generic/hypothetical so small models don't
@@ -537,6 +626,16 @@ _inline_emb_loaded = False
 
 _INLINE_COSINE_THRESHOLD = 0.80
 
+# Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
+# escalation-spec-2026-07-21.md section 10.5/10.10 item 5): confidence ceiling applied to both
+# nodes in a contested pair. Belt-and-suspenders, not the primary mechanism -- the primary
+# exclusion is the existing status != 'active' FTS gate (storage.py's knowledge_fts_search),
+# which hides contested nodes from default search entirely. This ceiling only matters when a
+# contested node is explicitly surfaced via include_historical=True: below the existing 0.4
+# no-boost gate (core.py's _search_knowledge), so a contested node never gets a ranking boost
+# regardless of its original confidence. Named constant so the dogfood run can tune it.
+_CONTESTED_CONFIDENCE_CEILING = 0.3
+
 # Content-type-aware dedup thresholds.
 # Personal content gets more permissive thresholds (preserve nuanced facts).
 # Code content gets more aggressive thresholds (filter generic tool output).
@@ -554,6 +653,197 @@ def _get_dedup_thresholds(content_profile=None) -> tuple[float, float]:
         return _DEDUP_THRESHOLDS["mixed"]
     ct = getattr(content_profile, "content_type", "mixed")
     return _DEDUP_THRESHOLDS.get(ct, _DEDUP_THRESHOLDS["mixed"])
+
+
+# A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md, Opus's
+# 2026-07-17 ruling on the PR #892 1c finding): containment for the create-branch dedup
+# decision is a contiguous TOKEN-subsequence match, not a raw character substring match.
+# Punctuation is stripped ONLY at token boundaries (leading/trailing); punctuation INSIDE a
+# token is preserved, so "v1.3" and "v1.35" stay distinct atomic tokens (never collapse into
+# each other via a shared numeric prefix) while "hold;" and "hold," reduce to the same token
+# "hold" (a clause-boundary separator carries no content of its own). "?" is deliberately
+# EXCLUDED from the strip set: a trailing question mark changes the speech act (an assertion
+# and a question about the same words are not the same claim), so "?" is preserved as part of
+# its token rather than stripped -- see test_a7_question_form_never_merges_with_assertion.
+#
+# "!" IS included (Opus's ruling on Sentinel's reviewer-2 record/code mismatch, 2026-07-17):
+# unlike "?", an exclamation mark does not change what KIND of utterance a sentence is (still
+# an assertion, not a question) -- it marks emphasis/register on an otherwise identical claim,
+# boundary noise the same way ";" is. "the deploy failed" and "the deploy failed!" are the
+# same claim at different volume -- see test_a7_exclamation_is_boundary_noise_not_a_new_claim.
+_TOKEN_BOUNDARY_STRIP = ".,;:!"
+
+
+def _tokenize_for_containment(text: str) -> list[str]:
+    """Lowercase + whitespace-split, then strip only `_TOKEN_BOUNDARY_STRIP` characters from
+    each token's own leading/trailing edge. Intra-token characters (decimals, hyphens,
+    underscores, slashes, question marks) are never touched, so a real prefix like "--verbose"
+    or "-x" is preserved whole -- `_TOKEN_BOUNDARY_STRIP` deliberately excludes "-" for exactly
+    this reason (Sentinel's reviewer-2 caution, 2026-07-17: never strip a meaningful CLI-flag
+    prefix while fixing standalone separators).
+    A punctuation-only "word" strips to an empty string via the normal boundary strip (a spaced
+    ellipsis: "landed . . . eventually" -> the isolated "." tokens vanish) and is dropped rather
+    than kept as a positional placeholder that would pollute a contiguous-subsequence match with
+    a stray gap the other text has no counterpart for. A STANDALONE dash/em-dash token ("a - b")
+    is caught separately: it never touches `_TOKEN_BOUNDARY_STRIP` (would strip "--verbose"),
+    so a token that strips to something made ENTIRELY of "-" characters is treated as empty too
+    -- see test_a7_standalone_dash_separator_is_not_content."""
+    tokens: list[str] = []
+    for raw in text.lower().split():
+        tok = raw.strip(_TOKEN_BOUNDARY_STRIP)
+        if not tok or set(tok) <= {"-"}:
+            continue
+        tokens.append(tok)
+    return tokens
+
+
+def _token_sequence_contains(shorter: list[str], longer: list[str]) -> bool:
+    """True if `shorter` appears as a CONTIGUOUS run inside `longer`, token-for-token (not a
+    character substring). An empty `shorter` is trivially contained, mirroring `"" in s`."""
+    if not shorter:
+        return True
+    n = len(shorter)
+    return any(longer[i:i + n] == shorter for i in range(len(longer) - n + 1))
+
+
+def _b3_containment_decision(candidate_content: str, existing_content: str) -> str:
+    """The create-branch auto-corroborate decision rule, replacing the old unconditional
+    threshold-crossing convert-to-corroborate. Returns "keep_existing" (candidate's claim is
+    already fully covered by existing -- corroborate, never touching content), "supersede"
+    (existing's claim is fully covered by candidate, which says strictly more -- mark existing
+    superseded, persist the fuller content as a new node), or "keep_both" (neither contains the
+    other -- skip the auto-corroborate branch entirely, fall through to the ordinary create
+    path unchanged)."""
+    cand_tokens = _tokenize_for_containment(candidate_content)
+    exist_tokens = _tokenize_for_containment(existing_content)
+    if _token_sequence_contains(cand_tokens, exist_tokens):
+        return "keep_existing"
+    if _token_sequence_contains(exist_tokens, cand_tokens):
+        return "supersede"
+    return "keep_both"
+
+
+def _representative_source_unit_id(raw_node: dict) -> "str | None":
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section
+    3): reads a B4 action-item dict's chronology signal. A singleton pass-through carries
+    ``source_unit_id`` (singular, threaded end-to-end from ``_decide_actions``). A composed
+    group carries ``source_unit_ids`` (plural, one per member — see the ``"source_unit_ids":
+    [m.get("source_unit_id") for m in members]`` shape at compose time). Returns the LATEST
+    member's value for a composed group (Opus's r1 decision, spec section 9.2): a composed
+    node represents the current synthesized understanding, so biasing its effective
+    chronology toward its most recent contributing fact makes it HARDER to supersede later —
+    fewer false-supersedes, the failure mode most worth avoiding under constraint 2's
+    asymmetric conservatism. ``None`` for any shape without a usable value (legacy/collection
+    paths never set either key) — never fabricated, never a proxy."""
+    singular = raw_node.get("source_unit_id")
+    if singular is not None:
+        return singular
+    plural = raw_node.get("source_unit_ids")
+    if not plural:
+        return None
+    candidates = [s for s in plural if s is not None]
+    if not candidates:
+        return None
+    latest = candidates[0]
+    for candidate in candidates[1:]:
+        if _source_unit_id_order(candidate, latest) == 1:
+            latest = candidate
+    return latest
+
+
+def _b3_temporal_conflict_escalation(
+    *,
+    candidate_content: str,
+    candidate_source_unit_id: "str | None",
+    existing_content: str,
+    existing_source_unit_id: "str | None",
+    conflict_judge,
+) -> str:
+    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md,
+    section 10 -- Layne-ratified contested-memory-lifecycle reframe, 2026-07-21): only called
+    when ``_b3_containment_decision`` already returned ``"keep_both"`` — neither text contains
+    the other. Escalates to ``"contest"`` ONLY when the judge reports a genuine conflict; any
+    missing signal or judge uncertainty falls through to ``"keep_both"`` unchanged.
+    Asymmetric-conservative by construction: every early-return here is ``"keep_both"``, never
+    a guessed winner.
+
+    The judge is a FLAGGER, not a resolver (section 10.1) — ``"contest"`` is never auto-applied
+    by the caller; it always routes to the contested-memory lifecycle (mark both nodes
+    contested, queue for human/agent review via ``add_pending_contradiction``). This is why
+    the contract no longer distinguishes ``"supersede"`` from ``"keep_existing"``: chronology
+    direction is no longer used to pick an automatic winner here, only to annotate the queued
+    review with reviewer context (built by the caller via ``_source_unit_id_order``, not by
+    this function). Section 10.9/10.10 item 1: the same-entry-tie guard is DROPPED for this
+    reason — under contest, a tie needs no resolvable direction to be worth flagging; the
+    reviewer decides on content. Item 2: the missing-``source_unit_id`` guard STAYS — without
+    any chronology signal at all, a reviewer gets no useful context, and a node from a path
+    that doesn't thread the field (legacy, collection pass) is a documented, deliberate
+    known-limitation exclusion, not an oversight.
+
+    ``conflict_judge: Callable[[str, str], bool | None] | None`` — injected, not hardwired
+    (mirrors the ``infer`` seam B1/B2/B4 already use). ``None`` return from the judge means
+    genuinely uncertain and is treated identically to ``False``.
+    """
+    if conflict_judge is None:
+        return "keep_both"
+    if candidate_source_unit_id is None or existing_source_unit_id is None:
+        return "keep_both"
+    is_conflict = conflict_judge(candidate_content, existing_content)
+    if not is_conflict:  # False, or None (uncertain) -- both mean "not proven"
+        return "keep_both"
+    return "contest"
+
+
+def _local_conflict_judge(infer):
+    """Production default for ``_b3_temporal_conflict_escalation``'s ``conflict_judge``
+    parameter. Wraps the extract path's own already-injected ``infer`` seam
+    (``_make_recall_infer``) — local-first by construction, since ``infer`` IS the local
+    MLX/enrichment model this whole pipeline already runs on, never a new cloud dependency.
+    Only ever invoked from inside the caller's already-narrow high-similarity-non-containment
+    trigger band (constraint 1) — not on every ``keep_both``.
+
+    KNOWN, DOCUMENTED, LOW-STAKES GAP (config/design/recall-b3-temporal-conflict-escalation-
+    spec-2026-07-21.md section 9.4, reframed section 10.10 item 4): this exact wording — the
+    best of 4 tried, across both 4-bit and bf16 Ministral-3-3B — reliably classifies the
+    founding case (fixture a, REQUIRED) and a negation-flip (fixture d) correctly, but is NOT
+    reliable on same-entity-different-property pairs sharing strong lexical overlap without a
+    genuine logical conflict (fixture b) — it over-weights topical/lexical overlap as evidence
+    of conflict even when its own stated reasoning correctly identifies the two claims as
+    distinct properties. This is a real, reproducible model-capacity limit at this scale, not
+    a parsing or prompt-triviality issue; see the spec addendum for the full investigation.
+    Under the contested-memory-lifecycle reframe this is a review-queue-noise issue, not a
+    safety issue (tracked: recall#900) — a false CONFLICT call here costs a confidence dip and
+    a queue entry on both nodes, never a lost fact; the judge is a flagger, not a resolver.
+
+    Parsed strictly and conservatively: anything other than a response that starts with
+    exactly "CONFLICT" (case-insensitive, after stripping whitespace) returns ``None``
+    (uncertain), never ``True`` — a malformed response, an unexpected model utterance, or an
+    inference exception must never be silently treated as evidence of conflict.
+    """
+    def judge(candidate_content: str, existing_content: str) -> "bool | None":
+        prompt = (
+            "Two statements, possibly about the same general topic. Apply this exact "
+            "test: if Statement A is true, does that make Statement B FALSE (or vice "
+            "versa)? Sharing a topic is not enough -- they must actually contradict.\n\n"
+            f"Statement A: {candidate_content}\n"
+            f"Statement B: {existing_content}\n\n"
+            "If A being true would make B false (or B true would make A false): answer "
+            "CONFLICT.\n"
+            "If both statements can be true at the same time, even though they describe "
+            "different specific details of the same topic: answer COMPATIBLE.\n\n"
+            "Answer with exactly one word: CONFLICT or COMPATIBLE."
+        )
+        try:
+            response = infer({"messages": [{"role": "user", "content": prompt}]})
+        except Exception:
+            return None
+        answer = (response or "").strip().upper()
+        if answer.startswith("CONFLICT"):
+            return True
+        if answer.startswith("COMPATIBLE"):
+            return False
+        return None  # unparseable/malformed -- uncertain, not a guess
+    return judge
 
 
 def _inline_embedding_dedup(
@@ -684,10 +974,18 @@ def _log_dedup_decision(
     source: str = "",
     contradiction_note: str = "",
     negative_pairs: list[dict] | None = None,
+    reason: str = "",
 ) -> None:
     """Append one pairwise decision to the dedup decisions JSONL file.
 
     Pure logging — never disrupts consolidation.
+
+    *reason* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md):
+    for ``auto-corroborate``/``auto-supersede``/``contest`` entries, distinguishes WHICH
+    mechanism produced the decision — ``"containment"`` (A7's token-subsequence rule) vs
+    ``"chronology_contest"`` (section 10's contested-memory-lifecycle escalation: judge
+    flags CONFLICT, no direction is auto-applied) — matching guard 6's own precedent of
+    logging *why*, not just *what*.
     """
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -707,6 +1005,8 @@ def _log_dedup_decision(
         entry["contradiction_note"] = contradiction_note
     if negative_pairs:
         entry["negative_pairs"] = negative_pairs
+    if reason:
+        entry["reason"] = reason
 
     try:
         from synapt.recall._filelock import lock_exclusive
@@ -1089,11 +1389,19 @@ def _apply_consolidation_result(
     decision_log_path: Path | None = None,
     db=None,
     content_profile=None,
+    conflict_judge=None,
 ) -> ConsolidationResult:
     """Apply parsed LLM output: create, corroborate, or contradict nodes.
 
     When *db* (RecallDB) is provided, contradictions are queued as
     pending_contradictions for user review instead of auto-applied.
+
+    *conflict_judge* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-
+    2026-07-21.md): optional, defaults to None. Only the extract path
+    (``_run_extract_path``) passes this — the legacy and collection-pass callers never do,
+    so ``_b3_temporal_conflict_escalation`` is always a no-op for them (falls through to
+    ``keep_both``, byte-identical to pre-Fix-B behavior). See ``_local_conflict_judge`` for
+    the production default.
     """
     result = ConsolidationResult()
     nodes_list = parsed.get("nodes", [])
@@ -1113,11 +1421,11 @@ def _apply_consolidation_result(
             continue
 
         action = raw_node.get("action", "create")
-        content = scrub_text(_tw(str(raw_node.get("content", "")), 300))
-        # Strip markdown formatting (bold/italic) that small models inject
-        content = strip_markdown_formatting(content)
-        # Strip section header prefixes ("LGBTQ+ Support: ..." → "...")
-        content = _strip_section_prefix(content)
+        # Normalize + filter via the shared gate B4 also calls (_evaluate_create_content) —
+        # parity by construction, see that function's docstring. is_create mirrors the
+        # original per-check action=="create" gating exactly (contamination stays
+        # unconditional; generic/specificity/garbled stay create-only).
+        content = _normalize_create_content(str(raw_node.get("content", "")))
         category = scrub_text(str(raw_node.get("category", "workflow")))
         tags = raw_node.get("tags", [])
         if not isinstance(tags, list):
@@ -1130,37 +1438,16 @@ def _apply_consolidation_result(
             source_turns = []
         source_turns = [str(t) for t in source_turns if t]
 
+        # Fix B (section 3): the candidate's true source chronology, singleton or composed —
+        # None on any path that doesn't thread it (legacy, collection pass).
+        candidate_source_unit_id = _representative_source_unit_id(raw_node)
+
         if not content:
             continue
 
-        # Get adaptive params for content-aware filtering
-        _ap = None
-        if content_profile is not None:
-            from synapt.recall.content_profile import adaptive_params
-            _ap = adaptive_params(content_profile)
-
-        # Reject generic programming advice (disabled for personal content)
-        if action == "create" and (_ap is None or _ap.generic_filter_enabled):
-            if _is_generic_node(content):
-                logger.info("Rejected generic node (pattern): %s", content[:80])
-                continue
-        # Reject low-specificity (threshold + patterns adapt to content type)
-        if action == "create":
-            spec_threshold = _ap.specificity_threshold if _ap else 120
-            _ct = content_profile.content_type if content_profile is not None else None
-            if _lacks_specificity(content, threshold=spec_threshold, content_type=_ct):
-                logger.info("Rejected generic node (low specificity): %s", content[:80])
-                continue
-
-        # Reject contamination from few-shot example placeholders
-        if "[PersonA]" in content or "[PersonB]" in content:
-            logger.info("Rejected example-contaminated node: %s", content[:80])
-            continue
-
-        # Reject garbled content from 3B parsing failures — raw LLM
-        # structural metadata leaked into content.
-        if action == "create" and _is_garbled_content(content):
-            logger.info("Rejected garbled node: %s", content[:80])
+        if not _create_content_passes_filters(
+            content, content_profile, is_create=(action == "create"),
+        ):
             continue
 
         if action == "corroborate":
@@ -1281,6 +1568,12 @@ def _apply_consolidation_result(
                 continue  # Skip to next node (queued or legacy-applied)
 
         if action == "create":
+            # Moved up from just before the ordinary-create call below (Fix B contest branch,
+            # section 10.5, needs it too -- computed once, used by both).
+            confidence = raw_node.get("confidence", 0.5)
+            if not isinstance(confidence, (int, float)):
+                confidence = 0.5
+
             # Dedup: if content is very similar to an existing node,
             # auto-convert to corroborate instead of creating a duplicate.
             # Two signals: (1) keyword Jaccard, (2) embedding cosine.
@@ -1313,37 +1606,229 @@ def _apply_consolidation_result(
                     best_method = "cosine"
 
             if best_match and best_sim >= jaccard_thresh:
-                logger.info(
-                    "Auto-corroborate (%s=%.2f): %s",
-                    best_method, best_sim, content[:80],
-                )
-                new_sources = list(set(best_match.source_sessions + cluster_sessions))
-                new_confidence = compute_confidence(len(new_sources))
-                auto_updates: dict = {"source_sessions": new_sources, "confidence": new_confidence}
-                # BLOCKER 2 fix (Sentinel, 2026-07-15, third path found in self-review): this
-                # create-action candidate just got silently converted to corroborate by
-                # similarity — needs the SAME fill-missing-bound treatment as the explicit
-                # corroborate branch (_corroborate_bound_fill), or the fix doesn't reach here.
-                auto_updates.update(_corroborate_bound_fill(best_match, raw_node))
-                _apply_corroborate_update(best_match, auto_updates, knowledge_path)
-                result.nodes_corroborated += 1
-                if decision_log_path:
-                    _log_dedup_decision(
-                        decision_log_path,
-                        action="auto-corroborate",
-                        candidate_content=content,
-                        candidate_category=category,
-                        existing_id=best_match.id,
-                        existing_content=best_match.content,
-                        similarity_score=best_sim,
-                        source=f"auto-{best_method}",
-                        session_ids=cluster_sessions,
-                    )
-                continue
+                # A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md,
+                # Opus's 2026-07-17 ruling): a similarity match no longer unconditionally
+                # converts to corroborate. Content containment decides the outcome — the old
+                # unconditional path silently discarded any candidate content that wasn't an
+                # exact restatement of `best_match`, a live production bug (17/31
+                # auto-corroborates in one A6 dogfood run).
+                b3_decision = _b3_containment_decision(content, best_match.content)
+                decision_reason = "containment"
 
-            confidence = raw_node.get("confidence", 0.5)
-            if not isinstance(confidence, (int, float)):
-                confidence = 0.5
+                if b3_decision == "keep_both":
+                    # Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-
+                    # 2026-07-21.md, section 10 -- contested-memory-lifecycle reframe):
+                    # containment found neither side contains the other, but that alone
+                    # doesn't mean the two are compatible -- escalate to CONTEST (never an
+                    # auto-applied winner) when a genuine conflict is detected. No-op (stays
+                    # keep_both) whenever conflict_judge is None or either side lacks a
+                    # source_unit_id -- asymmetric-conservative by construction, see the
+                    # function's own docstring for every early-return path.
+                    escalated = _b3_temporal_conflict_escalation(
+                        candidate_content=content,
+                        candidate_source_unit_id=candidate_source_unit_id,
+                        existing_content=best_match.content,
+                        existing_source_unit_id=best_match.source_unit_id,
+                        conflict_judge=conflict_judge,
+                    )
+                    if escalated != "keep_both":
+                        b3_decision = escalated
+                        decision_reason = "chronology_contest"
+
+                if b3_decision == "keep_existing":
+                    logger.info(
+                        "Auto-corroborate (%s=%.2f, keep_existing): %s",
+                        best_method, best_sim, content[:80],
+                    )
+                    new_sources = list(set(best_match.source_sessions + cluster_sessions))
+                    new_confidence = compute_confidence(len(new_sources))
+                    auto_updates: dict = {
+                        "source_sessions": new_sources, "confidence": new_confidence,
+                    }
+                    # BLOCKER 2 fix (Sentinel, 2026-07-15, third path found in self-review): this
+                    # create-action candidate just got silently converted to corroborate by
+                    # similarity — needs the SAME fill-missing-bound treatment as the explicit
+                    # corroborate branch (_corroborate_bound_fill), or the fix doesn't reach here.
+                    auto_updates.update(_corroborate_bound_fill(best_match, raw_node))
+                    _apply_corroborate_update(best_match, auto_updates, knowledge_path)
+                    result.nodes_corroborated += 1
+                    if decision_log_path:
+                        _log_dedup_decision(
+                            decision_log_path,
+                            action="auto-corroborate",
+                            candidate_content=content,
+                            candidate_category=category,
+                            existing_id=best_match.id,
+                            existing_content=best_match.content,
+                            similarity_score=best_sim,
+                            source=f"auto-{best_method}",
+                            session_ids=cluster_sessions,
+                            reason=decision_reason,
+                        )
+                    continue
+
+                if b3_decision == "supersede":
+                    logger.info(
+                        "Auto-supersede (%s=%.2f): %s",
+                        best_method, best_sim, content[:80],
+                    )
+                    # Candidate strictly extends existing's claim (non-lossy gain) — persist the
+                    # fuller content as a NEW node and mark existing superseded. Never a bare
+                    # in-place overwrite: same persistence shape guard 6 already uses for
+                    # same-batch supersession, so the existing node's own history stays
+                    # inspectable rather than silently replaced.
+                    new_sources = list(set(best_match.source_sessions + cluster_sessions))
+                    new_tags = sorted(set(list(best_match.tags) + tags))
+                    superseding_node = KnowledgeNode.create(
+                        content=content,
+                        category=category,
+                        source_sessions=new_sources,
+                        confidence=compute_confidence(len(new_sources)),
+                        tags=new_tags,
+                        source_turns=source_turns,
+                        source_unit_id=candidate_source_unit_id,
+                    )
+                    if _env_flag("SYNAPT_DISABLE_TEMPORAL_EXTRACTION"):
+                        llm_valid_from = None
+                        llm_valid_until = None
+                    else:
+                        llm_valid_from = _validate_iso_date(raw_node.get("valid_from"))
+                        llm_valid_until = _validate_iso_date(raw_node.get("valid_until"))
+                    cluster_valid_from = _cluster_valid_from(cluster)
+                    superseding_node.valid_from = (
+                        llm_valid_from
+                        or cluster_valid_from
+                        or datetime.now(timezone.utc).isoformat()
+                    )
+                    if llm_valid_until:
+                        superseding_node.valid_until = llm_valid_until
+                    update_node(
+                        best_match.id,
+                        {"status": "superseded", "superseded_by": superseding_node.id},
+                        knowledge_path,
+                    )
+                    append_node(superseding_node, knowledge_path)
+                    existing_nodes.append(superseding_node)  # track for intra-batch dedup
+                    result.nodes_created += 1
+                    if decision_log_path:
+                        _log_dedup_decision(
+                            decision_log_path,
+                            action="auto-supersede",
+                            candidate_content=content,
+                            candidate_category=category,
+                            existing_id=best_match.id,
+                            existing_content=best_match.content,
+                            similarity_score=best_sim,
+                            source=f"auto-{best_method}",
+                            session_ids=cluster_sessions,
+                            reason=decision_reason,
+                        )
+                    continue
+
+                if b3_decision == "contest" and db is not None:
+                    # Contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
+                    # conflict-escalation-spec-2026-07-21.md section 10.5, Layne-ratified
+                    # 2026-07-21): the judge is a FLAGGER, not a resolver. Neither side is
+                    # auto-applied as a winner -- both nodes persist, both marked contested
+                    # with confidence capped, and a pending_contradiction queues the pair for
+                    # human/agent review (_apply_contest_resolution, server.py, is the
+                    # resolution path). Requires db: without a review mechanism, "contest" has
+                    # no meaningful legacy behavior (unlike the "contradict" action-item's
+                    # legacy auto-apply, contest's whole point is deferring to a judge that
+                    # is NOT the model) -- falls through to the ordinary create path below,
+                    # same as keep_both, when db is None.
+                    logger.info(
+                        "Contest (%s=%.2f): %s",
+                        best_method, best_sim, content[:80],
+                    )
+                    contested_node = KnowledgeNode.create(
+                        content=content,
+                        category=category,
+                        source_sessions=cluster_sessions,
+                        confidence=min(confidence, _CONTESTED_CONFIDENCE_CEILING),
+                        tags=tags,
+                        source_turns=source_turns,
+                        source_unit_id=candidate_source_unit_id,
+                    )
+                    contested_node.status = "contested"
+                    append_node(contested_node, knowledge_path)
+                    existing_nodes.append(contested_node)  # track for intra-batch dedup
+
+                    # recall#905 (0.17.0 blocker, Opus 2026-07-22, Part 1 -- root cause):
+                    # both nodes must ALSO be upserted into SQLite here, immediately, not
+                    # left to some later _sync_knowledge_to_db call. Without this, a fresh
+                    # contest's candidate node genuinely doesn't exist in SQLite until a sync
+                    # happens to run, and _apply_contest_resolution's db.get_knowledge_node
+                    # silently returns None the moment someone tries to resolve it before
+                    # that -- the dogfood-found false-success bug (Part 2, server.py, makes
+                    # that failure loud regardless; this closes the gap at its source so a
+                    # fresh contest is resolvable immediately, matching the real
+                    # conversation-memory flow where review can happen right after
+                    # detection).
+                    db.upsert_knowledge_node(contested_node.to_dict())
+
+                    existing_updates = {
+                        "status": "contested",
+                        "confidence": min(
+                            best_match.confidence, _CONTESTED_CONFIDENCE_CEILING
+                        ),
+                    }
+                    update_node(best_match.id, existing_updates, knowledge_path)
+                    existing_dict = best_match.to_dict()
+                    existing_dict.update(existing_updates)
+                    db.upsert_knowledge_node(existing_dict)
+
+                    # Chronology direction is reviewer CONTEXT here, never a resolution --
+                    # the escalation function itself no longer computes or uses it (section
+                    # 10.5: direction moved from the pure function to this call site).
+                    order = _source_unit_id_order(
+                        candidate_source_unit_id, best_match.source_unit_id
+                    )
+                    if order == 1:
+                        contest_reason = (
+                            "Chronology: candidate (newer) conflicts with existing (older) "
+                            "-- judge flagged CONFLICT, escalation does not auto-resolve."
+                        )
+                    elif order == -1:
+                        contest_reason = (
+                            "Chronology: candidate (older) conflicts with existing (newer) "
+                            "-- judge flagged CONFLICT, escalation does not auto-resolve."
+                        )
+                    else:
+                        contest_reason = (
+                            "Same-entry conflict, no chronology tiebreaker available -- "
+                            "judge flagged CONFLICT, escalation does not auto-resolve."
+                        )
+                    db.add_pending_contradiction(
+                        old_node_id=best_match.id,
+                        new_content=content,
+                        new_node_id=contested_node.id,
+                        category=category,
+                        reason=contest_reason,
+                        source_sessions=cluster_sessions,
+                        detected_by="b3-temporal-conflict-escalation",
+                    )
+                    result.nodes_contested += 1
+                    if decision_log_path:
+                        _log_dedup_decision(
+                            decision_log_path,
+                            action="contest",
+                            candidate_content=content,
+                            candidate_category=category,
+                            existing_id=best_match.id,
+                            existing_content=best_match.content,
+                            similarity_score=best_sim,
+                            source=f"auto-{best_method}",
+                            session_ids=cluster_sessions,
+                            reason=decision_reason,
+                        )
+                    continue
+
+                # b3_decision == "keep_both" (or "contest" with no db to queue against):
+                # neither contains the other and nothing was auto-resolved. Deliberately no
+                # `continue` here — falls through to the ordinary create path below, exactly as
+                # if no similarity match had been found at all. Zero new node-creation logic.
+
             new_node = KnowledgeNode.create(
                 content=content,
                 category=category,
@@ -1351,6 +1836,7 @@ def _apply_consolidation_result(
                 confidence=min(1.0, max(0.0, confidence)),
                 tags=tags,
                 source_turns=source_turns,
+                source_unit_id=candidate_source_unit_id,
             )
             # Use LLM-extracted temporal bounds if provided, else default.
             # Validate dates — LLMs can hallucinate non-ISO formats.
@@ -1489,7 +1975,7 @@ def _get_consolidation_client(max_tokens: int = MIN_RESPONSE_TOKENS):
     return MLXClient(MLXOptions(max_tokens=max_tokens))
 
 
-def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESPONSE_TOKENS):
+def _make_recall_infer(client, model: str):
     """Build the SYNC inference seam that extract_batch injects: a
     ``BatchInferRequest -> completion str`` callable wrapping recall's model client.
 
@@ -1498,13 +1984,21 @@ def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESP
     (zero recall coupling). extract_batch calls this SYNCHRONOUSLY (never awaited), so it
     stays a plain function.
 
-    ``max_tokens`` is read PER-REQUEST from an optional ``request["max_tokens"]`` key
-    (falling back to ``default_max_tokens`` when absent) rather than fixed once at build
-    time — one ``infer`` closure serves BOTH B1's per-unit extract_batch calls (small,
-    fixed-shape responses, the default floor is fine) AND B2's per-CLUSTER action-decision
-    call (whose response size scales with candidate count — a flat floor silently truncates
-    a dense cluster's response, see ``_estimate_action_decision_budget``). extract_batch's
-    own ``BatchInferRequest`` never sets this key, so B1's behavior is unchanged.
+    ``max_tokens`` is read PER-REQUEST from an optional ``request["max_tokens"]`` key. One
+    ``infer`` closure serves B1's per-unit extract_batch calls, B2's per-cluster
+    action-decision call, and B4's per-cluster rejoin call — B2/B4 always set their own
+    ``request["max_tokens"]`` explicitly (candidate-count-scaled), so this fallback only
+    ever fires for B1.
+
+    B1's ``BatchInferRequest`` (extract#33, synapt-extract) never sets ``max_tokens`` — it
+    is out of recall's control (extract_batch owns per-unit request construction). The
+    fallback used to be a flat ``MIN_RESPONSE_TOKENS`` (800) floor on the theory that B1's
+    per-unit responses were small and fixed-shape; the Phase C dogfood (RESULTS.md
+    "Truncation read") falsified that on 3 real unit shapes — Qwen hit 8 extract-unit
+    length-finishes against exactly those 3 prompts. Reusing ``_estimate_response_budget``
+    (already context-aware: gives most short prompts up to ``CONTEXT_BUDGET`` tokens, only
+    drops toward the 800 floor as the prompt itself grows large) closes the gap with no new
+    estimator — the same fix class B2 already applied to its own flat-floor bug.
     """
     def recall_infer(request) -> str:
         raw_messages = request.get("messages") or []
@@ -1514,7 +2008,9 @@ def _make_recall_infer(client, model: str, *, default_max_tokens: int = MIN_RESP
         ]
         if not messages:  # fall back to the flat prompt if the request carried no messages
             messages = [Message(role="user", content=request.get("prompt", ""))]
-        max_tokens = request.get("max_tokens") or default_max_tokens
+        max_tokens = request.get("max_tokens") or _estimate_response_budget(
+            request.get("prompt", "")
+        )
         return client.chat(
             model=model,
             messages=messages,
@@ -1600,8 +2096,9 @@ async def _extract_cluster_units(
     than built here so the helper is testable with a fake infer and zero model dependency,
     mirroring extract_batch's own injected-seam design.
     """
-    # Lazy import: the published synapt-extract lacks extract_batch, so importing at module
-    # scope would break every existing consolidate caller. Only the flag-on path needs it.
+    # Lazy import: synapt-extract is an optional dependency (the `extract` extra) since
+    # SYNAPT_USE_EXTRACT is off-by-default; importing at module scope would break every
+    # existing consolidate caller that never installs it. Only the flag-on path needs it.
     from synapt.extract.batch import extract_batch, BatchUnit
     from synapt.recall.identify import identify, batch_unit_id
 
@@ -1678,8 +2175,9 @@ def _run_extract_path(
     content_profile=None,
 ) -> ConsolidationResult | None:
     """The decomposed extract path (SYNAPT_USE_EXTRACT): B1 (extract) -> B2 (action-decision)
-    -> B3 (reconcile — the SAME ``_apply_consolidation_result`` the monolithic path uses).
-    Failed extract units are logged (never silent-dropped, see ``_log_extract_failure``); facts
+    -> B4 (rejoin — see ``_rejoin_create_actions``) -> B3 (reconcile — the SAME
+    ``_apply_consolidation_result`` the monolithic path uses). Failed extract units are logged
+    (never silent-dropped, see ``_log_extract_failure``); facts
     that extract successfully are handed to the focused action-decision pass (B2), then fed to
     reconcile exactly as the monolith's parsed LLM output would be.
 
@@ -1720,15 +2218,35 @@ def _run_extract_path(
     # B2: decide actions for the successfully-extracted facts against existing knowledge.
     action_items = _decide_actions(cluster, cluster_id, ok, existing_nodes, infer) if ok else []
 
+    # B4: rejoin CREATE-bound items into compound memories before reconcile executes.
+    # Shape-preserving (see _rejoin_create_actions) — B3 below needs zero changes.
+    # content_profile threaded through so B4 evaluates composed content under the SAME
+    # adaptive thresholds B3 will actually apply below (Sentinel, recall#884 re-review
+    # round 2: this call site already receives content_profile for B3; B4 was missing it).
+    action_items = _rejoin_create_actions(
+        action_items, cluster_id, infer,
+        decision_log_path=decision_log_path, content_profile=content_profile,
+    )
+
     # B3: feed the SAME reconcile the monolithic path uses.
+    # conflict_judge (Fix B): only the extract path wires this -- the legacy and collection
+    # passes never pass it, so the escalation is always a no-op for them by construction,
+    # not by a separate check (spec section 2's explicit scope boundary). UNGATED (contested-
+    # memory-lifecycle reframe, spec section 10.5, Layne-ratified 2026-07-21): the judge is a
+    # FLAGGER, not a resolver -- a detected conflict routes to contest+queue, never an
+    # auto-applied winner, so the judge's own accuracy no longer needs gating (a false
+    # CONFLICT call costs a confidence dip and a queue entry, never a lost fact). The prior
+    # _gate_destructive_conflict_judgment wrapper is gone; this wires the raw judge directly.
     cluster_result = _apply_consolidation_result(
         {"nodes": action_items}, existing_nodes, cluster, kn_path,
         decision_log_path=decision_log_path, db=db, content_profile=content_profile,
+        conflict_judge=_local_conflict_judge(infer),
     )
     logger.info(
-        "extract-path cluster %s: reconcile -> %d created, %d corroborated, %d contradicted",
+        "extract-path cluster %s: reconcile -> %d created, %d corroborated, "
+        "%d contradicted, %d contested",
         cluster_id, cluster_result.nodes_created, cluster_result.nodes_corroborated,
-        cluster_result.nodes_contradicted,
+        cluster_result.nodes_contradicted, cluster_result.nodes_contested,
     )
     return cluster_result
 
@@ -2009,11 +2527,14 @@ def _decide_actions(
     infer,
 ) -> list[dict]:
     """B2: the action-decision pass. Flattens B1's successfully-extracted facts, asks a focused
-    LLM pass (existing knowledge + new facts -> per-fact action) and returns reconcile-ready
-    dicts: EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
+    LLM pass (existing knowledge + new facts -> per-fact action) and returns B4-ready dicts:
+    EXACTLY ``_apply_consolidation_result``'s ``parsed["nodes"]`` item shape (``action``,
     ``existing_id``, ``content``, ``category``, ``tags``, ``source_turns``,
-    ``contradiction_note``, ``valid_from``, ``valid_until``). ``confidence`` is NOT included —
-    reconcile computes it itself (B1 contract-read Finding 3) with no fallback gap.
+    ``contradiction_note``, ``valid_from``, ``valid_until``), PLUS ``source_unit_id`` — a
+    pass-through B4 needs for decision-log provenance (guard 3, contract-answer
+    2026-07-15); reconcile ignores the extra key (verified, not assumed — B3 stays
+    zero-changes). ``confidence`` is NOT included — reconcile computes it itself (B1
+    contract-read Finding 3) with no fallback gap.
 
     ``valid_from``/``valid_until`` come from each fact's unit-level ``temporal_refs``, mapped
     DETERMINISTICALLY by role in ``_flatten_envelope_facts`` (module TEMPORAL — ROLE note) — this
@@ -2106,8 +2627,806 @@ def _decide_actions(
             # the action means it survives the fail-closed-to-create path unchanged.
             "valid_from": fact.get("valid_from"),
             "valid_until": fact.get("valid_until"),
+            # Pass-through provenance for B4 (config/design/recall-B4-rejoin-stage-2026-07-15.md
+            # guard 3, contract-answer 2026-07-15): reconcile ignores unknown dict keys (verified,
+            # not assumed — every field _apply_consolidation_result reads comes off .get(), never
+            # **kwargs/dataclass unpacking), so this rides through B3 unused until B4 unions member
+            # ids into the decision log. Not a KnowledgeNode field — no schema/storage change.
+            "source_unit_id": fact.get("source_unit_id"),
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# B4 — the rejoin/compose stage (behind SYNAPT_USE_EXTRACT, same flag as B1/B2)
+#
+# Position: B2 -> B4 -> B3. Every stage up to here atomizes or passes atoms through; nothing
+# ever reassembles. The Phase C dogfood (config/design/recall-B4-rejoin-stage-2026-07-15.md)
+# found the decomposed path finds more and lies less than legacy but fragments compound
+# memories (378 nodes vs the 185-node frontier ideal, boundary F1 9.1% vs legacy's 23.0%) —
+# and fragmentation CORRUPTS truth (3 concrete false memories in verification). B4 rejoins:
+# it takes a cluster's CREATE-bound action items and composes them into compound memories at
+# ideal granularity before reconcile executes. Only CREATE items participate — corroborate/
+# contradict target existing nodes and carry no new granularity, so they pass through B4
+# untouched and never reach the model.
+#
+# Five contract guards, each its own mechanism-TDD test (recall#883, Sentinel):
+#   1. COUNT-INVARIANT, never-drop: every create index appears in exactly one output group.
+#      A group with ANY invalid/hallucinated index is dropped WHOLE (per-group degradation —
+#      the composed text was written describing a membership set that doesn't exist once one
+#      member is fake; trusting it for the survivors would persist text written for a
+#      different group). Duplicate membership ACROSS groups invalidates the ENTIRE response
+#      (whole-cluster fail-open) — a stronger violation than a single bad group, since it
+#      means the model's own bookkeeping is incoherent, not just one group's target set.
+#   2. COMPOSE FROM MEMBERS ONLY: v1 enforcement is PROMPT-LEVEL (the composition prompt pins
+#      anti-corruption instructions against the three observed truth-corruption classes —
+#      negation flip, convention misread, relation/causal misread). Runtime entailment
+#      checking is v2, gated on the dogfood's source-clean precision axis.
+#   3. METADATA UNION: tags unioned, category by majority-of-members (ties broken by the
+#      FIRST member in the MODEL's own group order — Counter.most_common()'s stable sort
+#      naturally does this when members are visited in group order). Durable NODE-level
+#      provenance is a v2 follow-up; v1 traceability lives in the decision log (member
+#      source_unit_ids + content digests + composed content), keeping B3/KnowledgeNode
+#      unchanged.
+#   4. TEMPORAL CONFLICT RULE: identical bounds across bounded members -> carry; conflicting
+#      non-null bounds (including two members with different single-sided bounds that would
+#      otherwise synthesize an unasserted range) -> the group is REJECTED and its members
+#      revert to individual pass-through (per-group degradation, same mechanism as #1's
+#      invalid-index drop — NOT the whole-cluster fail-open of #1's duplicate case); exactly
+#      one bounded member -> carry that member's bound verbatim (safe because #878's fan-out
+#      suppression already made "non-null bound => sole output of its source unit" true at
+#      write time — no text re-detection needed here).
+#   5. FAIL-OPEN degradation: an unparseable/wrong-shape response or an infer exception
+#      degrades the WHOLE cluster's creates to pass-through, never blocked, never dropped —
+#      plus a loud, non-silent B4_COMPOSE_FAIL_OPEN warning naming the cluster and reason.
+# ---------------------------------------------------------------------------
+
+_B4_COMPOSE_PROMPT = """\
+You are grouping and composing related facts into compound memories.
+
+## Facts to consider (indexed)
+{candidates}
+
+## Task
+Decide which of the facts above describe the SAME underlying memory and should be composed \
+together into one compound entry. A fact that stands alone should be its own singleton group.
+
+For EACH fact index above, put it in exactly one group. Give each group's member indices and \
+ONE composed content string for that group.
+
+Also decide, for each group, whether it "supersedes" any OTHER index — meaning that OTHER \
+index describes the SAME subject at an earlier point in time, and this group's content \
+updates, corrects, or contradicts it (not merely relates to it or shares its vocabulary). \
+List those other indices in a "supersedes" array (empty if none). Two facts about the same \
+subject that are simply complementary, not in conflict, are NOT a supersession — shared \
+vocabulary alone is never enough; only flag a genuine same-subject update, correction, or \
+contradiction.
+
+Rules:
+1. Compose ONLY from the given MEMBER facts — never assert a relation, cause, or qualifier \
+that is not directly present in a member's own text. Do not flip a negation (a fact stating \
+something is unrelated must stay unrelated in the composition). Do not alter a stated \
+convention or definition (e.g. what a label means) when restating it.
+2. Every index above must appear in EXACTLY ONE group.
+3. Output ONLY valid JSON, no markdown fences, no explanation.
+
+{{"groups": [{{"indices": [0, 1], "content": "...", "supersedes": []}}, \
+{{"indices": [2], "content": "...", "supersedes": [0]}}]}}
+"""
+
+
+def _build_rejoin_prompt(creates: list[dict]) -> str:
+    """Render the create-only candidates as an indexed list for the compose prompt. Indices
+    are positions within *creates* (the FILTERED create-only list the model sees) — NOT
+    positions in the full action_items list, since the model never sees non-create items."""
+    candidates = "\n".join(f"[{i}] {item['content']}" for i, item in enumerate(creates))
+    return _B4_COMPOSE_PROMPT.format(candidates=candidates)
+
+
+# A composed group's content is a full merged sentence (potentially several member facts
+# folded together) — larger than a single action-decision item, so a bigger per-group
+# estimate than B2's _ACTION_ITEM_TOKEN_ESTIMATE. Mirrors _estimate_action_decision_budget's
+# shape: do NOT repeat the flat-800-floor bug class at this stage either.
+_B4_COMPOSE_GROUP_TOKEN_ESTIMATE = 150
+
+
+def _estimate_rejoin_budget(prompt: str, n_creates: int) -> int:
+    """Estimate ``max_tokens`` for B4's compose response, scaled to create-item count (see
+    module note — the same fix class as ``_estimate_action_decision_budget``).
+
+    Deliberately does NOT take ``max(..., _estimate_response_budget(prompt))`` the way B2
+    does: B4's prompt itself grows with ``n_creates`` (more candidates listed), so
+    ``_estimate_response_budget``'s CONTEXT_BUDGET-minus-prompt-tokens term actively SHRINKS
+    as the cluster gets denser — the opposite of what "scale with create count" needs. A
+    pure count-scaled floor is generous on its own (no upper cap; the model stops at EOS)
+    and, unlike the combinator, never fights its own growth as the prompt lengthens.
+    """
+    return MIN_RESPONSE_TOKENS + _B4_COMPOSE_GROUP_TOKEN_ESTIMATE * n_creates
+
+
+def _group_temporal_bound(members: list[dict]) -> tuple[str | None, str | None] | None:
+    """Guard 4: decide the (valid_from, valid_until) a composed group should carry, or None
+    if the group must be REJECTED for conflicting bounds (caller then reverts its members to
+    individual pass-through — see module note, per-group degradation).
+
+    A member "has a bound" when either field is non-null. Zero bounded members -> (None,
+    None), trivially. Exactly one bounded member -> carry its tuple verbatim (safe per #878's
+    fan-out suppression: a non-null bound already means "sole output of its unit"). Two or
+    more bounded members whose tuples are ALL identical -> carry that shared tuple. Any
+    difference between bounded members' tuples — including two members with different
+    single-sided bounds that would otherwise synthesize an unasserted range — is a conflict:
+    reject the group. Precision-first: a validity boundary is real evidence of two different
+    memories; do not merge across it.
+    """
+    bounded = [
+        (m.get("valid_from"), m.get("valid_until"))
+        for m in members
+        if m.get("valid_from") or m.get("valid_until")
+    ]
+    if not bounded:
+        return (None, None)
+    distinct = set(bounded)
+    if len(distinct) == 1:
+        return bounded[0]
+    return None
+
+
+# The composed content's own safety ceiling, matched to _apply_consolidation_result's real
+# create-branch pipeline (content = scrub_text(_tw(str(raw_node.get("content", "")), 300))) —
+# NOT a new independent limit. A composition that would arrive at B3 empty-after-scrub (e.g.
+# whitespace-only) is silently DROPPED there (0 nodes created, both members lost); one that
+# exceeds 300 chars is silently WORD-TRUNCATED (the load-bearing final clause can vanish with
+# no warning). Both are real, fruit-confirmed (Sentinel, recall#884 re-review): B4 must reject
+# a group whose composed content would hit either path, BEFORE it ever reaches B3, and fall
+# the group's members back to individual pass-through instead.
+_B4_COMPOSE_CONTENT_MAX_CHARS = 300
+
+
+def _b4_composed_content_is_safe(content: str, content_profile=None) -> bool:
+    """Whether *content* is safe to persist as a B4-composed node.
+
+    Two parts. First, ONE check B4 alone needs, stricter than B3 itself: reject (don't
+    silently truncate) raw content over B3's real 300-char ceiling. B3 tolerates truncation —
+    ``_tw`` silently cuts at 300 chars and moves on, the monolith's long-standing behavior for
+    ANY create-action content. B4 does not: a COMPOSED sentence that needs truncation has
+    already lost information the model was told to preserve faithfully (guard 2), and unlike
+    an atomic fact, B4 has a safe fallback B3 doesn't — degrade the whole group back to its
+    original, already-safe, un-composed members — so it refuses rather than risk a silently
+    cut load-bearing clause (Sentinel, recall#884 re-review, original finding).
+
+    Second, everything else routes through ``_evaluate_create_content`` — the SAME function
+    B3's create branch calls — so this verdict is provably identical to what B3 will compute
+    later: parity by construction (Sentinel, recall#884 re-review round 2: an earlier version
+    of this function hard-coded ``threshold=120``/``content_type=None``/no-normalize and
+    diverged from what B3 actually evaluates once ``content_profile`` flows in, which it
+    already does at B3 via ``_run_extract_path`` — fruit: a real mixed-profile threshold=200
+    dropped a 144-char composition B4 had waved through; a 152-char section-prefixed
+    composition B4 waved through stripped to a 118-char low-specificity remainder at B3).
+    """
+    if len(content) > _B4_COMPOSE_CONTENT_MAX_CHARS:
+        return False
+    return _evaluate_create_content(content, content_profile) is not None
+
+
+def _log_b4_compose_decision(
+    decision_log_path: Path,
+    cluster_id: str,
+    member_indices: list[int],
+    members: list[dict],
+    composed_content: str,
+) -> bool:
+    """Durable v1 traceability for a B4 composition (guard 3): the full member -> group
+    mapping in the decision log — the existing durable audit substrate — rather than a new
+    KnowledgeNode field (B3/schema stay unchanged).
+
+    Returns whether the entry was actually persisted. UNLIKE ``_log_dedup_decision`` (whose
+    write failure is harmless best-effort telemetry), guard 3 chose the decision log as v1's
+    ONLY durable member provenance — best-effort-swallow-the-OSError would silently persist an
+    untraceable compound with no record anywhere of what it was composed from (fruit-confirmed,
+    Sentinel, recall#884 re-review). The caller must reject the composition on ``False``, not
+    treat this as fire-and-forget logging.
+    """
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "b4-compose",
+        "cluster_id": cluster_id,
+        "member_indices": list(member_indices),
+        "source_unit_ids": [m.get("source_unit_id") for m in members],
+        "member_content_digests": [
+            hashlib.sha256(m["content"].encode("utf-8")).hexdigest() for m in members
+        ],
+        "composed_content": composed_content,
+    }
+    try:
+        from synapt.recall._filelock import lock_exclusive
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(decision_log_path, "a", encoding="utf-8") as f:
+            lock_exclusive(f)
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+        return True
+    except OSError:
+        logger.debug("Failed to write B4 compose decision log")
+        return False
+
+
+def _b4_fail_open(action_items: list[dict], cluster_id: str, reason: str) -> list[dict]:
+    """Guard 5: degrade the WHOLE cluster's creates to pass-through, loudly. Never blocked,
+    never dropped — worst case is the status quo ante (every create stays atomic)."""
+    logger.warning(
+        "B4_COMPOSE_FAIL_OPEN cluster=%s reason=%s", cluster_id, reason,
+    )
+    return action_items
+
+
+# B4 compose: bounded retry + rejection telemetry (A4, grouping-contract tighten, sprint-41).
+# Not a new numbered guard — guard-6 is reserved for A3's supersession guard (A1 contract,
+# config f552875 section 4). This is a tightening of guards 1/3/4's existing failure paths: a
+# bounded retry on the response-level validation those guards already perform, plus loud
+# telemetry on the per-group rejections guard 4 and the content-safety check already make.
+#
+# The 2026-07-15 dogfood packet's 3 whole-cluster fail-opens were ALL caused by a response
+# failing guard-3 schema validation or the duplicate-membership scan — never by an infer-
+# backend exception. A single bounded retry with a prompt naming exactly what was wrong gives
+# the model one real chance to self-correct before the cluster degrades to full atomization.
+# Deliberately does NOT retry a well-formed response that a later PER-GROUP guard rejects
+# (content-unsafe / temporal-conflict) — those are correct, deliberate degradations of valid
+# model output, not malformed output worth re-asking for.
+_B4_COMPOSE_MAX_ATTEMPTS = 2  # 1 initial + 1 corrective retry — bounded, never unbounded
+
+
+def _b4_validate_compose_response(
+    parsed: dict, n: int,
+) -> (
+    "tuple[list[tuple[list, str, list, str | None]], list[list[int]], None] "
+    "| tuple[None, None, str]"
+):
+    """Guard 3 (schema) + duplicate-membership validation for ONE compose attempt.
+
+    Returns ``(raw_groups, group_real_members, None)`` on success or ``(None, None, reason)``
+    on failure. ``reason`` feeds both the eventual ``B4_COMPOSE_FAIL_OPEN`` marker (attempts
+    exhausted) and the next attempt's corrective prompt (attempts remain) — see the bounded-
+    retry module note above.
+
+    Each ``raw_groups`` entry is ``(indices, content, supersedes, malformed_supersedes_reason)``.
+    ``supersedes`` (guard 6, A3) is OPTIONAL; the base composition contract (indices/content) is
+    guard 3's concern, and a broken supersession hint on top of an otherwise-valid group is
+    never the same class of failure as a broken group itself. Malformed handling follows
+    Sentinel's spec-author ruling (A3 re-review, m_4adb43c0):
+
+    - A MISSING ``supersedes`` field degrades silently to no claim — backward compatible, no
+      telemetry, since the field didn't exist before this sprint.
+    - A PRESENT-but-wrong-typed field, or a list containing invalid/out-of-range targets, is a
+      real detection-signal failure, not a benign absence: ``malformed_supersedes_reason`` names
+      why, and the caller emits exactly one ``b4-group-rejected`` telemetry entry (stage
+      ``malformed-supersedes``) per such group — "malformed optional detection metadata must
+      never cost data, but silently dropping it erases the model-quality signal A6 needs."
+    - Valid targets inside an otherwise-partially-invalid list are KEPT, not discarded
+      wholesale, matching that same "never cost data" rule.
+    """
+    raw_groups: list[tuple[list, str, list, "str | None"]] = []
+    for g in parsed["groups"]:
+        if not isinstance(g, dict):
+            return None, None, (
+                "compose response contains a structurally malformed group entry (not an object)"
+            )
+        idxs = g.get("indices")
+        content = g.get("content")
+        if not isinstance(idxs, list) or not isinstance(content, str):
+            return None, None, (
+                "compose response contains a structurally malformed group entry "
+                "(indices/content wrong type — schema violation)"
+            )
+
+        malformed_reason: "str | None" = None
+        if "supersedes" not in g:
+            supersedes: list[int] = []
+        else:
+            raw_supersedes = g["supersedes"]
+            if not isinstance(raw_supersedes, list):
+                supersedes = []
+                malformed_reason = (
+                    "supersedes field was present but not a list — supersession signal "
+                    "ignored, composition preserved"
+                )
+            else:
+                supersedes = [
+                    i for i in raw_supersedes
+                    if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
+                ]
+                if len(supersedes) != len(raw_supersedes):
+                    malformed_reason = (
+                        "supersedes list contained invalid or out-of-range targets — "
+                        "filtered, valid targets retained, composition preserved"
+                    )
+        raw_groups.append((idxs, content, supersedes, malformed_reason))
+
+    group_real_members: list[list[int]] = []
+    seen: set[int] = set()
+    duplicate = False
+    for idxs, _content, _supersedes, _malformed in raw_groups:
+        real = [
+            i for i in idxs
+            if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < n
+        ]
+        group_real_members.append(real)
+        for i in real:
+            if i in seen:
+                duplicate = True
+            seen.add(i)
+    if duplicate:
+        return None, None, "duplicate membership across groups"
+
+    return raw_groups, group_real_members, None
+
+
+def _log_b4_group_rejection(
+    decision_log_path: Path | None,
+    cluster_id: str,
+    member_indices: list[int],
+    stage: str,
+    reason: str,
+) -> None:
+    """B4 compose rejection telemetry (A4): best-effort per-group rejection telemetry,
+    distinguishable by ``stage``.
+
+    Closes the exact gap the 2026-07-15 dogfood packet named (B4-FRUIT.md): "production
+    telemetry exposes that these groups degraded to member pass-through, but it does not
+    record which per-group guard rejected each proposal... A content-versus-temporal
+    breakdown therefore cannot be claimed from this run." Unlike guard 3's compose-SUCCESS
+    provenance (whose loss means an untraceable persist — reject the composition), a lost
+    REJECTION-telemetry entry loses nothing that was ever persisted, so this is pure
+    best-effort logging, same shape as ``_log_dedup_decision``: never disrupts consolidation.
+    """
+    logger.info(
+        "B4_GROUP_REJECTED cluster=%s stage=%s reason=%s member_indices=%s",
+        cluster_id, stage, reason, member_indices,
+    )
+    if decision_log_path is None:
+        return
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "b4-group-rejected",
+        "cluster_id": cluster_id,
+        "member_indices": list(member_indices),
+        "stage": stage,
+        "reason": reason,
+    }
+    try:
+        from synapt.recall._filelock import lock_exclusive
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(decision_log_path, "a", encoding="utf-8") as f:
+            lock_exclusive(f)
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+    except OSError:
+        logger.debug("Failed to write B4 group-rejection decision log")
+
+
+def _entry_index_if_parseable(source_unit_id: "str | None") -> "int | None":
+    """Parse the real ``{cluster}:{entry_index}:{field}:{item}`` format's ``entry_index``
+    numerically when the shape matches (exactly 4 colon-segments, second segment a plain int).
+    Returns ``None`` for any other shape — an honest degradation the caller falls back on,
+    never a crash on an unexpected ``source_unit_id``."""
+    parts = (source_unit_id or "").split(":")
+    if len(parts) != 4:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _source_unit_id_order(a: "str | None", b: "str | None") -> int:
+    """Chronological order of *a* relative to *b*, for guard 6's direction resolution: ``-1`` if
+    *a* is earlier, ``1`` if *b* is earlier, ``0`` if they are TIED — same ``entry_index`` (or,
+    for a non-real-format shape, byte-identical strings).
+
+    A tie is a real, distinct outcome, not a coin flip resolved by whichever side the boolean
+    comparison's ``else`` branch happens to favor (Sentinel, A3 re-review — the original
+    boolean-only ``_source_unit_id_is_earlier`` returned ``False`` for BOTH ``is_earlier(a, b)``
+    and ``is_earlier(b, a)`` on a tie, and the caller's if/else treated "not earlier" as
+    "definitely later," silently suppressing whichever side happened to be the loop's `target`.
+    A1 §7 explicitly names same-entry siblings — the tie is on ``entry_index`` itself, which
+    spans across fields (a ``decisions`` item and a ``done`` item from the same entry tie just
+    as much as two items from the same field) — as "no usable direction signal from
+    source_unit_id alone"; the caller must preserve both sides on ``0``, never suppress).
+
+    Parses the real 4-segment format's ``entry_index`` numerically when BOTH sides match it —
+    robust to any future ``_split_large_cluster`` ``max_size`` change; there is no hidden
+    lexicographic-vs-numeric equivalence here to silently invert if that bound ever climbs past
+    9 (Opus, 2026-07-16). Falls back to full-string comparison for any other shape, which is
+    exactly what A2's synthetic test fixtures use (e.g. ``"s020c00:0"`` — 2 segments, not 4).
+    """
+    a_idx = _entry_index_if_parseable(a)
+    b_idx = _entry_index_if_parseable(b)
+    if a_idx is not None and b_idx is not None:
+        if a_idx == b_idx:
+            return 0
+        return -1 if a_idx < b_idx else 1
+    a_str, b_str = (a or ""), (b or "")
+    if a_str == b_str:
+        return 0
+    return -1 if a_str < b_str else 1
+
+
+def _log_b4_supersede_decision(
+    decision_log_path: "Path | None",
+    cluster_id: str,
+    superseded_index: int,
+    superseding_index: int,
+    superseded_source_unit_id: "str | None",
+    superseding_source_unit_id: "str | None",
+    superseded_content: str,
+    superseding_content: str,
+) -> bool:
+    """Guard 6 (A3, supersession suppression): durable traceability for a suppressed same-batch
+    supersession — and REJECT-ON-FAILURE, not fire-and-forget (Sentinel, A3 re-review:
+    "suppression is only truth-preserving when the audit record is durable" — a lost
+    supersede-telemetry entry means the suppressed candidate is gone with zero trace of why).
+    Returns whether the entry was actually persisted; the caller must NOT add the superseded
+    position to ``suppressed_positions`` unless this returns ``True`` — on any failure to
+    persist, both candidates stay in output instead.
+
+    ``decision_log_path is None`` ALSO returns ``False`` here (Sentinel, A3 audit clarification)
+    — guard 3's compose path treats a ``None`` path as a legitimate silent opt-out, but not
+    because composition merely "adds a node" (it can replace several member creates with one
+    compound, same as here). The true boundary: compose-from-members PRESERVES every member's
+    content by contract — the atoms are still there, just folded together — while supersession
+    INTENTIONALLY DISCARDS one claim entirely. A skipped compose-provenance breadcrumb loses a
+    trace of how content was folded; a skipped supersede breadcrumb loses the only record that a
+    claim ever existed before it vanished. That is the same risk class as a write failure, not a
+    lesser one. Every real production call site (``_run_extract_path``) always supplies a
+    concrete path regardless."""
+    if decision_log_path is None:
+        return False
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "action": "b4-supersede",
+        "cluster_id": cluster_id,
+        "superseded_index": superseded_index,
+        "superseding_index": superseding_index,
+        "superseded_source_unit_id": superseded_source_unit_id,
+        "superseding_source_unit_id": superseding_source_unit_id,
+        "superseded_content_digest": hashlib.sha256(
+            superseded_content.encode("utf-8")
+        ).hexdigest(),
+        "superseding_content_digest": hashlib.sha256(
+            superseding_content.encode("utf-8")
+        ).hexdigest(),
+    }
+    try:
+        from synapt.recall._filelock import lock_exclusive
+        decision_log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(decision_log_path, "a", encoding="utf-8") as f:
+            lock_exclusive(f)
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+        return True
+    except OSError:
+        logger.warning(
+            "B4_SUPERSEDE_LOG_FAILED cluster=%s superseded_index=%s — "
+            "suppression NOT applied, both candidates retained",
+            cluster_id, superseded_index,
+        )
+        return False
+
+
+def _rejoin_create_actions(
+    action_items: list[dict],
+    cluster_id: str,
+    infer,
+    *,
+    decision_log_path: Path | None = None,
+    content_profile=None,
+) -> list[dict]:
+    """B4: rejoin CREATE-bound action items into compound memories at natural granularity
+    before B3 reconcile executes. Consumes B2's action-item list and emits a possibly-shorter
+    list of the SAME shape — grouped creates replaced by composed creates, everything else
+    (corroborate/contradict, unaddressed/singleton/rejected-group creates) passed through
+    unchanged at its original position. B3 needs ZERO changes (see module note).
+
+    See config/design/recall-B4-rejoin-stage-2026-07-15.md for the full contract; the guard
+    numbers referenced below match that spec.
+
+    ``content_profile`` is threaded from ``_run_extract_path`` (which already receives it and
+    passes it to B3) so B4's content-safety check (``_b4_composed_content_is_safe`` ->
+    ``_evaluate_create_content``) evaluates composed content under the SAME adaptive
+    thresholds B3 will actually apply at persist time — B4 has a real production
+    ``content_profile`` to thread through; it is not the profile-less default some earlier
+    revisions of this docstring claimed (Sentinel, recall#884 re-review round 2).
+
+    NOTE: ``decision_log_path=None`` is a total, silent opt-out of guard 3's traceability —
+    a composition proceeds with zero provenance logged, the same as if the write had failed.
+    Every real production call site (``_run_extract_path``) always supplies a concrete path,
+    so this is reachable only for a caller that deliberately omits it.
+    """
+    create_indices = [i for i, item in enumerate(action_items) if item.get("action") == "create"]
+    if not create_indices:
+        return action_items  # guard 1 scope line: nothing to compose, no inference call
+
+    creates = [action_items[i] for i in create_indices]
+    n = len(creates)
+    prompt = _build_rejoin_prompt(creates)
+    budget = _estimate_rejoin_budget(prompt, n)
+
+    # B4 compose bounded retry (A4) — see _B4_COMPOSE_MAX_ATTEMPTS docstring. Attempt 0's prompt
+    # is byte-identical to the pre-retry single-shot prompt; only a failed attempt mutates it.
+    raw_groups: "list[tuple[list, str, list, str | None]] | None" = None
+    group_real_members: list[list[int]] | None = None
+    last_reason = ""
+    for attempt in range(_B4_COMPOSE_MAX_ATTEMPTS):
+        attempt_prompt = prompt if attempt == 0 else (
+            f"{prompt}\n\nYour previous response was rejected: {last_reason}. "
+            "Fix this and respond again with valid JSON only."
+        )
+        request = {
+            "prompt": attempt_prompt,
+            "messages": [{"role": "user", "content": attempt_prompt}],
+            "capabilities": [],
+            "max_tokens": budget,
+        }
+
+        try:
+            response = infer(request)
+        except Exception as exc:
+            last_reason = f"compose inference backend unavailable, exception: {exc!r}"
+            continue
+
+        parsed = _parse_llm_response(response)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("groups"), list):
+            last_reason = "compose response unparseable or wrong group shape/schema"
+            continue
+
+        # Guard 3 (schema): a group entry with the WRONG TYPE for indices/content (e.g. a
+        # string "0,1" instead of a list) is not an intentional unaddressed response — it
+        # means the model's response as a whole doesn't conform to the contract. Guard 1
+        # (never-drop) + duplicate detection: real (in-range, non-bool int) member indices are
+        # computed for every group BEFORE deciding whether to drop any for containing an
+        # invalid one — duplicate membership is scanned across every group's real members
+        # regardless of whether that specific group later gets dropped, since a real index
+        # appearing in two DIFFERENT proposed groups means the model's own bookkeeping is
+        # incoherent even if one of those groups also happens to contain a hallucinated index
+        # (fruit-confirmed, Sentinel: [0,1,999] + [0,2] let index 0's cross-group collision
+        # through when the first group was filtered BEFORE the duplicate scan ran).
+        raw_groups, group_real_members, reason = _b4_validate_compose_response(parsed, n)
+        if reason is None:
+            break
+        last_reason = reason
+    else:
+        return _b4_fail_open(
+            action_items, cluster_id,
+            f"exhausted {_B4_COMPOSE_MAX_ATTEMPTS} attempts, last reason: {last_reason}",
+        )
+
+    # Malformed-supersedes telemetry (Sentinel, A3 re-review spec-author ruling, m_4adb43c0):
+    # fires for EVERY group whose supersedes field was malformed, independent of what else
+    # happens to that group (invalid-index drop, content-unsafe rejection, etc.) — the
+    # detection-signal failure is worth recording on its own, before any other guard's fate is
+    # decided for the group.
+    for idxs, _content, _supersedes, malformed_reason in raw_groups:
+        if malformed_reason is not None:
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, idxs, "malformed-supersedes", malformed_reason,
+            )
+
+    # NOW drop any group that contained an invalid/hallucinated index (per-group degradation —
+    # its real members are not partially trusted under text written for a fabricated/different
+    # membership set) or was empty to begin with.
+    candidate_groups: list[tuple[list[int], str, list[int]]] = []
+    for (idxs, content, supersedes, _malformed), real in zip(raw_groups, group_real_members):
+        if not real or len(real) != len(idxs):
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, real or idxs, "invalid-index",
+                "group contained an invalid or hallucinated member index",
+            )
+            continue
+        candidate_groups.append((real, content, supersedes))
+
+    # Guard 4 + composition: singleton groups (len 1) are pass-through, never rewritten, even
+    # if the model proposed text for them. Multi-member groups compose only if their bounds
+    # don't conflict (guard 4), their composed content is safe for B3's real content pipeline
+    # (guard "content" below), and — when a decision-log path was given — provenance actually
+    # persisted (guard 3 traceability below). Any of these failing is per-group degradation,
+    # not the whole cluster.
+    successful_by_first_pos: dict[int, dict] = {}
+    composed_member_positions: set[int] = set()
+    for idxs, content, _supersedes in candidate_groups:
+        if len(idxs) < 2:
+            continue
+
+        # Guard "content": reject a composition that would silently vanish or degrade once it
+        # reaches _apply_consolidation_result's real create branch — see
+        # _b4_composed_content_is_safe for the full list of checks reused from B3. Members
+        # fall back to individual pass-through.
+        if not _b4_composed_content_is_safe(content, content_profile):
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, idxs, "content-unsafe",
+                "composed content failed B3's shared create-content gate",
+            )
+            continue
+
+        members = [creates[i] for i in idxs]
+        bound = _group_temporal_bound(members)
+        if bound is None:
+            # guard 4 conflict: this group's members fall back to pass-through
+            _log_b4_group_rejection(
+                decision_log_path, cluster_id, idxs, "temporal-conflict",
+                "members carry conflicting non-null valid_from/valid_until bounds",
+            )
+            continue
+        categories = [m["category"] for m in members]
+        category = Counter(categories).most_common(1)[0][0]
+        # Sanitize member-supplied tag elements the SAME way _apply_consolidation_result's own
+        # monolith-path tags do (scrub_text(str(t)) for t in tags if t) — a real B2 response can
+        # carry a non-string tag element (fruit-confirmed, Sentinel: ["good", 7]), and a bare
+        # sorted({...}) over a mixed-type set raises TypeError, crashing B4 entirely outside the
+        # fail-open path. str() coercion first means the set is always string-only; sorted()
+        # can never see a type it can't compare.
+        tags = sorted({
+            scrub_text(str(t)) for m in members for t in (m.get("tags") or []) if t
+        })
+
+        if decision_log_path is not None:
+            logged_ok = _log_b4_compose_decision(
+                decision_log_path, cluster_id, idxs, members, content,
+            )
+            if not logged_ok:
+                # Guard 3 traceability: the decision log is v1's ONLY durable member
+                # provenance (fruit-confirmed, Sentinel). A write failure means this
+                # composition CANNOT be traced back to its members — reject it loudly rather
+                # than persist an untraceable compound; members fall back to pass-through.
+                logger.warning(
+                    "B4_COMPOSE_FAIL_OPEN cluster=%s reason=%s member_indices=%s",
+                    cluster_id, "decision-log provenance write failed", idxs,
+                )
+                continue
+
+        composed = {
+            "action": "create",
+            "existing_id": None,
+            "content": content,
+            "category": category,
+            "tags": tags,
+            "source_turns": [],
+            "contradiction_note": "",
+            "valid_from": bound[0],
+            "valid_until": bound[1],
+        }
+        first_original_pos = create_indices[idxs[0]]
+        successful_by_first_pos[first_original_pos] = composed
+        for i in idxs:
+            composed_member_positions.add(create_indices[i])
+
+    # Guard 6 (A3, supersession suppression — NOT a new numbered guard for THIS module note's
+    # own counting scheme; "guard 6" is the A1 contract's name for this specific mechanism,
+    # config f552875 section 4). A group's `supersedes` claim marks a candidate index this
+    # group's content updates, corrects, or contradicts — same subject, different point in
+    # time. Direction is NEVER trusted from the model: source_unit_id chronology
+    # (_source_unit_id_order) is the sole arbiter, because the model can and does attribute the
+    # claim to the wrong side (fruit: A2's negation-flip fixture flags the relationship from the
+    # chronologically-earlier group's own entry). A claim only fires when BOTH sides of the pair
+    # actually produced real output — a group already rejected by an earlier guard cannot be the
+    # superseding OR superseded side; suppressing one side of a claim that never really resolved
+    # to independent output would violate never-drop.
+    member_to_group_first: dict[int, int] = {}
+    group_supersedes_by_first: dict[int, list[int]] = {}
+    group_is_singleton_by_first: dict[int, bool] = {}
+    for idxs, _content, supersedes in candidate_groups:
+        first = idxs[0]
+        for i in idxs:
+            member_to_group_first[i] = first
+        group_supersedes_by_first[first] = supersedes
+        group_is_singleton_by_first[first] = len(idxs) < 2
+
+    def _surviving_position(creates_index: int) -> "int | None":
+        """The original action_items position *creates_index*'s content actually appears at in
+        the final output, or None if it never independently resolves to real output. For a
+        SUCCESSFULLY composed multi-member group, EVERY member maps to the SAME composed output
+        position (Sentinel, A3 re-review: "supersedes is defined over any candidate index, so
+        first-member position cannot change the verdict" — a fix-confirmed bug: targeting a
+        non-first member of an accepted [0,1] composition used to silently no-op while targeting
+        member 0 suppressed the whole composed output, purely because of which original index
+        the claim happened to name, even though both indices now refer to ONE logical memory)."""
+        first = member_to_group_first.get(creates_index)
+        if first is None:
+            return None
+        if group_is_singleton_by_first[first]:
+            return create_indices[creates_index]  # singletons always survive at their own pos
+        if create_indices[first] in successful_by_first_pos:
+            # composed successfully — ALL members map to the ONE composed output position.
+            return create_indices[first]
+        # composed group was rejected by an earlier guard — every member reverts to its own
+        # original, unmodified pass-through position.
+        return create_indices[creates_index]
+
+    def _group_claim_is_valid(first: int) -> bool:
+        """Whether the group whose first member is *first* actually produced the composed
+        content its `supersedes` claim was attached to. A claim from a REJECTED multi-member
+        group must never fire, even though its individual members revert to pass-through —
+        the composed sentence that CARRIED the claim never became real output; reverted
+        members are unrelated atomic facts with no claim of their own (fruit-confirmed:
+        without this check, a content-unsafe-rejected group's supersedes target was wrongly
+        suppressed even though the rejected group itself fully vanished)."""
+        if group_is_singleton_by_first[first]:
+            return True  # a singleton's own fact IS its claim — nothing to have failed
+        return create_indices[first] in successful_by_first_pos
+
+    suppressed_positions: set[int] = set()
+    seen_pairs: set[frozenset] = set()
+    for idxs, _content, supersedes in candidate_groups:
+        if not supersedes:
+            continue
+        representative = idxs[0]
+        if not _group_claim_is_valid(representative):
+            continue  # the claiming group's own composition never succeeded
+        for target in supersedes:
+            if target == representative:
+                continue
+            pair = frozenset((representative, target))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            rep_pos = _surviving_position(representative)
+            target_pos = _surviving_position(target)
+            if rep_pos is None or target_pos is None:
+                continue  # one side never independently resolved to real output
+            if rep_pos == target_pos:
+                # Sentinel, A3 addendum: with every accepted-group member now mapping to the
+                # SAME output position, a group's OWN supersedes claim against its own sibling
+                # member (e.g. successful [0,1] with supersedes=[1] on member 0) would otherwise
+                # try to suppress its sole composed output with itself — a self-reference, not a
+                # genuine cross-entity supersession. Never-drop: skip it.
+                continue
+
+            rep_source = creates[representative].get("source_unit_id")
+            target_source = creates[target].get("source_unit_id")
+            order = _source_unit_id_order(rep_source, target_source)
+            if order == 0:
+                # A1 §7: same-entry siblings carry "no usable direction signal from
+                # source_unit_id alone." A tie is not a coin flip — preserve both candidates and
+                # record that a claim existed but couldn't be resolved (Sentinel, A3 re-review).
+                _log_b4_group_rejection(
+                    decision_log_path, cluster_id, [representative, target],
+                    "ambiguous-supersession-order",
+                    "supersedes claim between same-entry source_unit_ids has no usable "
+                    "chronological direction — both candidates preserved",
+                )
+                continue
+            superseded, superseding = (
+                (representative, target) if order == -1 else (target, representative)
+            )
+
+            superseded_pos = _surviving_position(superseded)
+            if superseded_pos is None or superseded_pos in suppressed_positions:
+                continue
+            logged_ok = _log_b4_supersede_decision(
+                decision_log_path, cluster_id, superseded, superseding,
+                creates[superseded].get("source_unit_id"),
+                creates[superseding].get("source_unit_id"),
+                creates[superseded]["content"], creates[superseding]["content"],
+            )
+            if not logged_ok:
+                # Sentinel, A3 re-review + audit clarification: suppression is only truth-
+                # preserving when the audit record is durable. A failed (or opted-out) write
+                # means both candidates stay — never suppress on an untraceable decision.
+                continue
+            suppressed_positions.add(superseded_pos)
+
+    output: list[dict] = []
+    for pos, item in enumerate(action_items):
+        if pos in suppressed_positions:
+            continue  # guard 6: suppressed at creation, never enters output
+        if item.get("action") != "create":
+            output.append(item)
+        elif pos in successful_by_first_pos:
+            output.append(successful_by_first_pos[pos])
+        elif pos in composed_member_positions:
+            continue  # a non-first member of a successful group — already emitted
+        else:
+            output.append(item)  # unaddressed / singleton / rejected-group member
+    return output
 
 
 def consolidate(
@@ -2266,6 +3585,7 @@ def consolidate(
             result.nodes_created += cluster_result.nodes_created
             result.nodes_corroborated += cluster_result.nodes_corroborated
             result.nodes_contradicted += cluster_result.nodes_contradicted
+            result.nodes_contested += cluster_result.nodes_contested
             return True
 
         cached_entry = response_cache.get(cache_key)
@@ -2333,6 +3653,7 @@ def consolidate(
         result.nodes_created += cluster_result.nodes_created
         result.nodes_corroborated += cluster_result.nodes_corroborated
         result.nodes_contradicted += cluster_result.nodes_contradicted
+        result.nodes_contested += cluster_result.nodes_contested
 
         # Cache successful response + prompt for future runs / adapter training
         _save_cached_response(cache_path, cache_key, response, prompt)
@@ -2351,9 +3672,9 @@ def consolidate(
                 # Reload existing nodes for subsequent clusters
                 existing_nodes = read_nodes(kn_path, status="active")
                 logger.info(
-                    "Cluster %d/%d done: %d nodes created, %d corroborated",
+                    "Cluster %d/%d done: %d nodes created, %d corroborated, %d contested",
                     ci + 1, n_clusters,
-                    result.nodes_created, result.nodes_corroborated,
+                    result.nodes_created, result.nodes_corroborated, result.nodes_contested,
                 )
                 continue
 
@@ -2381,7 +3702,10 @@ def consolidate(
         # Sync knowledge.jsonl → SQLite when nodes were modified OR when
         # the knowledge file has nodes that may not be in SQLite yet
         # (e.g. from a prior run that wrote to JSONL but crashed before sync).
-        if result.nodes_created or result.nodes_corroborated or result.nodes_contradicted:
+        if (
+            result.nodes_created or result.nodes_corroborated
+            or result.nodes_contradicted or result.nodes_contested
+        ):
             _set_last_consolidation_ts(project_dir)
 
             # Post-consolidation dedup — merges near-duplicates that the

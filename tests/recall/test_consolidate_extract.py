@@ -451,6 +451,70 @@ def test_run_extract_path_creates_a_node_when_action_is_create(tmp_path):
     assert persisted[0].source_sessions == ["s1"]  # cluster provenance still flows through
 
 
+def test_run_extract_path_wires_the_real_production_conflict_judge(tmp_path):
+    """Sentinel r2 coverage gap (PR#903 issuecomment-5037168639): removing
+    ``conflict_judge=_local_conflict_judge(infer)`` from this exact call site
+    (consolidate.py:2229) left all 578 existing tests green — every OTHER fixture injects a
+    ``conflict_judge`` directly into ``_apply_consolidation_result``/
+    ``_b3_temporal_conflict_escalation``, never exercising ``_run_extract_path``'s OWN wiring.
+
+    Captures the actual kwarg ``_run_extract_path`` passes and BEHAVIORALLY verifies it — not
+    just "is not None" — by calling the captured judge and confirming it round-trips through
+    the real ``client.chat`` seam with the judge's distinctive CONFLICT/COMPATIBLE prompt
+    shape, exactly as ``_local_conflict_judge(infer)`` would. Removing the kwarg entirely, or
+    wiring a wrong/placeholder judge, must make this fail."""
+    from unittest.mock import patch
+    from synapt.recall import consolidate as consolidate_mod
+
+    fact = "recall#875 wired extract_batch into consolidation"
+    cluster = [_entry(session_id="s1", done=[fact])]
+    failures_path = tmp_path / "consolidation_failures.jsonl"
+    kn_path = tmp_path / "knowledge.jsonl"
+
+    class _JudgeRoutingFakeClient:
+        """Routes THREE ways on distinctive prompt markers: B1 extract, B2 action-decision
+        (matches _RoutingFakeClient's own marker), and the conflict-judge prompt ("Statement
+        A:" — _local_conflict_judge's own distinctive text, never emitted by B1/B2)."""
+
+        def __init__(self):
+            self.calls = []
+
+        def chat(self, *, model, messages, **kwargs):
+            self.calls.append({"model": model, "messages": messages})
+            content = messages[0].content if messages else ""
+            if "Statement A:" in content:
+                return "CONFLICT"
+            if "New Facts (indexed)" in content:
+                return '{"actions": [{"index": 0, "action": "create"}]}'
+            return _ok_envelope(fact)
+
+    client = _JudgeRoutingFakeClient()
+
+    captured = {}
+    real_apply = consolidate_mod._apply_consolidation_result
+
+    def _spy_apply(*args, **kwargs):
+        captured["conflict_judge"] = kwargs.get("conflict_judge")
+        return real_apply(*args, **kwargs)
+
+    with patch.object(consolidate_mod, "_apply_consolidation_result", side_effect=_spy_apply):
+        result = _run_extract_path(cluster, "clu", client, "m", failures_path, [], kn_path)
+
+    assert result is not None
+    judge = captured.get("conflict_judge")
+    assert judge is not None, "conflict_judge was not wired at this call site at all"
+
+    calls_before = len(client.calls)
+    verdict = judge("candidate content", "existing content")
+    assert verdict is True, (
+        "the captured conflict_judge did not classify a scripted CONFLICT response as "
+        f"True -- got {verdict!r} (wrong judge wired, or the wiring is severed)"
+    )
+    # Confirms the judge genuinely round-tripped through client.chat (the real infer seam),
+    # not a stub that happens to return True for unrelated reasons.
+    assert len(client.calls) == calls_before + 1
+
+
 def test_run_extract_path_corroborates_against_existing_node(tmp_path):
     kn_path = tmp_path / "knowledge.jsonl"
     existing_node = KnowledgeNode.create(
@@ -686,21 +750,37 @@ def test_run_extract_path_mixed_auto_then_explicit_corroborate_same_node_first_b
     never exercised, mutated or not. Fixed by SWAPPING the order: the AUTO candidate now runs
     FIRST and is the one that actually WRITES the bound, so the test's outcome genuinely depends
     on whether ITS call site syncs memory on success. Verified: reverting only the auto call site
-    now makes this test fail (confirmed via targeted mutation before landing this fix)."""
+    now makes this test fail (confirmed via targeted mutation before landing this fix).
+
+    UPDATED by A7 (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md):
+    fact_auto was originally a pure REORDERING of existing_content's own tokens (same keyword
+    SET, Jaccard=1.0, different word order) -- deliberately chosen so it would NOT be caught by
+    _decide_actions's exact-match guard, only by the create branch's own Jaccard-similarity
+    conversion. A7 now runs a content-CONTAINMENT check inside that same conversion, and a full
+    token reordering is neither a prefix nor a suffix of the original (no contiguous token run
+    survives), so it correctly stopped merging -- exactly the class of fix A7 exists to make
+    (identical keyword SETS are not sufficient grounds to merge; fixture 1b in the A7 design doc
+    is the same finding from real production data, via a different mechanism). Reconstructed as
+    a genuine token-PREFIX of existing_content instead (drops the trailing "in production_env"
+    clause) so it still (a) is not byte-identical, (b) does not trip _decide_actions's exact-
+    match guard, (c) still crosses the create branch's Jaccard threshold on its own, and NOW
+    ALSO (d) genuinely satisfies A7's containment check -- restoring the auto-corroborate route
+    this test needs to exercise its real subject: the same-batch bound-fill sync ordering."""
     kn_path = tmp_path / "knowledge.jsonl"
     existing_content = "the api_key_rotation_policy governs when API keys expire in production_env"
     existing = KnowledgeNode.create(content=existing_content, category="fact", node_id="kn-policy")
     from synapt.recall.knowledge import append_node
     append_node(existing, kn_path)
 
-    # Same keyword SET as existing_content (Jaccard=1.0), different literal STRING (exact-match
-    # dedup, which is order-sensitive, must NOT fire) -- genuinely routes through the create
-    # branch's own Jaccard-similarity auto-corroborate, not _decide_actions's exact-match guard.
-    fact_auto = "when API keys expire in production_env, the api_key_rotation_policy governs"
+    # A genuine token-prefix of existing_content (drops the trailing "in production_env" clause):
+    # not exact-match (guard won't fire in _decide_actions), still crosses the create branch's
+    # own Jaccard threshold, and satisfies A7's containment check so it genuinely routes through
+    # auto-corroborate rather than falling through to create.
+    fact_auto = "the api_key_rotation_policy governs when API keys expire"
     fact_explicit = "reminder to review the api_key_rotation_policy before the next audit"
     assert fact_auto != existing_content  # sanity: genuinely non-exact
     assert _normalize_for_dedup(fact_auto) != _normalize_for_dedup(existing_content)  # exact-match won't fire
-    assert _jaccard(_extract_keywords(fact_auto), _extract_keywords(existing_content)) == 1.0  # but still Jaccard-identical
+    assert _jaccard(_extract_keywords(fact_auto), _extract_keywords(existing_content)) >= 0.5  # crosses threshold
 
     # Auto candidate FIRST (index 0) -- it is the one that WRITES the bound, so the test's
     # pass/fail genuinely depends on its call site's sync-on-success, not the explicit branch's.
