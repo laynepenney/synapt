@@ -973,6 +973,165 @@ def create_app() -> FastAPI:
     # Terminal pop-out: xterm.js + WebSocket bridge to tmux
     # -----------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Memento portal — four polaroids, one per agent, chat inside the frame.
+    # Presentation layer over existing plumbing: /api/agent/{name}/snapshot
+    # for the live pane text, /api/agent/{name}/input for talking back.
+    # ------------------------------------------------------------------
+
+    _MEMENTO_AGENTS = [
+        {"name": "opus", "label": "OPUS", "note": "the coordinator. remembers for the team.", "tilt": -2.4},
+        {"name": "apollo", "label": "APOLLO", "note": "builds. mends what breaks.", "tilt": 1.8},
+        {"name": "atlas", "label": "ATLAS", "note": "research. follows the spirals.", "tilt": -1.2},
+        {"name": "sentinel", "label": "SENTINEL", "note": "verifies everything. trust the lens.", "tilt": 2.6},
+    ]
+    _PORTRAITS_DIR = Path(
+        os.environ.get(
+            "SYNAPT_PORTRAITS_DIR",
+            str(Path.home() / "Development/synapt/config/design/owl-canon/portraits"),
+        )
+    )
+
+    @app.get("/memento/portrait/{name}")
+    async def memento_portrait(name: str):
+        """Serve an agent's canon portrait for the memento page (local demo)."""
+        safe = re.sub(r"[^a-z]", "", name.lower())
+        p = _PORTRAITS_DIR / f"portrait-{safe}.png"
+        if p.exists():
+            return FileResponse(p, media_type="image/png")
+        raise HTTPException(status_code=404, detail="no portrait")
+
+    @app.get("/memento", response_class=HTMLResponse)
+    async def memento_page():
+        """Four polaroids pinned to the board; the chat with each agent inside."""
+        cards = []
+        for a in _MEMENTO_AGENTS:
+            cards.append(f'''
+            <div class="polaroid" style="--tilt:{a["tilt"]}deg" data-agent="{a["name"]}">
+              <div class="tape"></div>
+              <div class="photo">
+                <img src="/memento/portrait/{a["name"]}" alt="{a["label"]}"
+                     onerror="this.style.display='none';this.parentElement.classList.add('noimg')">
+                <pre class="chat" id="chat-{a["name"]}">…</pre>
+              </div>
+              <div class="caption">
+                <span class="cname">{a["label"]}</span>
+                <span class="cnote">— {a["note"]}</span>
+              </div>
+              <form class="talk" data-agent="{a["name"]}">
+                <input type="text" placeholder="say something to {a["label"].lower()}…" autocomplete="off">
+              </form>
+            </div>''')
+        cards_html = "\n".join(cards)
+        page = '''<!doctype html>
+<html><head><meta charset="utf-8"><title>synapt — memento</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; }}
+  body {{
+    min-height: 100vh; padding: 3rem 2rem;
+    background: #16130f radial-gradient(ellipse at 30% 20%, #241f18 0%, #16130f 60%);
+    font-family: -apple-system, system-ui, sans-serif; color: #ddd;
+  }}
+  h1 {{
+    text-align: center; font-family: "Permanent Marker", "Marker Felt", "Comic Sans MS", cursive;
+    color: #e8e2d4; font-size: 1.6rem; letter-spacing: .06em; margin-bottom: .4rem;
+  }}
+  .sub {{ text-align: center; color: #8b8375; font-size: .8rem; margin-bottom: 2.2rem; }}
+  .board {{
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 2.4rem; max-width: 1500px; margin: 0 auto;
+  }}
+  .polaroid {{
+    background: #f4f1e8; padding: 14px 14px 10px; border-radius: 2px;
+    transform: rotate(var(--tilt)); position: relative;
+    box-shadow: 0 12px 30px rgba(0,0,0,.55), 0 2px 6px rgba(0,0,0,.4);
+    transition: transform .25s ease;
+  }}
+  .polaroid:hover {{ transform: rotate(0deg) scale(1.02); z-index: 5; }}
+  .tape {{
+    position: absolute; top: -12px; left: 50%; transform: translateX(-50%) rotate(-1.5deg);
+    width: 92px; height: 26px; background: rgba(230,220,180,.55);
+    box-shadow: 0 1px 3px rgba(0,0,0,.25); border-left: 1px dashed rgba(0,0,0,.08);
+    border-right: 1px dashed rgba(0,0,0,.08);
+  }}
+  .photo {{
+    background: #0b0e13; height: 360px; position: relative; overflow: hidden;
+    display: flex; flex-direction: column;
+  }}
+  .photo img {{
+    width: 100%; height: 150px; object-fit: cover; object-position: center 28%;
+    opacity: .92; flex: none;
+  }}
+  .photo.noimg {{ background: linear-gradient(160deg, #1a1f2e, #0b0e13); }}
+  .chat {{
+    flex: 1; overflow-y: auto; padding: 8px 10px; margin: 0;
+    font: 10.5px/1.45 "SF Mono", ui-monospace, Menlo, monospace;
+    color: #9fd3a8; white-space: pre-wrap; word-break: break-word;
+    background: rgba(6,8,12,.92); border-top: 1px solid rgba(120,200,140,.15);
+    scrollbar-width: thin;
+  }}
+  .caption {{ padding: 9px 4px 4px; }}
+  .cname {{
+    font-family: "Permanent Marker", "Marker Felt", "Comic Sans MS", cursive;
+    font-size: 1.05rem; color: #23201a; letter-spacing: .04em;
+  }}
+  .cnote {{
+    font-family: "Bradley Hand", "Marker Felt", cursive;
+    font-size: .8rem; color: #4c463c; margin-left: .3rem;
+  }}
+  .talk input {{
+    width: 100%; margin-top: 6px; padding: 7px 9px;
+    border: 1px solid #c9c2b2; border-radius: 3px; background: #fbf9f2;
+    font: 12.5px -apple-system, sans-serif; color: #23201a; outline: none;
+  }}
+  .talk input:focus {{ border-color: #8a8270; box-shadow: 0 0 0 2px rgba(140,130,110,.2); }}
+  .polaroid.sent {{ animation: flash .5s ease; }}
+  @keyframes flash {{ 0% {{ box-shadow: 0 0 0 3px rgba(140,200,150,.8), 0 12px 30px rgba(0,0,0,.55); }} }}
+</style></head>
+<body>
+  <h1>remember for them</h1>
+  <div class="sub">the team, live &mdash; type into a photo to speak to its agent</div>
+  <div class="board">
+__CARDS__
+  </div>
+<script>
+  async function poll(agent) {{
+    try {{
+      const r = await fetch(`/api/agent/${{agent}}/snapshot?lines=40`);
+      if (r.ok) {{
+        const j = await r.json();
+        const el = document.getElementById(`chat-${{agent}}`);
+        const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+        el.textContent = (j && j.content) ? j.content : "";
+        if (atBottom) el.scrollTop = el.scrollHeight;
+      }}
+    }} catch (e) {{ /* pane may be gone; keep last frame */ }}
+  }}
+  document.querySelectorAll(".polaroid").forEach(p => {{
+    const agent = p.dataset.agent;
+    poll(agent);
+    setInterval(() => poll(agent), 2500);
+  }});
+  document.querySelectorAll(".talk").forEach(f => {{
+    f.addEventListener("submit", async ev => {{
+      ev.preventDefault();
+      const input = f.querySelector("input");
+      const text = input.value.trim();
+      if (!text) return;
+      const fd = new FormData();
+      fd.append("text", text);
+      const r = await fetch(`/api/agent/${{f.dataset.agent}}/input`, {{ method: "POST", body: fd }});
+      if (r.ok) {{
+        input.value = "";
+        f.closest(".polaroid").classList.add("sent");
+        setTimeout(() => f.closest(".polaroid").classList.remove("sent"), 600);
+      }}
+    }});
+  }});
+</script>
+</body></html>'''
+        return HTMLResponse(page.replace("{{", "\x00").replace("}}", "\x01").replace("\x00", "{").replace("\x01", "}").replace("__CARDS__", cards_html))
+
     @app.get("/terminal/{name}")
     async def terminal_page(name: str):
         """Serve the xterm.js terminal pop-out page."""
