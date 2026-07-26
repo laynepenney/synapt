@@ -1260,6 +1260,14 @@ def create_app() -> FastAPI:
     background: #16130f radial-gradient(ellipse at 30% 20%, #241f18 0%, #16130f 60%);
     font-family: -apple-system, system-ui, sans-serif; color: #ddd;
   }
+  /* pinned header — title, subtitle, and photo-size control stay on top */
+  .topbar {
+    position: sticky; top: 0; z-index: 50;
+    margin: -3rem -2rem 1.6rem; padding: 1.3rem 2rem 1rem;
+    background: #16130f; box-shadow: 0 8px 22px rgba(0,0,0,.55);
+    border-bottom: 1px solid rgba(180,170,150,.10);
+  }
+  .topbar .controls { margin-bottom: 0; }
   h1 {
     text-align: center; font-family: "Permanent Marker", "Marker Felt", "Comic Sans MS", cursive;
     color: #e8e2d4; font-size: 1.6rem; letter-spacing: .06em; margin-bottom: .4rem;
@@ -1458,9 +1466,11 @@ def create_app() -> FastAPI:
   }
 </style></head>
 <body>
-  <h1>Memento agere, memento mori.</h1>
-  <div class="sub">Remember to act. Remember you will die.</div>
-  <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"></div>
+  <div class="topbar">
+    <h1>Memento agere, memento mori.</h1>
+    <div class="sub">Remember to act. Remember you will die.</div>
+    <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"></div>
+  </div>
 __CARDS__
   <div class="lightbox" id="lightbox">
     <div class="lb-close">&times;</div>
