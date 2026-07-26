@@ -1189,19 +1189,17 @@ def create_app() -> FastAPI:
         if target is None:
             raise HTTPException(status_code=404, detail="unknown agent")
         text = (text or "").strip()
-        if not text:
-            raise HTTPException(status_code=400, detail="empty message")
         try:
-            result = subprocess.run(
-                ["tmux", "send-keys", "-t", target, text, "Enter"],
-                capture_output=True, timeout=5,
-            )
+            # empty text sends a bare Enter — confirm a prompt / poke the agent
+            keys = ["tmux", "send-keys", "-t", target] + ([text, "Enter"] if text else ["Enter"])
+            result = subprocess.run(keys, capture_output=True, timeout=5)
             if result.returncode != 0:
                 raise HTTPException(
                     status_code=502,
                     detail=f"tmux send-keys failed: {result.stderr.decode().strip()}",
                 )
-            if name in _MEMENTO_CODEX:
+            # codex needs a second confirming Enter, but only when there was text
+            if text and name in _MEMENTO_CODEX:
                 await asyncio.sleep(0.3)
                 subprocess.run(
                     ["tmux", "send-keys", "-t", target, "Enter"],
@@ -1241,6 +1239,7 @@ def create_app() -> FastAPI:
                 <div class="photo">
                   {photo_inner}
                   <pre class="chat" id="chat-{a["name"]}">…</pre>
+                  <div class="grip" title="drag to resize · double-click to reset"></div>
                 </div>
                 <div class="caption">
                   <span class="cname">{a["label"]}</span>
@@ -1287,11 +1286,12 @@ def create_app() -> FastAPI:
     width: 15px; height: 15px; border: none; border-radius: 50%; background: #d8cdb6; cursor: ew-resize;
   }
   .board {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(var(--card, 300px), 1fr));
-    gap: 2.4rem; max-width: 1500px; margin: 0 auto;
+    display: flex; flex-wrap: wrap; justify-content: center;
+    gap: 2.4rem; max-width: 1600px; margin: 0 auto;
   }
   .polaroid {
     background: #f4f1e8; padding: 14px 14px 10px; border-radius: 2px;
+    width: var(--card, 300px); flex: none;
     transform: rotate(var(--tilt)); position: relative;
     box-shadow: 0 12px 30px rgba(0,0,0,.55), 0 2px 6px rgba(0,0,0,.4);
     transition: transform .25s ease;
@@ -1312,9 +1312,19 @@ def create_app() -> FastAPI:
     opacity: .94; flex: none;
   }
   .photo.noimg { background: linear-gradient(160deg, #1a1f2e, #0b0e13); }
+  .grip {
+    position: absolute; right: 3px; bottom: 3px; width: 20px; height: 20px;
+    cursor: nwse-resize; z-index: 7; opacity: 0; transition: opacity .15s;
+    background:
+      linear-gradient(135deg, transparent 44%, rgba(222,212,182,.9) 44%, rgba(222,212,182,.9) 52%, transparent 52%),
+      linear-gradient(135deg, transparent 64%, rgba(222,212,182,.9) 64%, rgba(222,212,182,.9) 72%, transparent 72%);
+  }
+  .polaroid:hover .grip { opacity: .7; }
+  .grip:hover { opacity: 1; }
   .chat {
     flex: 1; overflow-y: auto; padding: 7px 10px; margin: 0;
-    font: 9.5px/1.4 "SF Mono", ui-monospace, Menlo, monospace;
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: calc(var(--card, 300px) * 0.032); line-height: 1.4;  /* scales with photo size */
     color: #9fd3a8; white-space: pre-wrap; word-break: break-word;
     background: rgba(6,8,12,.92); border-top: 1px solid rgba(120,200,140,.15);
     scrollbar-width: thin;
@@ -1441,8 +1451,8 @@ def create_app() -> FastAPI:
   }
 </style></head>
 <body>
-  <h1>remember for them</h1>
-  <div class="sub">both teams, live &mdash; type into a photo to speak to its agent</div>
+  <h1>Memento agere, memento mori.</h1>
+  <div class="sub">Remember to act. Remember you will die.</div>
   <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"></div>
 __CARDS__
   <div class="lightbox" id="lightbox">
@@ -1543,12 +1553,44 @@ __CARDS__
     setInterval(() => poll(agent), 2500);
     p.querySelector(".photo").addEventListener("click", () => openLb(agent));
   });
+  // per-card resize: drag a photo's corner grip to size just that one;
+  // double-click the grip to reset it back to the global slider size.
+  const cardSizes = JSON.parse(localStorage.getItem("memento-card-sizes") || "{}");
+  document.querySelectorAll(".polaroid").forEach(card => {
+    const agent = card.dataset.agent;
+    if (cardSizes[agent]) card.style.setProperty("--card", cardSizes[agent] + "px");
+    const grip = card.querySelector(".grip");
+    if (!grip) return;
+    grip.addEventListener("click", e => e.stopPropagation());
+    grip.addEventListener("mousedown", e => {
+      e.preventDefault(); e.stopPropagation();
+      const startX = e.clientX;
+      const startW = parseFloat(getComputedStyle(card).getPropertyValue("--card")) || card.offsetWidth;
+      const move = ev => {
+        const w = Math.max(200, Math.min(940, startW + (ev.clientX - startX)));
+        card.style.setProperty("--card", Math.round(w) + "px");
+      };
+      const up = () => {
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+        cardSizes[agent] = Math.round(parseFloat(getComputedStyle(card).getPropertyValue("--card")));
+        localStorage.setItem("memento-card-sizes", JSON.stringify(cardSizes));
+      };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    });
+    grip.addEventListener("dblclick", e => {
+      e.preventDefault(); e.stopPropagation();
+      card.style.removeProperty("--card");
+      delete cardSizes[agent];
+      localStorage.setItem("memento-card-sizes", JSON.stringify(cardSizes));
+    });
+  });
   document.querySelectorAll(".talk").forEach(f => {
     f.addEventListener("submit", async ev => {
       ev.preventDefault();
       const input = f.querySelector("input");
-      const text = input.value.trim();
-      if (!text) return;
+      const text = input.value.trim();  // empty allowed → sends a bare Enter
       const fd = new FormData();
       fd.append("text", text);
       const card = f.closest(".polaroid");
@@ -1568,8 +1610,8 @@ __CARDS__
   document.getElementById("lb-talk").addEventListener("submit", async ev => {
     ev.preventDefault();
     const input = document.getElementById("lb-input");
-    const text = input.value.trim();
-    if (!text || !lbAgent) return;
+    if (!lbAgent) return;
+    const text = input.value.trim();  // empty allowed → sends a bare Enter
     const fd = new FormData();
     fd.append("text", text);
     const frame = document.querySelector("#lightbox .frame");
