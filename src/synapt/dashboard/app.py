@@ -1055,17 +1055,17 @@ def create_app() -> FastAPI:
     border-right: 1px dashed rgba(0,0,0,.08);
   }
   .photo {
-    background: #0b0e13; height: 360px; position: relative; overflow: hidden;
-    display: flex; flex-direction: column;
+    background: #0b0e13; height: 400px; position: relative; overflow: hidden;
+    display: flex; flex-direction: column; cursor: zoom-in;
   }
   .photo img {
-    width: 100%; height: 150px; object-fit: cover; object-position: center 28%;
-    opacity: .92; flex: none;
+    width: 100%; height: 268px; object-fit: cover; object-position: center 22%;
+    opacity: .94; flex: none;
   }
   .photo.noimg { background: linear-gradient(160deg, #1a1f2e, #0b0e13); }
   .chat {
-    flex: 1; overflow-y: auto; padding: 8px 10px; margin: 0;
-    font: 10.5px/1.45 "SF Mono", ui-monospace, Menlo, monospace;
+    flex: 1; overflow-y: auto; padding: 7px 10px; margin: 0;
+    font: 9.5px/1.4 "SF Mono", ui-monospace, Menlo, monospace;
     color: #9fd3a8; white-space: pre-wrap; word-break: break-word;
     background: rgba(6,8,12,.92); border-top: 1px solid rgba(120,200,140,.15);
     scrollbar-width: thin;
@@ -1090,6 +1090,38 @@ def create_app() -> FastAPI:
   .polaroid.senderr .talk input { border-color: #b3543f; box-shadow: 0 0 0 2px rgba(179,84,63,.3); }
   @keyframes shake { 0%,100% { transform: rotate(var(--tilt)); } 25% { transform: rotate(var(--tilt)) translateX(-6px); } 75% { transform: rotate(var(--tilt)) translateX(6px); } }
   @keyframes flash { 0% { box-shadow: 0 0 0 3px rgba(140,200,150,.8), 0 12px 30px rgba(0,0,0,.55); } }
+  /* fullscreen lightbox */
+  .lightbox {
+    position: fixed; inset: 0; z-index: 100; display: none;
+    background: rgba(8,6,4,.93); backdrop-filter: blur(6px);
+    align-items: center; justify-content: center; padding: 3vh 3vw; cursor: zoom-out;
+  }
+  .lightbox.open { display: flex; }
+  .lightbox .frame {
+    background: #f4f1e8; padding: 20px 20px 16px; border-radius: 3px; cursor: default;
+    box-shadow: 0 30px 90px rgba(0,0,0,.75); width: min(900px, 92vw);
+    max-height: 94vh; display: flex; flex-direction: column;
+  }
+  .lightbox .lb-photo {
+    background: #0b0e13; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .lightbox .lb-photo img { width: 100%; height: 48vh; object-fit: cover; object-position: center 20%; }
+  .lightbox .lb-chat {
+    flex: 1; overflow-y: auto; padding: 14px 18px; margin: 0;
+    font: 13px/1.55 "SF Mono", ui-monospace, Menlo, monospace; color: #9fd3a8;
+    white-space: pre-wrap; word-break: break-word; background: rgba(6,8,12,.96);
+    border-top: 1px solid rgba(120,200,140,.15);
+  }
+  .lightbox .lb-cap {
+    font-family: "Permanent Marker", "Marker Felt", cursive; color: #23201a;
+    font-size: 1.5rem; padding: 14px 4px 2px;
+  }
+  .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #4c463c; font-size: 1rem; margin-left: .4rem; }
+  .lightbox .lb-close {
+    position: absolute; top: 3vh; right: 3vw; color: #e8e2d4; font-size: 2.2rem;
+    cursor: pointer; opacity: .7; line-height: 1;
+  }
+  .lightbox .lb-close:hover { opacity: 1; }
 </style></head>
 <body>
   <h1>remember for them</h1>
@@ -1097,7 +1129,30 @@ def create_app() -> FastAPI:
   <div class="board">
 __CARDS__
   </div>
+  <div class="lightbox" id="lightbox">
+    <div class="lb-close">&times;</div>
+    <div class="frame">
+      <div class="lb-photo"><img id="lb-img" alt=""><pre class="lb-chat" id="lb-chat"></pre></div>
+      <div class="lb-cap"><span id="lb-name"></span><span class="lb-note" id="lb-note"></span></div>
+    </div>
+  </div>
 <script>
+  const AGENTS = ["opus","apollo","atlas","sentinel"];
+  let lbAgent = null;
+  const lb = document.getElementById("lightbox");
+  function openLb(agent) {
+    lbAgent = agent;
+    const card = document.querySelector(`.polaroid[data-agent="${agent}"]`);
+    document.getElementById("lb-img").src = `/memento/portrait/${agent}`;
+    document.getElementById("lb-name").textContent = card.querySelector(".cname").textContent;
+    document.getElementById("lb-note").textContent = card.querySelector(".cnote").textContent;
+    document.getElementById("lb-chat").textContent = document.getElementById(`chat-${agent}`).textContent;
+    lb.classList.add("open");
+    const c = document.getElementById("lb-chat"); c.scrollTop = c.scrollHeight;
+  }
+  function closeLb() { lb.classList.remove("open"); lbAgent = null; }
+  lb.addEventListener("click", e => { if (e.target === lb || e.target.classList.contains("lb-close")) closeLb(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape") closeLb(); });
   async function poll(agent) {
     try {
       const r = await fetch(`/api/agent/${agent}/snapshot?lines=40`);
@@ -1107,6 +1162,12 @@ __CARDS__
         const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
         el.textContent = (j && j.content) ? j.content : "";
         if (atBottom) el.scrollTop = el.scrollHeight;
+        if (lbAgent === agent) {
+          const lc = document.getElementById("lb-chat");
+          const lbAt = lc.scrollTop + lc.clientHeight >= lc.scrollHeight - 40;
+          lc.textContent = el.textContent;
+          if (lbAt) lc.scrollTop = lc.scrollHeight;
+        }
       }
     } catch (e) { /* pane may be gone; keep last frame */ }
   }
@@ -1114,6 +1175,7 @@ __CARDS__
     const agent = p.dataset.agent;
     poll(agent);
     setInterval(() => poll(agent), 2500);
+    p.querySelector(".photo").addEventListener("click", () => openLb(agent));
   });
   document.querySelectorAll(".talk").forEach(f => {
     f.addEventListener("submit", async ev => {
