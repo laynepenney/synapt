@@ -1814,6 +1814,13 @@ def create_app() -> FastAPI:
     text-transform: uppercase; cursor: pointer; transition: all .18s ease;
   }
   .demo-btn:hover { border-color: var(--mem); color: #e8e2d4; }
+  .asof-label { margin-left: .9rem; }
+  .asof-input {
+    background: rgba(180,170,150,.08); color: #cfc8b8; border: 1px solid rgba(180,170,150,.3);
+    border-radius: 4px; padding: 4px 8px; margin-left: .4rem; cursor: pointer;
+    font: .72rem -apple-system, system-ui, sans-serif; color-scheme: dark;
+  }
+  .asof-input:hover { border-color: var(--mem); }
   body.demo .demo-btn { background: var(--mem); border-color: var(--mem); color: #06232a; font-weight: 700; }
   /* Demo Mode — the control app BECOMES the Leonard Test stage (brief's Mode 2):
      the working-chatter goes quiet, the memory chips take the stage, and the
@@ -1894,7 +1901,7 @@ def create_app() -> FastAPI:
   <div class="topbar">
     <h1>Memento agere, memento mori.</h1>
     <div class="sub">Remember to act. Remember you will die.</div>
-    <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"><button id="demo-toggle" class="demo-btn" type="button" aria-pressed="false">Demo Mode</button><button id="leonard-run" class="demo-btn leonard-run" type="button">&#9654; Leonard Test</button></div>
+    <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"><button id="demo-toggle" class="demo-btn" type="button" aria-pressed="false">Demo Mode</button><button id="leonard-run" class="demo-btn leonard-run" type="button">&#9654; Leonard Test</button><span class="ctl-label asof-label">memory as of</span><input type="date" id="asof" class="asof-input" aria-label="memory as of date"><button id="asof-now" class="demo-btn" type="button" title="jump to latest (live)">now</button></div>
   </div>
 __CARDS__
   <!-- The Leonard Test: memory crosses the session boundary, staged from live memory. -->
@@ -1918,6 +1925,23 @@ __CARDS__
     </div>
   </div>
 <script>
+  // time-travel: scope the wall's memory to a chosen day ("" = now / all memory)
+  let _asof = new URLSearchParams(location.search).get("asof") || "";
+  if (!/^\\d{4}-\\d{2}-\\d{2}$/.test(_asof)) _asof = "";
+  function asofQS(p){ return _asof ? p + "asof=" + encodeURIComponent(_asof) : ""; }
+  function refreshAll(){ document.querySelectorAll(".polaroid").forEach(p => loadProv(p.dataset.agent)); }
+  (function(){
+    const inp = document.getElementById("asof");
+    const nowBtn = document.getElementById("asof-now");
+    if (!inp) return;
+    fetch("/memento/timerange").then(r => r.json()).then(tr => {
+      if (tr.min) inp.min = tr.min;
+      if (tr.max) inp.max = tr.max;
+      inp.value = _asof || tr.max || "";   // show latest; _asof stays "" (live) until picked
+    }).catch(() => {});
+    inp.addEventListener("change", () => { _asof = inp.value || ""; refreshAll(); });
+    if (nowBtn) nowBtn.addEventListener("click", () => { _asof = ""; inp.value = inp.max || ""; refreshAll(); });
+  })();
   // board photo resize — scales all polaroids via --card, remembered across reloads
   (function(){
     const sizer = document.getElementById("sizer");
@@ -1973,7 +1997,7 @@ __CARDS__
       return el;
     };
     let d;
-    try { d = await (await fetch("/memento/leonard/" + agent)).json(); }
+    try { d = await (await fetch("/memento/leonard/" + agent + asofQS("?"))).json(); }
     catch (e) { add('could not reach memory.'); _lnRunning = false; return; }
     if (!d.reachable || !d.act1) {
       add('<div style="text-align:center;color:#8b8375">' + escProv(agent)
@@ -2096,7 +2120,7 @@ __CARDS__
     const strip = document.getElementById(`prov-${agent}`);
     if(!strip) return;
     try{
-      const r = await fetch(`/memento/provenance/${agent}?limit=2`);
+      const r = await fetch(`/memento/provenance/${agent}?limit=2` + asofQS("&"));
       if(!r.ok) return;
       const items = await r.json();
       if(!Array.isArray(items) || !items.length){ strip.innerHTML = ""; return; }
