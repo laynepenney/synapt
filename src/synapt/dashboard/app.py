@@ -1213,25 +1213,43 @@ def create_app() -> FastAPI:
   }
   .lightbox.open { display: flex; }
   .lightbox .frame {
-    background: #f4f1e8; padding: 20px 20px 16px; border-radius: 3px; cursor: default;
-    box-shadow: 0 30px 90px rgba(0,0,0,.75); width: min(900px, 92vw);
-    max-height: 94vh; display: flex; flex-direction: column;
+    background: #0b0e13; padding: 0; border-radius: 4px; cursor: default;
+    box-shadow: 0 30px 90px rgba(0,0,0,.75);
+    width: min(720px, 94vw); height: min(86vh, 860px);
+    position: relative; overflow: hidden; display: flex; flex-direction: column;
   }
-  .lightbox .lb-photo {
-    background: #0b0e13; flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden;
-  }
-  .lightbox .lb-photo img { width: 100%; height: 48vh; object-fit: cover; object-position: center 20%; }
-  .lightbox .lb-chat {
-    flex: 1; overflow-y: auto; padding: 14px 18px; margin: 0;
-    font: 13px/1.55 "SF Mono", ui-monospace, Menlo, monospace; color: #9fd3a8;
-    white-space: pre-wrap; word-break: break-word; background: rgba(6,8,12,.96);
-    border-top: 1px solid rgba(120,200,140,.15);
+  /* full-bleed owl behind the whole card */
+  .lightbox .lb-photo { position: absolute; inset: 0; z-index: 0; background: #0b0e13; }
+  .lightbox .lb-photo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; opacity: .95; }
+  /* OG-style darkening gradient so the chat reads over the owl */
+  .lightbox .lb-scrim {
+    position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background: linear-gradient(to bottom, rgba(10,12,18,.28) 0%, rgba(10,12,18,.64) 46%, rgba(10,12,18,.93) 100%);
   }
   .lightbox .lb-cap {
-    font-family: "Permanent Marker", "Marker Felt", cursive; color: #23201a;
-    font-size: 1.5rem; padding: 14px 4px 2px;
+    position: relative; z-index: 2; padding: 18px 20px 4px;
+    font-family: "Permanent Marker", "Marker Felt", cursive; color: #f4efe2;
+    font-size: 1.5rem; text-shadow: 0 2px 10px rgba(0,0,0,.85);
   }
-  .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #4c463c; font-size: 1rem; margin-left: .4rem; }
+  .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #dccfba; font-size: 1rem; margin-left: .4rem; }
+  .lightbox .lb-chat {
+    position: relative; z-index: 2; flex: 1; min-height: 0; overflow-y: auto;
+    padding: 8px 20px 10px; margin: 0; background: transparent;
+    font: 13px/1.6 "SF Mono", ui-monospace, Menlo, monospace; color: #dcf4da;
+    white-space: pre-wrap; word-break: break-word;
+    text-shadow: 0 1px 4px rgba(0,0,0,.95); scrollbar-width: thin;
+  }
+  .lightbox .lb-talk { position: relative; z-index: 2; padding: 6px 16px 16px; }
+  .lightbox .lb-talk input {
+    width: 100%; padding: 13px 15px; border: 1px solid rgba(235,228,212,.32);
+    border-radius: 7px; background: rgba(18,20,26,.72);
+    -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+    font: 15px -apple-system, sans-serif; color: #f4efe2; outline: none;
+  }
+  .lightbox .lb-talk input::placeholder { color: rgba(235,228,212,.5); }
+  .lightbox .lb-talk input:focus { border-color: rgba(150,205,155,.75); box-shadow: 0 0 0 2px rgba(120,190,125,.3); }
+  .lightbox .frame.sent .lb-talk input { border-color: rgba(120,205,135,.95); box-shadow: 0 0 0 2px rgba(120,205,135,.4); }
+  .lightbox .frame.senderr .lb-talk input { border-color: #d0714f; box-shadow: 0 0 0 2px rgba(205,105,75,.4); }
   .lightbox .lb-close {
     position: absolute; top: 3vh; right: 3vw; color: #e8e2d4; font-size: 2.2rem;
     cursor: pointer; opacity: .7; line-height: 1;
@@ -1267,7 +1285,7 @@ def create_app() -> FastAPI:
   }
   .polaroid.pending .cnote { color: #6b6456; font-style: italic; }
   .lightbox .lb-ghost {
-    flex: 1; min-height: 0; display: flex; flex-direction: column;
+    position: absolute; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 16px;
     background: repeating-linear-gradient(135deg, #0c0f16, #0c0f16 12px, #0a0d12 12px, #0a0d12 24px);
   }
@@ -1283,8 +1301,11 @@ __CARDS__
   <div class="lightbox" id="lightbox">
     <div class="lb-close">&times;</div>
     <div class="frame">
-      <div class="lb-photo"><img id="lb-img" alt=""><div id="lb-ghost" class="lb-ghost" style="display:none"><svg class="ghostowl" viewBox="0 0 100 118"><path d="M28 20 L40 40 M72 20 L60 40"/><circle cx="50" cy="46" r="30"/><circle cx="39" cy="45" r="6"/><circle cx="61" cy="45" r="6"/><path d="M50 52 l-4 8 h8 z"/><ellipse cx="50" cy="86" rx="27" ry="28"/></svg><span>mark not yet authored</span></div><pre class="lb-chat" id="lb-chat"></pre></div>
+      <div class="lb-photo"><img id="lb-img" alt=""><div id="lb-ghost" class="lb-ghost" style="display:none"><svg class="ghostowl" viewBox="0 0 100 118"><path d="M28 20 L40 40 M72 20 L60 40"/><circle cx="50" cy="46" r="30"/><circle cx="39" cy="45" r="6"/><circle cx="61" cy="45" r="6"/><path d="M50 52 l-4 8 h8 z"/><ellipse cx="50" cy="86" rx="27" ry="28"/></svg><span>mark not yet authored</span></div></div>
+      <div class="lb-scrim"></div>
       <div class="lb-cap"><span id="lb-name"></span><span class="lb-note" id="lb-note"></span></div>
+      <pre class="lb-chat" id="lb-chat"></pre>
+      <form class="lb-talk" id="lb-talk"><input type="text" id="lb-input" placeholder="say something…" autocomplete="off"></form>
     </div>
   </div>
 <script>
@@ -1308,6 +1329,8 @@ __CARDS__
     document.getElementById("lb-chat").textContent = document.getElementById(`chat-${agent}`).textContent;
     lb.classList.add("open");
     const c = document.getElementById("lb-chat"); c.scrollTop = c.scrollHeight;
+    const li = document.getElementById("lb-input");
+    if (li) { li.value = ""; setTimeout(() => li.focus(), 30); }
   }
   function closeLb() { lb.classList.remove("open"); lbAgent = null; }
   lb.addEventListener("click", e => { if (e.target === lb || e.target.classList.contains("lb-close")) closeLb(); });
@@ -1361,6 +1384,27 @@ __CARDS__
         setTimeout(() => card.classList.remove("senderr"), 900);
       }
     });
+  });
+  // fullscreen talk: sends to whichever agent's photo is currently open
+  document.getElementById("lb-talk").addEventListener("submit", async ev => {
+    ev.preventDefault();
+    const input = document.getElementById("lb-input");
+    const text = input.value.trim();
+    if (!text || !lbAgent) return;
+    const fd = new FormData();
+    fd.append("text", text);
+    const frame = document.querySelector("#lightbox .frame");
+    try {
+      const r = await fetch(`/memento/say/${lbAgent}`, { method: "POST", body: fd });
+      if (!r.ok) throw new Error(`send failed: ${r.status}`);
+      input.value = "";
+      frame.classList.add("sent");
+      setTimeout(() => frame.classList.remove("sent"), 600);
+    } catch (err) {
+      frame.classList.add("senderr");
+      setTimeout(() => frame.classList.remove("senderr"), 900);
+    }
+    input.focus();
   });
 </script>
 </body></html>'''
