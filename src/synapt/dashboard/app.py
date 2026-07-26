@@ -1356,9 +1356,11 @@ def create_app() -> FastAPI:
   .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #dccfba; font-size: 1rem; margin-left: .4rem; }
   .lightbox .lb-chat {
     position: relative; z-index: 2; flex: 1; min-height: 0; overflow: auto;
-    padding: 8px 22px 12px; margin: 0; background: transparent;
-    font: 12.5px/1.5 "SF Mono", ui-monospace, Menlo, monospace; color: #9fd3a8;
-    white-space: pre;
+    overscroll-behavior: contain;  /* don't chain scroll to the board behind */
+    padding: 10px 26px 14px; margin: 0; background: transparent;
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    font-size: clamp(11px, 1.5vw, 22px); line-height: 1.5;  /* fills window width; re-adapts on resize */
+    color: #9fd3a8; white-space: pre;
     text-shadow: 0 1px 3px rgba(0,0,0,.98); scrollbar-width: thin;
   }
   .lightbox .lb-talk { position: relative; z-index: 2; padding: 6px 16px 16px; }
@@ -1373,10 +1375,14 @@ def create_app() -> FastAPI:
   .lightbox .frame.sent .lb-talk input { border-color: rgba(120,205,135,.95); box-shadow: 0 0 0 2px rgba(120,205,135,.4); }
   .lightbox .frame.senderr .lb-talk input { border-color: #d0714f; box-shadow: 0 0 0 2px rgba(205,105,75,.4); }
   .lightbox .lb-close {
-    position: absolute; top: 3vh; right: 3vw; color: #e8e2d4; font-size: 2.2rem;
-    cursor: pointer; opacity: .7; line-height: 1;
+    position: absolute; top: 2.4vh; right: 2.4vw; z-index: 200;
+    width: 46px; height: 46px; display: flex; align-items: center; justify-content: center;
+    color: #f4efe2; font-size: 1.9rem; line-height: 1; cursor: pointer;
+    background: rgba(12,14,20,.72); border: 1px solid rgba(235,228,212,.38);
+    border-radius: 50%; -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+    opacity: .9; transition: opacity .15s ease, transform .15s ease;
   }
-  .lightbox .lb-close:hover { opacity: 1; }
+  .lightbox .lb-close:hover { opacity: 1; transform: scale(1.08); }
   /* teams + the undeveloped-polaroid placeholder (unauthored marks) */
   .team { max-width: 1500px; margin: 0 auto 2.8rem; }
   .team-head {
@@ -1450,6 +1456,7 @@ __CARDS__
     document.getElementById("lb-name").textContent = card.querySelector(".cname").textContent;
     document.getElementById("lb-note").textContent = card.querySelector(".cnote").textContent;
     lb.classList.add("open");
+    document.body.style.overflow = "hidden";   // lock the board behind
     const li = document.getElementById("lb-input");
     if (li) { li.value = ""; setTimeout(() => li.focus(), 30); }
     pollLb();                                  // fetch the full colour screen now
@@ -1458,6 +1465,7 @@ __CARDS__
   }
   function closeLb() {
     lb.classList.remove("open"); lbAgent = null;
+    document.body.style.overflow = "";         // restore board scroll
     if (lbTimer) { clearInterval(lbTimer); lbTimer = null; }
   }
   lb.addEventListener("click", e => { if (e.target === lb || e.target.classList.contains("lb-close")) closeLb(); });
