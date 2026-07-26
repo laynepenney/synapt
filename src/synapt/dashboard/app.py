@@ -1163,8 +1163,8 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="unknown agent")
         if full:
             # fullscreen: the whole live screen (input box + hint bar + refs),
-            # plus some scrollback above it, in colour, unstripped.
-            cmd = ["tmux", "capture-pane", "-t", target, "-p", "-e", "-S", "-50"]
+            # plus generous scrollback above it, in colour, unstripped.
+            cmd = ["tmux", "capture-pane", "-t", target, "-p", "-e", "-S", "-400"]
         else:
             # board: scrollback tail with the trailing chrome trimmed off.
             cap = min(max(int(lines), 10), 200) + 26
@@ -1459,6 +1459,8 @@ __CARDS__
     document.body.style.overflow = "hidden";   // lock the board behind
     const li = document.getElementById("lb-input");
     if (li) { li.value = ""; setTimeout(() => li.focus(), 30); }
+    const lc0 = document.getElementById("lb-chat");
+    lc0.innerHTML = ""; lc0.dataset.seeded = "";  // fresh load for this agent
     pollLb();                                  // fetch the full colour screen now
     if (lbTimer) clearInterval(lbTimer);
     lbTimer = setInterval(pollLb, 2000);
@@ -1489,14 +1491,18 @@ __CARDS__
   // fullscreen polls the FULL live screen (input box + hint bar + refs), in colour
   async function pollLb() {
     if (!lbAgent) return;
+    const lc = document.getElementById("lb-chat");
+    // freeze updates while the user has scrolled up to read scrollback;
+    // resume + stick to bottom once they scroll back down.
+    const atBottom = lc.scrollTop + lc.clientHeight >= lc.scrollHeight - 60;
+    if (lc.dataset.seeded && !atBottom) return;
     try {
       const r = await fetch(`/memento/pane/${lbAgent}?full=1`);
       if (!r.ok) return;
       const j = await r.json();
-      const lc = document.getElementById("lb-chat");
-      const atBottom = lc.scrollTop + lc.clientHeight >= lc.scrollHeight - 60;
       lc.innerHTML = (j && j.reachable) ? (j.content_html || "") : "· not connected ·";
-      if (atBottom) lc.scrollTop = lc.scrollHeight;
+      lc.dataset.seeded = "1";
+      lc.scrollTop = lc.scrollHeight;
     } catch (e) { /* keep last frame */ }
   }
   document.querySelectorAll(".polaroid").forEach(p => {
