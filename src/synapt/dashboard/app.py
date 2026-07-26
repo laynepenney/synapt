@@ -1319,6 +1319,94 @@ def create_app() -> FastAPI:
         safe = re.sub(r"[^a-z]", "", name.lower())
         return _memento_provenance(safe, limit=limit)
 
+    # --- the Leonard Test: memory crosses the session boundary, with proof ----
+    # Three acts, all from live journal memory, nothing invented:
+    #   act 1 (death)      a decision from a PRIOR session — it outlived the
+    #                      session that made it.
+    #   act 2 (waking)     narrated by the UI; a fresh instance has read nothing.
+    #   act 3 (remember)   three stranger-proof questions, each answered from
+    #                      the journal with a provenance chip (what/who/when/where).
+    _LEONARD_REJECT = (" not ", "instead", "reject", "don't", "do not", "deferred",
+                       "dropped", "reversed", "stays ", "no longer", "never ", " over ")
+
+    def _memento_leonard(name: str) -> dict:
+        if name not in _MEMENTO_TARGETS:
+            return {"agent": name, "reachable": False, "act1": None, "act3": []}
+        try:
+            wt_dir = project_data_dir(None) / "worktrees"
+        except Exception:
+            return {"agent": name, "reachable": False, "act1": None, "act3": []}
+        entries: list[tuple[str, dict]] = []
+        if wt_dir.exists():
+            for jf in wt_dir.glob("*/journal.jsonl"):
+                try:
+                    text = jf.read_text(errors="ignore")
+                except Exception:
+                    continue
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    who = (e.get("agent_id") or "").split("-")[0] or (e.get("griptree") or "")
+                    if who == name:
+                        entries.append((e.get("timestamp") or "", e))
+        entries.sort(key=lambda r: r[0], reverse=True)
+
+        def _chip(e: dict, what: str, kind: str) -> dict:
+            what = " ".join(str(what).split())
+            if len(what) > 150:
+                what = what[:147].rstrip() + "…"
+            return {"what": what, "kind": kind, "who": name,
+                    "when_label": _prov_when_label(e.get("timestamp") or ""),
+                    "where": _prov_where(what, e.get("session_id") or "")}
+
+        decisions = [(e, d) for _ts, e in entries for d in (e.get("decisions") or []) if str(d).strip()]
+        nexts = [(e, n) for _ts, e in entries for n in (e.get("next_steps") or []) if str(n).strip()]
+
+        # act 1: prefer a decision from a session OTHER than the newest one, so
+        # the boundary-crossing is real, not same-session recall.
+        act1 = None
+        if decisions:
+            e0, d0 = decisions[0]
+            sid0 = e0.get("session_id") or ""
+            older = next(((e, d) for e, d in decisions
+                          if (e.get("session_id") or "") and (e.get("session_id") or "") != sid0), None)
+            e1, d1 = older or (e0, d0)
+            act1 = {"chip": _chip(e1, d1, "decided"),
+                    "session": (e1.get("session_id") or "")[:8] or "a prior session",
+                    "when": _prov_when_label(e1.get("timestamp") or "")}
+
+        q: list[dict] = []
+        seen: set[str] = set()
+        if act1:
+            q.append({"q": "What did we decide, and why?", "chip": act1["chip"]})
+            seen.add(act1["chip"]["what"])
+        for e, d in decisions:  # what was rejected, and who
+            low = " " + str(d).lower() + " "
+            if any(m in low for m in _LEONARD_REJECT):
+                c = _chip(e, d, "rejected")
+                if c["what"] not in seen:
+                    q.append({"q": "What was rejected, and who rejected it?", "chip": c})
+                    seen.add(c["what"])
+                    break
+        for e, n in nexts:  # what should I not re-derive
+            c = _chip(e, n, "planned")
+            if c["what"] not in seen:
+                q.append({"q": "What should I not re-derive today?", "chip": c})
+                seen.add(c["what"])
+                break
+        return {"agent": name, "reachable": bool(entries), "act1": act1, "act3": q}
+
+    @app.get("/memento/leonard/{name}")
+    async def memento_leonard(name: str):
+        """The Leonard Test for a being, staged from live journal memory."""
+        safe = re.sub(r"[^a-z]", "", name.lower())
+        return _memento_leonard(safe)
+
     @app.get("/memento", response_class=HTMLResponse)
     async def memento_page():
         """Four polaroids pinned to the board; the chat with each agent inside."""
@@ -1606,14 +1694,100 @@ def create_app() -> FastAPI:
   }
   .chip-meta b { color: #3c362c; font-weight: 600; }
   .chip-where { color: var(--mem); }
+  /* Demo Mode toggle button (topbar) */
+  .demo-btn {
+    margin-left: .9rem; padding: 5px 12px; border: 1px solid rgba(180,170,150,.3);
+    border-radius: 4px; background: rgba(180,170,150,.08); color: #cfc8b8;
+    font: .72rem -apple-system, system-ui, sans-serif; letter-spacing: .05em;
+    text-transform: uppercase; cursor: pointer; transition: all .18s ease;
+  }
+  .demo-btn:hover { border-color: var(--mem); color: #e8e2d4; }
+  body.demo .demo-btn { background: var(--mem); border-color: var(--mem); color: #06232a; font-weight: 700; }
+  /* Demo Mode — the control app BECOMES the Leonard Test stage (brief's Mode 2):
+     the working-chatter goes quiet, the memory chips take the stage, and the
+     operator controls step off. Same app, staged. Linkable via ?demo=1. */
+  body.demo .chat { opacity: 0; transition: opacity .6s ease; }
+  body.demo .photo::after {
+    background: linear-gradient(to bottom, transparent 24%, rgba(8,10,14,.5) 55%, rgba(8,10,14,.9) 100%);
+  }
+  body.demo .talk { display: none; }
+  body.demo #sizer, body.demo .ctl-label { opacity: .28; }
+  body.demo .provstrip { gap: 7px; padding-top: 5px; }
+  body.demo .chip { padding: 7px 11px 8px; }
+  body.demo .chip-kind { font-size: .64rem; letter-spacing: .13em; }
+  body.demo .chip-what { font-size: 1.02rem; line-height: 1.4; }
+  body.demo .chip-meta { font-size: .74rem; }
+  body.demo .cname { font-size: 1.32rem; }
+  body.demo .cnote { font-size: .95rem; }
+  /* The Leonard Test — the three-act play, staged over the whole app. */
+  #leonard-run { display: none; }
+  body.demo #leonard-run { display: inline-block; }
+  .leonard {
+    position: fixed; inset: 0; z-index: 200; display: none;
+    background: radial-gradient(ellipse at 50% -10%, #14110c 0%, #080706 68%);
+    overflow: auto; padding: 6vh 6vw 10vh;
+  }
+  .leonard.open { display: block; }
+  .ln-scroll { max-width: 760px; margin: 0 auto; }
+  .ln-head {
+    text-align: center; color: #8b8375; font-size: .78rem; letter-spacing: .16em;
+    text-transform: uppercase; margin-bottom: 2.8rem;
+  }
+  .ln-head span { color: #e8e2d4; }
+  .ln-act {
+    opacity: 0; transform: translateY(12px); margin-bottom: 2.8rem;
+    transition: opacity .85s ease, transform .85s ease;
+  }
+  .ln-act.in { opacity: 1; transform: none; }
+  .leonard.still .ln-act, .leonard.still .ln-qa-item { opacity: 1 !important; transform: none !important; transition: none !important; }
+  .ln-tag {
+    font-size: .62rem; letter-spacing: .2em; text-transform: uppercase;
+    font-weight: 700; color: var(--mem); margin-bottom: .8rem;
+  }
+  .ln-death .ln-decision { font-size: 1.4rem; line-height: 1.5; color: #eae4d6; font-weight: 300; }
+  .ln-death .ln-src { color: #6f695d; font-size: .82rem; margin-top: .9rem; font-family: "SF Mono", ui-monospace, monospace; }
+  .ln-death .ln-cap { color: #c86a54; font-size: .98rem; margin-top: 1.3rem; letter-spacing: .01em; }
+  .ln-wake { text-align: center; color: #8b8375; padding: .6rem 0; }
+  .ln-wake .ln-cap { font-size: 1.1rem; color: #cfc8b8; }
+  .ln-remember .ln-qa { margin-top: .3rem; }
+  .ln-qa-item {
+    margin-bottom: 1.6rem; opacity: 0; transform: translateY(8px);
+    transition: opacity .7s ease, transform .7s ease;
+  }
+  .ln-qa-item.in { opacity: 1; transform: none; }
+  .ln-q { color: #cfc8b8; font-size: 1.06rem; margin-bottom: .6rem; }
+  .ln-q::before { content: "Q  "; color: var(--mem); font-weight: 700; }
+  .leonard .chip { background: rgba(15,151,166,.1); border-left: 3px solid var(--mem); border-radius: 3px; padding: 9px 13px 10px; }
+  .leonard .chip-kind { color: var(--mem); }
+  .leonard .chip-what { color: #e6e0d2; font-size: .96rem; line-height: 1.4; }
+  .leonard .chip-meta { color: #8b8375; }
+  .leonard .chip-meta b { color: #cfc8b8; }
+  .ln-end { text-align: center; margin: 2.2rem 0 1rem; }
+  .ln-end .ln-latin { color: #e8e2d4; font-size: 1.18rem; font-style: italic; letter-spacing: .01em; }
+  .ln-end .ln-thesis { color: #8b8375; font-size: .96rem; margin-top: .6rem; }
+  .ln-close {
+    position: fixed; top: 2.4vh; right: 2.6vw; z-index: 210;
+    width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
+    color: #f4efe2; font-size: 1.8rem; cursor: pointer; border-radius: 50%;
+    background: rgba(20,18,14,.7); border: 1px solid rgba(235,228,212,.32);
+  }
+  .ln-close:hover { border-color: var(--mem); }
 </style></head>
 <body>
   <div class="topbar">
     <h1>Memento agere, memento mori.</h1>
     <div class="sub">Remember to act. Remember you will die.</div>
-    <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"></div>
+    <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"><button id="demo-toggle" class="demo-btn" type="button" aria-pressed="false">Demo Mode</button><button id="leonard-run" class="demo-btn leonard-run" type="button">&#9654; Leonard Test</button></div>
   </div>
 __CARDS__
+  <!-- The Leonard Test: memory crosses the session boundary, staged from live memory. -->
+  <div class="leonard" id="leonard" aria-hidden="true">
+    <div class="ln-scroll">
+      <div class="ln-head"><span id="ln-agent">opus</span> &middot; the Leonard Test</div>
+      <div class="ln-body" id="ln-body"></div>
+    </div>
+    <div class="ln-close" id="ln-close" title="close">&times;</div>
+  </div>
   <div class="lightbox" id="lightbox">
     <div class="lb-close">&times;</div>
     <div class="frame">
@@ -1635,6 +1809,99 @@ __CARDS__
     const saved = localStorage.getItem("memento-card");
     if (saved) { setGlobal(+saved); sizer.value = saved; } else { setGlobal(+sizer.value); }
     sizer.addEventListener("input", () => { setGlobal(+sizer.value); localStorage.setItem("memento-card", sizer.value); });
+  })();
+  // Demo Mode — turn the control app into the Leonard Test stage. ?demo=1 links it.
+  (function(){
+    const btn = document.getElementById("demo-toggle");
+    const apply = on => { document.body.classList.toggle("demo", on); if (btn) btn.setAttribute("aria-pressed", on ? "true" : "false"); };
+    const urlDemo = new URLSearchParams(location.search).get("demo") === "1";
+    apply(urlDemo || localStorage.getItem("memento-demo") === "1");
+    if (btn) btn.addEventListener("click", () => {
+      const on = !document.body.classList.contains("demo");
+      apply(on); localStorage.setItem("memento-demo", on ? "1" : "0");
+    });
+  })();
+  // ---- The Leonard Test: three acts, staged from LIVE memory (replay = live).
+  const _lnOverlay = document.getElementById("leonard");
+  const _lnWait = ms => new Promise(r => setTimeout(r, ms));
+  function _lnChip(ch){
+    return '<div class="chip"><span class="chip-kind">' + escProv(ch.kind) + '</span>'
+      + '<span class="chip-what">' + escProv(ch.what) + '</span>'
+      + '<span class="chip-meta"><b>' + escProv(ch.who) + '</b> · ' + escProv(ch.when_label)
+      + ' · <span class="chip-where">' + escProv(ch.where) + '</span></span></div>';
+  }
+  let _lnRunning = false;
+  async function runLeonard(agent){
+    if (_lnRunning) return;
+    _lnRunning = true;
+    agent = (agent || "opus").replace(/[^a-z]/g, "") || "opus";
+    const params = new URLSearchParams(location.search);
+    const still = params.get("still") === "1";
+    const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const pace = still ? 0 : (reduce ? 0.3 : 1);
+    const step = base => _lnWait(still ? 15 : base * pace + 300);
+    const body = document.getElementById("ln-body");
+    document.getElementById("ln-agent").textContent = agent;
+    body.innerHTML = "";
+    _lnOverlay.classList.toggle("still", still);
+    _lnOverlay.classList.add("open");
+    _lnOverlay.setAttribute("aria-hidden", "false");
+    document.body.style.overflow = "hidden";
+    const add = html => {
+      const el = document.createElement("div");
+      el.className = "ln-act";
+      el.innerHTML = html;
+      body.appendChild(el);
+      requestAnimationFrame(() => el.classList.add("in"));
+      return el;
+    };
+    let d;
+    try { d = await (await fetch("/memento/leonard/" + agent)).json(); }
+    catch (e) { add('could not reach memory.'); _lnRunning = false; return; }
+    if (!d.reachable || !d.act1) {
+      add('<div style="text-align:center;color:#8b8375">' + escProv(agent)
+        + ' has authored no memory in this store yet — nothing to remember, honestly.</div>');
+      _lnRunning = false; return;
+    }
+    // Act 1 — Death: a decision that outlived the session that made it.
+    add('<div class="ln-death"><div class="ln-tag">Act 1 · Death</div>'
+      + '<div class="ln-decision">“' + escProv(d.act1.chip.what) + '”</div>'
+      + '<div class="ln-src">decided in session ' + escProv(d.act1.session) + ' · ' + escProv(d.act1.when) + '</div>'
+      + '<div class="ln-cap">Session ended. Context destroyed.</div></div>');
+    await step(3800);
+    // Act 2 — Waking: a fresh instance, zero context.
+    add('<div class="ln-wake"><div class="ln-tag">Act 2 · Waking</div>'
+      + '<div class="ln-cap">New session. This instance has read nothing.</div></div>');
+    await step(2500);
+    // Act 3 — Remembering: stranger-proof questions, each answered with a chip.
+    const rem = add('<div class="ln-remember"><div class="ln-tag">Act 3 · Remembering</div><div class="ln-qa" id="ln-qa"></div></div>');
+    const qaEl = rem.querySelector("#ln-qa");
+    for (const item of d.act3){
+      const qi = document.createElement("div");
+      qi.className = "ln-qa-item";
+      qi.innerHTML = '<div class="ln-q">' + escProv(item.q) + '</div>' + _lnChip(item.chip);
+      qaEl.appendChild(qi);
+      requestAnimationFrame(() => qi.classList.add("in"));
+      await step(2600);
+    }
+    add('<div class="ln-end"><div class="ln-latin">Memento agere, memento mori.</div>'
+      + '<div class="ln-thesis">What you feed the memory outlives the session that fed it.</div></div>');
+    _lnRunning = false;
+  }
+  function closeLeonard(){
+    _lnOverlay.classList.remove("open");
+    _lnOverlay.setAttribute("aria-hidden", "true");
+    document.body.style.overflow = "";
+  }
+  (function(){
+    const run = document.getElementById("leonard-run");
+    if (run) run.addEventListener("click", () => runLeonard("opus"));
+    const close = document.getElementById("ln-close");
+    if (close) close.addEventListener("click", closeLeonard);
+    if (_lnOverlay) _lnOverlay.addEventListener("click", e => { if (e.target === _lnOverlay) closeLeonard(); });
+    document.addEventListener("keydown", e => { if (e.key === "Escape" && _lnOverlay.classList.contains("open")) closeLeonard(); });
+    const la = new URLSearchParams(location.search).get("leonard");
+    if (la){ document.body.classList.add("demo"); setTimeout(() => runLeonard(la), 400); }
   })();
   let lbAgent = null;
   let lbTimer = null;
