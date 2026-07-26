@@ -1304,11 +1304,11 @@ def create_app() -> FastAPI:
     border-right: 1px dashed rgba(0,0,0,.08);
   }
   .photo {
-    background: #0b0e13; height: calc(var(--card, 300px) * 1.33); position: relative; overflow: hidden;
+    background: #0b0e13; height: var(--ph, 400px); position: relative; overflow: hidden;
     display: flex; flex-direction: column; cursor: zoom-in;
   }
   .photo img {
-    width: 100%; height: calc(var(--card, 300px) * 0.89); object-fit: cover; object-position: center 22%;
+    width: 100%; height: calc(var(--ph, 400px) * 0.66); object-fit: cover; object-position: center 22%;
     opacity: .94; flex: none;
   }
   .photo.noimg { background: linear-gradient(160deg, #1a1f2e, #0b0e13); }
@@ -1426,7 +1426,7 @@ def create_app() -> FastAPI:
   .polaroid.pending { background: #ece8dc; }
   .polaroid.pending .photo { cursor: zoom-in; }
   .ghost {
-    flex: none; height: calc(var(--card, 300px) * 0.89); display: flex; flex-direction: column;
+    flex: none; height: calc(var(--ph, 400px) * 0.66); display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 12px;
     background: repeating-linear-gradient(135deg, #0c0f16, #0c0f16 9px, #0a0d12 9px, #0a0d12 18px);
   }
@@ -1472,12 +1472,13 @@ __CARDS__
   (function(){
     const sizer = document.getElementById("sizer");
     if (!sizer) return;
+    const setGlobal = v => {
+      document.documentElement.style.setProperty("--card", v + "px");
+      document.documentElement.style.setProperty("--ph", Math.round(v * 1.33) + "px");
+    };
     const saved = localStorage.getItem("memento-card");
-    if (saved) { document.documentElement.style.setProperty("--card", saved + "px"); sizer.value = saved; }
-    sizer.addEventListener("input", () => {
-      document.documentElement.style.setProperty("--card", sizer.value + "px");
-      localStorage.setItem("memento-card", sizer.value);
-    });
+    if (saved) { setGlobal(+saved); sizer.value = saved; } else { setGlobal(+sizer.value); }
+    sizer.addEventListener("input", () => { setGlobal(+sizer.value); localStorage.setItem("memento-card", sizer.value); });
   })();
   let lbAgent = null;
   let lbTimer = null;
@@ -1558,22 +1559,30 @@ __CARDS__
   const cardSizes = JSON.parse(localStorage.getItem("memento-card-sizes") || "{}");
   document.querySelectorAll(".polaroid").forEach(card => {
     const agent = card.dataset.agent;
-    if (cardSizes[agent]) card.style.setProperty("--card", cardSizes[agent] + "px");
+    const s = cardSizes[agent];
+    if (s) {  // {w,h}; tolerate the old numeric (width-only) format
+      const w = (typeof s === "number") ? s : s.w;
+      const h = (typeof s === "object") ? s.h : null;
+      if (w) card.style.setProperty("--card", w + "px");
+      if (h) card.style.setProperty("--ph", h + "px");
+    }
     const grip = card.querySelector(".grip");
     if (!grip) return;
     grip.addEventListener("click", e => e.stopPropagation());
     grip.addEventListener("mousedown", e => {
       e.preventDefault(); e.stopPropagation();
-      const startX = e.clientX;
-      const startW = parseFloat(getComputedStyle(card).getPropertyValue("--card")) || card.offsetWidth;
-      const move = ev => {
-        const w = Math.max(200, Math.min(940, startW + (ev.clientX - startX)));
-        card.style.setProperty("--card", Math.round(w) + "px");
+      const startX = e.clientX, startY = e.clientY, cs = getComputedStyle(card);
+      const startW = parseFloat(cs.getPropertyValue("--card")) || card.offsetWidth;
+      const startH = parseFloat(cs.getPropertyValue("--ph")) || card.querySelector(".photo").offsetHeight;
+      const move = ev => {  // horizontal = width, vertical = height → free aspect ratio
+        card.style.setProperty("--card", Math.round(Math.max(200, Math.min(1000, startW + (ev.clientX - startX)))) + "px");
+        card.style.setProperty("--ph", Math.round(Math.max(150, Math.min(1200, startH + (ev.clientY - startY)))) + "px");
       };
       const up = () => {
         document.removeEventListener("mousemove", move);
         document.removeEventListener("mouseup", up);
-        cardSizes[agent] = Math.round(parseFloat(getComputedStyle(card).getPropertyValue("--card")));
+        const c = getComputedStyle(card);
+        cardSizes[agent] = { w: Math.round(parseFloat(c.getPropertyValue("--card"))), h: Math.round(parseFloat(c.getPropertyValue("--ph"))) };
         localStorage.setItem("memento-card-sizes", JSON.stringify(cardSizes));
       };
       document.addEventListener("mousemove", move);
@@ -1581,7 +1590,7 @@ __CARDS__
     });
     grip.addEventListener("dblclick", e => {
       e.preventDefault(); e.stopPropagation();
-      card.style.removeProperty("--card");
+      card.style.removeProperty("--card"); card.style.removeProperty("--ph");
       delete cardSizes[agent];
       localStorage.setItem("memento-card-sizes", JSON.stringify(cardSizes));
     });
