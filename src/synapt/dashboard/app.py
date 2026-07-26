@@ -1211,6 +1211,114 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=504, detail="tmux send-keys timed out")
         return {"ok": True, "agent": name, "codex": name in _MEMENTO_CODEX}
 
+    # --- provenance chips: what each being has committed to memory --------
+    # Sourced from the per-agent journals (author-native: each entry carries
+    # its own agent_id + session_id), never from the live pane. This is the
+    # wall showing *remembering*, not just working. Honesty rule enforced
+    # here, not in the CSS: `who` is the journal's own agent_id, never
+    # inferred; a being that has authored nothing in this store returns an
+    # empty list, so we can never render a chip that isn't backed by a real
+    # entry. "If an answer has no chip, it does not appear" is a property of
+    # this endpoint, not a discipline someone has to remember.
+    _PROV_MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    # matches "grip#790", "PR#123", and bare "#888" — no leading \b, which
+    # would never match before '#' unless a letter preceded it (dropping the
+    # bare-ref case and under-reporting real provenance).
+    _PROV_REF_RE = re.compile(r"(?:[A-Za-z]{2,12})?#\d{1,6}\b")
+
+    def _prov_when_label(ts: str) -> str:
+        # "2026-07-26T..." -> "Jul 26"; degrade to the raw date if malformed.
+        try:
+            _y, m, d = ts[:10].split("-")
+            return f"{_PROV_MONTHS[int(m)]} {int(d)}"
+        except Exception:
+            return ts[:10]
+
+    def _prov_where(what: str, session_id: str) -> str:
+        # Prefer a real ref the author wrote (grip#790, #123); else the
+        # session receipt; else the journal itself. Shown only when real.
+        m = _PROV_REF_RE.search(what or "")
+        if m:
+            return m.group(0)
+        if session_id:
+            return "s:" + session_id[:6]
+        return "journal"
+
+    def _memento_provenance(name: str, limit: int = 2) -> list[dict]:
+        """Most-recent memory a being has authored, as chip records.
+
+        Scans every worktree journal and keeps entries whose own
+        ``agent_id`` (or ``griptree``) resolves to ``name``.  Returns
+        ``[{what, kind, who, when, when_label, where}]`` newest first, or an
+        empty list when the being has authored nothing here — honest silence.
+        """
+        if name not in _MEMENTO_TARGETS:
+            return []
+        try:
+            wt_dir = project_data_dir(None) / "worktrees"
+        except Exception:
+            return []
+        if not wt_dir.exists():
+            return []
+        rows: list[tuple[str, dict]] = []
+        for jf in wt_dir.glob("*/journal.jsonl"):
+            try:
+                text = jf.read_text(errors="ignore")
+            except Exception:
+                continue
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except Exception:
+                    continue
+                who = (e.get("agent_id") or "").split("-")[0] or (e.get("griptree") or "")
+                if who != name:
+                    continue
+                decisions = e.get("decisions") or []
+                nexts = e.get("next_steps") or []
+                if decisions:
+                    what, kind = str(decisions[0]), "decided"
+                elif nexts:
+                    what, kind = str(nexts[0]), "planned"
+                elif e.get("focus"):
+                    what, kind = str(e["focus"]), "focus"
+                else:
+                    continue
+                what = " ".join(what.split())  # collapse whitespace/newlines
+                if len(what) > 132:
+                    what = what[:129].rstrip() + "…"
+                ts = e.get("timestamp") or ""
+                rows.append((ts, {
+                    "what": what,
+                    "kind": kind,
+                    "who": name,
+                    "when": ts[:10],
+                    "when_label": _prov_when_label(ts),
+                    "where": _prov_where(what, e.get("session_id") or ""),
+                }))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        seen: set[str] = set()
+        out: list[dict] = []
+        cap = max(1, min(int(limit or 2), 5))
+        for _ts, rec in rows:
+            if rec["what"] in seen:
+                continue  # same decision re-journaled across sessions
+            seen.add(rec["what"])
+            out.append(rec)
+            if len(out) >= cap:
+                break
+        return out
+
+    @app.get("/memento/provenance/{name}")
+    async def memento_provenance(name: str, limit: int = 2):
+        """Provenance chips for a being: what it has committed to memory."""
+        safe = re.sub(r"[^a-z]", "", name.lower())
+        return _memento_provenance(safe, limit=limit)
+
     @app.get("/memento", response_class=HTMLResponse)
     async def memento_page():
         """Four polaroids pinned to the board; the chat with each agent inside."""
@@ -1246,6 +1354,7 @@ def create_app() -> FastAPI:
                   <span class="cname">{a["label"]}</span>
                   <span class="cnote">— {a["note"]}</span>
                 </div>
+                <div class="provstrip" id="prov-{a["name"]}" aria-label="what {a["label"].lower()} remembers"></div>
                 <form class="talk" data-agent="{a["name"]}">
                   <input type="text" placeholder="say something to {a["label"].lower()}…" autocomplete="off">
                 </form>
@@ -1472,6 +1581,31 @@ def create_app() -> FastAPI:
   .lightbox .lb-ghost span {
     font-family: "Bradley Hand", cursive; color: rgba(184,178,162,.55); font-size: 1.1rem;
   }
+  /* provenance chips — what a being has committed to memory. The one place
+     the memory accent (--mem) is used; the eye learns it in one exposure.
+     Sits on the cream caption strip, never on the owl. Reads as a receipt. */
+  :root { --mem: #0f97a6; }
+  .provstrip { display: flex; flex-direction: column; gap: 5px; padding: 2px 2px 0; }
+  .provstrip:empty { display: none; }
+  .chip {
+    border-left: 3px solid var(--mem); border-radius: 2px;
+    background: rgba(15,151,166,.07); padding: 4px 8px 5px;
+  }
+  .chip-kind {
+    display: inline-block; font-size: .52rem; letter-spacing: .11em;
+    text-transform: uppercase; font-weight: 700; color: var(--mem);
+    font-family: -apple-system, system-ui, sans-serif;
+  }
+  .chip-what {
+    display: block; margin: 1px 0 2px; font-size: .73rem; line-height: 1.34;
+    color: #2a2620; font-family: -apple-system, system-ui, sans-serif;
+  }
+  .chip-meta {
+    font-size: .6rem; color: #726a5c; letter-spacing: .01em;
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  }
+  .chip-meta b { color: #3c362c; font-weight: 600; }
+  .chip-where { color: var(--mem); }
 </style></head>
 <body>
   <div class="topbar">
@@ -1570,10 +1704,32 @@ __CARDS__
       lc.scrollTop = lc.scrollHeight;
     } catch (e) { /* keep last frame */ }
   }
+  // provenance chips — fetch what each being has committed to memory and
+  // render receipts on the cream. Empty (no authored memory) → nothing shown.
+  function escProv(s){ return String(s==null?"":s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+  async function loadProv(agent){
+    const strip = document.getElementById(`prov-${agent}`);
+    if(!strip) return;
+    try{
+      const r = await fetch(`/memento/provenance/${agent}?limit=2`);
+      if(!r.ok) return;
+      const items = await r.json();
+      if(!Array.isArray(items) || !items.length){ strip.innerHTML = ""; return; }
+      strip.innerHTML = items.map(it => `
+        <div class="chip" title="${escProv(it.what)}">
+          <span class="chip-kind">${escProv(it.kind)}</span>
+          <span class="chip-what">${escProv(it.what)}</span>
+          <span class="chip-meta"><b>${escProv(it.who)}</b> · ${escProv(it.when_label)} · <span class="chip-where">${escProv(it.where)}</span></span>
+        </div>`).join("");
+    }catch(e){ /* keep last render */ }
+  }
   document.querySelectorAll(".polaroid").forEach(p => {
     const agent = p.dataset.agent;
     poll(agent);
     setInterval(() => poll(agent), 2500);
+    loadProv(agent);
+    setInterval(() => loadProv(agent), 30000);  // memory changes slowly
     p.querySelector(".photo").addEventListener("click", () => openLb(agent));
   });
   // per-card resize: drag a photo's corner grip to size just that one;
