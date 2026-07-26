@@ -1214,9 +1214,10 @@ def create_app() -> FastAPI:
     @app.get("/memento", response_class=HTMLResponse)
     async def memento_page():
         """Four polaroids pinned to the board; the chat with each agent inside."""
-        sections = []
+        # one freeform canvas: every agent is a card the operator can drag,
+        # resize, and rearrange anywhere; team shows as a small tag per card.
+        cards = []
         for tm in _MEMENTO_TEAMS:
-            cards = []
             for a in tm["agents"]:
                 authored = a.get("authored", True)
                 pend = "" if authored else " pending"
@@ -1234,12 +1235,12 @@ def create_app() -> FastAPI:
                         '<span class="pendlabel">mark not yet authored</span></div>'
                     )
                 cards.append(f'''
-              <div class="polaroid{pend}" style="--tilt:{a["tilt"]}deg" data-agent="{a["name"]}">
+              <div class="polaroid{pend}" style="--tilt:{a["tilt"]}deg" data-agent="{a["name"]}" data-team="{tm["team"]}">
                 <div class="tape"></div>
+                <div class="team-tag">{tm["label"]}</div>
                 <div class="photo">
                   {photo_inner}
                   <pre class="chat" id="chat-{a["name"]}">…</pre>
-                  <div class="grip" title="drag to resize · double-click to reset"></div>
                 </div>
                 <div class="caption">
                   <span class="cname">{a["label"]}</span>
@@ -1249,15 +1250,7 @@ def create_app() -> FastAPI:
                   <input type="text" placeholder="say something to {a["label"].lower()}…" autocomplete="off">
                 </form>
               </div>''')
-            sections.append(
-                '\n            <section class="team">'
-                f'\n              <div class="team-head"><span class="tname">{tm["label"]}</span>'
-                f'<span class="tsub">{tm["sub"]}</span></div>'
-                '\n              <div class="board">'
-                + "".join(cards)
-                + '\n              </div>\n            </section>'
-            )
-        cards_html = "\n".join(sections)
+        cards_html = '<div class="canvas" id="canvas">' + "".join(cards) + '</div>'
         page = '''<!doctype html>
 <html><head><meta charset="utf-8"><title>synapt — memento</title>
 <style>
@@ -1285,7 +1278,7 @@ def create_app() -> FastAPI:
   .controls input[type=range]::-moz-range-thumb {
     width: 15px; height: 15px; border: none; border-radius: 50%; background: #d8cdb6; cursor: ew-resize;
   }
-  .board {
+  .canvas {
     display: flex; flex-wrap: wrap; justify-content: center;
     gap: 2.4rem; max-width: 1600px; margin: 0 auto;
   }
@@ -1302,13 +1295,27 @@ def create_app() -> FastAPI:
     width: 92px; height: 26px; background: rgba(230,220,180,.55);
     box-shadow: 0 1px 3px rgba(0,0,0,.25); border-left: 1px dashed rgba(0,0,0,.08);
     border-right: 1px dashed rgba(0,0,0,.08);
+    cursor: grab; z-index: 6;
+  }
+  .tape:active { cursor: grabbing; }
+  .team-tag {
+    position: absolute; top: -8px; left: 12px; z-index: 6;
+    font-family: -apple-system, system-ui, sans-serif;
+    font-size: .56rem; letter-spacing: .09em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 3px; color: #2a2620;
+    background: #d8cdb6; box-shadow: 0 1px 3px rgba(0,0,0,.4); pointer-events: none;
+  }
+  .polaroid[data-team="conversa"] .team-tag { background: #b7c4d6; }
+  .polaroid.dragging {
+    opacity: .55; z-index: 20; transform: rotate(0deg) scale(1.03);
+    box-shadow: 0 22px 50px rgba(0,0,0,.6);
   }
   .photo {
-    background: #0b0e13; height: var(--ph, 400px); position: relative; overflow: hidden;
+    background: #0b0e13; height: calc(var(--card, 300px) * 1.33); position: relative; overflow: hidden;
     display: flex; flex-direction: column; cursor: zoom-in;
   }
   .photo img {
-    width: 100%; height: calc(var(--ph, 400px) * 0.66); object-fit: cover; object-position: center 22%;
+    width: 100%; height: calc(var(--card, 300px) * 0.89); object-fit: cover; object-position: center 22%;
     opacity: .94; flex: none;
   }
   .photo.noimg { background: linear-gradient(160deg, #1a1f2e, #0b0e13); }
@@ -1426,7 +1433,7 @@ def create_app() -> FastAPI:
   .polaroid.pending { background: #ece8dc; }
   .polaroid.pending .photo { cursor: zoom-in; }
   .ghost {
-    flex: none; height: calc(var(--ph, 400px) * 0.66); display: flex; flex-direction: column;
+    flex: none; height: calc(var(--card, 300px) * 0.89); display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 12px;
     background: repeating-linear-gradient(135deg, #0c0f16, #0c0f16 9px, #0a0d12 9px, #0a0d12 18px);
   }
@@ -1472,10 +1479,7 @@ __CARDS__
   (function(){
     const sizer = document.getElementById("sizer");
     if (!sizer) return;
-    const setGlobal = v => {
-      document.documentElement.style.setProperty("--card", v + "px");
-      document.documentElement.style.setProperty("--ph", Math.round(v * 1.33) + "px");
-    };
+    const setGlobal = v => document.documentElement.style.setProperty("--card", v + "px");
     const saved = localStorage.getItem("memento-card");
     if (saved) { setGlobal(+saved); sizer.value = saved; } else { setGlobal(+sizer.value); }
     sizer.addEventListener("input", () => { setGlobal(+sizer.value); localStorage.setItem("memento-card", sizer.value); });
@@ -1556,43 +1560,45 @@ __CARDS__
   });
   // per-card resize: drag a photo's corner grip to size just that one;
   // double-click the grip to reset it back to the global slider size.
-  const cardSizes = JSON.parse(localStorage.getItem("memento-card-sizes") || "{}");
-  document.querySelectorAll(".polaroid").forEach(card => {
-    const agent = card.dataset.agent;
-    const s = cardSizes[agent];
-    if (s) {  // {w,h}; tolerate the old numeric (width-only) format
-      const w = (typeof s === "number") ? s : s.w;
-      const h = (typeof s === "object") ? s.h : null;
-      if (w) card.style.setProperty("--card", w + "px");
-      if (h) card.style.setProperty("--ph", h + "px");
-    }
-    const grip = card.querySelector(".grip");
-    if (!grip) return;
-    grip.addEventListener("click", e => e.stopPropagation());
-    grip.addEventListener("mousedown", e => {
-      e.preventDefault(); e.stopPropagation();
-      const startX = e.clientX, startY = e.clientY, cs = getComputedStyle(card);
-      const startW = parseFloat(cs.getPropertyValue("--card")) || card.offsetWidth;
-      const startH = parseFloat(cs.getPropertyValue("--ph")) || card.querySelector(".photo").offsetHeight;
-      const move = ev => {  // horizontal = width, vertical = height → free aspect ratio
-        card.style.setProperty("--card", Math.round(Math.max(200, Math.min(1000, startW + (ev.clientX - startX)))) + "px");
-        card.style.setProperty("--ph", Math.round(Math.max(150, Math.min(1200, startH + (ev.clientY - startY)))) + "px");
+  // drag-and-drop reorder: grab a card's tape and shift it on the board;
+  // the others reflow, and the order is remembered across reloads.
+  const canvas = document.getElementById("canvas");
+  function persistOrder() {
+    localStorage.setItem("memento-order",
+      JSON.stringify([...canvas.querySelectorAll(".polaroid")].map(c => c.dataset.agent)));
+  }
+  (function restoreOrder() {
+    const saved = JSON.parse(localStorage.getItem("memento-order") || "null");
+    if (!saved) return;
+    saved.forEach(agent => {
+      const c = canvas.querySelector(`.polaroid[data-agent="${agent}"]`);
+      if (c) canvas.appendChild(c);  // re-append in saved order
+    });
+  })();
+  let dragCard = null;
+  document.querySelectorAll(".polaroid .tape").forEach(tape => {
+    tape.addEventListener("mousedown", e => {
+      e.preventDefault();
+      dragCard = tape.closest(".polaroid");
+      dragCard.classList.add("dragging");
+      const move = ev => {
+        const el = document.elementFromPoint(ev.clientX, ev.clientY);
+        const target = el && el.closest(".polaroid");
+        if (target && target !== dragCard && target.parentElement === canvas) {
+          const r = target.getBoundingClientRect();
+          const before = ev.clientX < r.left + r.width / 2;
+          canvas.insertBefore(dragCard, before ? target : target.nextSibling);
+        }
       };
       const up = () => {
         document.removeEventListener("mousemove", move);
         document.removeEventListener("mouseup", up);
-        const c = getComputedStyle(card);
-        cardSizes[agent] = { w: Math.round(parseFloat(c.getPropertyValue("--card"))), h: Math.round(parseFloat(c.getPropertyValue("--ph"))) };
-        localStorage.setItem("memento-card-sizes", JSON.stringify(cardSizes));
+        if (dragCard) dragCard.classList.remove("dragging");
+        dragCard = null;
+        persistOrder();
       };
       document.addEventListener("mousemove", move);
       document.addEventListener("mouseup", up);
-    });
-    grip.addEventListener("dblclick", e => {
-      e.preventDefault(); e.stopPropagation();
-      card.style.removeProperty("--card"); card.style.removeProperty("--ph");
-      delete cardSizes[agent];
-      localStorage.setItem("memento-card-sizes", JSON.stringify(cardSizes));
     });
   });
   document.querySelectorAll(".talk").forEach(f => {
