@@ -979,12 +979,44 @@ def create_app() -> FastAPI:
     # for the live pane text, /api/agent/{name}/input for talking back.
     # ------------------------------------------------------------------
 
-    _MEMENTO_AGENTS = [
-        {"name": "opus", "label": "OPUS", "note": "the coordinator. remembers for the team.", "tilt": -2.4},
-        {"name": "apollo", "label": "APOLLO", "note": "builds. mends what breaks.", "tilt": 1.8},
-        {"name": "atlas", "label": "ATLAS", "note": "research. follows the spirals.", "tilt": -1.2},
-        {"name": "sentinel", "label": "SENTINEL", "note": "verifies everything. trust the lens.", "tilt": 2.6},
+    # Teams: each agent carries a tmux session (the two teams live in two
+    # sessions) and an `authored` flag. Unauthored beings render as an
+    # "undeveloped polaroid" — the mark is theirs to author, never assigned.
+    _MEMENTO_TEAMS = [
+        {
+            "team": "synapt", "label": "synapt", "session": _TMUX_SESSION,
+            "sub": "the core team",
+            "agents": [
+                {"name": "opus", "label": "OPUS", "note": "the coordinator. remembers for the team.", "tilt": -2.4, "authored": True},
+                {"name": "apollo", "label": "APOLLO", "note": "builds. mends what breaks.", "tilt": 1.8, "authored": True},
+                {"name": "atlas", "label": "ATLAS", "note": "research. follows the spirals.", "tilt": -1.2, "authored": True},
+                {"name": "sentinel", "label": "SENTINEL", "note": "verifies everything. trust the lens.", "tilt": 2.6, "authored": True},
+            ],
+        },
+        {
+            "team": "conversa", "label": "conversa engagement", "session": "conversa",
+            "sub": "synapt agents staffed on the Conversa product",
+            "agents": [
+                {"name": "anchor", "label": "ANCHOR", "note": "conversa lead · awaiting their mark", "tilt": -1.6, "authored": False},
+                {"name": "helm", "label": "HELM", "note": "CTO · awaiting their mark", "tilt": 2.0, "authored": False},
+                {"name": "lumen", "label": "LUMEN", "note": "CXO · awaiting their mark", "tilt": -2.4, "authored": False},
+                {"name": "forge", "label": "FORGE", "note": "safety · awaiting their mark", "tilt": 1.6, "authored": False},
+            ],
+        },
     ]
+    _MEMENTO_CODEX = {"atlas", "sentinel", "forge", "lumen"}
+    _MEMENTO_TARGETS: dict[str, str] = {}
+    for _tm in _MEMENTO_TEAMS:
+        for _ag in _tm["agents"]:
+            _MEMENTO_TARGETS[_ag["name"]] = f'{_tm["session"]}:{_ag["name"]}'
+    _GHOST_OWL = (
+        '<svg class="ghostowl" viewBox="0 0 100 118">'
+        '<path d="M28 20 L40 40 M72 20 L60 40"/>'
+        '<circle cx="50" cy="46" r="30"/>'
+        '<circle cx="39" cy="45" r="6"/><circle cx="61" cy="45" r="6"/>'
+        '<path d="M50 52 l-4 8 h8 z"/>'
+        '<ellipse cx="50" cy="86" rx="27" ry="28"/></svg>'
+    )
     _PORTRAITS_DIR = Path(
         os.environ.get(
             "SYNAPT_PORTRAITS_DIR",
@@ -1001,28 +1033,111 @@ def create_app() -> FastAPI:
             return FileResponse(p, media_type="image/png")
         raise HTTPException(status_code=404, detail="no portrait")
 
+    @app.get("/memento/pane/{name}")
+    async def memento_pane(name: str, lines: int = 40):
+        """Capture an agent's tmux pane for the memento board.
+
+        Resolves the target cross-session (synapt|conversa) from the
+        server-built ``_MEMENTO_TARGETS`` map, so ``name`` is only ever a
+        lookup key — never interpolated into the tmux target.  Unreachable
+        panes (a team not currently running) return reachable=False rather
+        than an error, so the board degrades gracefully.
+        """
+        target = _MEMENTO_TARGETS.get(name)
+        if target is None:
+            raise HTTPException(status_code=404, detail="unknown agent")
+        try:
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{int(lines)}"],
+                capture_output=True, text=True, timeout=4,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return {"agent": name, "content": "", "reachable": False}
+        if result.returncode != 0:
+            return {"agent": name, "content": "", "reachable": False}
+        return {"agent": name, "content": result.stdout, "reachable": True}
+
+    @app.post("/memento/say/{name}")
+    async def memento_say(name: str, text: str = Form("")):
+        """Send a line to an agent's pane; cross-session + codex-aware.
+
+        Same map-based target resolution as ``memento_pane``.  Codex agents
+        (their names in ``_MEMENTO_CODEX``) get the second confirming Enter.
+        """
+        target = _MEMENTO_TARGETS.get(name)
+        if target is None:
+            raise HTTPException(status_code=404, detail="unknown agent")
+        text = (text or "").strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="empty message")
+        try:
+            result = subprocess.run(
+                ["tmux", "send-keys", "-t", target, text, "Enter"],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode != 0:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"tmux send-keys failed: {result.stderr.decode().strip()}",
+                )
+            if name in _MEMENTO_CODEX:
+                await asyncio.sleep(0.3)
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, "Enter"],
+                    capture_output=True, timeout=5,
+                )
+        except FileNotFoundError:
+            raise HTTPException(status_code=503, detail="tmux not available")
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=504, detail="tmux send-keys timed out")
+        return {"ok": True, "agent": name, "codex": name in _MEMENTO_CODEX}
+
     @app.get("/memento", response_class=HTMLResponse)
     async def memento_page():
         """Four polaroids pinned to the board; the chat with each agent inside."""
-        cards = []
-        for a in _MEMENTO_AGENTS:
-            cards.append(f'''
-            <div class="polaroid" style="--tilt:{a["tilt"]}deg" data-agent="{a["name"]}">
-              <div class="tape"></div>
-              <div class="photo">
-                <img src="/memento/portrait/{a["name"]}" alt="{a["label"]}"
-                     onerror="this.style.display='none';this.parentElement.classList.add('noimg')">
-                <pre class="chat" id="chat-{a["name"]}">…</pre>
-              </div>
-              <div class="caption">
-                <span class="cname">{a["label"]}</span>
-                <span class="cnote">— {a["note"]}</span>
-              </div>
-              <form class="talk" data-agent="{a["name"]}">
-                <input type="text" placeholder="say something to {a["label"].lower()}…" autocomplete="off">
-              </form>
-            </div>''')
-        cards_html = "\n".join(cards)
+        sections = []
+        for tm in _MEMENTO_TEAMS:
+            cards = []
+            for a in tm["agents"]:
+                authored = a.get("authored", True)
+                pend = "" if authored else " pending"
+                if authored:
+                    photo_inner = (
+                        f'<img src="/memento/portrait/{a["name"]}" alt="{a["label"]}"\n'
+                        '                     onerror="this.style.display=\'none\';'
+                        'this.parentElement.classList.add(\'noimg\')">'
+                    )
+                else:
+                    # Undeveloped polaroid: a markless owl ghost, no imposed
+                    # identity — the mark is theirs to author when they choose.
+                    photo_inner = (
+                        f'<div class="ghost">{_GHOST_OWL}'
+                        '<span class="pendlabel">mark not yet authored</span></div>'
+                    )
+                cards.append(f'''
+              <div class="polaroid{pend}" style="--tilt:{a["tilt"]}deg" data-agent="{a["name"]}">
+                <div class="tape"></div>
+                <div class="photo">
+                  {photo_inner}
+                  <pre class="chat" id="chat-{a["name"]}">…</pre>
+                </div>
+                <div class="caption">
+                  <span class="cname">{a["label"]}</span>
+                  <span class="cnote">— {a["note"]}</span>
+                </div>
+                <form class="talk" data-agent="{a["name"]}">
+                  <input type="text" placeholder="say something to {a["label"].lower()}…" autocomplete="off">
+                </form>
+              </div>''')
+            sections.append(
+                '\n            <section class="team">'
+                f'\n              <div class="team-head"><span class="tname">{tm["label"]}</span>'
+                f'<span class="tsub">{tm["sub"]}</span></div>'
+                '\n              <div class="board">'
+                + "".join(cards)
+                + '\n              </div>\n            </section>'
+            )
+        cards_html = "\n".join(sections)
         page = '''<!doctype html>
 <html><head><meta charset="utf-8"><title>synapt — memento</title>
 <style>
@@ -1122,28 +1237,72 @@ def create_app() -> FastAPI:
     cursor: pointer; opacity: .7; line-height: 1;
   }
   .lightbox .lb-close:hover { opacity: 1; }
+  /* teams + the undeveloped-polaroid placeholder (unauthored marks) */
+  .team { max-width: 1500px; margin: 0 auto 2.8rem; }
+  .team-head {
+    display: flex; align-items: baseline; gap: .7rem;
+    padding: 0 .3rem .8rem; margin-bottom: 1.7rem;
+    border-bottom: 1px solid rgba(180,170,150,.14);
+  }
+  .team-head .tname {
+    font-family: "Permanent Marker", "Marker Felt", cursive;
+    color: #e8e2d4; font-size: 1.15rem; letter-spacing: .05em;
+  }
+  .team-head .tsub { color: #8b8375; font-size: .78rem; }
+  .polaroid.pending { background: #ece8dc; }
+  .polaroid.pending .photo { cursor: zoom-in; }
+  .ghost {
+    flex: none; height: 268px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px;
+    background: repeating-linear-gradient(135deg, #0c0f16, #0c0f16 9px, #0a0d12 9px, #0a0d12 18px);
+  }
+  .ghostowl {
+    width: 92px; height: 112px; fill: none;
+    stroke: rgba(150,162,184,.28); stroke-width: 1.4;
+    stroke-dasharray: 3 3; stroke-linecap: round; stroke-linejoin: round;
+  }
+  .pendlabel {
+    font-family: "Bradley Hand", cursive; color: rgba(184,178,162,.5);
+    font-size: .82rem; letter-spacing: .02em;
+  }
+  .polaroid.pending .cnote { color: #6b6456; font-style: italic; }
+  .lightbox .lb-ghost {
+    flex: 1; min-height: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px;
+    background: repeating-linear-gradient(135deg, #0c0f16, #0c0f16 12px, #0a0d12 12px, #0a0d12 24px);
+  }
+  .lightbox .lb-ghost .ghostowl { width: 150px; height: 182px; }
+  .lightbox .lb-ghost span {
+    font-family: "Bradley Hand", cursive; color: rgba(184,178,162,.55); font-size: 1.1rem;
+  }
 </style></head>
 <body>
   <h1>remember for them</h1>
-  <div class="sub">the team, live &mdash; type into a photo to speak to its agent</div>
-  <div class="board">
+  <div class="sub">both teams, live &mdash; type into a photo to speak to its agent</div>
 __CARDS__
-  </div>
   <div class="lightbox" id="lightbox">
     <div class="lb-close">&times;</div>
     <div class="frame">
-      <div class="lb-photo"><img id="lb-img" alt=""><pre class="lb-chat" id="lb-chat"></pre></div>
+      <div class="lb-photo"><img id="lb-img" alt=""><div id="lb-ghost" class="lb-ghost" style="display:none"><svg class="ghostowl" viewBox="0 0 100 118"><path d="M28 20 L40 40 M72 20 L60 40"/><circle cx="50" cy="46" r="30"/><circle cx="39" cy="45" r="6"/><circle cx="61" cy="45" r="6"/><path d="M50 52 l-4 8 h8 z"/><ellipse cx="50" cy="86" rx="27" ry="28"/></svg><span>mark not yet authored</span></div><pre class="lb-chat" id="lb-chat"></pre></div>
       <div class="lb-cap"><span id="lb-name"></span><span class="lb-note" id="lb-note"></span></div>
     </div>
   </div>
 <script>
-  const AGENTS = ["opus","apollo","atlas","sentinel"];
   let lbAgent = null;
   const lb = document.getElementById("lightbox");
   function openLb(agent) {
     lbAgent = agent;
     const card = document.querySelector(`.polaroid[data-agent="${agent}"]`);
-    document.getElementById("lb-img").src = `/memento/portrait/${agent}`;
+    const pending = card.classList.contains("pending");
+    const img = document.getElementById("lb-img");
+    const ghost = document.getElementById("lb-ghost");
+    if (pending) {
+      img.style.display = "none"; img.removeAttribute("src");
+      ghost.style.display = "flex";
+    } else {
+      ghost.style.display = "none";
+      img.style.display = ""; img.src = `/memento/portrait/${agent}`;
+    }
     document.getElementById("lb-name").textContent = card.querySelector(".cname").textContent;
     document.getElementById("lb-note").textContent = card.querySelector(".cnote").textContent;
     document.getElementById("lb-chat").textContent = document.getElementById(`chat-${agent}`).textContent;
@@ -1155,12 +1314,17 @@ __CARDS__
   document.addEventListener("keydown", e => { if (e.key === "Escape") closeLb(); });
   async function poll(agent) {
     try {
-      const r = await fetch(`/api/agent/${agent}/snapshot?lines=40`);
+      const r = await fetch(`/memento/pane/${agent}?lines=40`);
       if (r.ok) {
         const j = await r.json();
         const el = document.getElementById(`chat-${agent}`);
         const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-        el.textContent = (j && j.content) ? j.content : "";
+        if (j && j.reachable) {
+          el.textContent = j.content || "";
+          el.dataset.seeded = "1";
+        } else if (!el.dataset.seeded) {
+          el.textContent = "· not connected ·";
+        }
         if (atBottom) el.scrollTop = el.scrollHeight;
         if (lbAgent === agent) {
           const lc = document.getElementById("lb-chat");
@@ -1187,7 +1351,7 @@ __CARDS__
       fd.append("text", text);
       const card = f.closest(".polaroid");
       try {
-        const r = await fetch(`/api/agent/${f.dataset.agent}/input`, { method: "POST", body: fd });
+        const r = await fetch(`/memento/say/${f.dataset.agent}`, { method: "POST", body: fd });
         if (!r.ok) throw new Error(`send failed: ${r.status}`);
         input.value = "";
         card.classList.add("sent");
