@@ -1882,6 +1882,11 @@ def create_app() -> FastAPI:
   .ln-qa-item.in { opacity: 1; transform: none; }
   .ln-q { color: #cfc8b8; font-size: 1.06rem; margin-bottom: .6rem; }
   .ln-q::before { content: "Q  "; color: var(--mem); font-weight: 700; }
+  .ln-gen {
+    font-size: .68rem; color: var(--mem); font-style: italic; letter-spacing: .03em;
+    margin-left: .45rem; animation: lngenpulse 1.2s ease-in-out infinite;
+  }
+  @keyframes lngenpulse { 0%, 100% { opacity: .35; } 50% { opacity: .95; } }
   .leonard .chip { background: rgba(15,151,166,.1); border-left: 3px solid var(--mem); border-radius: 3px; padding: 9px 13px 10px; }
   .leonard .chip-kind { color: var(--mem); }
   .leonard .chip-what { color: #e6e0d2; font-size: .96rem; line-height: 1.4; }
@@ -1997,8 +2002,15 @@ __CARDS__
       requestAnimationFrame(() => el.classList.add("in"));
       return el;
     };
+    // Loading strategy: play instantly with the template questions (never freeze
+    // while the 3B warms), then upgrade each question to the model's content-specific
+    // version in the background — you watch the questions sharpen in place. still /
+    // smart=0 take one deterministic fetch and skip the upgrade (recorded-clip mode).
+    const explicitTemplates = params.get("smart") === "0";
+    const doUpgrade = !still && !explicitTemplates;
+    const leoURL = s => "/memento/leonard/" + agent + "?smart=" + s + (_asof ? "&asof=" + encodeURIComponent(_asof) : "");
     let d;
-    try { d = await (await fetch("/memento/leonard/" + agent + asofQS("?"))).json(); }
+    try { d = await (await fetch(leoURL((still && !explicitTemplates) ? 1 : 0))).json(); }
     catch (e) { add('could not reach memory.'); _lnRunning = false; return; }
     if (!d.reachable || !d.act1) {
       add('<div style="text-align:center;color:#8b8375">' + escProv(agent)
@@ -2018,17 +2030,30 @@ __CARDS__
     // Act 3 — Remembering: stranger-proof questions, each answered with a chip.
     const rem = add('<div class="ln-remember"><div class="ln-tag">Act 3 · Remembering</div><div class="ln-qa" id="ln-qa"></div></div>');
     const qaEl = rem.querySelector("#ln-qa");
+    const qEls = [];
     for (const item of d.act3){
       const qi = document.createElement("div");
       qi.className = "ln-qa-item";
-      qi.innerHTML = '<div class="ln-q">' + escProv(item.q) + '</div>' + _lnChip(item.chip);
+      qi.innerHTML = '<div class="ln-q">' + escProv(item.q)
+        + (doUpgrade ? ' <span class="ln-gen">generating from memory…</span>' : '') + '</div>' + _lnChip(item.chip);
       qaEl.appendChild(qi);
+      qEls.push(qi.querySelector(".ln-q"));
       requestAnimationFrame(() => qi.classList.add("in"));
       await step(2600);
     }
     add('<div class="ln-end"><div class="ln-latin">Memento agere, memento mori.</div>'
       + '<div class="ln-thesis">What you feed the memory outlives the session that fed it.</div></div>');
     _lnRunning = false;
+    // background: the local 3B rewrites each template question to be content-specific.
+    // Each swaps in when it lands (the visible progress while the model works), and
+    // the shimmer clears with it. Cached server-side, so a second run is instant.
+    if (doUpgrade) {
+      fetch(leoURL(1)).then(r => r.json()).then(sd => {
+        (sd.act3 || []).forEach((it, i) => {
+          if (qEls[i] && it.q) qEls[i].innerHTML = escProv(it.q);
+        });
+      }).catch(() => {});
+    }
   }
   function closeLeonard(){
     _lnOverlay.classList.remove("open");
