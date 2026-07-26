@@ -1438,9 +1438,11 @@ def create_app() -> FastAPI:
         entries.sort(key=lambda r: r[0], reverse=True)
 
         def _chip(e: dict, what: str, kind: str) -> dict:
+            # Leonard answers are read full-screen — show the whole decision, not a
+            # sticky-sized snippet. Only a generous cap against a runaway paragraph.
             what = " ".join(str(what).split())
-            if len(what) > 150:
-                what = what[:147].rstrip() + "…"
+            if len(what) > 400:
+                what = what[:397].rstrip() + "…"
             return {"what": what, "kind": kind, "who": name,
                     "when_label": _prov_when_label(e.get("timestamp") or ""),
                     "where": _prov_where(what, e.get("session_id") or "")}
@@ -1448,15 +1450,13 @@ def create_app() -> FastAPI:
         decisions = [(e, d) for _ts, e in entries for d in (e.get("decisions") or []) if str(d).strip()]
         nexts = [(e, n) for _ts, e in entries for n in (e.get("next_steps") or []) if str(n).strip()]
 
-        # act 1: prefer a decision from a session OTHER than the newest one, so
-        # the boundary-crossing is real, not same-session recall.
+        # act 1: the most recent decision within the as-of scope — what the being
+        # had most recently committed as of the chosen day. This VARIES as you
+        # scrub the date (the whole point of the picker), and it is always a real
+        # decision from a session that has since ended.
         act1 = None
         if decisions:
-            e0, d0 = decisions[0]
-            sid0 = e0.get("session_id") or ""
-            older = next(((e, d) for e, d in decisions
-                          if (e.get("session_id") or "") and (e.get("session_id") or "") != sid0), None)
-            e1, d1 = older or (e0, d0)
+            e1, d1 = decisions[0]
             act1 = {"chip": _chip(e1, d1, "decided"),
                     "session": (e1.get("session_id") or "")[:8] or "a prior session",
                     "when": _prov_when_label(e1.get("timestamp") or "")}
@@ -1548,6 +1548,7 @@ def create_app() -> FastAPI:
 <html><head><meta charset="utf-8"><title>synapt — memento</title>
 <style>
   * { box-sizing: border-box; margin: 0; }
+  html { background: #16130f; }  /* fills the viewport under a short/overscrolled body — no white band */
   body {
     min-height: 100vh; padding: 3rem 2rem;
     background: #16130f radial-gradient(ellipse at 30% 20%, #241f18 0%, #16130f 60%);
