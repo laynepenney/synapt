@@ -1287,12 +1287,11 @@ def create_app() -> FastAPI:
     width: 15px; height: 15px; border: none; border-radius: 50%; background: #d8cdb6; cursor: ew-resize;
   }
   .canvas {
-    display: flex; flex-wrap: wrap; justify-content: center;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(var(--card, 300px), 1fr));
     gap: 2.4rem; max-width: 1600px; margin: 0 auto;
   }
   .polaroid {
     background: #f4f1e8; padding: 14px 14px 10px; border-radius: 2px;
-    width: var(--card, 300px); flex: none;
     transform: rotate(var(--tilt)); position: relative;
     box-shadow: 0 12px 30px rgba(0,0,0,.55), 0 2px 6px rgba(0,0,0,.4);
     transition: transform .25s ease;
@@ -1320,13 +1319,18 @@ def create_app() -> FastAPI:
   }
   .photo {
     background: #0b0e13; height: calc(var(--card, 300px) * 1.33); position: relative; overflow: hidden;
-    display: flex; flex-direction: column; cursor: zoom-in;
+    cursor: zoom-in;
   }
   .photo img {
-    width: 100%; height: calc(var(--card, 300px) * 0.89); object-fit: cover; object-position: center 22%;
-    opacity: .94; flex: none;
+    position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover;
+    object-position: center 22%; opacity: .94;
   }
   .photo.noimg { background: linear-gradient(160deg, #1a1f2e, #0b0e13); }
+  /* scrim so the terminal text reads as it scrolls up over the owl */
+  .photo::after {
+    content: ""; position: absolute; inset: 0; z-index: 1; pointer-events: none;
+    background: linear-gradient(to bottom, transparent 30%, rgba(8,10,14,.5) 60%, rgba(8,10,14,.92) 100%);
+  }
   .grip {
     position: absolute; right: 3px; bottom: 3px; width: 20px; height: 20px;
     cursor: nwse-resize; z-index: 7; opacity: 0; transition: opacity .15s;
@@ -1337,11 +1341,15 @@ def create_app() -> FastAPI:
   .polaroid:hover .grip { opacity: .7; }
   .grip:hover { opacity: 1; }
   .chat {
-    flex: 1; overflow-y: auto; padding: 7px 10px; margin: 0;
+    position: absolute; inset: 0; z-index: 2; overflow-y: auto;
+    padding: calc(var(--card, 300px) * 0.62) 10px 8px; margin: 0;
     font-family: "SF Mono", ui-monospace, Menlo, monospace;
     font-size: calc(var(--card, 300px) * 0.032); line-height: 1.4;  /* scales with photo size */
     color: #9fd3a8; white-space: pre-wrap; word-break: break-word;
-    background: rgba(6,8,12,.92); border-top: 1px solid rgba(120,200,140,.15);
+    background: transparent; text-shadow: 0 1px 3px rgba(0,0,0,.96);
+    /* text is solid where it rests low, and fades into the owl as it scrolls up */
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 30%, #000 100%);
+    mask-image: linear-gradient(to bottom, transparent 0, #000 30%, #000 100%);
     scrollbar-width: thin;
   }
   .caption { padding: 9px 4px 4px; }
@@ -1441,7 +1449,7 @@ def create_app() -> FastAPI:
   .polaroid.pending { background: #ece8dc; }
   .polaroid.pending .photo { cursor: zoom-in; }
   .ghost {
-    flex: none; height: calc(var(--card, 300px) * 0.89); display: flex; flex-direction: column;
+    position: absolute; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 12px;
     background: repeating-linear-gradient(135deg, #0c0f16, #0c0f16 9px, #0a0d12 9px, #0a0d12 18px);
   }
