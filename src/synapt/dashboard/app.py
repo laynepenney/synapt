@@ -1710,7 +1710,11 @@ def create_app() -> FastAPI:
   body.demo .photo::after {
     background: linear-gradient(to bottom, transparent 24%, rgba(8,10,14,.5) 55%, rgba(8,10,14,.9) 100%);
   }
-  body.demo .talk { display: none; }
+  /* keep the CHAT interface — talking to your agents is what the control app IS;
+     only the raw pane chatter is quieted, never the ability to speak to them. */
+  body.demo .talk input { font-size: .9rem; padding: 9px 12px; border-color: rgba(15,151,166,.38); }
+  body.demo .talk input::placeholder { color: #8a8270; }
+  body.demo .talk input:focus { border-color: var(--mem); box-shadow: 0 0 0 2px rgba(15,151,166,.25); }
   body.demo #sizer, body.demo .ctl-label { opacity: .28; }
   body.demo .provstrip { gap: 7px; padding-top: 5px; }
   body.demo .chip { padding: 7px 11px 8px; }
