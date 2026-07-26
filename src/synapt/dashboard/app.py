@@ -1018,10 +1018,86 @@ def create_app() -> FastAPI:
         '<ellipse cx="50" cy="86" rx="27" ry="28"/></svg>'
     )
 
-    # --- pane chrome stripping -------------------------------------------
-    # Claude Code / Codex panes carry a fat input widget + hint bar + status
-    # refs at the bottom. On a small photo that chrome eats the visible area,
-    # so we trim the trailing block and show the tail of the real conversation.
+    # --- pane rendering: ANSI colour + chrome stripping ------------------
+    # Panes are captured with `-e` so tmux keeps the ANSI SGR codes; we turn
+    # those into safe coloured HTML (every text run escaped, only our own
+    # <span style> emitted). The board strips the trailing input widget;
+    # fullscreen keeps the whole terminal.
+    _ANSI_SGR_RE = re.compile(r"\x1b\[([0-9;]*)m")
+    _ANSI_ANY_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+    _ANSI16 = [
+        "#1c1c1c", "#cc6666", "#8ae234", "#e6c547", "#729fcf", "#c39ac9", "#5fd7d7", "#d3d7cf",
+        "#6b6b6b", "#ff8a8a", "#b9f27c", "#fce94f", "#8cb6ff", "#e6a8e6", "#8ff0f0", "#ffffff",
+    ]
+
+    def _xterm256(n: int) -> str:
+        if n < 16:
+            return _ANSI16[n]
+        if n < 232:
+            n -= 16
+            r, g, b = n // 36, (n // 6) % 6, n % 6
+            c = lambda v: 0 if v == 0 else 55 + 40 * v
+            return "#%02x%02x%02x" % (c(r), c(g), c(b))
+        v = 8 + (n - 232) * 10
+        return "#%02x%02x%02x" % (v, v, v)
+
+    def _ansi_to_html(text: str) -> str:
+        """Convert a tmux `-e` capture (ANSI SGR) into safe coloured HTML."""
+        def esc(s: str) -> str:
+            s = _ANSI_ANY_RE.sub("", s)  # strip leftover CSI (cursor, erase, etc.)
+            if "\x1b" in s:
+                s = re.sub(r"\x1b\][^\x07]*(?:\x07)?", "", s)  # OSC title strings
+                s = s.replace("\x1b", "")
+            s = s.replace("\x07", "")  # stray BEL
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        st = {"fg": None, "bg": None, "bold": False}
+        def wrap(seg: str) -> str:
+            styles = []
+            if st["fg"]:
+                styles.append("color:" + st["fg"])
+            if st["bg"]:
+                styles.append("background-color:" + st["bg"])
+            if st["bold"]:
+                styles.append("font-weight:600")
+            return ('<span style="%s">%s</span>' % (";".join(styles), esc(seg))) if styles else esc(seg)
+        out, idx = [], 0
+        for m in _ANSI_SGR_RE.finditer(text):
+            if m.start() > idx:
+                out.append(wrap(text[idx:m.start()]))
+            params = [int(x) for x in m.group(1).split(";") if x] or [0]
+            i = 0
+            while i < len(params):
+                p = params[i]
+                if p == 0:
+                    st["fg"] = st["bg"] = None; st["bold"] = False
+                elif p == 1:
+                    st["bold"] = True
+                elif p == 22:
+                    st["bold"] = False
+                elif (30 <= p <= 37):
+                    st["fg"] = _ANSI16[p - 30]
+                elif (90 <= p <= 97):
+                    st["fg"] = _ANSI16[p - 82]
+                elif p == 39:
+                    st["fg"] = None
+                elif (40 <= p <= 47):
+                    st["bg"] = _ANSI16[p - 40]
+                elif (100 <= p <= 107):
+                    st["bg"] = _ANSI16[p - 92]
+                elif p == 49:
+                    st["bg"] = None
+                elif p in (38, 48) and i + 1 < len(params):
+                    key = "fg" if p == 38 else "bg"
+                    if params[i + 1] == 5 and i + 2 < len(params):
+                        st[key] = _xterm256(params[i + 2]); i += 2
+                    elif params[i + 1] == 2 and i + 4 < len(params):
+                        st[key] = "#%02x%02x%02x" % (params[i+2], params[i+3], params[i+4]); i += 4
+                i += 1
+            idx = m.end()
+        if idx < len(text):
+            out.append(wrap(text[idx:]))
+        return "".join(out)
+
     _PANE_CHROME_SUBSTR = (
         "bypass permissions", "esc to interrupt", "ctrl+t", "shift+tab",
         "for agents", "for shortcuts", "↩ for", "⏎ send", "context left",
@@ -1030,7 +1106,7 @@ def create_app() -> FastAPI:
     _PANE_BOX_CHARS = set("─│╭╮╰╯━┃┏┓┗┛┌┐└┘▏▕┄┈╌·➤▌▐▎▍▊▋ ⏵")
 
     def _is_pane_chrome(line: str) -> bool:
-        s = line.strip()
+        s = _ANSI_ANY_RE.sub("", line).strip()  # judge on visible text, not codes
         if not s:
             return True
         if all(ch in _PANE_BOX_CHARS for ch in s):
@@ -1045,7 +1121,7 @@ def create_app() -> FastAPI:
         return False
 
     def _clean_pane_text(text: str) -> str:
-        """Trim trailing terminal chrome so the tail shows real conversation.
+        """Trim trailing terminal chrome so the board tail shows real work.
 
         Only the trailing block is touched: walk up from the bottom dropping
         chrome lines and stop at the first substantive line, so separators or
@@ -1073,7 +1149,7 @@ def create_app() -> FastAPI:
         raise HTTPException(status_code=404, detail="no portrait")
 
     @app.get("/memento/pane/{name}")
-    async def memento_pane(name: str, lines: int = 40):
+    async def memento_pane(name: str, lines: int = 40, full: int = 0):
         """Capture an agent's tmux pane for the memento board.
 
         Resolves the target cross-session (synapt|conversa) from the
@@ -1085,17 +1161,22 @@ def create_app() -> FastAPI:
         target = _MEMENTO_TARGETS.get(name)
         if target is None:
             raise HTTPException(status_code=404, detail="unknown agent")
-        cap = min(max(int(lines), 10), 200) + 26  # extra to absorb stripped chrome
+        if full:
+            # fullscreen: the whole live screen (input box + hint bar + refs),
+            # plus some scrollback above it, in colour, unstripped.
+            cmd = ["tmux", "capture-pane", "-t", target, "-p", "-e", "-S", "-50"]
+        else:
+            # board: scrollback tail with the trailing chrome trimmed off.
+            cap = min(max(int(lines), 10), 200) + 26
+            cmd = ["tmux", "capture-pane", "-t", target, "-p", "-e", "-S", f"-{cap}"]
         try:
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{cap}"],
-                capture_output=True, text=True, timeout=4,
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=4)
         except (FileNotFoundError, subprocess.TimeoutExpired):
-            return {"agent": name, "content": "", "reachable": False}
+            return {"agent": name, "content_html": "", "reachable": False}
         if result.returncode != 0:
-            return {"agent": name, "content": "", "reachable": False}
-        return {"agent": name, "content": _clean_pane_text(result.stdout), "reachable": True}
+            return {"agent": name, "content_html": "", "reachable": False}
+        raw = result.stdout if full else _clean_pane_text(result.stdout)
+        return {"agent": name, "content_html": _ansi_to_html(raw), "reachable": True}
 
     @app.post("/memento/say/{name}")
     async def memento_say(name: str, text: str = Form("")):
@@ -1249,13 +1330,14 @@ def create_app() -> FastAPI:
   .lightbox {
     position: fixed; inset: 0; z-index: 100; display: none;
     background: rgba(8,6,4,.93); backdrop-filter: blur(6px);
-    align-items: center; justify-content: center; padding: 3vh 3vw; cursor: zoom-out;
+    align-items: center; justify-content: center; padding: 1.5vh 1.5vw; cursor: zoom-out;
   }
   .lightbox.open { display: flex; }
   .lightbox .frame {
-    background: #0b0e13; padding: 0; border-radius: 4px; cursor: default;
+    background: #0b0e13; padding: 0; border-radius: 3px; cursor: default;
     box-shadow: 0 30px 90px rgba(0,0,0,.75);
-    width: min(720px, 94vw); height: min(86vh, 860px);
+    width: 100%; height: 100%;
+    border: 10px solid #efe9db;  /* keep the photograph border, full screen */
     position: relative; overflow: hidden; display: flex; flex-direction: column;
   }
   /* full-bleed owl behind the whole card */
@@ -1274,8 +1356,8 @@ def create_app() -> FastAPI:
   .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #dccfba; font-size: 1rem; margin-left: .4rem; }
   .lightbox .lb-chat {
     position: relative; z-index: 2; flex: 1; min-height: 0; overflow: auto;
-    padding: 8px 20px 12px; margin: 0; background: transparent;
-    font: 11px/1.5 "SF Mono", ui-monospace, Menlo, monospace; color: #9fd3a8;
+    padding: 8px 22px 12px; margin: 0; background: transparent;
+    font: 12.5px/1.5 "SF Mono", ui-monospace, Menlo, monospace; color: #9fd3a8;
     white-space: pre;
     text-shadow: 0 1px 3px rgba(0,0,0,.98); scrollbar-width: thin;
   }
@@ -1350,6 +1432,7 @@ __CARDS__
   </div>
 <script>
   let lbAgent = null;
+  let lbTimer = null;
   const lb = document.getElementById("lightbox");
   function openLb(agent) {
     lbAgent = agent;
@@ -1366,37 +1449,47 @@ __CARDS__
     }
     document.getElementById("lb-name").textContent = card.querySelector(".cname").textContent;
     document.getElementById("lb-note").textContent = card.querySelector(".cnote").textContent;
-    document.getElementById("lb-chat").textContent = document.getElementById(`chat-${agent}`).textContent;
     lb.classList.add("open");
-    const c = document.getElementById("lb-chat"); c.scrollTop = c.scrollHeight;
     const li = document.getElementById("lb-input");
     if (li) { li.value = ""; setTimeout(() => li.focus(), 30); }
+    pollLb();                                  // fetch the full colour screen now
+    if (lbTimer) clearInterval(lbTimer);
+    lbTimer = setInterval(pollLb, 2000);
   }
-  function closeLb() { lb.classList.remove("open"); lbAgent = null; }
+  function closeLb() {
+    lb.classList.remove("open"); lbAgent = null;
+    if (lbTimer) { clearInterval(lbTimer); lbTimer = null; }
+  }
   lb.addEventListener("click", e => { if (e.target === lb || e.target.classList.contains("lb-close")) closeLb(); });
   document.addEventListener("keydown", e => { if (e.key === "Escape") closeLb(); });
   async function poll(agent) {
     try {
       const r = await fetch(`/memento/pane/${agent}?lines=40`);
-      if (r.ok) {
-        const j = await r.json();
-        const el = document.getElementById(`chat-${agent}`);
-        const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
-        if (j && j.reachable) {
-          el.textContent = j.content || "";
-          el.dataset.seeded = "1";
-        } else if (!el.dataset.seeded) {
-          el.textContent = "· not connected ·";
-        }
-        if (atBottom) el.scrollTop = el.scrollHeight;
-        if (lbAgent === agent) {
-          const lc = document.getElementById("lb-chat");
-          const lbAt = lc.scrollTop + lc.clientHeight >= lc.scrollHeight - 40;
-          lc.textContent = el.textContent;
-          if (lbAt) lc.scrollTop = lc.scrollHeight;
-        }
+      if (!r.ok) return;
+      const j = await r.json();
+      const el = document.getElementById(`chat-${agent}`);
+      const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+      if (j && j.reachable) {
+        el.innerHTML = j.content_html || "";
+        el.dataset.seeded = "1";
+      } else if (!el.dataset.seeded) {
+        el.textContent = "· not connected ·";
       }
+      if (atBottom) el.scrollTop = el.scrollHeight;
     } catch (e) { /* pane may be gone; keep last frame */ }
+  }
+  // fullscreen polls the FULL live screen (input box + hint bar + refs), in colour
+  async function pollLb() {
+    if (!lbAgent) return;
+    try {
+      const r = await fetch(`/memento/pane/${lbAgent}?full=1`);
+      if (!r.ok) return;
+      const j = await r.json();
+      const lc = document.getElementById("lb-chat");
+      const atBottom = lc.scrollTop + lc.clientHeight >= lc.scrollHeight - 60;
+      lc.innerHTML = (j && j.reachable) ? (j.content_html || "") : "· not connected ·";
+      if (atBottom) lc.scrollTop = lc.scrollHeight;
+    } catch (e) { /* keep last frame */ }
   }
   document.querySelectorAll(".polaroid").forEach(p => {
     const agent = p.dataset.agent;
