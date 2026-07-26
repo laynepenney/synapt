@@ -1288,7 +1288,7 @@ def create_app() -> FastAPI:
                     what, kind = str(e["focus"]), "focus"
                 else:
                     continue
-                what = " ".join(what.split())  # collapse whitespace/newlines
+                what = re.sub(r"^\s*[-•*]\s+", "", " ".join(what.split()))  # collapse + strip bullet
                 if len(what) > 132:
                     what = what[:129].rstrip() + "…"
                 ts = e.get("timestamp") or ""
@@ -1431,7 +1431,7 @@ def create_app() -> FastAPI:
                         '<span class="pendlabel">mark not yet authored</span></div>'
                     )
                 cards.append(f'''
-              <div class="polaroid{pend}" style="--tilt:{a["tilt"]}deg" data-agent="{a["name"]}" data-team="{tm["team"]}">
+              <div class="polaroid{pend}" style="--tilt:{a["tilt"]}deg" data-agent="{a["name"]}" data-team="{tm["team"]}" data-view="stickies">
                 <div class="tape"></div>
                 <div class="team-tag">{tm["label"]}</div>
                 <div class="photo">
@@ -1441,6 +1441,10 @@ def create_app() -> FastAPI:
                 <div class="caption">
                   <span class="cname">{a["label"]}</span>
                   <span class="cnote">— {a["note"]}</span>
+                </div>
+                <div class="viewtoggle" role="group" aria-label="card view">
+                  <button type="button" class="vt" data-agent="{a["name"]}" data-view="stickies" title="what {a["label"].lower()} remembers">notes</button>
+                  <button type="button" class="vt" data-agent="{a["name"]}" data-view="chat" title="what {a["label"].lower()} is working on">chat</button>
                 </div>
                 <div class="provstrip" id="prov-{a["name"]}" aria-label="what {a["label"].lower()} remembers"></div>
                 <form class="talk" data-agent="{a["name"]}">
@@ -1675,6 +1679,22 @@ def create_app() -> FastAPI:
   :root { --mem: #0f97a6; }
   .provstrip { display: flex; flex-direction: column; gap: 5px; padding: 2px 2px 0; }
   .provstrip:empty { display: none; }
+  /* per-card view toggle: stickies (what they remember) vs chat output (live pane) */
+  .viewtoggle { display: flex; justify-content: flex-end; gap: 0; margin: 3px 2px 1px; }
+  .vt {
+    border: 1px solid #d3ccbb; background: #efece2; color: #6f695d;
+    font: .56rem -apple-system, system-ui, sans-serif; letter-spacing: .07em;
+    text-transform: uppercase; padding: 3px 9px; cursor: pointer; transition: all .15s ease;
+  }
+  .vt:first-child { border-radius: 4px 0 0 4px; }
+  .vt:last-child { border-radius: 0 4px 4px 0; border-left: none; }
+  .vt:hover { color: #2a2620; }
+  .polaroid[data-view="stickies"] .vt[data-view="stickies"],
+  .polaroid[data-view="chat"] .vt[data-view="chat"] {
+    background: var(--mem); color: #06232a; font-weight: 700; border-color: var(--mem);
+  }
+  .polaroid[data-view="stickies"] .chat { opacity: 0; pointer-events: none; }
+  .polaroid[data-view="chat"] .provstrip { display: none; }
   .chip {
     border-left: 3px solid var(--mem); border-radius: 2px;
     background: rgba(15,151,166,.07); padding: 4px 8px 5px;
@@ -1706,7 +1726,8 @@ def create_app() -> FastAPI:
   /* Demo Mode — the control app BECOMES the Leonard Test stage (brief's Mode 2):
      the working-chatter goes quiet, the memory chips take the stage, and the
      operator controls step off. Same app, staged. Linkable via ?demo=1. */
-  body.demo .chat { opacity: 0; transition: opacity .6s ease; }
+  /* chatter visibility is now per-card (data-view, default stickies), so Demo
+     Mode no longer force-hides it — a card can still be flipped to chat on stage. */
   body.demo .photo::after {
     background: linear-gradient(to bottom, transparent 24%, rgba(8,10,14,.5) 55%, rgba(8,10,14,.9) 100%);
   }
@@ -2002,6 +2023,19 @@ __CARDS__
     loadProv(agent);
     setInterval(() => loadProv(agent), 30000);  // memory changes slowly
     p.querySelector(".photo").addEventListener("click", () => openLb(agent));
+  });
+  // per-card view toggle: stickies (memory) vs chat output (live pane), remembered per agent
+  document.querySelectorAll(".polaroid").forEach(p => {
+    const saved = localStorage.getItem("memento-view-" + p.dataset.agent);
+    if (saved === "stickies" || saved === "chat") p.dataset.view = saved;
+  });
+  document.querySelectorAll(".vt").forEach(b => {
+    b.addEventListener("click", ev => {
+      ev.stopPropagation();
+      const card = b.closest(".polaroid");
+      card.dataset.view = b.dataset.view;
+      localStorage.setItem("memento-view-" + b.dataset.agent, b.dataset.view);
+    });
   });
   // per-card resize: drag a photo's corner grip to size just that one;
   // double-click the grip to reset it back to the global slider size.
