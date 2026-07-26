@@ -1017,6 +1017,45 @@ def create_app() -> FastAPI:
         '<path d="M50 52 l-4 8 h8 z"/>'
         '<ellipse cx="50" cy="86" rx="27" ry="28"/></svg>'
     )
+
+    # --- pane chrome stripping -------------------------------------------
+    # Claude Code / Codex panes carry a fat input widget + hint bar + status
+    # refs at the bottom. On a small photo that chrome eats the visible area,
+    # so we trim the trailing block and show the tail of the real conversation.
+    _PANE_CHROME_SUBSTR = (
+        "bypass permissions", "esc to interrupt", "ctrl+t", "shift+tab",
+        "for agents", "for shortcuts", "↩ for", "⏎ send", "context left",
+        "tokens used", "esc to edit", "/rc", "auto-accept edits", "plan mode",
+    )
+    _PANE_BOX_CHARS = set("─│╭╮╰╯━┃┏┓┗┛┌┐└┘▏▕┄┈╌·➤▌▐▎▍▊▋ ⏵")
+
+    def _is_pane_chrome(line: str) -> bool:
+        s = line.strip()
+        if not s:
+            return True
+        if all(ch in _PANE_BOX_CHARS for ch in s):
+            return True
+        low = s.lower()
+        if any(m in low for m in _PANE_CHROME_SUBSTR):
+            return True
+        if s.startswith("⧉"):
+            return True
+        if s in (">", "❯", "│ >", "│ ❯"):
+            return True
+        return False
+
+    def _clean_pane_text(text: str) -> str:
+        """Trim trailing terminal chrome so the tail shows real conversation.
+
+        Only the trailing block is touched: walk up from the bottom dropping
+        chrome lines and stop at the first substantive line, so separators or
+        a stray '/rc' mid-conversation are never removed.
+        """
+        lines = text.rstrip("\n").split("\n")
+        while lines and _is_pane_chrome(lines[-1]):
+            lines.pop()
+        return "\n".join(lines)
+
     _PORTRAITS_DIR = Path(
         os.environ.get(
             "SYNAPT_PORTRAITS_DIR",
@@ -1046,16 +1085,17 @@ def create_app() -> FastAPI:
         target = _MEMENTO_TARGETS.get(name)
         if target is None:
             raise HTTPException(status_code=404, detail="unknown agent")
+        cap = min(max(int(lines), 10), 200) + 26  # extra to absorb stripped chrome
         try:
             result = subprocess.run(
-                ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{int(lines)}"],
+                ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{cap}"],
                 capture_output=True, text=True, timeout=4,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return {"agent": name, "content": "", "reachable": False}
         if result.returncode != 0:
             return {"agent": name, "content": "", "reachable": False}
-        return {"agent": name, "content": result.stdout, "reachable": True}
+        return {"agent": name, "content": _clean_pane_text(result.stdout), "reachable": True}
 
     @app.post("/memento/say/{name}")
     async def memento_say(name: str, text: str = Form("")):
@@ -1220,11 +1260,11 @@ def create_app() -> FastAPI:
   }
   /* full-bleed owl behind the whole card */
   .lightbox .lb-photo { position: absolute; inset: 0; z-index: 0; background: #0b0e13; }
-  .lightbox .lb-photo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; opacity: .95; }
+  .lightbox .lb-photo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; opacity: .82; }
   /* OG-style darkening gradient so the chat reads over the owl */
   .lightbox .lb-scrim {
     position: absolute; inset: 0; z-index: 1; pointer-events: none;
-    background: linear-gradient(to bottom, rgba(10,12,18,.28) 0%, rgba(10,12,18,.64) 46%, rgba(10,12,18,.93) 100%);
+    background: linear-gradient(to bottom, rgba(8,10,15,.52) 0%, rgba(8,10,15,.80) 45%, rgba(8,10,15,.97) 100%);
   }
   .lightbox .lb-cap {
     position: relative; z-index: 2; padding: 18px 20px 4px;
@@ -1233,11 +1273,11 @@ def create_app() -> FastAPI:
   }
   .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #dccfba; font-size: 1rem; margin-left: .4rem; }
   .lightbox .lb-chat {
-    position: relative; z-index: 2; flex: 1; min-height: 0; overflow-y: auto;
-    padding: 8px 20px 10px; margin: 0; background: transparent;
-    font: 13px/1.6 "SF Mono", ui-monospace, Menlo, monospace; color: #dcf4da;
-    white-space: pre-wrap; word-break: break-word;
-    text-shadow: 0 1px 4px rgba(0,0,0,.95); scrollbar-width: thin;
+    position: relative; z-index: 2; flex: 1; min-height: 0; overflow: auto;
+    padding: 8px 20px 12px; margin: 0; background: transparent;
+    font: 11px/1.5 "SF Mono", ui-monospace, Menlo, monospace; color: #9fd3a8;
+    white-space: pre;
+    text-shadow: 0 1px 3px rgba(0,0,0,.98); scrollbar-width: thin;
   }
   .lightbox .lb-talk { position: relative; z-index: 2; padding: 6px 16px 16px; }
   .lightbox .lb-talk input {
