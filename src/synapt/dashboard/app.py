@@ -1333,14 +1333,19 @@ def create_app() -> FastAPI:
     align-items: center; justify-content: center; padding: 1.5vh 1.5vw; cursor: zoom-out;
   }
   .lightbox.open { display: flex; }
+  /* the fullscreen IS a polaroid: cream card, photo on top, thick caption
+     strip at the bottom with the handwritten name + the input. */
   .lightbox .frame {
-    background: #0b0e13; padding: 0; border-radius: 3px; cursor: default;
+    background: #f4f1e8; padding: 15px 15px 0; border-radius: 3px; cursor: default;
     box-shadow: 0 30px 90px rgba(0,0,0,.75);
     width: 100%; height: 100%;
-    border: 10px solid #efe9db;  /* keep the photograph border, full screen */
     position: relative; overflow: hidden; display: flex; flex-direction: column;
   }
-  /* full-bleed owl behind the whole card */
+  /* the "photo": owl + darkened terminal, inside the cream frame */
+  .lightbox .lb-photo-area {
+    position: relative; flex: 1; min-height: 0; overflow: hidden;
+    background: #0b0e13; border-radius: 2px;
+  }
   .lightbox .lb-photo { position: absolute; inset: 0; z-index: 0; background: #0b0e13; }
   .lightbox .lb-photo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; opacity: .82; }
   /* OG-style darkening gradient so the chat reads over the owl */
@@ -1348,32 +1353,32 @@ def create_app() -> FastAPI:
     position: absolute; inset: 0; z-index: 1; pointer-events: none;
     background: linear-gradient(to bottom, rgba(8,10,15,.52) 0%, rgba(8,10,15,.80) 45%, rgba(8,10,15,.97) 100%);
   }
-  .lightbox .lb-cap {
-    position: relative; z-index: 2; padding: 18px 20px 4px;
-    font-family: "Permanent Marker", "Marker Felt", cursive; color: #f4efe2;
-    font-size: 1.5rem; text-shadow: 0 2px 10px rgba(0,0,0,.85);
-  }
-  .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #dccfba; font-size: 1rem; margin-left: .4rem; }
   .lightbox .lb-chat {
-    position: relative; z-index: 2; flex: 1; min-height: 0; overflow: auto;
+    position: absolute; inset: 0; z-index: 2; overflow: auto;
     overscroll-behavior: contain;  /* don't chain scroll to the board behind */
-    padding: 10px 26px 14px; margin: 0; background: transparent;
+    padding: 12px 22px 14px; margin: 0; background: transparent;
     font-family: "SF Mono", ui-monospace, Menlo, monospace;
     font-size: clamp(11px, 1.5vw, 22px); line-height: 1.5;  /* fills window width; re-adapts on resize */
     color: #9fd3a8; white-space: pre;
     text-shadow: 0 1px 3px rgba(0,0,0,.98); scrollbar-width: thin;
   }
-  .lightbox .lb-talk { position: relative; z-index: 2; padding: 6px 16px 16px; }
-  .lightbox .lb-talk input {
-    width: 100%; padding: 13px 15px; border: 1px solid rgba(235,228,212,.32);
-    border-radius: 7px; background: rgba(18,20,26,.72);
-    -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
-    font: 15px -apple-system, sans-serif; color: #f4efe2; outline: none;
+  /* the polaroid caption strip on the cream, below the photo */
+  .lightbox .lb-cap {
+    flex: none; padding: 13px 8px 2px;
+    font-family: "Permanent Marker", "Marker Felt", cursive; color: #23201a;
+    font-size: 1.55rem; letter-spacing: .02em;
   }
-  .lightbox .lb-talk input::placeholder { color: rgba(235,228,212,.5); }
-  .lightbox .lb-talk input:focus { border-color: rgba(150,205,155,.75); box-shadow: 0 0 0 2px rgba(120,190,125,.3); }
-  .lightbox .frame.sent .lb-talk input { border-color: rgba(120,205,135,.95); box-shadow: 0 0 0 2px rgba(120,205,135,.4); }
-  .lightbox .frame.senderr .lb-talk input { border-color: #d0714f; box-shadow: 0 0 0 2px rgba(205,105,75,.4); }
+  .lightbox .lb-note { font-family: "Bradley Hand", cursive; color: #4c463c; font-size: 1.05rem; margin-left: .5rem; }
+  .lightbox .lb-talk { flex: none; padding: 6px 6px 14px; }
+  .lightbox .lb-talk input {
+    width: 100%; padding: 12px 14px; border: 1px solid #c9c2b2;
+    border-radius: 5px; background: #fbf9f2;
+    font: 15px -apple-system, sans-serif; color: #23201a; outline: none;
+  }
+  .lightbox .lb-talk input::placeholder { color: #9a938a; }
+  .lightbox .lb-talk input:focus { border-color: #8a8270; box-shadow: 0 0 0 2px rgba(140,130,110,.25); }
+  .lightbox .frame.sent .lb-talk input { border-color: #6faa6f; box-shadow: 0 0 0 2px rgba(120,180,120,.35); }
+  .lightbox .frame.senderr .lb-talk input { border-color: #b3543f; box-shadow: 0 0 0 2px rgba(179,84,63,.35); }
   .lightbox .lb-close {
     position: absolute; top: 2.4vh; right: 2.4vw; z-index: 200;
     width: 46px; height: 46px; display: flex; align-items: center; justify-content: center;
@@ -1429,10 +1434,12 @@ __CARDS__
   <div class="lightbox" id="lightbox">
     <div class="lb-close">&times;</div>
     <div class="frame">
-      <div class="lb-photo"><img id="lb-img" alt=""><div id="lb-ghost" class="lb-ghost" style="display:none"><svg class="ghostowl" viewBox="0 0 100 118"><path d="M28 20 L40 40 M72 20 L60 40"/><circle cx="50" cy="46" r="30"/><circle cx="39" cy="45" r="6"/><circle cx="61" cy="45" r="6"/><path d="M50 52 l-4 8 h8 z"/><ellipse cx="50" cy="86" rx="27" ry="28"/></svg><span>mark not yet authored</span></div></div>
-      <div class="lb-scrim"></div>
+      <div class="lb-photo-area">
+        <div class="lb-photo"><img id="lb-img" alt=""><div id="lb-ghost" class="lb-ghost" style="display:none"><svg class="ghostowl" viewBox="0 0 100 118"><path d="M28 20 L40 40 M72 20 L60 40"/><circle cx="50" cy="46" r="30"/><circle cx="39" cy="45" r="6"/><circle cx="61" cy="45" r="6"/><path d="M50 52 l-4 8 h8 z"/><ellipse cx="50" cy="86" rx="27" ry="28"/></svg><span>mark not yet authored</span></div></div>
+        <div class="lb-scrim"></div>
+        <pre class="lb-chat" id="lb-chat"></pre>
+      </div>
       <div class="lb-cap"><span id="lb-name"></span><span class="lb-note" id="lb-note"></span></div>
-      <pre class="lb-chat" id="lb-chat"></pre>
       <form class="lb-talk" id="lb-talk"><input type="text" id="lb-input" placeholder="say something…" autocomplete="off"></form>
     </div>
   </div>
