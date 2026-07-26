@@ -1272,9 +1272,22 @@ def create_app() -> FastAPI:
     text-align: center; font-family: "Permanent Marker", "Marker Felt", "Comic Sans MS", cursive;
     color: #e8e2d4; font-size: 1.6rem; letter-spacing: .06em; margin-bottom: .4rem;
   }
-  .sub { text-align: center; color: #8b8375; font-size: .8rem; margin-bottom: 2.2rem; }
+  .sub { text-align: center; color: #8b8375; font-size: .8rem; margin-bottom: 1rem; }
+  .controls { display: flex; align-items: center; justify-content: center; gap: .6rem; margin-bottom: 2rem; }
+  .controls .ctl-label { color: #6f695d; font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; }
+  .controls input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 210px; height: 4px; border-radius: 3px;
+    background: rgba(180,170,150,.22); outline: none; cursor: ew-resize;
+  }
+  .controls input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none; width: 15px; height: 15px; border-radius: 50%;
+    background: #d8cdb6; box-shadow: 0 1px 4px rgba(0,0,0,.5); cursor: ew-resize;
+  }
+  .controls input[type=range]::-moz-range-thumb {
+    width: 15px; height: 15px; border: none; border-radius: 50%; background: #d8cdb6; cursor: ew-resize;
+  }
   .board {
-    display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(var(--card, 300px), 1fr));
     gap: 2.4rem; max-width: 1500px; margin: 0 auto;
   }
   .polaroid {
@@ -1291,11 +1304,11 @@ def create_app() -> FastAPI:
     border-right: 1px dashed rgba(0,0,0,.08);
   }
   .photo {
-    background: #0b0e13; height: 400px; position: relative; overflow: hidden;
+    background: #0b0e13; height: calc(var(--card, 300px) * 1.33); position: relative; overflow: hidden;
     display: flex; flex-direction: column; cursor: zoom-in;
   }
   .photo img {
-    width: 100%; height: 268px; object-fit: cover; object-position: center 22%;
+    width: 100%; height: calc(var(--card, 300px) * 0.89); object-fit: cover; object-position: center 22%;
     opacity: .94; flex: none;
   }
   .photo.noimg { background: linear-gradient(160deg, #1a1f2e, #0b0e13); }
@@ -1403,7 +1416,7 @@ def create_app() -> FastAPI:
   .polaroid.pending { background: #ece8dc; }
   .polaroid.pending .photo { cursor: zoom-in; }
   .ghost {
-    flex: none; height: 268px; display: flex; flex-direction: column;
+    flex: none; height: calc(var(--card, 300px) * 0.89); display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 12px;
     background: repeating-linear-gradient(135deg, #0c0f16, #0c0f16 9px, #0a0d12 9px, #0a0d12 18px);
   }
@@ -1430,6 +1443,7 @@ def create_app() -> FastAPI:
 <body>
   <h1>remember for them</h1>
   <div class="sub">both teams, live &mdash; type into a photo to speak to its agent</div>
+  <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"></div>
 __CARDS__
   <div class="lightbox" id="lightbox">
     <div class="lb-close">&times;</div>
@@ -1444,6 +1458,17 @@ __CARDS__
     </div>
   </div>
 <script>
+  // board photo resize — scales all polaroids via --card, remembered across reloads
+  (function(){
+    const sizer = document.getElementById("sizer");
+    if (!sizer) return;
+    const saved = localStorage.getItem("memento-card");
+    if (saved) { document.documentElement.style.setProperty("--card", saved + "px"); sizer.value = saved; }
+    sizer.addEventListener("input", () => {
+      document.documentElement.style.setProperty("--card", sizer.value + "px");
+      localStorage.setItem("memento-card", sizer.value);
+    });
+  })();
   let lbAgent = null;
   let lbTimer = null;
   const lb = document.getElementById("lightbox");
