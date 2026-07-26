@@ -95,7 +95,9 @@ def test_leonard_three_acts_from_real_memory(tmp_path, monkeypatch):
          "next_steps": ["Collect the strip confirmations"]},
     ])
     c = _client(tmp_path, monkeypatch)
-    d = c.get("/memento/leonard/opus").json()
+    # smart=0 pins the deterministic template questions (the 3B path is live/nondeterministic
+    # and would load the model); this test verifies structure + attribution, not phrasing.
+    d = c.get("/memento/leonard/opus?smart=0").json()
 
     assert d["reachable"] is True
     # act 1 pulls from the PRIOR (older) session, not the newest one
@@ -106,3 +108,20 @@ def test_leonard_three_acts_from_real_memory(tmp_path, monkeypatch):
     assert d["act3"], "expected remembering Q&A"
     assert all(item["chip"]["who"] == "opus" for item in d["act3"])
     assert any("rejected" in item["q"].lower() for item in d["act3"])
+
+
+def test_leonard_asof_scopes_and_is_honest(tmp_path, monkeypatch):
+    wt = tmp_path / ".synapt" / "recall" / "worktrees"
+    _write_journal(wt, "wt-a", [
+        {"timestamp": "2026-06-15T10:00:00+00:00", "session_id": "s1",
+         "agent_id": "opus-001", "decisions": ["A decision made on June 15"], "next_steps": []},
+    ])
+    c = _client(tmp_path, monkeypatch)
+    # as of before the only entry: nothing remembered yet — honest, never invented
+    before = c.get("/memento/leonard/opus?asof=2026-06-01&smart=0").json()
+    assert before["reachable"] is False
+    assert before["act1"] is None
+    # as of after: the memory is present and correctly scoped
+    after = c.get("/memento/leonard/opus?asof=2026-07-01&smart=0").json()
+    assert after["reachable"] is True
+    assert "June 15" in after["act1"]["chip"]["what"]

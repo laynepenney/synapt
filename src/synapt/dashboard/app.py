@@ -1245,7 +1245,7 @@ def create_app() -> FastAPI:
             return "s:" + session_id[:6]
         return "journal"
 
-    def _memento_provenance(name: str, limit: int = 2) -> list[dict]:
+    def _memento_provenance(name: str, limit: int = 2, asof: str | None = None) -> list[dict]:
         """Most-recent memory a being has authored, as chip records.
 
         Scans every worktree journal and keeps entries whose own
@@ -1277,6 +1277,8 @@ def create_app() -> FastAPI:
                     continue
                 who = (e.get("agent_id") or "").split("-")[0] or (e.get("griptree") or "")
                 if who != name:
+                    continue
+                if asof and (e.get("timestamp") or "")[:10] > asof:
                     continue
                 decisions = e.get("decisions") or []
                 nexts = e.get("next_steps") or []
@@ -1314,10 +1316,44 @@ def create_app() -> FastAPI:
         return out
 
     @app.get("/memento/provenance/{name}")
-    async def memento_provenance(name: str, limit: int = 2):
-        """Provenance chips for a being: what it has committed to memory."""
+    async def memento_provenance(name: str, limit: int = 2, asof: str = ""):
+        """Provenance chips for a being (?asof=YYYY-MM-DD scopes memory to on/before that day)."""
         safe = re.sub(r"[^a-z]", "", name.lower())
-        return _memento_provenance(safe, limit=limit)
+        asof_d = asof if re.match(r"^\d{4}-\d{2}-\d{2}$", asof) else None
+        return _memento_provenance(safe, limit=limit, asof=asof_d)
+
+    @app.get("/memento/timerange")
+    async def memento_timerange():
+        """Real min/max day of team memory, so the date picker only offers days we have."""
+        try:
+            wt_dir = project_data_dir(None) / "worktrees"
+        except Exception:
+            return {"min": None, "max": None}
+        valid = set(_MEMENTO_TARGETS)
+        lo = hi = None
+        if wt_dir.exists():
+            for jf in wt_dir.glob("*/journal.jsonl"):
+                try:
+                    text = jf.read_text(errors="ignore")
+                except Exception:
+                    continue
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except Exception:
+                        continue
+                    who = (e.get("agent_id") or "").split("-")[0] or (e.get("griptree") or "")
+                    if who not in valid:
+                        continue
+                    ts = (e.get("timestamp") or "")[:10]
+                    if not ts:
+                        continue
+                    lo = ts if lo is None else min(lo, ts)
+                    hi = ts if hi is None else max(hi, ts)
+        return {"min": lo, "max": hi}
 
     # --- the Leonard Test: memory crosses the session boundary, with proof ----
     # Three acts, all from live journal memory, nothing invented:
@@ -1329,7 +1365,51 @@ def create_app() -> FastAPI:
     _LEONARD_REJECT = (" not ", "instead", "reject", "don't", "do not", "deferred",
                        "dropped", "reversed", "stays ", "no longer", "never ", " over ")
 
-    def _memento_leonard(name: str) -> dict:
+    # --- 3B-generated, content-specific Leonard questions (local MLX Ministral-3B).
+    # The model writes the QUESTION only, never the answer/facts — so a wobble is
+    # just an awkward question, never a fabricated memory. Cached per content so
+    # repeat runs are stable + instant; template fallback if the model misses/errs.
+    _LEONARD_NAMES = ("Opus, Apollo, Atlas, Sentinel, Anchor, Helm, Lumen, Forge and Stromus "
+                      "are AGENT NAMES (people on the team) — keep them as names, never as "
+                      "common words, versions, or software.")
+    _leonard_q_cache: dict = {}
+    _leonard_client_box: list = []
+
+    def _leonard_client():
+        if not _leonard_client_box:
+            try:
+                from synapt.recall._model_router import get_client, RecallTask
+                _leonard_client_box.append(get_client(RecallTask.ENRICH, max_tokens=40))
+            except Exception:
+                _leonard_client_box.append(None)
+        return _leonard_client_box[0]
+
+    def _leonard_smart_q(cat_label: str, content: str, template: str) -> str:
+        key = (cat_label, content)
+        if key in _leonard_q_cache:
+            return _leonard_q_cache[key]
+        result = template
+        client = _leonard_client()
+        if client is not None:
+            try:
+                from synapt.recall._model_router import DEFAULT_DECODER_MODEL
+                from synapt._models.base import Message
+                prompt = (f"{_LEONARD_NAMES}\n\nAn agent wrote this journal note:\n\"{content}\"\n\n"
+                          f"Write ONE natural question (max 16 words) that this exact note answers, "
+                          f"in the category \"{cat_label}\". Keep the note's real subject and names. "
+                          f"Output ONLY the question, ending with \"?\".")
+                out = client.chat(DEFAULT_DECODER_MODEL,
+                                  [Message(role="user", content=prompt)],
+                                  temperature=0.2, max_tokens=40)
+                out = " ".join((out or "").split()).strip().strip('"')
+                if out.endswith("?") and 8 <= len(out) <= 140:
+                    result = out  # accept only a clean single question; else keep template
+            except Exception:
+                result = template
+        _leonard_q_cache[key] = result
+        return result
+
+    def _memento_leonard(name: str, asof: str | None = None, smart: bool = True) -> dict:
         if name not in _MEMENTO_TARGETS:
             return {"agent": name, "reachable": False, "act1": None, "act3": []}
         try:
@@ -1352,8 +1432,9 @@ def create_app() -> FastAPI:
                     except Exception:
                         continue
                     who = (e.get("agent_id") or "").split("-")[0] or (e.get("griptree") or "")
-                    if who == name:
-                        entries.append((e.get("timestamp") or "", e))
+                    ts = e.get("timestamp") or ""
+                    if who == name and not (asof and ts[:10] > asof):
+                        entries.append((ts, e))
         entries.sort(key=lambda r: r[0], reverse=True)
 
         def _chip(e: dict, what: str, kind: str) -> dict:
@@ -1380,32 +1461,43 @@ def create_app() -> FastAPI:
                     "session": (e1.get("session_id") or "")[:8] or "a prior session",
                     "when": _prov_when_label(e1.get("timestamp") or "")}
 
+        def _mkq(cat_label: str, template: str, chip: dict) -> dict:
+            question = _leonard_smart_q(cat_label, chip["what"], template) if smart else template
+            return {"q": question, "chip": chip}
+
         q: list[dict] = []
         seen: set[str] = set()
         if act1:
-            q.append({"q": "What did we decide, and why?", "chip": act1["chip"]})
+            q.append(_mkq("what we decided, and why", "What did we decide, and why?", act1["chip"]))
             seen.add(act1["chip"]["what"])
         for e, d in decisions:  # what was rejected, and who
             low = " " + str(d).lower() + " "
             if any(m in low for m in _LEONARD_REJECT):
                 c = _chip(e, d, "rejected")
                 if c["what"] not in seen:
-                    q.append({"q": "What was rejected, and who rejected it?", "chip": c})
+                    q.append(_mkq("what was rejected, and who rejected it", "What was rejected, and who rejected it?", c))
                     seen.add(c["what"])
                     break
         for e, n in nexts:  # what should I not re-derive
             c = _chip(e, n, "planned")
             if c["what"] not in seen:
-                q.append({"q": "What should I not re-derive today?", "chip": c})
+                q.append(_mkq("what I should not re-derive today", "What should I not re-derive today?", c))
                 seen.add(c["what"])
                 break
         return {"agent": name, "reachable": bool(entries), "act1": act1, "act3": q}
 
     @app.get("/memento/leonard/{name}")
-    async def memento_leonard(name: str):
-        """The Leonard Test for a being, staged from live journal memory."""
+    async def memento_leonard(name: str, asof: str = "", smart: int = 1):
+        """The Leonard Test for a being, staged from live journal memory.
+
+        ?asof=YYYY-MM-DD scopes memory to on/before that day; ?smart=0 forces the
+        fixed template questions (deterministic) instead of the live 3B-generated
+        ones. Runs in a thread so the model call never blocks the event loop.
+        """
         safe = re.sub(r"[^a-z]", "", name.lower())
-        return _memento_leonard(safe)
+        asof_d = asof if re.match(r"^\d{4}-\d{2}-\d{2}$", asof) else None
+        # run on the handler thread (not a worker pool): MLX must stay single-threaded
+        return _memento_leonard(safe, asof_d, bool(smart))
 
     @app.get("/memento", response_class=HTMLResponse)
     async def memento_page():
