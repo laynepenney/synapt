@@ -1551,6 +1551,338 @@ def create_app() -> FastAPI:
         # run on the handler thread (not a worker pool): MLX must stay single-threaded
         return _memento_leonard(safe, asof_d, bool(smart))
 
+    # -----------------------------------------------------------------
+    # Live Console (the demo stage): coordinator-primary mission control
+    # -----------------------------------------------------------------
+    # Composes the existing live substrate into the real operating topology:
+    # Layne -> the coordinator -> the team. Nothing here is mocked — every
+    # panel reads the same endpoints the operator tools do: /memento/pane
+    # (tmux capture + reachability), /memento/provenance (journal-sourced
+    # memory chips), /memento/say (drive a pane), and /console/feed (#dev).
+    # The coordinator (address "opus", shown as "Stromus") is the hero; the
+    # team are live highlights that "come alive" as `gr spawn` brings panes
+    # online (reachable flips false->true -> a wake pulse on the card).
+    _CONSOLE_ACCENT = {
+        "opus": "#9b7ff0", "stromus": "#9b7ff0",
+        "apollo": "#ff8a5c", "atlas": "#57c7c1", "sentinel": "#5b8def",
+    }
+
+    def _console_roster() -> list[dict]:
+        team = next((t for t in _MEMENTO_TEAMS if t.get("team") == "synapt"), None)
+        agents = team["agents"] if team else []
+        out = []
+        for a in agents:
+            nm = a["name"]
+            out.append({
+                "name": nm,
+                "label": "STROMUS" if nm == "opus" else a["label"],
+                "note": a.get("note", ""),
+                "coordinator": nm == "opus",
+                "accent": _CONSOLE_ACCENT.get(nm, "#0f97a6"),
+            })
+        return out
+
+    @app.get("/console/feed")
+    async def console_feed(limit: int = 14):
+        """Clean #dev ticker: recent human-readable team posts, noise filtered.
+
+        Reuses the operator console's channel reader, maps to a minimal
+        {who, ts, text}, and drops join/leave/heartbeat lines so the demo
+        ticker shows the team *talking*, not session churn.
+        """
+        ch_dir = _channels_dir_for(None, None)
+        try:
+            msgs = channel_messages_json(
+                channel="dev", limit=max(int(limit) * 4, 40), channels_dir=ch_dir
+            )
+        except Exception:
+            msgs = []
+        out: list[dict] = []
+        for m in msgs:
+            who = (m.get("from_display") or m.get("from") or m.get("name")
+                   or m.get("author") or m.get("sender") or "")
+            text = (m.get("body") or m.get("content") or m.get("message")
+                    or m.get("text") or "").strip()
+            ts = m.get("timestamp") or m.get("ts") or m.get("time") or ""
+            low = text.lower()
+            if not text or low == "test":
+                continue
+            if ("joined #dev" in low or "timed out from #dev" in low
+                    or "left #dev" in low):
+                continue
+            out.append({"who": who, "ts": ts, "text": text})
+        return {"messages": out[-int(limit):]}
+
+    @app.get("/console", response_class=HTMLResponse)
+    async def console_page():
+        """The live console — the demo stage, built entirely on live endpoints."""
+        import json as _json
+        roster = _json.dumps(_console_roster())
+        page = '''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>synapt · live console</title>
+<style>
+  :root{ --bg:#16130f; --panel:#0c0a08; --ink:#e8e2d6; --muted:#9a9285;
+    --line:#2a251d; --mem:#0f97a6; --coord:#9b7ff0; }
+  *{box-sizing:border-box}
+  html{height:100%; background:var(--bg)}
+  body{margin:0; height:100vh; background:var(--bg); color:var(--ink); overflow:hidden;
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    display:flex; flex-direction:column;}
+  /* header + topology */
+  .con-head{display:flex; align-items:center; gap:22px; padding:12px 18px;
+    border-bottom:1px solid var(--line); flex:0 0 auto;}
+  .brand{font-weight:700; letter-spacing:.3px}
+  .brand span{color:var(--mem); font-weight:600}
+  .con-topo{display:flex; align-items:center; gap:10px; color:var(--muted); font-size:13px}
+  .con-topo b{color:var(--ink)}
+  .con-topo .you{color:var(--coord)}
+  .con-topo .arrow{color:#4a4238; font-size:15px}
+  .topo-dots{display:inline-flex; gap:6px; align-items:center; margin-left:4px}
+  .con-status{margin-left:auto; color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums}
+  .con-status b{color:var(--mem)}
+  /* presence dot */
+  .dot{width:9px; height:9px; border-radius:50%; background:#48423a; flex:0 0 auto;
+    transition:background .3s, box-shadow .3s}
+  .dot.online{background:var(--ac,#0f97a6); box-shadow:0 0 9px var(--ac,#0f97a6)}
+  .dot.active{animation:pulse 1.1s ease-out infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 var(--ac,#0f97a6)}70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}
+  /* main grid */
+  .con-grid{flex:1 1 auto; display:grid; grid-template-columns:1fr 366px; gap:14px; padding:14px; min-height:0}
+  /* coordinator hero */
+  .hero{display:flex; flex-direction:column; min-height:0; overflow:hidden;
+    border:1px solid var(--line); border-radius:12px; background:#100d0a}
+  .hero-head{display:flex; align-items:center; gap:12px; padding:13px 16px; border-bottom:1px solid var(--line)}
+  .hero-head h1{margin:0; font-size:17px; letter-spacing:1px}
+  .hero-head .role{color:var(--muted); font-size:12px}
+  .hero-head .live{margin-left:auto; font-size:11px; color:var(--coord);
+    border:1px solid var(--coord); border-radius:20px; padding:2px 10px; opacity:.4}
+  .hero-head .live.on{opacity:1}
+  .pane{flex:1 1 auto; min-height:0; overflow:auto; margin:0; background:var(--panel);
+    color:#cbc3b4; padding:14px 16px; white-space:pre-wrap; word-break:break-word;
+    font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+  .pane .off{color:var(--muted); font-style:italic}
+  .mem-strip{flex:0 0 auto; border-top:1px solid var(--line); padding:11px 16px; background:#0f0c09}
+  .mem-label{display:block; font-size:11px; letter-spacing:.6px; text-transform:uppercase;
+    color:var(--mem); margin-bottom:8px}
+  .chips{display:flex; flex-direction:column; gap:7px; max-height:132px; overflow:auto}
+  .chip{background:rgba(15,151,166,.09); border-left:3px solid var(--mem); border-radius:4px; padding:7px 11px; font-size:12.5px}
+  .chip .cwhat{color:var(--ink)}
+  .chip .cmeta{display:block; margin-top:3px; color:var(--muted); font-size:11px}
+  .chip .cmeta b{color:var(--mem); font-weight:600}
+  .chips .none{color:var(--muted); font-size:12px; font-style:italic}
+  .say{flex:0 0 auto; display:flex; gap:8px; padding:11px 16px; border-top:1px solid var(--line)}
+  .say input{flex:1; background:#0c0a08; border:1px solid var(--line); border-radius:8px; color:var(--ink); padding:9px 12px; font-size:13px}
+  .say input:focus{outline:none; border-color:var(--coord)}
+  .say button{background:var(--coord); border:none; border-radius:8px; color:#140f22; font-weight:700; padding:0 16px; cursor:pointer}
+  /* team rail */
+  .team{display:flex; flex-direction:column; gap:10px; min-height:0}
+  .team-h{font-size:11px; letter-spacing:.7px; text-transform:uppercase; color:var(--muted); padding:2px}
+  #team-cards{display:flex; flex-direction:column; gap:12px; overflow:auto; min-height:0}
+  .tcard{border:1px solid var(--line); border-radius:11px; background:#100d0a; overflow:hidden; display:flex; flex-direction:column}
+  .tcard.waking{animation:wake 1.7s ease-out}
+  @keyframes wake{0%{border-color:var(--ac); box-shadow:0 0 0 0 var(--ac)}30%{box-shadow:0 0 20px -4px var(--ac)}100%{box-shadow:0 0 0 0 transparent}}
+  .tcard-head{display:flex; align-items:center; gap:9px; padding:10px 12px}
+  .tcard-head b{font-size:13px; letter-spacing:.5px}
+  .tcard-head .trole{color:var(--muted); font-size:11px; margin-left:auto; text-align:right; max-width:158px}
+  .tgwrap{position:relative; border-top:1px solid var(--line)}
+  .tgwrap::before{content:""; position:absolute; top:0; left:0; right:0; height:20px; z-index:2; pointer-events:none; background:linear-gradient(#100d0a,transparent)}
+  .tglimpse{height:94px; overflow:auto; scrollbar-width:none; background:var(--panel); color:#b7b0a2;
+    padding:9px 12px; white-space:pre-wrap; word-break:break-word; font:11px/1.42 ui-monospace,Menlo,monospace}
+  .tglimpse::-webkit-scrollbar{display:none}
+  .tglimpse .off{color:var(--muted); font-style:italic}
+  .tmem{padding:8px 12px; border-top:1px solid var(--line); font-size:11.5px; color:var(--muted)}
+  .tmem b{color:var(--mem)}
+  .tmem .tw{color:#cfc7b8}
+  /* ticker */
+  .ticker{flex:0 0 auto; display:flex; align-items:center; gap:14px; border-top:1px solid var(--line);
+    padding:9px 18px; background:#100d0a; overflow:hidden}
+  .ticker-label{color:var(--mem); font-weight:700; font-size:12px; flex:0 0 auto}
+  .ticker-feed{display:flex; gap:26px; overflow:hidden; white-space:nowrap; color:var(--muted); font-size:12.5px}
+  .ticker-feed .tk{flex:0 0 auto}
+  .ticker-feed .tk b{color:var(--ink)}
+</style>
+</head>
+<body>
+  <div class="con-head">
+    <div class="brand">synapt <span>· live</span></div>
+    <div class="con-topo">
+      <span>Layne</span><span class="arrow">&rarr;</span>
+      <b class="you" id="coord-name">Stromus</b><span class="arrow">&rarr;</span>
+      <span class="topo-dots" id="topo-dots"></span>
+    </div>
+    <div class="con-status"><span id="clock">&ndash;</span> &nbsp;&middot;&nbsp; <b id="up-count">0</b> online</div>
+  </div>
+
+  <div class="con-grid">
+    <section class="hero">
+      <div class="hero-head">
+        <span class="dot" id="coord-dot"></span>
+        <h1 id="coord-title">STROMUS</h1>
+        <span class="role" id="coord-role">coordinator</span>
+        <span class="live" id="coord-live">live</span>
+      </div>
+      <pre class="pane" id="coord-pane"><span class="off">waiting for the coordinator&hellip; run gr spawn up</span></pre>
+      <div class="mem-strip">
+        <span class="mem-label">what Stromus remembers</span>
+        <div class="chips" id="coord-chips"><span class="none">&hellip;</span></div>
+      </div>
+      <form class="say" id="coord-say" autocomplete="off">
+        <input id="coord-input" placeholder="talk to Stromus&hellip;">
+        <button type="submit">send</button>
+      </form>
+    </section>
+
+    <aside class="team">
+      <div class="team-h">the team</div>
+      <div id="team-cards"></div>
+    </aside>
+  </div>
+
+  <div class="ticker">
+    <div class="ticker-label">#dev</div>
+    <div class="ticker-feed" id="ticker">the channel is quiet&hellip;</div>
+  </div>
+
+<script>
+(function(){
+  var ROSTER = __ROSTER__;
+  var COORD = ROSTER.filter(function(a){return a.coordinator;})[0] || {name:"opus",label:"STROMUS",accent:"#9b7ff0",note:"coordinator"};
+  var TEAM  = ROSTER.filter(function(a){return !a.coordinator;});
+  document.documentElement.style.setProperty('--coord', COORD.accent);
+  document.getElementById('coord-title').textContent = COORD.label;
+  document.getElementById('coord-name').textContent = COORD.label;
+  if(COORD.note) document.getElementById('coord-role').textContent = COORD.note;
+
+  var onlineWas = {};
+
+  function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}); }
+  function jget(u){ return fetch(u).then(function(r){return r.json();}).catch(function(){return null;}); }
+  function nearBottom(el){ return el.scrollHeight - el.scrollTop - el.clientHeight < 42; }
+  function setPane(el, html, reachable, stickAlways){
+    if(!reachable){ el.innerHTML = '<span class="off">waiting for spawn&hellip;</span>'; el.removeAttribute('data-h'); return false; }
+    var sig = (html?html.length:0) + '|' + (html?html.slice(-140):'');
+    if(el.getAttribute('data-h') === sig) return false;
+    var stick = stickAlways || nearBottom(el);
+    el.innerHTML = html || '<span class="off">(quiet)</span>';
+    el.setAttribute('data-h', sig);
+    if(stick) el.scrollTop = el.scrollHeight;
+    return true;
+  }
+  function markDot(dot, reachable, changed, accent){
+    dot.style.setProperty('--ac', accent);
+    dot.classList.toggle('online', reachable);
+    dot.classList.toggle('active', reachable && changed);
+  }
+
+  // build team cards + topology dots from the real roster
+  var cardsBox = document.getElementById('team-cards');
+  var topoDots = document.getElementById('topo-dots');
+  TEAM.forEach(function(a){
+    var card = document.createElement('div');
+    card.className = 'tcard'; card.id = 'card-'+a.name; card.style.setProperty('--ac', a.accent);
+    card.innerHTML =
+      '<div class="tcard-head"><span class="dot" data-dot></span><b>'+esc(a.label)+'</b>'+
+      '<span class="trole">'+esc(a.note||'')+'</span></div>'+
+      '<div class="tgwrap"><div class="tglimpse" data-pane><span class="off">waiting for spawn&hellip;</span></div></div>'+
+      '<div class="tmem" data-mem>&mdash;</div>';
+    cardsBox.appendChild(card);
+    var td = document.createElement('span'); td.className='dot'; td.title=a.label; td.id='topo-'+a.name;
+    td.style.setProperty('--ac', a.accent); topoDots.appendChild(td);
+  });
+
+  var coordPane = document.getElementById('coord-pane');
+  var coordDot  = document.getElementById('coord-dot');
+  var coordLive = document.getElementById('coord-live');
+
+  function pollCoord(){
+    return jget('/memento/pane/'+COORD.name+'?full=1').then(function(d){
+      if(!d) return;
+      var changed = setPane(coordPane, d.content_html, d.reachable, false);
+      markDot(coordDot, d.reachable, changed, COORD.accent);
+      coordLive.classList.toggle('on', d.reachable);
+    });
+  }
+  function pollCoordChips(){
+    jget('/memento/provenance/'+COORD.name+'?limit=3').then(function(d){
+      var box = document.getElementById('coord-chips');
+      if(!d || !d.length){ box.innerHTML = '<span class="none">nothing remembered yet</span>'; return; }
+      box.innerHTML = d.map(function(c){
+        return '<div class="chip"><span class="cwhat">'+esc(c.what)+'</span>'+
+          '<span class="cmeta"><b>'+esc(c.who)+'</b> &middot; '+esc(c.when_label||'')+
+          (c.where?(' &middot; '+esc(c.where)):'')+'</span></div>';
+      }).join('');
+    });
+  }
+  function pollTeam(){
+    return Promise.all(TEAM.map(function(a){
+      return jget('/memento/pane/'+a.name+'?lines=14').then(function(d){
+        var card = document.getElementById('card-'+a.name);
+        var pane = card.querySelector('[data-pane]');
+        var dot  = card.querySelector('[data-dot]');
+        var topo = document.getElementById('topo-'+a.name);
+        if(!d) return 0;
+        var changed = setPane(pane, d.content_html, d.reachable, true);
+        markDot(dot, d.reachable, changed, a.accent);
+        markDot(topo, d.reachable, changed, a.accent);
+        if(d.reachable && onlineWas[a.name] === false){
+          card.classList.add('waking'); setTimeout(function(){card.classList.remove('waking');}, 1750);
+        }
+        onlineWas[a.name] = d.reachable;
+        return d.reachable ? 1 : 0;
+      });
+    })).then(function(ups){ return ups.reduce(function(s,x){return s+x;}, 0); });
+  }
+  function pollTeamMem(){
+    TEAM.forEach(function(a){
+      jget('/memento/provenance/'+a.name+'?limit=1').then(function(d){
+        var mem = document.getElementById('card-'+a.name).querySelector('[data-mem]');
+        if(d && d.length){ mem.innerHTML = '<b>remembers:</b> <span class="tw">'+esc(d[0].what.slice(0,88))+'</span>'; }
+        else { mem.innerHTML = '<span style="opacity:.55">no memory as of today</span>'; }
+      });
+    });
+  }
+  function pollTicker(){
+    jget('/console/feed?limit=14').then(function(d){
+      var el = document.getElementById('ticker');
+      if(!d || !d.messages || !d.messages.length){ el.textContent = 'the channel is quiet…'; return; }
+      el.innerHTML = d.messages.map(function(m){
+        return '<span class="tk"><b>'+esc(m.who||'?')+'</b> '+esc(m.text.slice(0,120))+'</span>';
+      }).join('');
+    });
+  }
+  function tick(){
+    pollCoord();
+    pollTeam().then(function(up){
+      var coordUp = coordDot.classList.contains('online') ? 1 : 0;
+      document.getElementById('up-count').textContent = up + coordUp;
+    });
+  }
+
+  document.getElementById('coord-say').addEventListener('submit', function(e){
+    e.preventDefault();
+    var inp = document.getElementById('coord-input');
+    var t = inp.value.trim(); if(!t) return;
+    inp.value=''; inp.disabled=true;
+    fetch('/memento/say/'+COORD.name, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'text='+encodeURIComponent(t)})
+      .catch(function(){}).then(function(){ inp.disabled=false; inp.focus(); setTimeout(pollCoord, 600); });
+  });
+
+  function clock(){ document.getElementById('clock').textContent = new Date().toLocaleTimeString(); }
+  clock(); setInterval(clock, 1000);
+  tick(); setInterval(tick, 1600);
+  pollCoordChips(); setInterval(pollCoordChips, 18000);
+  pollTeamMem();    setInterval(pollTeamMem, 18000);
+  pollTicker();     setInterval(pollTicker, 3000);
+})();
+</script>
+</body>
+</html>'''
+        return page.replace("__ROSTER__", roster)
+
     @app.get("/memento", response_class=HTMLResponse)
     async def memento_page():
         """Four polaroids pinned to the board; the chat with each agent inside."""
