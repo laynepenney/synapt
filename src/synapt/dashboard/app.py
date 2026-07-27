@@ -1409,6 +1409,44 @@ def create_app() -> FastAPI:
         _leonard_q_cache[key] = result
         return result
 
+    _leonard_qa_cache: dict = {}
+
+    def _leonard_smart_qa(content: str) -> dict:
+        """3B generates a question AND an answer grounded ONLY in this memory note.
+        The answer is the model's own prose (not verbatim), but it is instructed to
+        use only the note, and the caller shows the real note as the citation — so a
+        drifted answer is caught by its own receipt. Cached per content. {} on failure."""
+        if content in _leonard_qa_cache:
+            return _leonard_qa_cache[content]
+        qa: dict = {}
+        client = _leonard_client()
+        if client is not None:
+            try:
+                from synapt.recall._model_router import DEFAULT_DECODER_MODEL
+                from synapt._models.base import Message
+                prompt = (f"{_LEONARD_NAMES}\n\nHere is one thing an agent recorded in its memory:\n"
+                          f"\"{content}\"\n\n"
+                          f"Ask ONE natural question a colleague might ask, then answer it in 1-2 sentences "
+                          f"using ONLY this note — add no facts not in it. If the note doesn't support an "
+                          f"answer, answer exactly \"The note doesn't say.\"\n"
+                          f"Reply EXACTLY as:\nQ: <question>\nA: <answer>")
+                out = client.chat(DEFAULT_DECODER_MODEL,
+                                  [Message(role="user", content=prompt)],
+                                  temperature=0.2, max_tokens=160) or ""
+                q = a = ""
+                for line in out.splitlines():
+                    s = line.strip()
+                    if s[:2].upper() == "Q:":
+                        q = s[2:].strip().strip('"')
+                    elif s[:2].upper() == "A:":
+                        a = s[2:].strip().strip('"')
+                if q and a and q.endswith("?") and 8 <= len(q) <= 160 and 4 <= len(a) <= 400:
+                    qa = {"q": q, "a": a}
+            except Exception:
+                qa = {}
+        _leonard_qa_cache[content] = qa
+        return qa
+
     def _memento_leonard(name: str, asof: str | None = None, smart: bool = True) -> dict:
         if name not in _MEMENTO_TARGETS:
             return {"agent": name, "reachable": False, "act1": None, "act3": []}
@@ -1486,15 +1524,18 @@ def create_app() -> FastAPI:
         # never the fact). Only when smart=1; a few items beyond the canonical three.
         generated: list[dict] = []
         if smart:
-            pool = [(_chip(e, d, "decided"), "what the team decided") for e, d in decisions]
-            pool += [(_chip(e, n, "planned"), "what the team plans to do") for e, n in nexts]
-            for chip, cat in pool:
+            pool = [_chip(e, d, "decided") for e, d in decisions] + [_chip(e, n, "planned") for e, n in nexts]
+            attempts = 0
+            for chip in pool:
+                if len(generated) >= 3 or attempts >= 6:
+                    break
                 if chip["what"] in seen:
                     continue
                 seen.add(chip["what"])
-                generated.append({"q": _leonard_smart_q(cat, chip["what"], "What does this note say?"), "chip": chip})
-                if len(generated) >= 3:
-                    break
+                attempts += 1
+                qa = _leonard_smart_qa(chip["what"])  # model asks AND answers, grounded in this note
+                if qa.get("q") and qa.get("a"):
+                    generated.append({"q": qa["q"], "a": qa["a"], "chip": chip})  # chip = the cited source
         return {"agent": name, "reachable": bool(entries), "act1": act1, "act3": q, "generated": generated}
 
     @app.get("/memento/leonard/{name}")
@@ -1910,6 +1951,9 @@ def create_app() -> FastAPI:
   .ln-generated { border-top: 1px solid rgba(15,151,166,.22); padding-top: 1.5rem; }
   .ln-tag-gen { color: var(--mem); }
   .ln-genote { color: #8b8375; font-size: .8rem; font-style: italic; margin: -.4rem 0 1.2rem; max-width: 640px; }
+  .ln-a { color: #eae4d6; font-size: 1rem; line-height: 1.5; margin: .5rem 0 .55rem; }
+  .ln-a::before { content: "A  "; color: var(--mem); font-weight: 700; }
+  .ln-cite { font-size: .6rem; color: #6f695d; letter-spacing: .08em; text-transform: uppercase; margin-bottom: .35rem; }
   .ln-close {
     position: fixed; top: 2.4vh; right: 2.6vw; z-index: 210;
     width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
@@ -2080,7 +2124,10 @@ __CARDS__
         gen.forEach(item => {
           const qi = document.createElement("div");
           qi.className = "ln-qa-item in";
-          qi.innerHTML = '<div class="ln-q">' + escProv(item.q) + '</div>' + _lnChip(item.chip);
+          qi.innerHTML = '<div class="ln-q">' + escProv(item.q) + '</div>'
+            + '<div class="ln-a">' + escProv(item.a) + '</div>'
+            + '<div class="ln-cite">the model\'s answer &middot; drawn from this memory &darr;</div>'
+            + _lnChip(item.chip);
           genEl.appendChild(qi);
         });
       };
