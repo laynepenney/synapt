@@ -1637,6 +1637,12 @@ def create_app() -> FastAPI:
     border-bottom:1px solid var(--line); flex:0 0 auto;}
   .brand{font-weight:700; letter-spacing:.3px}
   .brand span{color:var(--mem); font-weight:600}
+  .con-nav{display:flex; gap:4px}
+  .con-nav a{font:11px -apple-system,system-ui,sans-serif; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--muted); text-decoration:none; padding:4px 11px; border:1px solid var(--line);
+    border-radius:5px; background:rgba(180,170,150,.04); transition:all .16s ease}
+  .con-nav a:hover{color:var(--ink); border-color:var(--mem)}
+  .con-nav a.active{color:#06232a; background:var(--mem); border-color:var(--mem); font-weight:700}
   .con-topo{display:flex; align-items:center; gap:10px; color:var(--muted); font-size:13px}
   .con-topo b{color:var(--ink)}
   .con-topo .you{color:var(--coord)}
@@ -1681,16 +1687,18 @@ def create_app() -> FastAPI:
   /* team rail */
   .team{display:flex; flex-direction:column; gap:10px; min-height:0}
   .team-h{font-size:11px; letter-spacing:.7px; text-transform:uppercase; color:var(--muted); padding:2px}
-  #team-cards{display:flex; flex-direction:column; gap:12px; overflow:auto; min-height:0}
-  .tcard{border:1px solid var(--line); border-radius:11px; background:#100d0a; overflow:hidden; display:flex; flex-direction:column}
+  #team-cards{display:flex; flex-direction:column; gap:12px; overflow:auto; min-height:0; flex:1 1 auto}
+  .tcard{border:1px solid var(--line); border-radius:11px; background:#100d0a; overflow:hidden; display:flex; flex-direction:column; flex:1 1 0; min-height:150px; cursor:pointer; transition:border-color .16s}
+  .tcard:hover{border-color:var(--ac,#0f97a6)}
+  .tav{width:22px; height:22px; border-radius:50%; object-fit:cover; object-position:center 20%; border:1px solid var(--line); flex:0 0 auto}
   .tcard.waking{animation:wake 1.7s ease-out}
   @keyframes wake{0%{border-color:var(--ac); box-shadow:0 0 0 0 var(--ac)}30%{box-shadow:0 0 20px -4px var(--ac)}100%{box-shadow:0 0 0 0 transparent}}
   .tcard-head{display:flex; align-items:center; gap:9px; padding:10px 12px}
   .tcard-head b{font-size:13px; letter-spacing:.5px}
   .tcard-head .trole{color:var(--muted); font-size:11px; margin-left:auto; text-align:right; max-width:158px}
-  .tgwrap{position:relative; border-top:1px solid var(--line)}
+  .tgwrap{position:relative; border-top:1px solid var(--line); flex:1 1 auto; min-height:0; display:flex; flex-direction:column}
   .tgwrap::before{content:""; position:absolute; top:0; left:0; right:0; height:20px; z-index:2; pointer-events:none; background:linear-gradient(#100d0a,transparent)}
-  .tglimpse{height:94px; overflow:auto; scrollbar-width:none; background:var(--panel); color:#b7b0a2;
+  .tglimpse{flex:1 1 auto; min-height:80px; overflow:auto; scrollbar-width:none; background:var(--panel); color:#b7b0a2;
     padding:9px 12px; white-space:pre-wrap; word-break:break-word; font:11px/1.42 ui-monospace,Menlo,monospace}
   .tglimpse::-webkit-scrollbar{display:none}
   .tglimpse .off{color:var(--muted); font-style:italic}
@@ -1709,6 +1717,7 @@ def create_app() -> FastAPI:
 <body>
   <div class="con-head">
     <div class="brand">synapt <span>· live</span></div>
+    <nav class="con-nav"><a href="/">mission control</a><a href="/console" class="active">console</a><a href="/memento?demo=1">demo</a><a href="/memento">memento</a></nav>
     <div class="con-topo">
       <span>Layne</span><span class="arrow">&rarr;</span>
       <b class="you" id="coord-name">Stromus</b><span class="arrow">&rarr;</span>
@@ -1751,11 +1760,18 @@ def create_app() -> FastAPI:
 (function(){
   var ROSTER = __ROSTER__;
   var COORD = ROSTER.filter(function(a){return a.coordinator;})[0] || {name:"opus",label:"STROMUS",accent:"#9b7ff0",note:"coordinator"};
-  var TEAM  = ROSTER.filter(function(a){return !a.coordinator;});
-  document.documentElement.style.setProperty('--coord', COORD.accent);
-  document.getElementById('coord-title').textContent = COORD.label;
-  document.getElementById('coord-name').textContent = COORD.label;
-  if(COORD.note) document.getElementById('coord-role').textContent = COORD.note;
+  var FEATURED = COORD;                       // whoever occupies the main hero pane (click a teammate to swap)
+  function railAgents(){ return ROSTER.filter(function(a){ return a.name !== FEATURED.name; }); }
+  function avatar(a){ return '<img class="tav" src="/memento/portrait/'+a.name+'" alt="" onerror="this.remove()">'; }
+  function renderHero(){
+    document.documentElement.style.setProperty('--coord', FEATURED.accent);
+    document.getElementById('coord-title').textContent = FEATURED.label;
+    document.getElementById('coord-name').textContent = FEATURED.label;
+    document.getElementById('coord-role').textContent = FEATURED.note || (FEATURED.coordinator ? 'coordinator' : 'agent');
+    var _ml = document.querySelector('.mem-label'); if(_ml) _ml.textContent = 'what '+FEATURED.label+' remembers';
+    var _ci = document.getElementById('coord-input'); if(_ci) _ci.placeholder = 'talk to '+FEATURED.label+'…';
+  }
+  renderHero();
 
   var onlineWas = {};
 
@@ -1778,36 +1794,48 @@ def create_app() -> FastAPI:
     dot.classList.toggle('active', reachable && changed);
   }
 
-  // build team cards + topology dots from the real roster
+  // build team cards + topology dots from the real roster (rebuilt on swap)
   var cardsBox = document.getElementById('team-cards');
   var topoDots = document.getElementById('topo-dots');
-  TEAM.forEach(function(a){
-    var card = document.createElement('div');
-    card.className = 'tcard'; card.id = 'card-'+a.name; card.style.setProperty('--ac', a.accent);
-    card.innerHTML =
-      '<div class="tcard-head"><span class="dot" data-dot></span><b>'+esc(a.label)+'</b>'+
-      '<span class="trole">'+esc(a.note||'')+'</span></div>'+
-      '<div class="tgwrap"><div class="tglimpse" data-pane><span class="off">waiting for spawn&hellip;</span></div></div>'+
-      '<div class="tmem" data-mem>&mdash;</div>';
-    cardsBox.appendChild(card);
-    var td = document.createElement('span'); td.className='dot'; td.title=a.label; td.id='topo-'+a.name;
-    td.style.setProperty('--ac', a.accent); topoDots.appendChild(td);
-  });
+  function buildRail(){
+    cardsBox.innerHTML = ''; topoDots.innerHTML = '';
+    railAgents().forEach(function(a){
+      var card = document.createElement('div');
+      card.className = 'tcard'; card.id = 'card-'+a.name; card.style.setProperty('--ac', a.accent);
+      card.title = 'click to feature '+a.label;
+      card.innerHTML =
+        '<div class="tcard-head">'+avatar(a)+'<span class="dot" data-dot></span><b>'+esc(a.label)+'</b>'+
+        '<span class="trole">'+esc(a.note||'')+'</span></div>'+
+        '<div class="tgwrap"><div class="tglimpse" data-pane><span class="off">waiting for spawn&hellip;</span></div></div>'+
+        '<div class="tmem" data-mem>&mdash;</div>';
+      card.addEventListener('click', function(){ feature(a); });
+      cardsBox.appendChild(card);
+      var td = document.createElement('span'); td.className='dot'; td.title=a.label; td.id='topo-'+a.name;
+      td.style.setProperty('--ac', a.accent); topoDots.appendChild(td);
+    });
+  }
+  function feature(a){
+    if(a.name === FEATURED.name) return;
+    FEATURED = a;
+    renderHero(); buildRail();
+    pollCoord(); pollCoordChips(); pollTeam(); pollTeamMem();
+  }
+  buildRail();
 
   var coordPane = document.getElementById('coord-pane');
   var coordDot  = document.getElementById('coord-dot');
   var coordLive = document.getElementById('coord-live');
 
   function pollCoord(){
-    return jget('/memento/pane/'+COORD.name+'?full=1').then(function(d){
+    return jget('/memento/pane/'+FEATURED.name+'?full=1').then(function(d){
       if(!d) return;
       var changed = setPane(coordPane, d.content_html, d.reachable, false);
-      markDot(coordDot, d.reachable, changed, COORD.accent);
+      markDot(coordDot, d.reachable, changed, FEATURED.accent);
       coordLive.classList.toggle('on', d.reachable);
     });
   }
   function pollCoordChips(){
-    jget('/memento/provenance/'+COORD.name+'?limit=3').then(function(d){
+    jget('/memento/provenance/'+FEATURED.name+'?limit=3').then(function(d){
       var box = document.getElementById('coord-chips');
       if(!d || !d.length){ box.innerHTML = '<span class="none">nothing remembered yet</span>'; return; }
       box.innerHTML = d.map(function(c){
@@ -1818,7 +1846,7 @@ def create_app() -> FastAPI:
     });
   }
   function pollTeam(){
-    return Promise.all(TEAM.map(function(a){
+    return Promise.all(railAgents().map(function(a){
       return jget('/memento/pane/'+a.name+'?lines=14').then(function(d){
         var card = document.getElementById('card-'+a.name);
         var pane = card.querySelector('[data-pane]');
@@ -1837,7 +1865,7 @@ def create_app() -> FastAPI:
     })).then(function(ups){ return ups.reduce(function(s,x){return s+x;}, 0); });
   }
   function pollTeamMem(){
-    TEAM.forEach(function(a){
+    railAgents().forEach(function(a){
       jget('/memento/provenance/'+a.name+'?limit=1').then(function(d){
         var mem = document.getElementById('card-'+a.name).querySelector('[data-mem]');
         if(d && d.length){ mem.innerHTML = '<b>remembers:</b> <span class="tw">'+esc(d[0].what.slice(0,88))+'</span>'; }
@@ -1867,7 +1895,7 @@ def create_app() -> FastAPI:
     var inp = document.getElementById('coord-input');
     var t = inp.value.trim(); if(!t) return;
     inp.value=''; inp.disabled=true;
-    fetch('/memento/say/'+COORD.name, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'text='+encodeURIComponent(t)})
+    fetch('/memento/say/'+FEATURED.name, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'text='+encodeURIComponent(t)})
       .catch(function(){}).then(function(){ inp.disabled=false; inp.focus(); setTimeout(pollCoord, 600); });
   });
 
@@ -1912,7 +1940,6 @@ def create_app() -> FastAPI:
                 <div class="team-tag">{tm["label"]}</div>
                 <div class="photo">
                   {photo_inner}
-                  <pre class="chat" id="chat-{a["name"]}">…</pre>
                 </div>
                 <div class="caption">
                   <span class="cname">{a["label"]}</span>
@@ -1923,6 +1950,7 @@ def create_app() -> FastAPI:
                   <button type="button" class="vt" data-agent="{a["name"]}" data-view="chat" title="what {a["label"].lower()} is working on">chat</button>
                 </div>
                 <div class="provstrip" id="prov-{a["name"]}" aria-label="what {a["label"].lower()} remembers"></div>
+                <pre class="chat" id="chat-{a["name"]}">…</pre>
                 <form class="talk" data-agent="{a["name"]}">
                   <input type="text" placeholder="say something to {a["label"].lower()}…" autocomplete="off">
                 </form>
@@ -1946,6 +1974,15 @@ def create_app() -> FastAPI:
     border-bottom: 1px solid rgba(180,170,150,.10);
   }
   .topbar .controls { margin-bottom: 0; }
+  .topnav { display: flex; gap: 4px; margin-bottom: .95rem; }
+  .topnav a {
+    font: .67rem -apple-system, system-ui, sans-serif; letter-spacing: .09em;
+    text-transform: uppercase; color: #9a9285; text-decoration: none;
+    padding: 5px 13px; border: 1px solid rgba(180,170,150,.22); border-radius: 5px;
+    background: rgba(180,170,150,.05); transition: all .16s ease;
+  }
+  .topnav a:hover { color: #e8e2d4; border-color: var(--mem); }
+  .topnav a.active { color: #06232a; background: var(--mem); border-color: var(--mem); font-weight: 700; }
   h1 {
     text-align: center; font-family: "Permanent Marker", "Marker Felt", "Comic Sans MS", cursive;
     color: #e8e2d4; font-size: 1.6rem; letter-spacing: .06em; margin-bottom: .4rem;
@@ -2018,16 +2055,15 @@ def create_app() -> FastAPI:
   }
   .polaroid:hover .grip { opacity: .7; }
   .grip:hover { opacity: 1; }
+  /* the live pane output — a contained terminal panel in the card whitespace,
+     never over the portrait (sits where the notes/provstrip sit). */
   .chat {
-    position: absolute; inset: 0; z-index: 2; overflow-y: auto;
-    padding: calc(var(--card, 300px) * 0.62) 10px 8px; margin: 0;
+    margin: 5px 4px 2px; padding: 8px 10px; overflow-y: auto;
+    max-height: calc(var(--card, 300px) * 0.72);
+    border-radius: 5px; border: 1px solid #22303a; background: #0a0d12;
     font-family: "SF Mono", ui-monospace, Menlo, monospace;
-    font-size: calc(var(--card, 300px) * 0.032); line-height: 1.4;  /* scales with photo size */
+    font-size: calc(var(--card, 300px) * 0.034); line-height: 1.44;  /* scales with photo size */
     color: #9fd3a8; white-space: pre-wrap; word-break: break-word;
-    background: transparent; text-shadow: 0 1px 3px rgba(0,0,0,.96);
-    /* text is solid where it rests low, and fades into the owl as it scrolls up */
-    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 30%, #000 100%);
-    mask-image: linear-gradient(to bottom, transparent 0, #000 30%, #000 100%);
     scrollbar-width: thin;
   }
   .caption { padding: 9px 4px 4px; }
@@ -2071,11 +2107,11 @@ def create_app() -> FastAPI:
     background: #0b0e13; border-radius: 2px;
   }
   .lightbox .lb-photo { position: absolute; inset: 0; z-index: 0; background: #0b0e13; }
-  .lightbox .lb-photo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; opacity: .82; }
-  /* OG-style darkening gradient so the chat reads over the owl */
+  .lightbox .lb-photo img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 20%; opacity: .30; filter: blur(3px); transform: scale(1.04); }
+  /* strong, near-uniform darkening so the terminal text reads clearly over the photo */
   .lightbox .lb-scrim {
     position: absolute; inset: 0; z-index: 1; pointer-events: none;
-    background: linear-gradient(to bottom, rgba(8,10,15,.52) 0%, rgba(8,10,15,.80) 45%, rgba(8,10,15,.97) 100%);
+    background: linear-gradient(to bottom, rgba(6,8,13,.80) 0%, rgba(6,8,13,.88) 45%, rgba(6,8,13,.98) 100%);
   }
   .lightbox .lb-chat {
     position: absolute; inset: 0; z-index: 2; overflow: auto;
@@ -2170,7 +2206,7 @@ def create_app() -> FastAPI:
   .polaroid[data-view="chat"] .vt[data-view="chat"] {
     background: var(--mem); color: #06232a; font-weight: 700; border-color: var(--mem);
   }
-  .polaroid[data-view="stickies"] .chat { opacity: 0; pointer-events: none; }
+  .polaroid[data-view="stickies"] .chat { display: none; }
   .polaroid[data-view="chat"] .provstrip { display: none; }
   .chip {
     border-left: 3px solid var(--mem); border-radius: 2px;
@@ -2296,6 +2332,7 @@ def create_app() -> FastAPI:
 </style></head>
 <body>
   <div class="topbar">
+    <nav class="topnav"><a href="/">mission control</a><a href="/console">console</a><a href="/memento?demo=1">demo</a><a href="/memento" class="active">memento</a></nav>
     <h1>Memento agere, memento mori.</h1>
     <div class="sub">Remember to act. Remember you will die.</div>
     <div class="controls"><span class="ctl-label">photo size</span><input type="range" id="sizer" min="240" max="640" step="10" value="300" aria-label="photo size"><button id="demo-toggle" class="demo-btn" type="button" aria-pressed="false">Demo Mode</button><button id="leonard-run" class="demo-btn leonard-run" type="button">&#9654; Leonard Test</button><span class="ctl-label asof-label">memory as of</span><input type="date" id="asof" class="asof-input" aria-label="memory as of date"><button id="asof-now" class="demo-btn" type="button" title="jump to latest (live)">now</button></div>
@@ -2458,7 +2495,7 @@ __CARDS__
           qi.className = "ln-qa-item in";
           qi.innerHTML = '<div class="ln-q">' + escProv(item.q) + '</div>'
             + '<div class="ln-a">' + escProv(item.a) + '</div>'
-            + '<div class="ln-cite">the model\'s answer &middot; drawn from this memory &darr;</div>'
+            + '<div class="ln-cite">the model&#39;s answer &middot; drawn from this memory &darr;</div>'
             + _lnChip(item.chip);
           genEl.appendChild(qi);
         });
