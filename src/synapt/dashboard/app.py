@@ -1438,11 +1438,9 @@ def create_app() -> FastAPI:
         entries.sort(key=lambda r: r[0], reverse=True)
 
         def _chip(e: dict, what: str, kind: str) -> dict:
-            # Leonard answers are read full-screen — show the whole decision, not a
-            # sticky-sized snippet. Only a generous cap against a runaway paragraph.
+            # Leonard answers are read full-screen and the overlay scrolls, so show
+            # the WHOLE decision — never truncated. (The wall stickies stay short.)
             what = " ".join(str(what).split())
-            if len(what) > 400:
-                what = what[:397].rstrip() + "…"
             return {"what": what, "kind": kind, "who": name,
                     "when_label": _prov_when_label(e.get("timestamp") or ""),
                     "where": _prov_where(what, e.get("session_id") or "")}
@@ -1461,30 +1459,43 @@ def create_app() -> FastAPI:
                     "session": (e1.get("session_id") or "")[:8] or "a prior session",
                     "when": _prov_when_label(e1.get("timestamp") or "")}
 
-        def _mkq(cat_label: str, template: str, chip: dict) -> dict:
-            question = _leonard_smart_q(cat_label, chip["what"], template) if smart else template
-            return {"q": question, "chip": chip}
-
+        # Act 3 — the three canonical questions, STATIC: deterministic templates with
+        # real chips. The trustworthy receipt foundation; the model never touches it.
         q: list[dict] = []
         seen: set[str] = set()
         if act1:
-            q.append(_mkq("what we decided, and why", "What did we decide, and why?", act1["chip"]))
+            q.append({"q": "What did we decide, and why?", "chip": act1["chip"]})
             seen.add(act1["chip"]["what"])
         for e, d in decisions:  # what was rejected, and who
             low = " " + str(d).lower() + " "
             if any(m in low for m in _LEONARD_REJECT):
                 c = _chip(e, d, "rejected")
                 if c["what"] not in seen:
-                    q.append(_mkq("what was rejected, and who rejected it", "What was rejected, and who rejected it?", c))
+                    q.append({"q": "What was rejected, and who rejected it?", "chip": c})
                     seen.add(c["what"])
                     break
         for e, n in nexts:  # what should I not re-derive
             c = _chip(e, n, "planned")
             if c["what"] not in seen:
-                q.append(_mkq("what I should not re-derive today", "What should I not re-derive today?", c))
+                q.append({"q": "What should I not re-derive today?", "chip": c})
                 seen.add(c["what"])
                 break
-        return {"agent": name, "reachable": bool(entries), "act1": act1, "act3": q}
+
+        # "Asked live" — the local 3B reads the being's OTHER memories and poses its
+        # own questions; the ANSWER stays a real chip (the model writes the question,
+        # never the fact). Only when smart=1; a few items beyond the canonical three.
+        generated: list[dict] = []
+        if smart:
+            pool = [(_chip(e, d, "decided"), "what the team decided") for e, d in decisions]
+            pool += [(_chip(e, n, "planned"), "what the team plans to do") for e, n in nexts]
+            for chip, cat in pool:
+                if chip["what"] in seen:
+                    continue
+                seen.add(chip["what"])
+                generated.append({"q": _leonard_smart_q(cat, chip["what"], "What does this note say?"), "chip": chip})
+                if len(generated) >= 3:
+                    break
+        return {"agent": name, "reachable": bool(entries), "act1": act1, "act3": q, "generated": generated}
 
     @app.get("/memento/leonard/{name}")
     async def memento_leonard(name: str, asof: str = "", smart: int = 1):
@@ -1895,6 +1906,10 @@ def create_app() -> FastAPI:
   .ln-end { text-align: center; margin: 2.2rem 0 1rem; }
   .ln-end .ln-latin { color: #e8e2d4; font-size: 1.18rem; font-style: italic; letter-spacing: .01em; }
   .ln-end .ln-thesis { color: #8b8375; font-size: .96rem; margin-top: .6rem; }
+  /* Act 4 — the model's own questions, clearly set apart from the static anchor */
+  .ln-generated { border-top: 1px solid rgba(15,151,166,.22); padding-top: 1.5rem; }
+  .ln-tag-gen { color: var(--mem); }
+  .ln-genote { color: #8b8375; font-size: .8rem; font-style: italic; margin: -.4rem 0 1.2rem; max-width: 640px; }
   .ln-close {
     position: fixed; top: 2.4vh; right: 2.6vw; z-index: 210;
     width: 44px; height: 44px; display: flex; align-items: center; justify-content: center;
@@ -2007,10 +2022,11 @@ __CARDS__
     // version in the background — you watch the questions sharpen in place. still /
     // smart=0 take one deterministic fetch and skip the upgrade (recorded-clip mode).
     const explicitTemplates = params.get("smart") === "0";
-    const doUpgrade = !still && !explicitTemplates;
+    const wantGenerated = !explicitTemplates;   // the 3B "Asked live" section
     const leoURL = s => "/memento/leonard/" + agent + "?smart=" + s + (_asof ? "&asof=" + encodeURIComponent(_asof) : "");
     let d;
-    try { d = await (await fetch(leoURL((still && !explicitTemplates) ? 1 : 0))).json(); }
+    // static acts come from a fast smart=0 fetch (no model wait); still renders it all at once.
+    try { d = await (await fetch(leoURL(still ? 1 : 0))).json(); }
     catch (e) { add('could not reach memory.'); _lnRunning = false; return; }
     if (!d.reachable || !d.act1) {
       add('<div style="text-align:center;color:#8b8375">' + escProv(agent)
@@ -2027,32 +2043,52 @@ __CARDS__
     add('<div class="ln-wake"><div class="ln-tag">Act 2 · Waking</div>'
       + '<div class="ln-cap">New session. This instance has read nothing.</div></div>');
     await step(2500);
-    // Act 3 — Remembering: stranger-proof questions, each answered with a chip.
-    const rem = add('<div class="ln-remember"><div class="ln-tag">Act 3 · Remembering</div><div class="ln-qa" id="ln-qa"></div></div>');
-    const qaEl = rem.querySelector("#ln-qa");
-    const qEls = [];
+    // Act 3 — Remembering: the three canonical questions, STATIC + real chips.
+    const rem = add('<div class="ln-remember"><div class="ln-tag">Act 3 · Remembering</div><div class="ln-qa"></div></div>');
+    const qaEl = rem.querySelector(".ln-qa");
     for (const item of d.act3){
       const qi = document.createElement("div");
       qi.className = "ln-qa-item";
-      qi.innerHTML = '<div class="ln-q">' + escProv(item.q)
-        + (doUpgrade ? ' <span class="ln-gen">generating from memory…</span>' : '') + '</div>' + _lnChip(item.chip);
+      qi.innerHTML = '<div class="ln-q">' + escProv(item.q) + '</div>' + _lnChip(item.chip);
       qaEl.appendChild(qi);
-      qEls.push(qi.querySelector(".ln-q"));
       requestAnimationFrame(() => qi.classList.add("in"));
       await step(2600);
+    }
+    // Act 4 — Asked live: the local 3B reads this being's OTHER memories and poses
+    // its own questions; the answers are still real chips (model writes the question,
+    // never the fact). Loads after the static acts — the "generating…" is the progress.
+    let genEl = null;
+    if (wantGenerated) {
+      const genSec = add('<div class="ln-remember ln-generated"><div class="ln-tag ln-tag-gen">Act 4 · Asked live by the model</div>'
+        + '<div class="ln-genote">the local 3B reads this being’s memory and asks its own questions — the answers are still real receipts</div>'
+        + '<div class="ln-qa" id="ln-genqa"></div>'
+        + '<div class="ln-gen" id="ln-genload">reading memory, writing questions…</div></div>');
+      genEl = genSec.querySelector("#ln-genqa");
     }
     add('<div class="ln-end"><div class="ln-latin">Memento agere, memento mori.</div>'
       + '<div class="ln-thesis">What you feed the memory outlives the session that fed it.</div></div>');
     _lnRunning = false;
-    // background: the local 3B rewrites each template question to be content-specific.
-    // Each swaps in when it lands (the visible progress while the model works), and
-    // the shimmer clears with it. Cached server-side, so a second run is instant.
-    if (doUpgrade) {
-      fetch(leoURL(1)).then(r => r.json()).then(sd => {
-        (sd.act3 || []).forEach((it, i) => {
-          if (qEls[i] && it.q) qEls[i].innerHTML = escProv(it.q);
+    // fill Act 4 from the 3B (already present for still; a background fetch otherwise)
+    if (wantGenerated) {
+      const renderGen = gen => {
+        const load = document.getElementById("ln-genload");
+        if (load) load.remove();
+        if (!gen || !gen.length) {
+          if (genEl) genEl.innerHTML = '<div style="color:#8b8375;font-size:.9rem">no further memories to ask about yet.</div>';
+          return;
+        }
+        gen.forEach(item => {
+          const qi = document.createElement("div");
+          qi.className = "ln-qa-item in";
+          qi.innerHTML = '<div class="ln-q">' + escProv(item.q) + '</div>' + _lnChip(item.chip);
+          genEl.appendChild(qi);
         });
-      }).catch(() => {});
+      };
+      if (still) { renderGen(d.generated); }
+      else {
+        fetch(leoURL(1)).then(r => r.json()).then(sd => renderGen(sd.generated))
+          .catch(() => { const l = document.getElementById("ln-genload"); if (l) l.textContent = "(model unavailable)"; });
+      }
     }
   }
   function closeLeonard(){
