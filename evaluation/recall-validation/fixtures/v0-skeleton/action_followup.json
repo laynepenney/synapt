@@ -7,7 +7,7 @@
     "query_date": "2026-05-05",
     "expected": {
       "matches": [
-        {"prayer_id": "sk-006", "rank": 1, "relevance": "high"}
+        {"record_id": "hx-006", "rank": 1, "relevance": "high"}
       ],
       "expect_empty": false
     }
@@ -20,8 +20,8 @@
     "query_date": "2026-05-05",
     "expected": {
       "matches": [
-        {"prayer_id": "sk-012", "rank": 1, "relevance": "high"},
-        {"prayer_id": "sk-008", "rank": 2, "relevance": "medium"}
+        {"record_id": "hx-012", "rank": 1, "relevance": "high"},
+        {"record_id": "hx-008", "rank": 2, "relevance": "medium"}
       ],
       "expect_empty": false
     }

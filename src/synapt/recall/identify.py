@@ -1,6 +1,6 @@
 """Structure-aware identify — recall consolidation step ① (Phase A, recall#868 wiring).
 
-The generic flattened-cluster identify was NO-GO (Atlas config#481: source-support
+The generic flattened-cluster identify was NO-GO (internal eval: source-support
 91.5% < 98%, clean-atomic 40% << 85% — the 3B fabricates/promotes/drifts when asked
 to re-find durable units in a flattened blob). The fix: `JournalEntry` (journal.py)
 already carries SEPARATE structured fields — `focus`, `done`, `decisions`,
@@ -22,10 +22,10 @@ Why there is no split step (a narrow-split sub-step was built, measured, and dro
      the would-be-under-split cases atomized. So the split is REDUNDANT (Opus decided,
      path b): `prefilter` → extract_batch DIRECTLY on raw candidates; extract_batch atomizes.
 The ~5% extract_batch drop-to-empty is the honest cost, arbitrated by the ≤-legacy dogfood.
-Full evidence: config/design/results/{split-fidelity,extract-atomization}-probe-2026-07-13/.
+Full evidence: internal design/results archive (split-fidelity + extract-atomization probes).
 
 Design-note config §RECONCILE: the prefilter's done/decisions-only choice is PRECISION-FIRST
-and carries a KNOWN, MEASURED recall gap of ~7.3% — the ~10 config#481 gold units that live
+and carries a KNOWN, MEASURED recall gap of ~7.3% — the ~10 gold units that live
 in rich `focus` lines (concentrated in the dogfood-04 "summary-in-focus" outlier). Accepted
 for v1 and NOT recovered by an LLM focus-classifier: that reintroduces the exact 3B
 fabrication the NO-GO proved, and a false memory pollutes worse than a missing one omits. The
@@ -41,7 +41,7 @@ from dataclasses import dataclass
 
 from synapt.recall.journal import JournalEntry
 
-# The journal fields that carry the durable units (per config#481 gold: ~93% source from
+# The journal fields that carry the durable units (per internal gold-set eval: ~93% source from
 # done[N] or decisions[N]; the ~7.3% focus/next remainder is the documented recall gap, see
 # §RECONCILE). focus/next_steps are excluded structurally.
 _DURABLE_FIELDS = ("done", "decisions")
@@ -113,6 +113,6 @@ def batch_unit_id(cluster_id: str, candidate: Candidate) -> str:
 def identify(cluster: list[JournalEntry]) -> list[Candidate]:
     """The identify step (Phase A) — a single deterministic pass, exactly the `prefilter`.
     It does NOT atomize compound items; extract_batch's structured extraction does that
-    downstream (measured clean: config/design/results/extract-atomization-probe-2026-07-13).
+    downstream (measured clean via internal atomization probe).
     Kept as the named step-① entry point for the consolidation pipeline + Phase-B wiring."""
     return prefilter(cluster)

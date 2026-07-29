@@ -3086,8 +3086,8 @@ class TranscriptIndex:
         elif status == "retracted":
             header = f"--- [knowledge{id_tag}, RETRACTED] {category} ---"
         elif status == "contested":
-            # Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
-            # conflict-escalation-spec-2026-07-21.md section 10.6, fixture d): shown only when
+            # Fix B contested-memory-lifecycle reframe (internal design spec, section 10.6,
+            # fixture d): shown only when
             # explicitly surfaced via include_historical=True -- hidden from default search by
             # the status != 'active' FTS gate (storage.py's knowledge_fts_search).
             header = f"--- [knowledge{id_tag}, CONTESTED] {category} ---"
@@ -4233,7 +4233,7 @@ def _git_main_worktree_root(path: Path) -> Path | None:
         )
         if common_dir.returncode != 0:
             return None
-        # --git-common-dir returns e.g. /Users/layne/Development/rd/.git
+        # --git-common-dir returns e.g. /Users/me/Development/rd/.git
         # The main worktree root is its parent
         return Path(common_dir.stdout.strip()).parent
     except (OSError, subprocess.TimeoutExpired):
@@ -4340,7 +4340,7 @@ def project_slug(project_dir: Path | None = None) -> str:
     where the slug is the absolute path with ``/`` replaced by ``-``.
 
     Examples:
-        /Users/layne/Development/synapse → -Users-layne-Development-synapse
+        /Users/me/Development/synapse → -Users-me-Development-synapse
     """
     p = (project_dir or Path.cwd()).resolve()
     # Use PurePosixPath to normalise Windows backslashes before slugifying.
@@ -4351,8 +4351,8 @@ def project_slug(project_dir: Path | None = None) -> str:
 def _worktree_name(project_dir: Path | None = None) -> str:
     """Return the current worktree's name (its directory basename).
 
-    For the main worktree at ``/Users/layne/Development/rd``, returns ``rd``.
-    For a linked worktree at ``/Users/layne/Development/poe``, returns ``poe``.
+    For the main worktree at ``/Users/me/Development/rd``, returns ``rd``.
+    For a linked worktree at ``/Users/me/Development/poe``, returns ``poe``.
     """
     return (project_dir or Path.cwd()).resolve().name
 

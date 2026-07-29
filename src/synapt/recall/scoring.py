@@ -1,36 +1,9 @@
 """ChunkScoringStrategy: pluggable scoring for chunks in consolidate + enrich.
 
-Per config#339 Pattern 4 ratification (Q1-Q4) + config#332 consolidation-primary
-locus:
-
-- **Protocol shape shared** across consolidate + enrich (Q2 ratified) — single
-  `ChunkScoringStrategy` Protocol; OSS Reference vs Premium Implementation rule
-  applies (OSS knows Protocol shape + provides default; premium implements
-  differentiated strategies without OSS naming them).
-- **Default RecencyScoring in OSS**; alternative strategies provided by
-  premium plugins via the registry (Q1 Pattern 4 strategy-resolver). OSS
-  does not name premium-side strategy implementations.
-- **Plugin-time activation** (Q3 ratified): premium plugin module-level code
-  calls `register_scoring_strategy` + `activate_scoring_strategy` at import; no
-  per-call override (would re-introduce search-side API surface rejected per
-  config#332 frame shift).
-- **Single-active-strategy by construction** (Pattern 4 caveat; revisit Pattern 3
-  hooks if multi-strategy composition becomes a need).
-- **window=16 default** per Layne directive 2026-06-07: keep the
-  empirically-anchored choice (RC4 calibration smoke baseline). Atlas
-  research#7 (2026-06-07) AXIS 3 sweep tested windows 4/8/16/32/64/128 and
-  found NO inflection — identical selections across all windows on this
-  fixture. config#339 originally recommended window=8 on theoretical
-  "conservative-dilution-resilient zone" rationale; with window=8 now
-  empirically equivalent to window=16 on the current fixture, the
-  empirical anchor (window=16) stays the locked default — no differentiated
-  reason to move. Selector-sensitive fixture lane (Atlas surfaced) is the
-  bigger lever for any future window-sensitivity work; until such a fixture
-  surfaces inflection, the anchor holds.
-
-Move 2 contract redesign: this module IS the redesigned contract for
-config#330's rejected compression-as-search-param-with-strategy-enum frame.
-Locus is consolidation + enrichment (substrate-reshape sites), not search.
+A single `ChunkScoringStrategy` Protocol is shared across consolidate and
+enrich. OSS provides a default `RecencyScoring` implementation; a
+downstream layer may register additional strategies via the registry in
+this module. Only one strategy is active at a time.
 """
 
 from __future__ import annotations
@@ -40,13 +13,6 @@ from typing import Protocol, runtime_checkable
 
 
 # Default recent-token window for recency-based scoring.
-# Anchored at the RC4 calibration smoke baseline (window=16). Atlas
-# research#7 (2026-06-07) AXIS 3 sweep tested windows 4/8/16/32/64/128
-# and found no inflection on the calibration fixture. Window=8 was
-# directly tested and is empirically equivalent to window=16 on this
-# fixture; Layne directive 2026-06-07 keeps window=16 as the locked
-# default because window=8 produced no differentiated reason to move.
-# See module docstring.
 DEFAULT_RECENT_TOKEN_WINDOW = 16
 
 
@@ -83,21 +49,13 @@ class ChunkScoringStrategy(Protocol):
     """Pluggable scoring strategy for chunks during consolidation + enrichment.
 
     OSS provides `RecencyScoring` as the default (temporal-position only).
-    Premium plugins may register alternative strategies via the registry
-    seam (`register_scoring_strategy` + `activate_scoring_strategy`). OSS
-    does not name premium-side strategy implementations — the Protocol
-    contract is the public seam.
-
-    Per Pattern 4 single-active-strategy constraint: only ONE strategy is active
-    at any time. Multi-strategy composition (Pattern 3 hooks) is a future
-    consideration if needed.
+    A downstream layer may register additional strategies via the registry
+    seam. Only one strategy is active at any time.
     """
 
     @property
     def name(self) -> str:
-        """Unique strategy identifier. OSS provides 'recency' as the default;
-        premium plugins may register additional named strategies via the
-        registry seam without OSS naming them here."""
+        """Unique strategy identifier. OSS provides 'recency' as the default."""
         ...
 
     @property
@@ -122,11 +80,6 @@ class RecencyScoring:
 
     Score formula: linear ramp from 0.0 (oldest in window) to 1.0 (newest)
     within the recent window; chunks outside the window receive 0.0.
-
-    This is the substrate-coherent OSS default per the OSS Reference vs Premium
-    Implementation rule (2026-05-04): OSS owns the Protocol + a real, usable
-    default; premium plugins provide differentiated implementations via the
-    registry seam without OSS naming them.
     """
 
     name = "recency"
@@ -171,8 +124,8 @@ class RecencyScoring:
         return scored
 
 
-# Module-level registry. Strategies register at plugin-import time; activated
-# strategy is selected at plugin-time (Q3 ratified — not per-call).
+# Module-level registry. Strategies register at import time; the active
+# strategy is selected separately (not per-call).
 _registered_strategies: dict[str, ChunkScoringStrategy] = {}
 _active_strategy_name: str | None = None
 
@@ -180,9 +133,8 @@ _active_strategy_name: str | None = None
 def register_scoring_strategy(name: str, strategy: ChunkScoringStrategy) -> None:
     """Register a scoring strategy by name.
 
-    Premium plugins call this at module-import time to make their strategies
-    available. The registry is process-global; subsequent
-    `activate_scoring_strategy` selects which registered strategy is active.
+    The registry is process-global; subsequent `activate_scoring_strategy`
+    selects which registered strategy is active.
 
     Raises:
         ValueError: name is empty/non-string or already registered.
@@ -202,8 +154,8 @@ def register_scoring_strategy(name: str, strategy: ChunkScoringStrategy) -> None
 def activate_scoring_strategy(name: str) -> None:
     """Activate a registered strategy by name.
 
-    Per Pattern 4 single-active-strategy constraint: subsequent calls to
-    `get_active_strategy()` will return the strategy registered under `name`.
+    Subsequent calls to `get_active_strategy()` return the strategy
+    registered under `name`.
 
     Raises:
         KeyError: name is not registered.
@@ -235,15 +187,9 @@ def get_active_strategy() -> ChunkScoringStrategy:
 class ScoreContractViolation(TypeError):
     """Raised when a strategy's `score()` return value violates the contract.
 
-    The Protocol provides static shape; this runtime check makes the plugin
-    seam fail closed. Premium plugins that violate the contract surface the
-    failure at the integration boundary (consolidate + enrich helpers) rather
-    than silently corrupting downstream callers.
-
-    Per Sentinel review on PR4f-A (recall#823 review-1): the registry-side
-    Protocol check accepts strategies with the right shape (name, window,
-    score callable) but doesn't validate return contract. This class is the
-    substrate-fix.
+    The Protocol provides static shape only; this runtime check validates
+    the return value so a non-conforming strategy fails closed instead of
+    silently corrupting downstream callers.
     """
 
 

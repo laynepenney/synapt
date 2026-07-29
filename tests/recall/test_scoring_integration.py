@@ -1,8 +1,7 @@
 """Integration tests for PR4f-A Phase 2: scoring strategy threading at
 consolidate.py + enrich.py callsites.
 
-Per config#339 Pattern 4 ratification + DI-threading-seam rule (per
-feedback_xfail_removal_doc_sweep.md): paired reject/accept E2E threading tests
+Per the DI-threading-seam rule: paired reject/accept E2E threading tests
 for the consolidate + enrich integration seam.
 
 Phase 1 (recall#823 Phase 1) tested the Protocol + registry seam in isolation.

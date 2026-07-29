@@ -351,8 +351,8 @@ class TestKnowledgeFtsHistorical:
         assert "c1" in ids
 
     def test_default_excludes_contested(self, tmp_path):
-        """Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
-        conflict-escalation-spec-2026-07-21.md section 10.6, fixture d): a contested node is
+        """Fix B contested-memory-lifecycle reframe (internal design spec, section 10.6,
+        fixture d): a contested node is
         hidden from default search by the SAME status != 'active' gate that already hides
         contradicted/superseded/retracted nodes -- no new mechanism, the existing one just
         gets a new status value."""
@@ -566,8 +566,8 @@ class TestFormatKnowledgeBlock:
         assert "replaced by newer approach" in block
 
     def test_contested_node_label(self):
-        """Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
-        conflict-escalation-spec-2026-07-21.md section 10.6, fixture d)."""
+        """Fix B contested-memory-lifecycle reframe (internal design spec, section 10.6,
+        fixture d)."""
         node = _make_knowledge_node(status="contested", confidence=0.3)
         block = TranscriptIndex._format_knowledge_block(node)
         assert "CONTESTED" in block
@@ -792,8 +792,8 @@ class TestRecallContradict:
 # ---------------------------------------------------------------------------
 
 class TestRecallContradictContestResolution:
-    """Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
-    escalation-spec-2026-07-21.md section 10.4/10.6 fixture c): the 3-way resolution vocabulary
+    """Fix B contested-memory-lifecycle reframe (internal design spec, section
+    10.4/10.6 fixture c): the 3-way resolution vocabulary
     for a contested pair (new_node_id set on the pending row), distinct from the ordinary
     confirmed/dismissed path exercised by TestRecallContradict above. Same _make_index-style
     setup as TestRecallContradict; a contested pair is two ALREADY-PERSISTED nodes plus one

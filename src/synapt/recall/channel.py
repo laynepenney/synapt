@@ -46,12 +46,12 @@ _AWAY_MINUTES = 120       # 30-120 min => away
 _JOIN_MENTION_LOOKBACK_MINUTES = 10  # How far back to scan for @mentions on join
 
 # ---------------------------------------------------------------------------
-# Hook registration — premium coordination layer (#553)
+# Hook registration — downstream coordination extension seam
 # ---------------------------------------------------------------------------
 # _append_message fires these hooks after writing a message to JSONL.
-# Premium registers handlers for @mention storage and wake emission.
+# A downstream layer may register additional coordination handlers.
 # OSS auto-registers its built-in handlers; without premium, the built-in
-# handlers still fire.  Premium can replace or extend them.
+# handlers still fire.  A downstream layer can replace or extend them.
 
 from typing import Callable
 
@@ -64,8 +64,7 @@ def register_message_hook(
     """Register a callback invoked after a message is appended to JSONL.
 
     Hooks receive (msg, project_dir) and run synchronously after the write.
-    Premium uses this to wire in @mention storage and wake emission without
-    coupling those systems into the OSS substrate.
+    A downstream layer may use this to register additional handlers.
     """
     _message_posted_hooks.append(hook)
 
@@ -3289,12 +3288,10 @@ def is_globally_claimed(
 
 
 # ---------------------------------------------------------------------------
-# Default hook registration — backward-compatible OSS behavior (#553)
+# Default hook registration
 # ---------------------------------------------------------------------------
-# Auto-register mention storage and wake emission as hooks so the channel
-# substrate works identically whether or not a premium plugin is installed.
-# Premium coordination.py can call _clear_message_hooks() + register its
-# own hooks to replace or extend this behavior.
+# Auto-register mention storage and wake emission as the default hooks so
+# channel behavior is consistent out of the box.
 
 def _default_mention_hook(msg: ChannelMessage, project_dir: Path | None = None) -> None:
     """Store @mentions from a posted message (default OSS hook)."""

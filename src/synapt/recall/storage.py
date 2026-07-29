@@ -103,8 +103,8 @@ CREATE TABLE IF NOT EXISTS pending_contradictions (
     claim_text TEXT,                                     -- free-text claim for manual contradictions
     valid_from TEXT,            -- ISO 8601: candidate's temporal bound, carried through to confirm
     valid_until TEXT,           -- ISO 8601: candidate's temporal bound, carried through to confirm
-    new_node_id TEXT            -- Fix B (config/design/recall-b3-temporal-conflict-escalation-
-                                 -- spec-2026-07-21.md section 10.3): id of an ALREADY-MATERIALIZED
+    new_node_id TEXT            -- Fix B (internal design spec, section 10.3): id of an
+                                 -- ALREADY-MATERIALIZED
                                  -- contested candidate node, when the row came from the contest
                                  -- path rather than a text-only queued claim. NULL for every other
                                  -- caller (co-retrieval, consolidation contradict, manual flag) --
@@ -663,8 +663,8 @@ class RecallDB:
 
     def _migrate_contradictions_table(self) -> None:
         """Migrate pending_contradictions: add claim_text, make old_node_id nullable, add
-        new_node_id (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-
-        2026-07-21.md section 10.10 -- Opus's five-check #2, installed/DB path requirement).
+        new_node_id (Fix B, internal design spec, section 10.10 -- Opus's five-check
+        #2, installed/DB path requirement).
 
         SQLite doesn't support ALTER COLUMN, so we recreate the table when
         old_node_id has a NOT NULL constraint from the old schema.
@@ -1554,8 +1554,8 @@ class RecallDB:
         contradiction is confirmed — otherwise they would be lost the moment
         the contradiction is queued.
 
-        *new_node_id* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-
-        2026-07-21.md section 10.3): set ONLY by the contest path, where the candidate is
+        *new_node_id* (Fix B, internal design spec, section 10.3): set ONLY by the
+        contest path, where the candidate is
         already a real, persisted (contested-status) node at queue time — resolution promotes
         this node rather than creating a new one from *new_content*. ``None`` for every other
         caller (co-retrieval, consolidation contradict, manual flag), where *new_content* is

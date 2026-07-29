@@ -400,8 +400,8 @@ def _merge_enrichment_results(results: list[dict]) -> dict:
 def score_transcript_windows(windows: list[str]):
     """Score transcript windows via the active scoring strategy.
 
-    Per config#332 consolidation-primary locus + config#339 Pattern 4 ratification:
-    enrichment-time scoring is a cheap precompute layer (scores stored on chunks
+    Per internal design ratification: enrichment-time scoring is a cheap
+    precompute layer (scores stored on chunks
     at ingest) that the consolidation primary site consumes. This helper exposes
     the `ChunkScoringStrategy` seam at the canonical enrichment scoring point.
 

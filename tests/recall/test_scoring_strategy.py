@@ -1,13 +1,12 @@
 """TDD tests for synapt.recall.scoring (PR4f-A Phase 1).
 
-Per config#339 Pattern 4 ratification:
+Per the scoring-strategy design rules:
 - ChunkScoringStrategy Protocol contract
 - Default RecencyScoring behavior
 - Module-level registry: register_scoring_strategy + activate_scoring_strategy
-- DI-threading-seam reject/accept E2E pairs (per
-  feedback_xfail_removal_doc_sweep.md DI-threading-seam rule)
+- DI-threading-seam reject/accept E2E pairs (per the DI-threading-seam rule)
 - window=16 default per Layne directive 2026-06-07 (keep empirical anchor;
-  Atlas research#7 tested 4/8/16/32/64/128 with no inflection on the current
+  Atlas research tested 4/8/16/32/64/128 with no inflection on the current
   fixture — window=8 empirically equivalent to window=16)
 - ScoreContractViolation runtime validator (recall#823 review-1 Blocker 1):
   bad-strategy returns rejected at the integration boundary

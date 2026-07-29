@@ -1,4 +1,4 @@
-"""Tests for per-fixture user_history and Conversa format compatibility."""
+"""Tests for per-fixture user_history and alternate-format compatibility."""
 
 from __future__ import annotations
 
@@ -18,9 +18,9 @@ rv_harness = importlib.import_module("recall-validation.harness")
 Category = rv.Category
 Expected = rv.Expected
 Fixture = rv.Fixture
-Prayer = rv.Prayer
+Record = rv.Record
 fixture_from_dict = rv.fixture_from_dict
-_prayer_from_dict = rv._prayer_from_dict
+_record_from_dict = rv._record_from_dict
 _parse_expected_matches = rv._parse_expected_matches
 CATEGORY_ALIASES = rv.CATEGORY_ALIASES
 
@@ -28,35 +28,35 @@ load_suite = rv_harness.load_suite
 _load_fixture_file = rv_harness._load_fixture_file
 
 
-class TestPrayerFromDict:
+class TestRecordFromDict:
     def test_harness_native_format(self):
         d = {
-            "id": "prayer-1",
+            "id": "record-1",
             "date": "2023-01-15",
-            "text": "A prayer about hope.",
+            "text": "A record about hope.",
             "themes": ["hope"],
             "entities": ["God"],
-            "summary": "Hope prayer",
+            "summary": "Hope record",
         }
-        p = _prayer_from_dict(d)
-        assert p.id == "prayer-1"
+        p = _record_from_dict(d)
+        assert p.id == "record-1"
         assert p.date == "2023-01-15"
-        assert p.text == "A prayer about hope."
+        assert p.text == "A record about hope."
         assert p.themes == ["hope"]
         assert p.entities == ["God"]
-        assert p.summary == "Hope prayer"
+        assert p.summary == "Hope record"
 
-    def test_conversa_format_uses_synthetic_date(self):
+    def test_alt_format_uses_synthetic_date(self):
         d = {
             "id": "Calvin:conv-50:session_1:event_summary:Calvin:1:1",
-            "text": "A prayer text.",
+            "text": "A record text.",
             "synthetic_date": "2023-03-23",
             "categories": ["transition", "work"],
             "emotional_register": "thanksgiving",
             "themes": ["thanksgiving", "transition"],
             "source_situation_id": "conv-50:session_1:event_summary:Calvin:1",
         }
-        p = _prayer_from_dict(d)
+        p = _record_from_dict(d)
         assert p.id == "Calvin:conv-50:session_1:event_summary:Calvin:1:1"
         assert p.date == "2023-03-23"
         assert p.themes == ["thanksgiving", "transition"]
@@ -64,8 +64,8 @@ class TestPrayerFromDict:
         assert p.summary == ""
 
     def test_missing_optional_fields_default(self):
-        d = {"id": "p-1", "text": "Minimal prayer."}
-        p = _prayer_from_dict(d)
+        d = {"id": "p-1", "text": "Minimal record."}
+        p = _record_from_dict(d)
         assert p.date == ""
         assert p.themes == []
         assert p.entities == []
@@ -78,20 +78,20 @@ class TestPrayerFromDict:
             "date": "2023-01-01",
             "synthetic_date": "2023-06-01",
         }
-        p = _prayer_from_dict(d)
+        p = _record_from_dict(d)
         assert p.date == "2023-01-01"
 
 
 class TestParseExpectedMatches:
     def test_ranked_list_becomes_expected_matches(self):
         d = {
-            "ranked": ["prayer-a", "prayer-b", "prayer-c"],
+            "ranked": ["record-a", "record-b", "record-c"],
             "min_precision_at_5": 0.6,
             "min_recall_at_10": 1.0,
         }
         expected = _parse_expected_matches(d)
         assert len(expected.matches) == 3
-        assert expected.matches[0].prayer_id == "prayer-a"
+        assert expected.matches[0].record_id == "record-a"
         assert expected.matches[0].rank == 1
         assert expected.matches[1].rank == 2
         assert expected.matches[2].rank == 3
@@ -118,7 +118,7 @@ class TestParseExpectedMatches:
 
 
 class TestCategoryAliases:
-    def test_all_conversa_short_names_resolve(self):
+    def test_all_short_names_resolve(self):
         assert CATEGORY_ALIASES["direct"] == Category.DIRECT_LOOKUP
         assert CATEGORY_ALIASES["thematic"] == Category.THEMATIC_RECALL
         assert CATEGORY_ALIASES["negative"] == Category.NEGATIVE_CASE
@@ -128,7 +128,7 @@ class TestCategoryAliases:
 
 
 class TestFixtureFromDict:
-    def test_conversa_format(self):
+    def test_alt_format(self):
         d = {
             "id": "direct:Calvin:01",
             "category": "direct",
@@ -137,13 +137,13 @@ class TestFixtureFromDict:
             "user_history": [
                 {
                     "id": "Calvin:p1",
-                    "text": "A prayer about my mansion.",
+                    "text": "A record about my mansion.",
                     "synthetic_date": "2023-03-23",
                     "themes": ["transition"],
                 },
                 {
                     "id": "Calvin:p2",
-                    "text": "Another prayer.",
+                    "text": "Another record.",
                     "synthetic_date": "2023-04-01",
                     "themes": ["gratitude"],
                 },
@@ -159,9 +159,9 @@ class TestFixtureFromDict:
         f = fixture_from_dict(d)
         assert f.id == "direct:Calvin:01"
         assert f.category == Category.DIRECT_LOOKUP
-        assert len(f.prayer_history) == 2
-        assert f.prayer_history[0].date == "2023-03-23"
-        assert f.expected.matches[0].prayer_id == "Calvin:p1"
+        assert len(f.history) == 2
+        assert f.history[0].date == "2023-03-23"
+        assert f.expected.matches[0].record_id == "Calvin:p1"
         assert f.expected.min_precision_at_5 == 0.8
         assert f.description == "Direct lookup for mansion purchase."
         assert f.query_date == ""
@@ -171,11 +171,11 @@ class TestFixtureFromDict:
             "id": "test-1",
             "category": "direct_lookup",
             "description": "Test fixture",
-            "prayer_history": [
+            "history": [
                 {
                     "id": "p-1",
                     "date": "2023-01-01",
-                    "text": "A prayer.",
+                    "text": "A record.",
                     "themes": [],
                     "entities": [],
                     "summary": "",
@@ -185,26 +185,26 @@ class TestFixtureFromDict:
             "query_date": "2023-06-01",
             "expected": {
                 "matches": [
-                    {"prayer_id": "p-1", "rank": 1, "relevance": "high"},
+                    {"record_id": "p-1", "rank": 1, "relevance": "high"},
                 ],
             },
         }
         f = fixture_from_dict(d)
         assert f.id == "test-1"
         assert f.category == Category.DIRECT_LOOKUP
-        assert f.prayer_history[0].date == "2023-01-01"
-        assert f.expected.matches[0].prayer_id == "p-1"
+        assert f.history[0].date == "2023-01-01"
+        assert f.expected.matches[0].record_id == "p-1"
         assert f.description == "Test fixture"
         assert f.query_date == "2023-06-01"
 
-    def test_negative_case_conversa_format(self):
+    def test_negative_case_alt_format(self):
         d = {
             "id": "negative:Calvin:01",
             "category": "negative",
             "persona_id": "Calvin",
             "query": "What about the Mars rover?",
             "user_history": [
-                {"id": "Calvin:p1", "text": "A prayer.", "synthetic_date": "2023-01-01"},
+                {"id": "Calvin:p1", "text": "A record.", "synthetic_date": "2023-01-01"},
             ],
             "expected_matches": {
                 "ranked": [],
@@ -267,30 +267,30 @@ class TestLoadSuitePerFixtureHistory:
             "fixture_files": {"direct_lookup": "direct.json"},
         }
 
-        shared_prayers = [
-            {"id": "shared-p1", "date": "2023-01-01", "text": "Shared prayer one.",
+        shared_records = [
+            {"id": "shared-p1", "date": "2023-01-01", "text": "Shared record one.",
              "themes": [], "entities": [], "summary": ""},
-            {"id": "shared-p2", "date": "2023-02-01", "text": "Shared prayer two.",
+            {"id": "shared-p2", "date": "2023-02-01", "text": "Shared record two.",
              "themes": [], "entities": [], "summary": ""},
         ]
 
         if shared_history:
-            suite_meta["shared_prayer_history"] = "prayer_history.json"
-            (suite_dir / "prayer_history.json").write_text(json.dumps(shared_prayers))
+            suite_meta["shared_history"] = "history.json"
+            (suite_dir / "history.json").write_text(json.dumps(shared_records))
 
         fixture = {
             "id": "test-1",
             "category": "direct_lookup",
             "description": "Test",
-            "query": "What about prayer one?",
+            "query": "What about record one?",
             "query_date": "2023-06-01",
             "expected": {
-                "matches": [{"prayer_id": "shared-p1", "rank": 1, "relevance": "high"}],
+                "matches": [{"record_id": "shared-p1", "rank": 1, "relevance": "high"}],
             },
         }
         if fixture_has_history:
             fixture["user_history"] = [
-                {"id": "own-p1", "text": "Own prayer.", "synthetic_date": "2023-05-01"},
+                {"id": "own-p1", "text": "Own record.", "synthetic_date": "2023-05-01"},
             ]
 
         (suite_dir / "direct.json").write_text(json.dumps([fixture]))
@@ -300,27 +300,27 @@ class TestLoadSuitePerFixtureHistory:
     def test_shared_history_injected_when_fixture_lacks_own(self, tmp_path, monkeypatch):
         self._create_suite(tmp_path, shared_history=True, fixture_has_history=False)
         monkeypatch.setattr(rv_harness, "FIXTURES_DIR", tmp_path)
-        _, prayer_history, fixtures = load_suite("test-suite")
-        assert len(prayer_history) == 2
+        _, history, fixtures = load_suite("test-suite")
+        assert len(history) == 2
         assert len(fixtures) == 1
-        assert len(fixtures[0].prayer_history) == 2
-        assert fixtures[0].prayer_history[0].id == "shared-p1"
+        assert len(fixtures[0].history) == 2
+        assert fixtures[0].history[0].id == "shared-p1"
 
     def test_per_fixture_history_used_when_present(self, tmp_path, monkeypatch):
         self._create_suite(tmp_path, shared_history=True, fixture_has_history=True)
         monkeypatch.setattr(rv_harness, "FIXTURES_DIR", tmp_path)
-        _, prayer_history, fixtures = load_suite("test-suite")
-        assert len(prayer_history) == 2
-        assert len(fixtures[0].prayer_history) == 1
-        assert fixtures[0].prayer_history[0].id == "own-p1"
+        _, history, fixtures = load_suite("test-suite")
+        assert len(history) == 2
+        assert len(fixtures[0].history) == 1
+        assert fixtures[0].history[0].id == "own-p1"
 
     def test_no_shared_history_with_per_fixture(self, tmp_path, monkeypatch):
         self._create_suite(tmp_path, shared_history=False, fixture_has_history=True)
         monkeypatch.setattr(rv_harness, "FIXTURES_DIR", tmp_path)
-        _, prayer_history, fixtures = load_suite("test-suite")
-        assert len(prayer_history) == 0
-        assert len(fixtures[0].prayer_history) == 1
-        assert fixtures[0].prayer_history[0].id == "own-p1"
+        _, history, fixtures = load_suite("test-suite")
+        assert len(history) == 0
+        assert len(fixtures[0].history) == 1
+        assert fixtures[0].history[0].id == "own-p1"
 
     def test_jsonl_fixture_loading(self, tmp_path, monkeypatch):
         suite_dir = tmp_path / "jsonl-suite"
@@ -341,7 +341,7 @@ class TestLoadSuitePerFixtureHistory:
                 "category": "direct",
                 "query": "Test query",
                 "user_history": [
-                    {"id": "p-1", "text": "Prayer text.", "synthetic_date": "2023-01-01"},
+                    {"id": "p-1", "text": "Record text.", "synthetic_date": "2023-01-01"},
                 ],
                 "expected_matches": {
                     "ranked": ["p-1"],
@@ -359,5 +359,5 @@ class TestLoadSuitePerFixtureHistory:
         assert len(fixtures) == 1
         assert fixtures[0].id == "direct:Test:01"
         assert fixtures[0].category == Category.DIRECT_LOOKUP
-        assert fixtures[0].prayer_history[0].date == "2023-01-01"
-        assert fixtures[0].expected.matches[0].prayer_id == "p-1"
+        assert fixtures[0].history[0].date == "2023-01-01"
+        assert fixtures[0].expected.matches[0].record_id == "p-1"

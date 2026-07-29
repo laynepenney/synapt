@@ -9,7 +9,7 @@ Shards are split by chunk count (default 10K chunks per shard).
 Sequential naming (data_001, data_002, ...) with a shard_metadata
 table in index.db for time-range queries and stats.
 
-See issue #89 and synapt-private #444 for design.
+See issue #89 for design.
 """
 
 from __future__ import annotations

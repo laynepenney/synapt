@@ -752,7 +752,7 @@ def test_run_extract_path_mixed_auto_then_explicit_corroborate_same_node_first_b
     on whether ITS call site syncs memory on success. Verified: reverting only the auto call site
     now makes this test fail (confirmed via targeted mutation before landing this fix).
 
-    UPDATED by A7 (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md):
+    UPDATED by A7 (internal design spec):
     fact_auto was originally a pure REORDERING of existing_content's own tokens (same keyword
     SET, Jaccard=1.0, different word order) -- deliberately chosen so it would NOT be caught by
     _decide_actions's exact-match guard, only by the create branch's own Jaccard-similarity

@@ -1,15 +1,14 @@
 {
   "schema_version": 1,
-  "artifact_revision": 2,
-  "frozen_by": "atlas",
-  "frozen_on": "2026-07-13",
-  "review_scope": "recall#873",
-  "source_revision": "8a08bb2",
+  "artifact_revision": 3,
+  "frozen_by": "synthetic",
+  "frozen_on": "2026-07-29",
+  "review_scope": "recall privacy forward-scrub",
+  "source_revision": "synthetic",
+  "gold_fixture": "tests/fixtures/identify/gold-units.jsonl",
   "publication_provenance": {
-    "supersedes_unpublished_sha256": "b93b7401572f9a24b703ece907c6929fe3d8b71d96a9afc475ec1a947c31824e",
-    "correction": "Pre-push staged-diff audit corrected an off-by-one generator shift in A045-G03 through A045-G08. This revision is the first origin-published map."
+    "note": "Synthetic fixture. Clusters and candidate positions are actual output of cluster_journal_entries()/prefilter() run against fictional journal content."
   },
-  "gold_fixture": "config/design/results/identify-step-probe-2026-07-13/gold-units.jsonl",
   "tuple_contract": {
     "key": [
       "cluster_id",
@@ -29,125 +28,72 @@
     "support_rule": "Every listed attribution is required to support the frozen gold boundary.",
     "prefilter_rule": "prefilter_expected is true exactly when every attribution field is done or decisions."
   },
-  "legacy_source_label_corrections": {
-    "D003-G03": "The legacy label says done[0]; the structured source is done[1].",
-    "D003-G04": "The legacy label says done[0]; the structured source is done[2].",
-    "D003-G05": "The legacy label says done[0]; the structured source is done[2].",
-    "D003-G06": "The legacy label says done[0]; the structured source is done[2].",
-    "D003-G07": "The legacy label says done[0]; the structured source is done[2].",
-    "D003-G08": "The legacy label says done[0]; the structured source is done[2].",
-    "D003-G11": "The legacy label says decisions[1], which does not exist; the structured source is decisions[0]."
-  },
+  "legacy_source_label_corrections": {},
   "test_contract": {
     "required_cluster_ids": [
       "dogfood-00",
       "dogfood-01",
       "dogfood-02",
       "dogfood-03",
-      "dogfood-04",
-      "dogfood-05",
-      "dogfood-06",
-      "dogfood-07",
-      "dogfood-08",
-      "dogfood-09",
-      "dogfood-10",
-      "atlas-journal-038",
-      "atlas-journal-040",
-      "atlas-journal-041",
-      "atlas-journal-042-043",
-      "atlas-journal-044",
-      "atlas-journal-045",
-      "atlas-journal-046"
+      "curated-01",
+      "curated-02",
+      "curated-03"
     ],
     "zero_gold_control_clusters": [
-      "dogfood-02",
-      "dogfood-09",
-      "dogfood-10"
+      "dogfood-01",
+      "curated-02"
     ],
     "exact_cluster_inventory_required": true,
-    "deletion_mutation_rule": "Removing any one of the 18 required clusters must fail the gate, including a zero-gold control cluster.",
-    "compound_mapping_rule": "Multiple gold IDs may map to one structured candidate. D007-G13 is the sole gold ID requiring two structured attributions.",
+    "deletion_mutation_rule": "Removing any one of the required clusters must fail the gate, including a zero-gold control cluster.",
+    "compound_mapping_rule": "Multiple gold IDs may map to one structured candidate. DF03-G01 is the sole gold ID requiring two structured attributions.",
     "attribution_uniqueness_rule": "Candidate identity is namespaced by cluster_id plus entry_index, field, and index."
   },
   "expected_counts": {
-    "clusters": 18,
-    "gold_units": 137,
-    "source_attributions": 138,
-    "one_attribution_gold_units": 136,
+    "clusters": 7,
+    "gold_units": 21,
+    "source_attributions": 22,
+    "one_attribution_gold_units": 20,
     "multi_attribution_gold_units": 1,
-    "prefilter_retained_gold_units": 127,
-    "prefilter_gap_gold_units": 10,
-    "prefilter_gap_rate": 0.072992700729927,
-    "dogfood_structured_candidates": 188,
-    "dogfood_namespaced_unique_candidates": 188,
-    "dogfood_bare_unique_candidates": 78,
-    "dogfood_bare_attribution_collisions": 110,
-    "all_cluster_structured_candidates": 238,
-    "all_cluster_namespaced_unique_candidates": 238,
+    "prefilter_retained_gold_units": 18,
+    "prefilter_gap_gold_units": 3,
+    "prefilter_gap_rate": 0.14285714285714285,
+    "dogfood_structured_candidates": 18,
+    "dogfood_namespaced_unique_candidates": 18,
+    "dogfood_bare_unique_candidates": 7,
+    "dogfood_bare_attribution_collisions": 11,
+    "all_cluster_structured_candidates": 28,
+    "all_cluster_namespaced_unique_candidates": 28,
     "gold_by_cluster": {
-      "dogfood-00": 9,
-      "dogfood-01": 2,
-      "dogfood-02": 0,
-      "dogfood-03": 11,
-      "dogfood-04": 17,
-      "dogfood-05": 12,
-      "dogfood-06": 2,
-      "dogfood-07": 16,
-      "dogfood-08": 10,
-      "dogfood-09": 0,
-      "dogfood-10": 0,
-      "atlas-journal-038": 9,
-      "atlas-journal-040": 7,
-      "atlas-journal-041": 5,
-      "atlas-journal-042-043": 9,
-      "atlas-journal-044": 3,
-      "atlas-journal-045": 15,
-      "atlas-journal-046": 10
+      "dogfood-00": 4,
+      "dogfood-01": 0,
+      "dogfood-02": 5,
+      "dogfood-03": 3,
+      "curated-01": 5,
+      "curated-02": 0,
+      "curated-03": 4
     },
     "retained_by_cluster": {
-      "dogfood-00": 9,
+      "dogfood-00": 4,
       "dogfood-01": 0,
-      "dogfood-02": 0,
-      "dogfood-03": 11,
-      "dogfood-04": 11,
-      "dogfood-05": 12,
-      "dogfood-06": 0,
-      "dogfood-07": 16,
-      "dogfood-08": 10,
-      "dogfood-09": 0,
-      "dogfood-10": 0,
-      "atlas-journal-038": 9,
-      "atlas-journal-040": 7,
-      "atlas-journal-041": 5,
-      "atlas-journal-042-043": 9,
-      "atlas-journal-044": 3,
-      "atlas-journal-045": 15,
-      "atlas-journal-046": 10
+      "dogfood-02": 3,
+      "dogfood-03": 3,
+      "curated-01": 5,
+      "curated-02": 0,
+      "curated-03": 3
     },
     "gap_by_cluster": {
       "dogfood-00": 0,
-      "dogfood-01": 2,
-      "dogfood-02": 0,
+      "dogfood-01": 0,
+      "dogfood-02": 2,
       "dogfood-03": 0,
-      "dogfood-04": 6,
-      "dogfood-05": 0,
-      "dogfood-06": 2,
-      "dogfood-07": 0,
-      "dogfood-08": 0,
-      "dogfood-09": 0,
-      "dogfood-10": 0,
-      "atlas-journal-038": 0,
-      "atlas-journal-040": 0,
-      "atlas-journal-041": 0,
-      "atlas-journal-042-043": 0,
-      "atlas-journal-044": 0,
-      "atlas-journal-045": 0,
-      "atlas-journal-046": 0
+      "curated-01": 0,
+      "curated-02": 0,
+      "curated-03": 1
     }
   },
   "mappings": [
     {
-      "gold_id": "D000-G01",
+      "gold_id": "DF00-G01",
       "cluster_id": "dogfood-00",
       "attributions": [
         {
@@ -159,7 +105,7 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "D000-G02",
+      "gold_id": "DF00-G02",
       "cluster_id": "dogfood-00",
       "attributions": [
         {
@@ -171,43 +117,7 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "D000-G03",
-      "cluster_id": "dogfood-00",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D000-G04",
-      "cluster_id": "dogfood-00",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D000-G05",
-      "cluster_id": "dogfood-00",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D000-G06",
+      "gold_id": "DF00-G03",
       "cluster_id": "dogfood-00",
       "attributions": [
         {
@@ -219,166 +129,10 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "D000-G07",
+      "gold_id": "DF00-G04",
       "cluster_id": "dogfood-00",
       "attributions": [
         {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D000-G08",
-      "cluster_id": "dogfood-00",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D000-G09",
-      "cluster_id": "dogfood-00",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D001-G01",
-      "cluster_id": "dogfood-01",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D001-G02",
-      "cluster_id": "dogfood-01",
-      "attributions": [
-        {
-          "entry_index": 1,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D003-G01",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G02",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G03",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G04",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G05",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G06",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G07",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G08",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G09",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
           "entry_index": 2,
           "field": "decisions",
           "index": 0
@@ -387,128 +141,8 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "D003-G10",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D003-G11",
-      "cluster_id": "dogfood-03",
-      "attributions": [
-        {
-          "entry_index": 2,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G01",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D004-G02",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D004-G03",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D004-G04",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D004-G05",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D004-G06",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "focus",
-          "index": null
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D004-G07",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G08",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G09",
-      "cluster_id": "dogfood-04",
+      "gold_id": "DF02-G01",
+      "cluster_id": "dogfood-02",
       "attributions": [
         {
           "entry_index": 0,
@@ -519,176 +153,8 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "D004-G10",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G11",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G12",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G13",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G14",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G15",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G16",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D004-G17",
-      "cluster_id": "dogfood-04",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G01",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G02",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G03",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G04",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G05",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G06",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G07",
-      "cluster_id": "dogfood-05",
+      "gold_id": "DF02-G02",
+      "cluster_id": "dogfood-02",
       "attributions": [
         {
           "entry_index": 1,
@@ -699,253 +165,61 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "D005-G08",
-      "cluster_id": "dogfood-05",
+      "gold_id": "DF02-G03",
+      "cluster_id": "dogfood-02",
       "attributions": [
         {
-          "entry_index": 1,
-          "field": "done",
-          "index": 1
+          "entry_index": 2,
+          "field": "decisions",
+          "index": 0
         }
       ],
       "prefilter_expected": true
     },
     {
-      "gold_id": "D005-G09",
-      "cluster_id": "dogfood-05",
+      "gold_id": "DF02-G04",
+      "cluster_id": "dogfood-02",
       "attributions": [
         {
-          "entry_index": 1,
-          "field": "done",
-          "index": 2
+          "entry_index": 0,
+          "field": "focus",
+          "index": null
         }
       ],
-      "prefilter_expected": true
+      "prefilter_expected": false
     },
     {
-      "gold_id": "D005-G10",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 1,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G11",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 1,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D005-G12",
-      "cluster_id": "dogfood-05",
-      "attributions": [
-        {
-          "entry_index": 1,
-          "field": "done",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D006-G01",
-      "cluster_id": "dogfood-06",
+      "gold_id": "DF02-G05",
+      "cluster_id": "dogfood-02",
       "attributions": [
         {
           "entry_index": 0,
           "field": "next_steps",
-          "index": 1
+          "index": 0
         }
       ],
       "prefilter_expected": false
     },
     {
-      "gold_id": "D006-G02",
-      "cluster_id": "dogfood-06",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "next_steps",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": false
-    },
-    {
-      "gold_id": "D007-G01",
-      "cluster_id": "dogfood-07",
+      "gold_id": "DF03-G01",
+      "cluster_id": "dogfood-03",
       "attributions": [
         {
           "entry_index": 0,
           "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G02",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G03",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G04",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G05",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 5
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G06",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 6
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G07",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 7
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G08",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 8
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G09",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 9
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G10",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 10
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G11",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 11
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G12",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 12
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G13",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 13
+          "index": 0
         },
         {
           "entry_index": 0,
           "field": "done",
-          "index": 14
+          "index": 1
         }
       ],
       "prefilter_expected": true
     },
     {
-      "gold_id": "D007-G14",
-      "cluster_id": "dogfood-07",
+      "gold_id": "DF03-G02",
+      "cluster_id": "dogfood-03",
       "attributions": [
         {
           "entry_index": 0,
@@ -956,467 +230,35 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "D007-G15",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D007-G16",
-      "cluster_id": "dogfood-07",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G01",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G02",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G03",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G04",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G05",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G06",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G07",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 5
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G08",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 6
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G09",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 7
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "D008-G10",
-      "cluster_id": "dogfood-08",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G01",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G02",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G03",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G04",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G05",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G06",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G07",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G08",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A038-G09",
-      "cluster_id": "atlas-journal-038",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A040-G01",
-      "cluster_id": "atlas-journal-040",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A040-G02",
-      "cluster_id": "atlas-journal-040",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A040-G03",
-      "cluster_id": "atlas-journal-040",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A040-G04",
-      "cluster_id": "atlas-journal-040",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A040-G05",
-      "cluster_id": "atlas-journal-040",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A040-G06",
-      "cluster_id": "atlas-journal-040",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A040-G07",
-      "cluster_id": "atlas-journal-040",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A041-G01",
-      "cluster_id": "atlas-journal-041",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A041-G02",
-      "cluster_id": "atlas-journal-041",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A041-G03",
-      "cluster_id": "atlas-journal-041",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A041-G04",
-      "cluster_id": "atlas-journal-041",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A041-G05",
-      "cluster_id": "atlas-journal-041",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A04243-G01",
-      "cluster_id": "atlas-journal-042-043",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A04243-G02",
-      "cluster_id": "atlas-journal-042-043",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A04243-G03",
-      "cluster_id": "atlas-journal-042-043",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A04243-G04",
-      "cluster_id": "atlas-journal-042-043",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A04243-G05",
-      "cluster_id": "atlas-journal-042-043",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A04243-G06",
-      "cluster_id": "atlas-journal-042-043",
+      "gold_id": "DF03-G03",
+      "cluster_id": "dogfood-03",
       "attributions": [
         {
           "entry_index": 1,
+          "field": "done",
+          "index": 0
+        }
+      ],
+      "prefilter_expected": true
+    },
+    {
+      "gold_id": "CU01-G01",
+      "cluster_id": "curated-01",
+      "attributions": [
+        {
+          "entry_index": 0,
+          "field": "done",
+          "index": 0
+        }
+      ],
+      "prefilter_expected": true
+    },
+    {
+      "gold_id": "CU01-G02",
+      "cluster_id": "curated-01",
+      "attributions": [
+        {
+          "entry_index": 0,
           "field": "decisions",
           "index": 0
         }
@@ -1424,83 +266,71 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "A04243-G07",
-      "cluster_id": "atlas-journal-042-043",
+      "gold_id": "CU01-G03",
+      "cluster_id": "curated-01",
       "attributions": [
         {
           "entry_index": 1,
-          "field": "decisions",
-          "index": 1
+          "field": "done",
+          "index": 0
         }
       ],
       "prefilter_expected": true
     },
     {
-      "gold_id": "A04243-G08",
-      "cluster_id": "atlas-journal-042-043",
+      "gold_id": "CU01-G04",
+      "cluster_id": "curated-01",
+      "attributions": [
+        {
+          "entry_index": 2,
+          "field": "done",
+          "index": 0
+        }
+      ],
+      "prefilter_expected": true
+    },
+    {
+      "gold_id": "CU01-G05",
+      "cluster_id": "curated-01",
+      "attributions": [
+        {
+          "entry_index": 2,
+          "field": "decisions",
+          "index": 0
+        }
+      ],
+      "prefilter_expected": true
+    },
+    {
+      "gold_id": "CU03-G01",
+      "cluster_id": "curated-03",
+      "attributions": [
+        {
+          "entry_index": 0,
+          "field": "done",
+          "index": 0
+        }
+      ],
+      "prefilter_expected": true
+    },
+    {
+      "gold_id": "CU03-G02",
+      "cluster_id": "curated-03",
+      "attributions": [
+        {
+          "entry_index": 0,
+          "field": "decisions",
+          "index": 0
+        }
+      ],
+      "prefilter_expected": true
+    },
+    {
+      "gold_id": "CU03-G03",
+      "cluster_id": "curated-03",
       "attributions": [
         {
           "entry_index": 1,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A04243-G09",
-      "cluster_id": "atlas-journal-042-043",
-      "attributions": [
-        {
-          "entry_index": 1,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A044-G01",
-      "cluster_id": "atlas-journal-044",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A044-G02",
-      "cluster_id": "atlas-journal-044",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A044-G03",
-      "cluster_id": "atlas-journal-044",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G01",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
           "field": "done",
           "index": 0
         }
@@ -1508,292 +338,16 @@
       "prefilter_expected": true
     },
     {
-      "gold_id": "A045-G02",
-      "cluster_id": "atlas-journal-045",
+      "gold_id": "CU03-G04",
+      "cluster_id": "curated-03",
       "attributions": [
         {
           "entry_index": 0,
-          "field": "done",
-          "index": 0
+          "field": "focus",
+          "index": null
         }
       ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G03",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G04",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G05",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G06",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G07",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 5
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G08",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 6
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G09",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G10",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 5
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G11",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 6
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G12",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 7
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G13",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 7
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G14",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 7
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A045-G15",
-      "cluster_id": "atlas-journal-045",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 7
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G01",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G02",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G03",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 2
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G04",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 3
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G05",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "done",
-          "index": 4
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G06",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 0
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G07",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G08",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G09",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
-    },
-    {
-      "gold_id": "A046-G10",
-      "cluster_id": "atlas-journal-046",
-      "attributions": [
-        {
-          "entry_index": 0,
-          "field": "decisions",
-          "index": 1
-        }
-      ],
-      "prefilter_expected": true
+      "prefilter_expected": false
     }
   ]
 }

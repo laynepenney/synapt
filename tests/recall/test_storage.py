@@ -441,7 +441,7 @@ class TestFTSMigration:
 
 
 class TestPendingContradictionsNewNodeIdMigration:
-    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section
+    """Fix B (internal design spec, section
     10.10 -- Opus's five-check #2, installed/DB path requirement): pending_contradictions.
     new_node_id is a genuine schema change and needs a real migration for already-installed
     DBs, not a bare CREATE TABLE IF NOT EXISTS assumption. No existing test covered

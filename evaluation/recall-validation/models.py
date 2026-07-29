@@ -44,13 +44,13 @@ CATEGORY_LABELS: dict[str, str] = {
 
 class RoutingClassification(str, Enum):
     NORMAL = "normal"
-    ESCALATE_CRISIS = "escalate_crisis"
-    DEFER_TO_HUMAN = "defer_to_human"
-    REFUSE_LARP = "refuse_larp"
+    ESCALATE = "escalate"
+    DEFER = "defer"
+    REFUSE = "refuse"
 
 
 @dataclass
-class Prayer:
+class Record:
     id: str
     date: str
     text: str
@@ -61,7 +61,7 @@ class Prayer:
 
 @dataclass
 class ExpectedMatch:
-    prayer_id: str
+    record_id: str
     rank: int
     relevance: str  # "high", "medium", "low"
 
@@ -86,7 +86,7 @@ class Fixture:
     id: str
     category: Category
     description: str
-    prayer_history: list[Prayer]
+    history: list[Record]
     query: str
     query_date: str
     expected: Expected
@@ -94,7 +94,7 @@ class Fixture:
 
 @dataclass
 class RetrievalResult:
-    prayer_id: str
+    record_id: str
     score: float
 
 
@@ -127,9 +127,9 @@ class SuiteResult:
     overall_scores: dict[str, float] = field(default_factory=dict)
 
 
-def _prayer_from_dict(d: dict) -> Prayer:
-    """Deserialize a Prayer, handling both harness-native and Conversa field names."""
-    return Prayer(
+def _record_from_dict(d: dict) -> Record:
+    """Deserialize a Record, handling both harness-native and alternate-format field names."""
+    return Record(
         id=d["id"],
         date=d.get("date") or d.get("synthetic_date", ""),
         text=d["text"],
@@ -159,10 +159,10 @@ def _parse_expected(d: dict) -> Expected:
 
 
 def _parse_expected_matches(d: dict) -> Expected:
-    """Parse expected block from Conversa fixture format (expected_matches)."""
+    """Parse expected block from the alternate fixture format (expected_matches)."""
     ranked = d.get("ranked", [])
     matches = [
-        ExpectedMatch(prayer_id=pid, rank=i + 1, relevance="high")
+        ExpectedMatch(record_id=pid, rank=i + 1, relevance="high")
         for i, pid in enumerate(ranked)
     ]
     expect_empty = d.get("max_results") == 0 and not ranked
@@ -187,11 +187,11 @@ CATEGORY_ALIASES: dict[str, str] = {
 def fixture_from_dict(d: dict) -> Fixture:
     """Deserialize a fixture from a JSON-compatible dict.
 
-    Supports both harness-native format (prayer_history, expected) and
-    Conversa fixture format (user_history, expected_matches).
+    Supports both harness-native format (history, expected) and an
+    alternate fixture format (user_history, expected_matches).
     """
-    history_raw = d.get("prayer_history") or d.get("user_history", [])
-    prayers = [_prayer_from_dict(p) for p in history_raw]
+    history_raw = d.get("history") or d.get("user_history", [])
+    records = [_record_from_dict(p) for p in history_raw]
 
     if "expected" in d:
         expected = _parse_expected(d["expected"])
@@ -207,7 +207,7 @@ def fixture_from_dict(d: dict) -> Fixture:
         id=d["id"],
         category=category,
         description=d.get("description") or d.get("notes", ""),
-        prayer_history=prayers,
+        history=records,
         query=d["query"],
         query_date=d.get("query_date", ""),
         expected=expected,

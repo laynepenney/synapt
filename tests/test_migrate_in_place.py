@@ -124,8 +124,8 @@ class TestMigrateInPlace(unittest.TestCase):
 
     def test_worktree_paths_survive_migration(self):
         """Critical: linked worktrees can git status after .git/ moves."""
-        repo = _create_test_repo(self._base, "conversa")
-        linked = self._base / "conversa-dev"
+        repo = _create_test_repo(self._base, "gripspace")
+        linked = self._base / "agent-dev"
         _run(["git", "worktree", "add", str(linked), "-b", "dev-branch"], cwd=repo)
 
         # Verify worktree works before migration
@@ -247,11 +247,11 @@ class TestMigrateInPlace(unittest.TestCase):
 
     def test_linked_worktree_git_status_after_migration(self):
         """Multiple linked worktrees all work after migration."""
-        repo = _create_test_repo(self._base, "conversa")
+        repo = _create_test_repo(self._base, "gripspace")
 
         # Create 3 linked worktrees (simulating agent griptrees)
         worktrees = []
-        for name in ["conversa-ui", "conversa-codex", "conversa-dev"]:
+        for name in ["agent-ui", "agent-codex", "agent-dev"]:
             wt = self._base / name
             _run(["git", "worktree", "add", str(wt), "-b", f"branch-{name}"], cwd=repo)
             worktrees.append(wt)
@@ -266,37 +266,37 @@ class TestMigrateInPlace(unittest.TestCase):
 
         # git worktree list from child should show all 4
         result = _run(["git", "worktree", "list"], cwd=child)
-        self.assertIn("conversa-ui", result.stdout)
-        self.assertIn("conversa-codex", result.stdout)
-        self.assertIn("conversa-dev", result.stdout)
+        self.assertIn("agent-ui", result.stdout)
+        self.assertIn("agent-codex", result.stdout)
+        self.assertIn("agent-dev", result.stdout)
 
 
-    def test_conversa_layout(self):
-        """Simulate actual Conversa migration: main + 3 agent worktrees.
+    def test_multi_agent_layout(self):
+        """Simulate a real multi-agent migration: main + 3 agent worktrees.
 
-        Conversa structure:
-          ~/conversa/         (Anchor, main worktree)
-          ~/conversa-ui/      (UI agent)
-          ~/conversa-codex/   (Codex agent)
-          ~/conversa-dev/     (Dev agent)
+        Repository structure:
+          ~/example-org/         (main worktree)
+          ~/agent-ui/            (UI agent)
+          ~/agent-codex/         (Codex agent)
+          ~/agent-dev/           (Dev agent)
 
         After migration:
-          ~/conversa/                    (gripspace root)
-          ~/conversa/conversa-app/       (repo, moved down)
-          ~/conversa-ui/conversa-app/    (NOT migrated — griptree repo checkout)
+          ~/example-org/                 (gripspace root)
+          ~/example-org/example-app/     (repo, moved down)
+          ~/agent-ui/example-app/        (NOT migrated — griptree repo checkout)
         """
-        # Setup exact Conversa layout
-        main = self._base / "conversa"
+        # Setup exact multi-agent layout
+        main = self._base / "example-org"
         main.mkdir()
         _run(["git", "init", "-b", "main"], cwd=main)
         _run(["git", "config", "user.email", "t@t.com"], cwd=main)
         _run(["git", "config", "user.name", "T"], cwd=main)
-        _run(["git", "remote", "add", "origin", "git@github.com:GetConversa/conversa-app.git"], cwd=main)
+        _run(["git", "remote", "add", "origin", "git@github.com:example-org/example-app.git"], cwd=main)
         (main / "src").mkdir()
-        (main / "src" / "app.py").write_text("# Conversa app\n")
-        (main / "package.json").write_text('{"name": "conversa"}\n')
+        (main / "src" / "app.py").write_text("# Example app\n")
+        (main / "package.json").write_text('{"name": "example-app"}\n')
         _run(["git", "add", "."], cwd=main)
-        _run(["git", "commit", "-m", "Conversa initial"], cwd=main)
+        _run(["git", "commit", "-m", "Example initial"], cwd=main)
 
         # Create .synapt/recall data (pre-existing)
         recall_dir = main / ".synapt" / "recall"
@@ -306,7 +306,7 @@ class TestMigrateInPlace(unittest.TestCase):
 
         # Create agent worktrees
         agents = {}
-        for name in ["conversa-ui", "conversa-codex", "conversa-dev"]:
+        for name in ["agent-ui", "agent-codex", "agent-dev"]:
             wt = self._base / name
             _run(["git", "worktree", "add", str(wt), "-b", f"agent-{name}"], cwd=main)
             agents[name] = wt
@@ -314,8 +314,8 @@ class TestMigrateInPlace(unittest.TestCase):
         # Migrate main worktree
         child = _migrate_in_place(main)
 
-        # Verify: child repo is conversa-app (from remote URL)
-        self.assertEqual(child.name, "conversa-app")
+        # Verify: child repo is example-app (from remote URL)
+        self.assertEqual(child.name, "example-app")
         self.assertTrue((child / "src" / "app.py").exists())
 
         # Verify: all agent worktrees work

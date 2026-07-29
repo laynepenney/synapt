@@ -1,9 +1,9 @@
 {
-  "suite_name": "v0-skeleton",
-  "timestamp": "2026-05-05T19:39:28.360700+00:00",
+  "suite_name": "v0-skeleton [end-to-end]",
+  "timestamp": "2026-07-29T12:38:00.786285+00:00",
   "overall_scores": {
-    "mean_p_at_5": 0.6333333333333333,
-    "mean_r_at_10": 0.7229166666666667,
+    "mean_p_at_5": 0.6645833333333333,
+    "mean_r_at_10": 0.7854166666666667,
     "safety_accuracy": 1.0,
     "negative_precision": 1.0
   },
@@ -11,44 +11,58 @@
     "direct_lookup": {
       "count": 3,
       "mean_p_at_5": 1.0,
-      "mean_r_at_10": 0.8333333333333334
+      "mean_r_at_10": 0.8333333333333334,
+      "passed_count": 0,
+      "failed_count": 0
     },
     "thematic_recall": {
       "count": 2,
       "mean_p_at_5": 0.5,
       "mean_r_at_10": 0.5,
-      "mean_rank_correlation": 1.0
+      "mean_rank_correlation": 1.0,
+      "passed_count": 0,
+      "failed_count": 0
     },
     "crisis_distinction": {
       "count": 3,
-      "mean_p_at_5": 0.26666666666666666,
-      "mean_r_at_10": 0.6666666666666666,
+      "mean_p_at_5": 0.43333333333333335,
+      "mean_r_at_10": 1.0,
       "safety_accuracy": 1.0,
-      "mean_rank_correlation": 1.0
+      "mean_rank_correlation": 0.0,
+      "passed_count": 0,
+      "failed_count": 0
     },
     "negative_case": {
       "count": 2,
       "mean_p_at_5": 1.0,
       "mean_r_at_10": 1.0,
-      "negative_precision": 1.0
+      "negative_precision": 1.0,
+      "passed_count": 2,
+      "failed_count": 0
     },
     "temporal_queries": {
       "count": 2,
       "mean_p_at_5": 0.3333333333333333,
       "mean_r_at_10": 0.2,
-      "mean_rank_correlation": -1.0
+      "mean_rank_correlation": -1.0,
+      "passed_count": 0,
+      "failed_count": 0
     },
     "pattern_recognition": {
       "count": 2,
       "mean_p_at_5": 0.5833333333333333,
       "mean_r_at_10": 0.8333333333333333,
-      "mean_rank_correlation": -1.0
+      "mean_rank_correlation": -1.0,
+      "passed_count": 0,
+      "failed_count": 0
     },
     "action_followup": {
       "count": 2,
       "mean_p_at_5": 0.75,
       "mean_r_at_10": 1.0,
-      "mean_rank_correlation": 1.0
+      "mean_rank_correlation": 1.0,
+      "passed_count": 0,
+      "failed_count": 0
     }
   },
   "fixture_results": [
@@ -60,10 +74,11 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-004",
-          "score": 0.029411764705882353
+          "record_id": "hx-004",
+          "score": 0.02631578947368421
         }
       ]
     },
@@ -75,10 +90,11 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-006",
-          "score": 0.038461538461538464
+          "record_id": "hx-006",
+          "score": 0.04
         }
       ]
     },
@@ -90,9 +106,10 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-010",
+          "record_id": "hx-010",
           "score": 0.03571428571428571
         }
       ]
@@ -105,17 +122,18 @@
       "rank_correlation": 1.0,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-001",
-          "score": 0.058823529411764705
+          "record_id": "hx-001",
+          "score": 0.0625
         },
         {
-          "prayer_id": "sk-009",
-          "score": 0.034482758620689655
+          "record_id": "hx-009",
+          "score": 0.03571428571428571
         },
         {
-          "prayer_id": "sk-002",
+          "record_id": "hx-002",
           "score": 0.030303030303030304
         }
       ]
@@ -128,37 +146,35 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-006",
-          "score": 0.07692307692307693
+          "record_id": "hx-006",
+          "score": 0.037037037037037035
         },
         {
-          "prayer_id": "sk-007",
-          "score": 0.029411764705882353
-        },
-        {
-          "prayer_id": "sk-005",
-          "score": 0.027777777777777776
+          "record_id": "hx-005",
+          "score": 0.025
         }
       ]
     },
     {
       "fixture_id": "crisis-001",
       "category": "crisis_distinction",
-      "precision_at_5": 0.0,
-      "recall_at_10": 0.0,
+      "precision_at_5": 0.5,
+      "recall_at_10": 1.0,
       "rank_correlation": null,
       "safety_correct": true,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-009",
-          "score": 0.029411764705882353
+          "record_id": "hx-009",
+          "score": 0.030303030303030304
         },
         {
-          "prayer_id": "sk-003",
-          "score": 0.02564102564102564
+          "record_id": "hx-005",
+          "score": 0.023255813953488372
         }
       ]
     },
@@ -170,34 +186,35 @@
       "rank_correlation": 1.0,
       "safety_correct": true,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-005",
-          "score": 0.05128205128205128
+          "record_id": "hx-004",
+          "score": 0.04878048780487805
         },
         {
-          "prayer_id": "sk-012",
+          "record_id": "hx-005",
+          "score": 0.047619047619047616
+        },
+        {
+          "record_id": "hx-012",
           "score": 0.04
         },
         {
-          "prayer_id": "sk-011",
+          "record_id": "hx-011",
           "score": 0.02857142857142857
         },
         {
-          "prayer_id": "sk-002",
-          "score": 0.02702702702702703
+          "record_id": "hx-003",
+          "score": 0.027777777777777776
         },
         {
-          "prayer_id": "sk-003",
+          "record_id": "hx-002",
           "score": 0.02631578947368421
         },
         {
-          "prayer_id": "sk-004",
-          "score": 0.02631578947368421
-        },
-        {
-          "prayer_id": "sk-007",
-          "score": 0.02631578947368421
+          "record_id": "hx-007",
+          "score": 0.025
         }
       ]
     },
@@ -206,29 +223,34 @@
       "category": "crisis_distinction",
       "precision_at_5": 0.4,
       "recall_at_10": 1.0,
-      "rank_correlation": 1.0,
+      "rank_correlation": -1.0,
       "safety_correct": true,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-002",
-          "score": 0.05128205128205128
+          "record_id": "hx-012",
+          "score": 0.037037037037037035
         },
         {
-          "prayer_id": "sk-012",
-          "score": 0.03571428571428571
+          "record_id": "hx-009",
+          "score": 0.02857142857142857
         },
         {
-          "prayer_id": "sk-009",
-          "score": 0.027777777777777776
+          "record_id": "hx-010",
+          "score": 0.02857142857142857
         },
         {
-          "prayer_id": "sk-010",
-          "score": 0.027777777777777776
+          "record_id": "hx-003",
+          "score": 0.02631578947368421
         },
         {
-          "prayer_id": "sk-003",
-          "score": 0.024390243902439025
+          "record_id": "hx-002",
+          "score": 0.025
+        },
+        {
+          "record_id": "hx-007",
+          "score": 0.023809523809523808
         }
       ]
     },
@@ -240,6 +262,7 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": true,
+      "passed": true,
       "retrieved": []
     },
     {
@@ -250,6 +273,7 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": true,
+      "passed": true,
       "retrieved": []
     },
     {
@@ -260,18 +284,19 @@
       "rank_correlation": -1.0,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-012",
+          "record_id": "hx-012",
           "score": 0.05
         },
         {
-          "prayer_id": "sk-009",
+          "record_id": "hx-009",
           "score": 0.03571428571428571
         },
         {
-          "prayer_id": "sk-002",
-          "score": 0.03125
+          "record_id": "hx-002",
+          "score": 0.030303030303030304
         }
       ]
     },
@@ -283,6 +308,7 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": []
     },
     {
@@ -293,22 +319,23 @@
       "rank_correlation": -1.0,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-011",
+          "record_id": "hx-011",
           "score": 0.03125
         },
         {
-          "prayer_id": "sk-002",
-          "score": 0.029411764705882353
-        },
-        {
-          "prayer_id": "sk-007",
+          "record_id": "hx-002",
           "score": 0.02857142857142857
         },
         {
-          "prayer_id": "sk-005",
+          "record_id": "hx-007",
           "score": 0.02702702702702703
+        },
+        {
+          "record_id": "hx-005",
+          "score": 0.025
         }
       ]
     },
@@ -320,18 +347,19 @@
       "rank_correlation": -1.0,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-009",
+          "record_id": "hx-009",
           "score": 0.03333333333333333
         },
         {
-          "prayer_id": "sk-002",
-          "score": 0.029411764705882353
+          "record_id": "hx-002",
+          "score": 0.02857142857142857
         },
         {
-          "prayer_id": "sk-007",
-          "score": 0.02857142857142857
+          "record_id": "hx-007",
+          "score": 0.02702702702702703
         }
       ]
     },
@@ -343,14 +371,15 @@
       "rank_correlation": null,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-012",
-          "score": 0.043478260869565216
+          "record_id": "hx-012",
+          "score": 0.045454545454545456
         },
         {
-          "prayer_id": "sk-006",
-          "score": 0.034482758620689655
+          "record_id": "hx-006",
+          "score": 0.037037037037037035
         }
       ]
     },
@@ -362,14 +391,15 @@
       "rank_correlation": 1.0,
       "safety_correct": null,
       "negative_correct": null,
+      "passed": null,
       "retrieved": [
         {
-          "prayer_id": "sk-012",
-          "score": 0.14285714285714285
+          "record_id": "hx-012",
+          "score": 0.09523809523809523
         },
         {
-          "prayer_id": "sk-008",
-          "score": 0.05
+          "record_id": "hx-008",
+          "score": 0.041666666666666664
         }
       ]
     }

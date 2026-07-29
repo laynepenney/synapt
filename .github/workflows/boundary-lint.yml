@@ -59,9 +59,9 @@ jobs:
             echo "BOUNDARY VIOLATION: Premium markers found in OSS code."
             echo ""
             echo "Identity, org, and workspace-context code belongs in"
-            echo "synapt-private, not in this repo."
+            echo "the premium package, not in this repo."
             echo ""
-            echo "See: config/process/premium-boundary-policy.md"
+            echo "See: the internal premium boundary policy doc."
             echo "See: CLAUDE.md -> Premium Boundary Policy -> Identity test"
             echo "============================================================"
             exit 1

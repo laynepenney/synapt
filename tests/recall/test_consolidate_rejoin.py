@@ -1783,7 +1783,7 @@ def test_decision_log_write_failure_rejects_the_composition_not_an_untraceable_p
 # before the whole cluster fails open. Recovers exactly the two
 # failure shapes that caused all 3 whole-cluster fail-opens in the 2026-07-15 dogfood packet
 # (dogfood-00/dogfood-08: duplicate membership; atlas-journal-038: malformed schema) — see
-# config/design/recall-supersession-guard-detection-contract-2026-07-16.md's sibling A4 scope
+# the internal design spec's sibling A4 scope
 # note. Retry does NOT apply to a well-formed response that a later per-group guard rejects
 # (content-unsafe / temporal-conflict) — those are correct, deliberate degradations of valid
 # model output, not malformed output worth re-asking for (pinned by the existing

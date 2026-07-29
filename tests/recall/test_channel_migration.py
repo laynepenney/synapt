@@ -3,7 +3,7 @@
 TDD — these tests are written before the implementation. They should
 all fail until the migration code is implemented.
 
-Design spec: config/design/channel-scoping.md (Phase 1)
+Design spec (internal), Phase 1
 Migration path: local .synapt/recall/channels/ → ~/.synapt/channels/<org>/<project>/
 """
 

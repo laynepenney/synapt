@@ -984,7 +984,7 @@ class TestGenericFilterInApply(unittest.TestCase):
         self.assertEqual(result.nodes_created, 1)
 
     def test_auto_corroborate_near_duplicate(self):
-        """UPDATED by A7 (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md):
+        """UPDATED by A7 (internal design spec):
         similar-by-keyword-overlap is no longer sufficient to auto-corroborate on its own. This
         fixture's candidate inserts a mid-sentence clarification ("(e.g., runtime errors)") and
         drops the existing's trailing "loop" -- neither text is a contiguous token-subsequence of
@@ -1270,8 +1270,8 @@ class TestGenericFilterInApply(unittest.TestCase):
         )
         self.assertEqual(result.nodes_corroborated, 1)
 
-    # --- A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md,
-    # config main @ ea7b52f): the create branch's auto-corroborate never writes `content` on
+    # --- A7 fix (internal design spec): the create branch's auto-corroborate never
+    # writes `content` on
     # the existing node -- when best_sim crosses threshold, the fresh candidate's actual text
     # is silently discarded forever (recoverable only in dedup_decisions.jsonl, never in
     # kn_path). A6's dogfood re-measure found this fired 17 of 31 auto-corroborate decisions
@@ -1361,7 +1361,7 @@ class TestGenericFilterInApply(unittest.TestCase):
         )
 
     def test_fix_b_1a_with_conflict_judge_and_source_unit_ids_resolves_via_contest(self):
-        """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md,
+        """Fix B (internal design spec,
         section 10 -- Layne-ratified contested-memory-lifecycle reframe, 2026-07-21): the SAME
         founding pair as test_a7_1a above, wired the way the extract path actually calls
         _apply_consolidation_result post-reframe -- conflict_judge provided, both sides carry
@@ -2152,7 +2152,7 @@ class TestRepresentativeSourceUnitId(unittest.TestCase):
 
 
 class TestB3TemporalConflictEscalation(unittest.TestCase):
-    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md, section
+    """Fix B (internal design spec, section
     10 -- Layne-ratified contested-memory-lifecycle reframe, 2026-07-21):
     _b3_temporal_conflict_escalation extends A7's containment-only "keep_both" outcome with a
     "contest" escalation, gated behind an injected conflict_judge seam. The judge is a
@@ -2251,8 +2251,8 @@ class TestB3TemporalConflictEscalation(unittest.TestCase):
         self.assertEqual(result, "contest")
 
     def test_fixture_d_negation_flip_generalizes_beyond_the_founding_wording(self):
-        """Mirrors A2's own negation-flip detection target (config/design/recall-supersession-
-        guard-detection-contract-2026-07-16.md section 2, fixture 2) -- now proven reachable on
+        """Mirrors A2's own negation-flip detection target (internal design spec,
+        section 2, fixture 2) -- now proven reachable on
         the corroborate branch too, since guard-6 cannot reach cross-batch/already-persisted
         pairs at all."""
         result = consolidate._b3_temporal_conflict_escalation(
@@ -2381,8 +2381,8 @@ class TestLocalConflictJudge(unittest.TestCase):
         """KNOWN, TRACKED, NOT SILENTLY HIDDEN: Ministral-3-3B reliably misclassifies this
         genuinely-complementary pair as CONFLICT. Verified not a parsing issue (clean raw
         "CONFLICT" response) and not a quantization artifact (identical failure on bf16 full
-        precision) across 5 different prompt designs -- config/design/recall-b3-temporal-
-        conflict-escalation-spec-2026-07-21.md section 9.4 has the full investigation.
+        precision) across 5 different prompt designs -- the internal design spec
+        (section 9.4) has the full investigation.
 
         expectedFailure, not deleted or weakened: if a future model/prompt ever fixes this,
         the test framework reports it as an unexpected PASS (xpass), which is the signal to

@@ -857,8 +857,8 @@ def recall_contradict(
                 "correct" (supersede a knowledge node with updated content).
         contradiction_id: ID of the contradiction to resolve (required for "resolve").
         resolution: "confirmed" (supersede old node) or "dismissed" (keep old node) for
-                    ordinary contradictions. For a CONTESTED pair (Fix B, config/design/
-                    recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section 10.4 --
+                    ordinary contradictions. For a CONTESTED pair (Fix B, internal design
+                    spec, section 10.4 --
                     both nodes already exist, both marked "contested"), use "candidate_wins"
                     (candidate promoted, existing superseded), "existing_wins" (existing
                     restored, candidate retired), or "false_positive" (both restored to
@@ -914,8 +914,8 @@ def recall_contradict(
             if contradiction_id is None:
                 return "Error: contradiction_id is required for 'resolve' action."
 
-            # Fetch BEFORE resolving (Fix B, config/design/recall-b3-temporal-conflict-
-            # escalation-spec-2026-07-21.md section 10.4): contest-row detection (new_node_id
+            # Fetch BEFORE resolving (Fix B, internal design spec, section 10.4):
+            # contest-row detection (new_node_id
             # set) determines how *resolution* maps onto the underlying confirmed/dismissed
             # vocabulary, and that mapping must be known before resolve_contradiction runs.
             # Filtering by status='pending' here is correct (unlike the single post-resolve
@@ -1243,8 +1243,7 @@ def _apply_contest_resolution(
     resolution: str,
 ) -> bool:
     """Execute a resolved Fix B contest: promote/restore/retire the two ALREADY-MATERIALIZED
-    nodes from a contested pair (config/design/recall-b3-temporal-conflict-escalation-spec-
-    2026-07-21.md section 10.4).
+    nodes from a contested pair (internal design spec, section 10.4).
 
     Returns ``True`` if the mutation actually happened, ``False`` otherwise (recall#905,
     0.17.0 blocker, Opus 2026-07-22 -- Part 2, co-primary). The caller MUST check this before

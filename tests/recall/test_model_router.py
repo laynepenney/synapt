@@ -144,7 +144,7 @@ class TestBackendRegistry:
         import synapt.recall._model_router as router
 
         sentinel = object()
-        # Isolate from any co-installed plugins (e.g. synapt-private)
+        # Isolate from any co-installed plugin packages
         monkeypatch.setattr(router, "_extra_backends", {})
         monkeypatch.setattr(router, "_backends_loaded", True)
         register_backend("test-backend", lambda mt: sentinel)
@@ -173,7 +173,7 @@ class TestBackendRegistry:
         """synapt.backends entry points are discovered when plugins installed."""
         import synapt.recall._model_router as router
         router._load_extra_backends()
-        # If synapt-private is editable-installed, modal backend is discovered.
+        # If a plugin package providing a modal backend is editable-installed, it is discovered.
         # In CI (public repo only), no plugin backends are expected.
         from importlib.metadata import entry_points
         eps = entry_points(group="synapt.backends")

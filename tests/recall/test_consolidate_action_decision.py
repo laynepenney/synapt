@@ -715,8 +715,8 @@ def test_decide_actions_exact_match_dedup_does_not_override_model_chosen_corrobo
 
 # --- TEMPORAL — ROLE MAPPING (2026-07-15, extract#31 landed the role field) ------------------
 #
-# The temporal loop is now closed the RIGHT way (config/design/extract-temporal-role-2026-07-14.
-# md): extraction reads direction ONCE and emits a validity ROLE; recall maps role -> valid_from/
+# The temporal loop is now closed the RIGHT way (internal design spec):
+# extraction reads direction ONCE and emits a validity ROLE; recall maps role -> valid_from/
 # valid_until DETERMINISTICALLY in _flatten_envelope_facts (see the _map_temporal_refs_to_bounds
 # tests above). Two invariants survive from the held-placeholder era and are STRONGER now, not
 # obsolete: (1) the action-decision LLM never supplies temporal — bounds come only from the

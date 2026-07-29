@@ -12,7 +12,7 @@
     "pattern_recognition",
     "action_followup"
   ],
-  "shared_prayer_history": "prayer_history.json",
+  "shared_history": "history.json",
   "fixture_files": {
     "direct_lookup": "direct_lookup.json",
     "thematic_recall": "thematic_recall.json",

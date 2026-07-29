@@ -12,7 +12,7 @@
   "pipeline_mode": "external",
   "provenance": {
     "timestamp": "2026-03-20T18:47:46.857031+00:00",
-    "python": "/Users/layne/.pyenv/versions/3.13.2/bin/python",
+    "python": "python",
     "python_version": "3.13.2",
     "synapt_version": "0.7.6",
     "code_ref": "acb4ca2",
@@ -65,7 +65,7 @@
       "pipeline_mode": "external",
       "provenance": {
         "timestamp": "2026-03-20T18:47:46.857031+00:00",
-        "python": "/Users/layne/.pyenv/versions/3.13.2/bin/python",
+        "python": "python",
         "python_version": "3.13.2",
         "synapt_version": "0.7.6",
         "code_ref": "acb4ca2",
