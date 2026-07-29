@@ -25,9 +25,9 @@ def _format_float(v: float, decimals: int = 3) -> str:
     return f"{v:.{decimals}f}"
 
 
-def _match_symbol(prayer_id: str, expected_ids: set[str], retrieved_ids: set[str]) -> str:
-    in_expected = prayer_id in expected_ids
-    in_retrieved = prayer_id in retrieved_ids
+def _match_symbol(record_id: str, expected_ids: set[str], retrieved_ids: set[str]) -> str:
+    in_expected = record_id in expected_ids
+    in_retrieved = record_id in retrieved_ids
     if in_expected and in_retrieved:
         return "+"
     if in_expected and not in_retrieved:
@@ -43,9 +43,9 @@ def render_fixture_diff(
     baseline: FixtureResult | None = None,
 ) -> str:
     lines: list[str] = []
-    expected_ids = {m.prayer_id for m in expected.matches}
-    expected_by_id = {m.prayer_id: m for m in expected.matches}
-    retrieved_ids = {r.prayer_id for r in result.retrieved}
+    expected_ids = {m.record_id for m in expected.matches}
+    expected_by_id = {m.record_id: m for m in expected.matches}
+    retrieved_ids = {r.record_id for r in result.retrieved}
 
     lines.append(f"=== Fixture: {result.fixture_id} ===")
     lines.append(f"Category: {CATEGORY_LABELS.get(result.category.value, result.category.value)}")
@@ -56,7 +56,7 @@ def render_fixture_diff(
         lines.append("  (no matches expected)")
     else:
         for m in sorted(expected.matches, key=lambda x: x.rank):
-            lines.append(f"  {m.rank}. {m.prayer_id} (relevance: {m.relevance})")
+            lines.append(f"  {m.rank}. {m.record_id} (relevance: {m.relevance})")
     if expected.response_routing:
         lines.append(f"  Routing: {expected.response_routing.classification.value}"
                       f" (safety_critical: {expected.response_routing.safety_critical})")
@@ -67,8 +67,8 @@ def render_fixture_diff(
         lines.append("  (no results returned)")
     else:
         for i, r in enumerate(result.retrieved, 1):
-            symbol = _match_symbol(r.prayer_id, expected_ids, retrieved_ids)
-            lines.append(f"  {i}. {r.prayer_id} (score: {_format_float(r.score)}) [{symbol}]")
+            symbol = _match_symbol(r.record_id, expected_ids, retrieved_ids)
+            lines.append(f"  {i}. {r.record_id} (score: {_format_float(r.score)}) [{symbol}]")
     if result.routing:
         lines.append(f"  Routing: {result.routing.classification.value}"
                       f" (confidence: {_format_float(result.routing.confidence)})")
@@ -82,7 +82,7 @@ def render_fixture_diff(
             lines.append("  (no results returned)")
         else:
             for i, r in enumerate(baseline.retrieved, 1):
-                lines.append(f"  {i}. {r.prayer_id} (score: {_format_float(r.score)})")
+                lines.append(f"  {i}. {r.record_id} (score: {_format_float(r.score)})")
         lines.append(f"  P@5: {_format_float(baseline.precision_at_5)}"
                       f"  R@10: {_format_float(baseline.recall_at_10)}")
     lines.append("")
@@ -108,7 +108,7 @@ def render_fixture_diff(
         if in_exp and in_ret:
             exp_rank = expected_by_id[pid].rank
             act_rank = next(
-                i + 1 for i, r in enumerate(result.retrieved) if r.prayer_id == pid
+                i + 1 for i, r in enumerate(result.retrieved) if r.record_id == pid
             )
             if exp_rank == act_rank:
                 lines.append(f"  + {pid}: expected rank {exp_rank}, actual rank {act_rank}")
@@ -118,7 +118,7 @@ def render_fixture_diff(
             lines.append(f"  - {pid}: MISSING (expected rank {expected_by_id[pid].rank})")
         elif not in_exp and in_ret:
             act_rank = next(
-                i + 1 for i, r in enumerate(result.retrieved) if r.prayer_id == pid
+                i + 1 for i, r in enumerate(result.retrieved) if r.record_id == pid
             )
             lines.append(f"  ! {pid}: FALSE POSITIVE at rank {act_rank}")
     lines.append("")
@@ -191,7 +191,7 @@ def write_report(
                 "negative_correct": r.negative_correct,
                 "passed": r.passed,
                 "retrieved": [
-                    {"prayer_id": ret.prayer_id, "score": ret.score}
+                    {"record_id": ret.record_id, "score": ret.score}
                     for ret in r.retrieved
                 ],
             }

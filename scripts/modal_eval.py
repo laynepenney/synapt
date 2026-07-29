@@ -30,7 +30,11 @@ import modal
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PRIVATE_REPO = REPO_ROOT.parent / "synapt-private"
+# Path to a locally-checked-out premium extension package, if present (private,
+# not part of this public repo). Override via SYNAPT_PREMIUM_LOCAL_DIR if your
+# checkout uses a different directory name.
+_PREMIUM_LOCAL_DIR = os.environ.get("SYNAPT_PREMIUM_LOCAL_DIR", "premium")
+PRIVATE_REPO = REPO_ROOT.parent / _PREMIUM_LOCAL_DIR
 LOCOMO_DATASET = PRIVATE_REPO / "evaluation" / "dataset" / "locomo10.json"
 
 app = modal.App("synapt-eval")

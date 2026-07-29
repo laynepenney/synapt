@@ -3,7 +3,7 @@
 TDD — claims move from per-gripspace channels.db to global _state.db
 with org/project scoping. First-writer-wins via INSERT OR IGNORE.
 
-Design spec: config/design/channel-scoping.md
+Design spec (internal)
 """
 
 from __future__ import annotations

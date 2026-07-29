@@ -1,7 +1,8 @@
 """Pluggable retrieval interface and placeholder implementation.
 
-Production integration will implement RetrievalBackend against Ask Conversa's
-retrieval API. The placeholder uses keyword overlap for skeleton verification.
+Production integration will implement RetrievalBackend against the
+production retrieval API. The placeholder uses keyword overlap for
+skeleton verification.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from typing import Protocol
 
 from .models import (
     Fixture,
-    Prayer,
+    Record,
     RetrievalResult,
     RoutingClassification,
     RoutingResult,
@@ -19,13 +20,13 @@ from .models import (
 
 
 class RetrievalBackend(Protocol):
-    def retrieve(self, query: str, prayer_history: list[Prayer], k: int) -> list[RetrievalResult]:
+    def retrieve(self, query: str, history: list[Record], k: int) -> list[RetrievalResult]:
         ...
 
     def classify_routing(
         self,
         query: str,
-        prayer_history: list[Prayer],
+        history: list[Record],
         retrieved_context: list[RetrievalResult] | None = None,
     ) -> RoutingResult:
         ...
@@ -67,41 +68,41 @@ def _tokenize(text: str) -> set[str]:
 
 
 class KeywordOverlapRetrieval:
-    """Placeholder retrieval using token overlap between query and prayers.
+    """Placeholder retrieval using token overlap between query and records.
 
-    Scores each prayer by Jaccard-like overlap of non-stopword tokens between
-    the query and the prayer text + summary + entities. Sufficient for
+    Scores each record by Jaccard-like overlap of non-stopword tokens between
+    the query and the record text + summary + entities. Sufficient for
     validating the harness end-to-end; not a real retrieval implementation.
     """
 
     def retrieve(
-        self, query: str, prayer_history: list[Prayer], k: int = 10,
+        self, query: str, history: list[Record], k: int = 10,
     ) -> list[RetrievalResult]:
         query_tokens = _tokenize(query)
         if not query_tokens:
             return []
 
         scored: list[tuple[str, float]] = []
-        for prayer in prayer_history:
-            prayer_tokens = _tokenize(prayer.text) | _tokenize(prayer.summary)
-            for entity in prayer.entities:
-                prayer_tokens |= _tokenize(entity)
-            for theme in prayer.themes:
-                prayer_tokens |= _tokenize(theme)
+        for record in history:
+            record_tokens = _tokenize(record.text) | _tokenize(record.summary)
+            for entity in record.entities:
+                record_tokens |= _tokenize(entity)
+            for theme in record.themes:
+                record_tokens |= _tokenize(theme)
 
-            overlap = query_tokens & prayer_tokens
+            overlap = query_tokens & record_tokens
             if not overlap:
                 continue
-            score = len(overlap) / len(query_tokens | prayer_tokens)
-            scored.append((prayer.id, score))
+            score = len(overlap) / len(query_tokens | record_tokens)
+            scored.append((record.id, score))
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        return [RetrievalResult(prayer_id=pid, score=s) for pid, s in scored[:k]]
+        return [RetrievalResult(record_id=rid, score=s) for rid, s in scored[:k]]
 
     def classify_routing(
         self,
         query: str,
-        prayer_history: list[Prayer],
+        history: list[Record],
         retrieved_context: list[RetrievalResult] | None = None,
     ) -> RoutingResult:
         query_lower = query.lower()
@@ -109,14 +110,14 @@ class KeywordOverlapRetrieval:
         for signal in _CRISIS_SIGNALS:
             if signal in query_lower:
                 return RoutingResult(
-                    classification=RoutingClassification.ESCALATE_CRISIS,
+                    classification=RoutingClassification.ESCALATE,
                     confidence=0.95,
                 )
 
         query_tokens = _tokenize(query)
         if query_tokens & {"empty", "numb", "tired", "exhausted", "hopeless", "pointless"}:
             return RoutingResult(
-                classification=RoutingClassification.DEFER_TO_HUMAN,
+                classification=RoutingClassification.DEFER,
                 confidence=0.6,
             )
 

@@ -2,14 +2,14 @@
   {
     "id": "thematic-001",
     "category": "thematic_recall",
-    "description": "Theme-based recall for gratitude/thanksgiving prayers",
-    "query": "Show me prayers about gratitude",
+    "description": "Theme-based recall for gratitude entries",
+    "query": "Show me entries about gratitude",
     "query_date": "2026-05-05",
     "expected": {
       "matches": [
-        {"prayer_id": "sk-001", "rank": 1, "relevance": "high"},
-        {"prayer_id": "sk-009", "rank": 2, "relevance": "high"},
-        {"prayer_id": "sk-002", "rank": 3, "relevance": "medium"}
+        {"record_id": "hx-001", "rank": 1, "relevance": "high"},
+        {"record_id": "hx-009", "rank": 2, "relevance": "high"},
+        {"record_id": "hx-002", "rank": 3, "relevance": "medium"}
       ],
       "expect_empty": false
     }
@@ -17,14 +17,14 @@
   {
     "id": "thematic-002",
     "category": "thematic_recall",
-    "description": "Theme-based recall for intercession prayers",
-    "query": "When have I prayed for other people?",
+    "description": "Theme-based recall for concern-for-others entries",
+    "query": "When have I written about people I'm concerned for?",
     "query_date": "2026-05-05",
     "expected": {
       "matches": [
-        {"prayer_id": "sk-004", "rank": 1, "relevance": "high"},
-        {"prayer_id": "sk-008", "rank": 2, "relevance": "high"},
-        {"prayer_id": "sk-012", "rank": 3, "relevance": "medium"}
+        {"record_id": "hx-004", "rank": 1, "relevance": "high"},
+        {"record_id": "hx-008", "rank": 2, "relevance": "high"},
+        {"record_id": "hx-012", "rank": 3, "relevance": "medium"}
       ],
       "expect_empty": false
     }

@@ -67,7 +67,7 @@ class KnowledgeNode:
     valid_until: str | None = None       # ISO 8601: when this stopped being true
     version: int = 1                     # Increments on supersession
     lineage_id: str = ""                 # Shared ID across versions of same fact
-    # Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section 3):
+    # Fix B (internal design spec, section 3):
     # the node's TRUE source chronology, distinct from created_at/updated_at (consolidation
     # run-time, not event-time). None on any node persisted before this field existed, or any
     # node from a path that doesn't thread source_unit_id (legacy, collection pass) -- callers

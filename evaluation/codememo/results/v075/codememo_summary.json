@@ -11,7 +11,7 @@
   "pipeline_mode": "recalldb",
   "provenance": {
     "timestamp": "2026-03-20T13:15:37.747698+00:00",
-    "python": "/Users/layne/.pyenv/versions/3.13.2/bin/python",
+    "python": "python",
     "python_version": "3.13.2",
     "synapt_version": "0.7.5",
     "code_ref": "32b3933",

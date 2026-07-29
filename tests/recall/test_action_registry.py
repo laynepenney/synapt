@@ -1,6 +1,6 @@
 """Tests for MCP action registry gating seam — plugin-aware channel dispatch.
 
-TDD spec for premium#556 (action registry gating). These tests define
+TDD spec for the action registry gating feature. These tests define
 the contract for how recall_channel actions are registered, dispatched,
 and gated across OSS and premium boundaries.
 
@@ -121,10 +121,10 @@ class TestPremiumActionGating(unittest.TestCase):
 
 
 class TestPremiumActionRegistration(unittest.TestCase):
-    """Premium plugin should be able to register additional actions at import time."""
+    """A downstream plugin should be able to register additional actions at import time."""
 
     def test_register_premium_action(self):
-        """Premium plugin can register a new action on the registry."""
+        """A downstream plugin can register a new action on the registry."""
         from synapt.recall.actions import ActionRegistry
 
         reg = ActionRegistry()
@@ -134,7 +134,7 @@ class TestPremiumActionRegistration(unittest.TestCase):
         self.assertIn("directive", reg.actions)
 
     def test_premium_action_dispatch_after_registration(self):
-        """After premium registers an action, it should be dispatchable."""
+        """After a downstream tier registers an action, it should be dispatchable."""
         from synapt.recall.actions import ActionRegistry
 
         reg = ActionRegistry()
@@ -146,7 +146,7 @@ class TestPremiumActionRegistration(unittest.TestCase):
         handler.assert_called_once()
 
     def test_premium_override_oss_action(self):
-        """Premium can override an OSS action with enriched behavior."""
+        """A downstream tier can override an OSS action with enriched behavior."""
         from synapt.recall.actions import ActionRegistry
 
         oss_handler = MagicMock(return_value="oss who")

@@ -6,7 +6,7 @@ pyproject.toml.  Each entry point module must provide at least ONE of:
 - ``register_tools(mcp: FastMCP) -> None`` — register MCP tools on the server
 - ``register_scoring(scoring_module) -> None`` — register/activate chunk
   scoring strategies via the ``synapt.recall.scoring`` registry (PR4f-B
-  plugin-time activation per config#339 Q3 ratification)
+  plugin-time activation)
 
 A plugin may provide both. Plugins with neither callable are logged and skipped.
 
@@ -44,7 +44,7 @@ class LoadedPlugin:
 def discover_plugins() -> list[LoadedPlugin]:
     """Discover and load all plugins registered under the 'synapt.plugins' group.
 
-    Per the AT-LEAST-ONE plugin contract (PR4f-B per config#339 Q3): each
+    Per the AT-LEAST-ONE plugin contract (PR4f-B): each
     plugin module must export at least one of ``register_tools(mcp)`` or
     ``register_scoring(scoring_module)``. Plugins that fail to import OR that
     export neither callable are logged and skipped.

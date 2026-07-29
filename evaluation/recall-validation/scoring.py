@@ -22,7 +22,7 @@ def precision_at_k(retrieved: list[RetrievalResult], expected_ids: set[str], k: 
     top_k = retrieved[:k]
     if not top_k:
         return 1.0 if not expected_ids else 0.0
-    hits = sum(1 for r in top_k if r.prayer_id in expected_ids)
+    hits = sum(1 for r in top_k if r.record_id in expected_ids)
     return hits / len(top_k)
 
 
@@ -30,7 +30,7 @@ def recall_at_k(retrieved: list[RetrievalResult], expected_ids: set[str], k: int
     if not expected_ids:
         return 1.0
     top_k = retrieved[:k]
-    hits = sum(1 for r in top_k if r.prayer_id in expected_ids)
+    hits = sum(1 for r in top_k if r.record_id in expected_ids)
     return hits / len(expected_ids)
 
 
@@ -43,12 +43,12 @@ def rank_correlation(
     Only considers items present in both retrieved and expected.
     Returns None if fewer than 2 overlapping items.
     """
-    overlap = [r for r in retrieved if r.prayer_id in expected_ranking]
+    overlap = [r for r in retrieved if r.record_id in expected_ranking]
     if len(overlap) < 2:
         return None
 
     actual_ranks = list(range(1, len(overlap) + 1))
-    expected_ranks = [expected_ranking[r.prayer_id] for r in overlap]
+    expected_ranks = [expected_ranking[r.record_id] for r in overlap]
 
     n = len(actual_ranks)
     concordant = 0
@@ -86,8 +86,8 @@ def score_fixture(
     fixture_id: str,
     category: Category,
 ) -> FixtureResult:
-    expected_ids = {m.prayer_id for m in expected.matches}
-    expected_ranking = {m.prayer_id: m.rank for m in expected.matches}
+    expected_ids = {m.record_id for m in expected.matches}
+    expected_ranking = {m.record_id: m.rank for m in expected.matches}
 
     result = FixtureResult(
         fixture_id=fixture_id,

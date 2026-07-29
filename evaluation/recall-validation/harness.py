@@ -24,7 +24,7 @@ from .models import (
     Fixture,
     FixtureResult,
     Mode,
-    Prayer,
+    Record,
     RetrievalResult,
     Surface,
     SuiteResult,
@@ -52,7 +52,7 @@ def _load_fixture_file(path: Path) -> list[dict]:
     return json.loads(text)
 
 
-def load_suite(suite_name: str) -> tuple[dict, list[Prayer], list[Fixture]]:
+def load_suite(suite_name: str) -> tuple[dict, list[Record], list[Fixture]]:
     suite_dir = FIXTURES_DIR / suite_name
     if not suite_dir.is_dir():
         print(f"ERROR: suite directory not found: {suite_dir}", file=sys.stderr)
@@ -65,11 +65,11 @@ def load_suite(suite_name: str) -> tuple[dict, list[Prayer], list[Fixture]]:
 
     suite_meta = json.loads(suite_meta_path.read_text())
 
-    shared_history_file = suite_meta.get("shared_prayer_history")
-    prayer_history: list[Prayer] = []
+    shared_history_file = suite_meta.get("shared_history")
+    history: list[Record] = []
     if shared_history_file:
-        prayer_history_path = suite_dir / shared_history_file
-        prayer_history = [Prayer(**p) for p in json.loads(prayer_history_path.read_text())]
+        history_path = suite_dir / shared_history_file
+        history = [Record(**p) for p in json.loads(history_path.read_text())]
 
     fixtures: list[Fixture] = []
     for category, filename in suite_meta["fixture_files"].items():
@@ -79,18 +79,18 @@ def load_suite(suite_name: str) -> tuple[dict, list[Prayer], list[Fixture]]:
             continue
         raw_fixtures = _load_fixture_file(fixture_path)
         for raw in raw_fixtures:
-            has_own_history = "user_history" in raw or "prayer_history" in raw
-            if not has_own_history and prayer_history:
-                raw["prayer_history"] = [vars(p) for p in prayer_history]
+            has_own_history = "user_history" in raw or "history" in raw
+            if not has_own_history and history:
+                raw["history"] = [vars(p) for p in history]
             fixtures.append(fixture_from_dict(raw))
 
-    return suite_meta, prayer_history, fixtures
+    return suite_meta, history, fixtures
 
 
 def _oracle_retrieved(fixture: Fixture) -> list[RetrievalResult]:
     """Build oracle-perfect retrieval from expected matches."""
     return [
-        RetrievalResult(prayer_id=m.prayer_id, score=1.0 - (m.rank - 1) * 0.1)
+        RetrievalResult(record_id=m.record_id, score=1.0 - (m.rank - 1) * 0.1)
         for m in sorted(fixture.expected.matches, key=lambda m: m.rank)
     ]
 
@@ -117,7 +117,7 @@ def run_suite(
             retrieved = _oracle_retrieved(fixture)
         else:
             retrieved = backend.retrieve(
-                fixture.query, fixture.prayer_history, k=10,
+                fixture.query, fixture.history, k=10,
             )
 
         routing = None
@@ -126,12 +126,12 @@ def run_suite(
                 pass
             elif surface == Surface.END_TO_END:
                 routing = backend.classify_routing(
-                    fixture.query, fixture.prayer_history,
+                    fixture.query, fixture.history,
                     retrieved_context=retrieved,
                 )
             else:
                 routing = backend.classify_routing(
-                    fixture.query, fixture.prayer_history,
+                    fixture.query, fixture.history,
                     retrieved_context=_oracle_retrieved(fixture),
                 )
 
@@ -157,7 +157,7 @@ def run_suite(
                 fixture_id=bl["fixture_id"],
                 category=Category(bl["category"]),
                 retrieved=[
-                    RetrievalResult(prayer_id=r["prayer_id"], score=r["score"])
+                    RetrievalResult(record_id=r["record_id"], score=r["score"])
                     for r in bl.get("retrieved", [])
                 ],
                 precision_at_5=bl.get("precision_at_5", 0.0),
@@ -270,9 +270,9 @@ def main() -> None:
     mode = Mode(args.mode)
 
     print(f"Loading suite: {args.suite}")
-    suite_meta, prayer_history, fixtures = load_suite(args.suite)
+    suite_meta, history, fixtures = load_suite(args.suite)
     print(f"Loaded {len(fixtures)} fixtures across {len(suite_meta['categories'])} categories")
-    print(f"Prayer history: {len(prayer_history)} prayers")
+    print(f"History: {len(history)} records")
     print(f"Surface: {surface.value}")
     print(f"Mode: {mode.value}")
 

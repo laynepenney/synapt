@@ -1,12 +1,7 @@
 """Provider protocols for the OSS/premium seam.
 
-OSS defines the protocols; premium implements them via entry points.
-This module contains:
-- OrgProvider / OrgInfo — org identity resolution (premium#553)
-- EntitlementProvider / FreeEntitlementProvider — capability gating (premium#558)
-
-Premium registers implementations under the 'synapt.providers' entry point group.
-OSS falls back to free/default providers when premium is not installed.
+OSS defines the protocols; implementations may be supplied by a
+downstream layer.
 """
 
 from __future__ import annotations
@@ -16,7 +11,7 @@ from typing import Protocol, runtime_checkable
 
 
 # ---------------------------------------------------------------------------
-# Org seam (premium#553)
+# Org seam
 # ---------------------------------------------------------------------------
 
 
@@ -25,18 +20,14 @@ class OrgInfo:
     """Resolved org identity."""
 
     org_id: str
-    source: str  # "manifest" | "license" | "account" | "env"
+    source: str  # where the value was resolved from
     name: str | None = None
     metadata: dict | None = None
 
 
 @runtime_checkable
 class OrgProvider(Protocol):
-    """Protocol for org identity resolution.
-
-    OSS default: resolves org_id from gripspace manifest URL.
-    Premium: resolves from license/account with membership + settings.
-    """
+    """Protocol for org identity resolution."""
 
     def resolve_org(self) -> OrgInfo | None:
         """Resolve the current org. Returns None if no org context."""
@@ -52,20 +43,16 @@ class OrgProvider(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Entitlements seam (premium#558)
+# Entitlements seam
 # ---------------------------------------------------------------------------
 
 
 @runtime_checkable
 class EntitlementProvider(Protocol):
-    """Protocol for capability/entitlement queries.
-
-    OSS default: free tier (all features disabled).
-    Premium: resolves from license.key / account.json / env.
-    """
+    """Protocol for capability/entitlement queries."""
 
     def has_feature(self, feature: str) -> bool:
-        """Return whether a named premium capability is enabled."""
+        """Return whether a named capability is enabled."""
         ...
 
     def tier(self) -> str:
@@ -82,7 +69,7 @@ class EntitlementProvider(Protocol):
 
 
 class FreeEntitlementProvider:
-    """Default provider when premium is not installed. Everything is free tier."""
+    """Default provider when no other implementation is installed. Everything is free tier."""
 
     def has_feature(self, feature: str) -> bool:
         return False

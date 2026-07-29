@@ -1,4 +1,4 @@
-"""Date-aware retrieval tests for Conversa-shaped temporal fixtures."""
+"""Date-aware retrieval tests for structured temporal fixtures."""
 
 from datetime import datetime, timezone
 

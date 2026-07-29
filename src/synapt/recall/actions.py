@@ -1,7 +1,7 @@
 """Plugin-aware action registry for recall_channel dispatch.
 
-Replaces the monolithic if/elif dispatcher in server.py with a registry
-that OSS populates with base actions and premium can extend at import time.
+Replaces the monolithic if/elif dispatcher in server.py with a pluggable
+action registry that a downstream layer may extend.
 """
 
 from __future__ import annotations
@@ -384,11 +384,9 @@ _DEFAULT_REGISTRY: ActionRegistry | None = None
 def get_action_registry() -> ActionRegistry:
     """Return the process-wide channel action registry.
 
-    OSS installs the base registry once. Premium registers coordination
-    handlers (directive, claim, board, etc.) via the plugin entry point
-    system.  Without premium, those actions show as "locked".
-
-    See: premium#553 (channel seam split)
+    OSS installs the base registry once. A downstream layer may register
+    additional coordination handlers (directive, claim, board, etc.) via
+    the plugin system.  Without premium, those actions show as "locked".
     """
     global _DEFAULT_REGISTRY
     if _DEFAULT_REGISTRY is None:
@@ -399,9 +397,8 @@ def get_action_registry() -> ActionRegistry:
 def register_coordination_handlers(registry: ActionRegistry | None = None) -> None:
     """Register the runtime coordination handlers on a registry.
 
-    Called by the premium coordination plugin at startup.  Exposed as a
-    public function so premium can wire these without reaching into
-    private dicts.
+    Public extension point for a downstream layer to register additional
+    handlers.
     """
     reg = registry or get_action_registry()
     for name, (handler, desc) in _RUNTIME_COORDINATION_HANDLERS.items():

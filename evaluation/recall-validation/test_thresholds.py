@@ -37,7 +37,7 @@ def _make_expected(
     expect_empty: bool = False,
 ) -> Expected:
     matches = [
-        ExpectedMatch(prayer_id=pid, rank=i + 1, relevance="high")
+        ExpectedMatch(record_id=pid, rank=i + 1, relevance="high")
         for i, pid in enumerate(match_ids)
     ]
     return Expected(
@@ -50,7 +50,7 @@ def _make_expected(
 
 def _make_retrieved(ids: list[str], base_score: float = 0.9) -> list[RetrievalResult]:
     return [
-        RetrievalResult(prayer_id=pid, score=base_score - i * 0.1)
+        RetrievalResult(record_id=pid, score=base_score - i * 0.1)
         for i, pid in enumerate(ids)
     ]
 

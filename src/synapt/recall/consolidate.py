@@ -356,8 +356,8 @@ class ConsolidationResult:
     nodes_created: int = 0
     nodes_corroborated: int = 0
     nodes_contradicted: int = 0
-    # Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
-    # escalation-spec-2026-07-21.md section 10.5): distinct from nodes_contradicted (the
+    # Fix B contested-memory-lifecycle reframe (internal design spec, section 10.5):
+    # distinct from nodes_contradicted (the
     # general contradict-action-item path) so the 0.17.0 dogfood fruit is countable cleanly --
     # one increment per contested PAIR (two nodes touched, one queue entry), not per node.
     nodes_contested: int = 0
@@ -626,8 +626,8 @@ _inline_emb_loaded = False
 
 _INLINE_COSINE_THRESHOLD = 0.80
 
-# Fix B contested-memory-lifecycle reframe (config/design/recall-b3-temporal-conflict-
-# escalation-spec-2026-07-21.md section 10.5/10.10 item 5): confidence ceiling applied to both
+# Fix B contested-memory-lifecycle reframe (internal design spec, section 10.5/10.10
+# item 5): confidence ceiling applied to both
 # nodes in a contested pair. Belt-and-suspenders, not the primary mechanism -- the primary
 # exclusion is the existing status != 'active' FTS gate (storage.py's knowledge_fts_search),
 # which hides contested nodes from default search entirely. This ceiling only matters when a
@@ -655,8 +655,8 @@ def _get_dedup_thresholds(content_profile=None) -> tuple[float, float]:
     return _DEDUP_THRESHOLDS.get(ct, _DEDUP_THRESHOLDS["mixed"])
 
 
-# A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md, Opus's
-# 2026-07-17 ruling on the PR #892 1c finding): containment for the create-branch dedup
+# A7 fix (internal design spec; Opus's 2026-07-17 ruling on the PR #892 1c
+# finding): containment for the create-branch dedup
 # decision is a contiguous TOKEN-subsequence match, not a raw character substring match.
 # Punctuation is stripped ONLY at token boundaries (leading/trailing); punctuation INSIDE a
 # token is preserved, so "v1.3" and "v1.35" stay distinct atomic tokens (never collapse into
@@ -724,8 +724,8 @@ def _b3_containment_decision(candidate_content: str, existing_content: str) -> s
 
 
 def _representative_source_unit_id(raw_node: dict) -> "str | None":
-    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md section
-    3): reads a B4 action-item dict's chronology signal. A singleton pass-through carries
+    """Fix B (internal design spec, section 3): reads a B4 action-item dict's chronology
+    signal. A singleton pass-through carries
     ``source_unit_id`` (singular, threaded end-to-end from ``_decide_actions``). A composed
     group carries ``source_unit_ids`` (plural, one per member — see the ``"source_unit_ids":
     [m.get("source_unit_id") for m in members]`` shape at compose time). Returns the LATEST
@@ -759,7 +759,7 @@ def _b3_temporal_conflict_escalation(
     existing_source_unit_id: "str | None",
     conflict_judge,
 ) -> str:
-    """Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md,
+    """Fix B (internal design spec,
     section 10 -- Layne-ratified contested-memory-lifecycle reframe, 2026-07-21): only called
     when ``_b3_containment_decision`` already returned ``"keep_both"`` — neither text contains
     the other. Escalates to ``"contest"`` ONLY when the judge reports a genuine conflict; any
@@ -802,8 +802,8 @@ def _local_conflict_judge(infer):
     Only ever invoked from inside the caller's already-narrow high-similarity-non-containment
     trigger band (constraint 1) — not on every ``keep_both``.
 
-    KNOWN, DOCUMENTED, LOW-STAKES GAP (config/design/recall-b3-temporal-conflict-escalation-
-    spec-2026-07-21.md section 9.4, reframed section 10.10 item 4): this exact wording — the
+    KNOWN, DOCUMENTED, LOW-STAKES GAP (internal design spec, section 9.4, reframed
+    section 10.10 item 4): this exact wording — the
     best of 4 tried, across both 4-bit and bf16 Ministral-3-3B — reliably classifies the
     founding case (fixture a, REQUIRED) and a negation-flip (fixture d) correctly, but is NOT
     reliable on same-entity-different-property pairs sharing strong lexical overlap without a
@@ -980,7 +980,7 @@ def _log_dedup_decision(
 
     Pure logging — never disrupts consolidation.
 
-    *reason* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md):
+    *reason* (Fix B, internal design spec):
     for ``auto-corroborate``/``auto-supersede``/``contest`` entries, distinguishes WHICH
     mechanism produced the decision — ``"containment"`` (A7's token-subsequence rule) vs
     ``"chronology_contest"`` (section 10's contested-memory-lifecycle escalation: judge
@@ -1396,8 +1396,8 @@ def _apply_consolidation_result(
     When *db* (RecallDB) is provided, contradictions are queued as
     pending_contradictions for user review instead of auto-applied.
 
-    *conflict_judge* (Fix B, config/design/recall-b3-temporal-conflict-escalation-spec-
-    2026-07-21.md): optional, defaults to None. Only the extract path
+    *conflict_judge* (Fix B, internal design spec): optional, defaults to None. Only
+    the extract path
     (``_run_extract_path``) passes this — the legacy and collection-pass callers never do,
     so ``_b3_temporal_conflict_escalation`` is always a no-op for them (falls through to
     ``keep_both``, byte-identical to pre-Fix-B behavior). See ``_local_conflict_judge`` for
@@ -1606,8 +1606,8 @@ def _apply_consolidation_result(
                     best_method = "cosine"
 
             if best_match and best_sim >= jaccard_thresh:
-                # A7 fix (config/design/recall-b3-corroborate-content-discard-fix-2026-07-16.md,
-                # Opus's 2026-07-17 ruling): a similarity match no longer unconditionally
+                # A7 fix (internal design spec; Opus's 2026-07-17 ruling): a similarity
+                # match no longer unconditionally
                 # converts to corroborate. Content containment decides the outcome — the old
                 # unconditional path silently discarded any candidate content that wasn't an
                 # exact restatement of `best_match`, a live production bug (17/31
@@ -1616,8 +1616,8 @@ def _apply_consolidation_result(
                 decision_reason = "containment"
 
                 if b3_decision == "keep_both":
-                    # Fix B (config/design/recall-b3-temporal-conflict-escalation-spec-
-                    # 2026-07-21.md, section 10 -- contested-memory-lifecycle reframe):
+                    # Fix B (internal design spec, section 10 -- contested-memory-lifecycle
+                    # reframe):
                     # containment found neither side contains the other, but that alone
                     # doesn't mean the two are compatible -- escalate to CONTEST (never an
                     # auto-applied winner) when a genuine conflict is detected. No-op (stays
@@ -1726,8 +1726,8 @@ def _apply_consolidation_result(
                     continue
 
                 if b3_decision == "contest" and db is not None:
-                    # Contested-memory-lifecycle reframe (config/design/recall-b3-temporal-
-                    # conflict-escalation-spec-2026-07-21.md section 10.5, Layne-ratified
+                    # Contested-memory-lifecycle reframe (internal design spec, section
+                    # 10.5, Layne-ratified
                     # 2026-07-21): the judge is a FLAGGER, not a resolver. Neither side is
                     # auto-applied as a winner -- both nodes persist, both marked contested
                     # with confidence capped, and a pending_contradiction queues the pair for
@@ -1883,8 +1883,8 @@ def _apply_consolidation_result(
 def score_cluster_chunks(cluster: list[JournalEntry]):
     """Score a cluster of journal entries via the active scoring strategy.
 
-    Per config#332 consolidation-primary locus + config#339 Pattern 4 ratification:
-    consolidation is the primary site for substrate-reshape scoring. This helper
+    Per internal design ratification: consolidation is the primary site for
+    substrate-reshape scoring. This helper
     exposes the `ChunkScoringStrategy` seam at the canonical consolidation
     scoring point.
 
@@ -2260,7 +2260,7 @@ def _run_extract_path(
 # B2 restores the monolith's action-logic (existing-knowledge-in-context -> action +
 # existing_id) as its own focused pass, batched per cluster, over B1's clean extracted facts.
 #
-# GATE (reframed 2026-07-14, Opus ratified): the frontier ideal (config#482, 185 nodes) turned
+# GATE (reframed 2026-07-14, Opus ratified): the frontier ideal (185 nodes) turned
 # out to be an END-STATE node-set (no action/existing_id/contradiction fields, 0 corpus
 # reversals) — NOT a per-fact action-gold, so B2 has no standalone corpus-accuracy gate the way
 # identify did. This is a MECHANISM gate (synthetic existing-knowledge + facts via a fake infer,
@@ -2292,8 +2292,8 @@ def _run_extract_path(
 # temporal cut (recall re-deriving via a SECOND LLM pass what extraction already read once). The
 # right fix lives in extract and now ships: extraction emits a validity ROLE (effective/expiry/
 # range/superseded/point) + resolved date at the BASE temporal_refs capability, and threads each
-# unit's SOURCE date as the relative-date resolution anchor (spec: config/design/extract-temporal-
-# role-2026-07-14.md). recall consumes it DETERMINISTICALLY, no LLM re-judgment: _EXTRACT_-
+# unit's SOURCE date as the relative-date resolution anchor (internal design spec).
+# recall consumes it DETERMINISTICALLY, no LLM re-judgment: _EXTRACT_-
 # CAPABILITIES requests temporal_refs; _extract_cluster_units threads BatchUnit.date
 # (_candidate_source_date); _flatten_envelope_facts maps role -> valid_from/valid_until
 # (_map_temporal_refs_to_bounds); _decide_actions PASSES THE BOUND THROUGH without judging it (the
@@ -2627,8 +2627,8 @@ def _decide_actions(
             # the action means it survives the fail-closed-to-create path unchanged.
             "valid_from": fact.get("valid_from"),
             "valid_until": fact.get("valid_until"),
-            # Pass-through provenance for B4 (config/design/recall-B4-rejoin-stage-2026-07-15.md
-            # guard 3, contract-answer 2026-07-15): reconcile ignores unknown dict keys (verified,
+            # Pass-through provenance for B4 (internal design spec, guard 3,
+            # contract-answer 2026-07-15): reconcile ignores unknown dict keys (verified,
             # not assumed — every field _apply_consolidation_result reads comes off .get(), never
             # **kwargs/dataclass unpacking), so this rides through B3 unused until B4 unions member
             # ids into the decision log. Not a KnowledgeNode field — no schema/storage change.
@@ -2641,7 +2641,7 @@ def _decide_actions(
 # B4 — the rejoin/compose stage (behind SYNAPT_USE_EXTRACT, same flag as B1/B2)
 #
 # Position: B2 -> B4 -> B3. Every stage up to here atomizes or passes atoms through; nothing
-# ever reassembles. The Phase C dogfood (config/design/recall-B4-rejoin-stage-2026-07-15.md)
+# ever reassembles. The Phase C dogfood (internal design spec)
 # found the decomposed path finds more and lies less than legacy but fragments compound
 # memories (378 nodes vs the 185-node frontier ideal, boundary F1 9.1% vs legacy's 23.0%) —
 # and fragmentation CORRUPTS truth (3 concrete false memories in verification). B4 rejoins:
@@ -3126,7 +3126,7 @@ def _rejoin_create_actions(
     (corroborate/contradict, unaddressed/singleton/rejected-group creates) passed through
     unchanged at its original position. B3 needs ZERO changes (see module note).
 
-    See config/design/recall-B4-rejoin-stage-2026-07-15.md for the full contract; the guard
+    See the internal design spec for the full contract; the guard
     numbers referenced below match that spec.
 
     ``content_profile`` is threaded from ``_run_extract_path`` (which already receives it and

@@ -8,9 +8,9 @@ Composes with recall_channel (broadcast) -- same storage root, different
 semantic layer.  Channels are broadcast; direct messages are unicast with
 delivery tracking and explicit acknowledgment.
 
-Hook registration for premium:
-  before_send hooks can reject messages (identity/auth/rate-limit).
-  state_change hooks fire on status transitions (audit subscription).
+Hook registration seam (a downstream layer may register handlers):
+  before_send hooks can reject a message (return a reason string, or None to allow).
+  state_change hooks fire on status transitions.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from typing import Any, Callable
 MAX_BODY_SIZE = 65536  # 64KB default cap
 
 # ---------------------------------------------------------------------------
-# Hook registration -- premium coordination layer
+# Hook registration -- downstream coordination extension seam
 # ---------------------------------------------------------------------------
 
 _before_send_hooks: list[Callable[["DirectMessage"], str | None]] = []

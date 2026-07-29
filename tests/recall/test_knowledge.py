@@ -61,8 +61,8 @@ class TestKnowledgeNode(unittest.TestCase):
         self.assertEqual(restored.content, node.content)
         self.assertEqual(restored.tags, node.tags)
 
-    # --- source_unit_id (config/design/recall-b3-temporal-conflict-escalation-spec-2026-07-21.md
-    # section 3): a small, additive, backward-compatible field carrying the node's TRUE source
+    # --- source_unit_id (internal design spec, section 3): a small, additive,
+    # backward-compatible field carrying the node's TRUE source
     # chronology -- distinct from created_at/updated_at, which are consolidation-run-time, not
     # event-time. Exists so Fix B's chronology escalation has a real value to compare on the
     # already-persisted side, not a proxy. ---
@@ -899,7 +899,7 @@ class TestColdStartOnboarding(unittest.TestCase):
             "id": "onboard_repos",
             "content": (
                 "Repository structure: synapt (public OSS — recall memory, MCP server, "
-                "plugin system), synapt-private (private — eval, training, repair engine), "
+                "plugin system), a private extension package (eval, training, repair engine), "
                 "gitgrip (multi-repo workspace orchestrator in Rust). Managed as a gripspace "
                 "under synapt-global/."
             ),
