@@ -442,6 +442,63 @@ def _is_garbled_content(content: str) -> bool:
     return False
 
 
+# Session/command BOOKKEEPING dressed up as durable facts. Distinct from
+# _GARBLED_CONTENT_PATTERNS above, which catches raw LLM *structural* metadata
+# (existing_id:, contradiction_note:) bleeding into the content field. This set
+# catches well-formed prose whose SUBJECT is journal bookkeeping or a one-off
+# command execution -- content that parses cleanly and means nothing later.
+#
+# _lacks_specificity does not catch these: it reads a bare date as a specificity
+# SIGNAL, so a bare "Session <hex-id>, <date>" tuple passes straight through it.
+#
+# Every pattern below is anchored on the metadata SHAPE, never on a keyword
+# alone, because the keywords ("session", "execute", "focus", "rm -rf") all
+# appear in legitimate durable facts. The KEEP controls in
+# tests/recall/test_consolidate_noise.py are the load-bearing half of the spec:
+# a filter that over-fires deletes real memory while reporting a cleanliness win.
+_METADATA_NOISE_PATTERNS = [
+    # Journal bookkeeping: "Session <hex-id>" where the id is a real session
+    # hash (6+ hex chars). NOT "Session 30" / "Session v2" / "Session 7", where
+    # "session" is a domain noun.
+    re.compile(r"(?i)^session\s+[0-9a-f]{6,}\b"),
+    re.compile(r"(?i)\bsession\s+[0-9a-f]{6,}\s+(occurred|from|focus)"),
+    # A slash-command execution log tied to a date: "Execute `/clear` command on
+    # <date>". The DATE is the discriminator -- "Execute /migrate after every
+    # schema upgrade" is a durable convention and is kept.
+    re.compile(r"(?i)^execute\s+[`'\"]?/\w+.*\d{4}-\d{2}-\d{2}"),
+    # A one-off execution EVENT against an ephemeral /tmp path, including the
+    # reworded-into-prose form a small model produces when it paraphrases rather
+    # than echoes. The ephemeral path plus a deletion verb is the discriminator --
+    # "Run cleanup with rm -rf only inside the generated build directory" is a
+    # durable rule with no /tmp path and is kept.
+    re.compile(r"(?i)/tmp/\S+.*\b(wiped|deleted|removed|rm\s+-rf)\b"),
+    re.compile(r"(?i)\brm\s+-rf\b\s+/tmp/\S+"),
+]
+
+
+def _is_metadata_noise(content: str) -> bool:
+    """Return True if *content* is session/command bookkeeping or a one-off
+    execution event dressed up as a durable fact.
+
+    HONEST LIMITATION: this is a shape-based backstop. A model that rewords a
+    transient event into novel declarative prose can slip past any fixed pattern
+    set, so a low rejection count is NOT evidence of clean output -- verify
+    quality by READING nodes, never by this filter's own counter, which is
+    circular.
+
+    Note on where the primary defence belongs: suppressing this class at the
+    PROMPT is strictly better than filtering it after the fact, but recall no
+    longer owns the Stage-1 prompt -- ``extract_batch`` builds it from the
+    extract package's own fragments, and recall passes only units, infer,
+    produced_by and capabilities. So until that forbid-list exists upstream,
+    this filter is the sole defence at this layer rather than a second one.
+    """
+    for pattern in _METADATA_NOISE_PATTERNS:
+        if pattern.search(content):
+            return True
+    return False
+
+
 # Pattern for section header prefixes that 3B models inject before content:
 # "LGBTQ+ Support: Caroline received...", "Art as Self-Expression: ..."
 # Only strip when the prefix is short (2-5 words) and the rest is a sentence.
@@ -529,6 +586,10 @@ def _create_content_passes_filters(
 
     if is_create and _is_garbled_content(content):
         logger.info("Rejected garbled node: %s", content[:80])
+        return False
+
+    if is_create and _is_metadata_noise(content):
+        logger.info("Rejected metadata-noise node: %s", content[:80])
         return False
     return True
 
