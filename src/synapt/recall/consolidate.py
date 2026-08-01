@@ -470,7 +470,13 @@ _METADATA_NOISE_PATTERNS = [
     # reworded-into-prose form a small model produces when it paraphrases rather
     # than echoes. The ephemeral path plus a deletion verb is the discriminator --
     # "Run cleanup with rm -rf only inside the generated build directory" is a
-    # durable rule with no /tmp path and is kept.
+    # durable rule with no /tmp path and is kept BY THIS FILTER.
+    #
+    # It does NOT survive a create today: _lacks_specificity, which runs EARLIER
+    # in this same is_create block, rejects that exact string (65 chars, no
+    # specificity signal, no proper noun), so the node dies before this filter is
+    # reached. That is a separate pre-existing precision defect, tracked on its
+    # own. A keep guarantee on ONE filter is not a keep guarantee for the pipeline.
     re.compile(r"(?i)/tmp/\S+.*\b(wiped|deleted|removed|rm\s+-rf)\b"),
     re.compile(r"(?i)\brm\s+-rf\b\s+/tmp/\S+"),
 ]

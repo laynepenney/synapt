@@ -97,11 +97,14 @@ class TestIsMetadataNoiseKeeps(unittest.TestCase):
     def test_keeps_rm_rf_safety_rule(self):
         # A durable RULE about rm -rf (no ephemeral temp path) is not an event.
         #
-        # NOTE: this string is ALSO rejected downstream by _lacks_specificity,
-        # a separate pre-existing precision defect filed on its own. That is why
-        # this guarantee is asserted at the PREDICATE level only -- a pipeline
-        # assertion here would go red for a reason this filter cannot fix, and
-        # would read as a failure of this change.
+        # NOTE: this string does NOT survive a create today. _lacks_specificity
+        # runs EARLIER in the same is_create block and rejects it, so the node
+        # dies before this filter is reached -- a separate pre-existing precision
+        # defect, tracked on its own. That is why this guarantee is asserted at
+        # the PREDICATE level only: a pipeline assertion would go red for a
+        # reason this filter cannot fix, and would read as a failure of this
+        # change. A keep guarantee on ONE filter is not a keep guarantee for the
+        # pipeline.
         self.assertFalse(_is_metadata_noise(
             "Run cleanup with rm -rf only inside the generated build directory"))
 
