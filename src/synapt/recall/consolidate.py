@@ -451,46 +451,250 @@ def _is_garbled_content(content: str) -> bool:
 # _lacks_specificity does not catch these: it reads a bare date as a specificity
 # SIGNAL, so a bare "Session <hex-id>, <date>" tuple passes straight through it.
 #
-# Every pattern below is anchored on the metadata SHAPE, never on a keyword
-# alone, because the keywords ("session", "execute", "focus", "rm -rf") all
-# appear in legitimate durable facts. The KEEP controls in
-# tests/recall/test_consolidate_noise.py are the load-bearing half of the spec:
-# a filter that over-fires deletes real memory while reporting a cleanliness win.
-_METADATA_NOISE_PATTERNS = [
-    # Journal bookkeeping: "Session <hex-id>" where the id is a real session
-    # hash (6+ hex chars). NOT "Session 30" / "Session v2" / "Session 7", where
-    # "session" is a domain noun.
-    re.compile(r"(?i)^session\s+[0-9a-f]{6,}\b"),
-    re.compile(r"(?i)\bsession\s+[0-9a-f]{6,}\s+(occurred|from|focus)"),
-    # A slash-command execution log tied to a date: "Execute `/clear` command on
-    # <date>". The DATE is the discriminator -- "Execute /migrate after every
-    # schema upgrade" is a durable convention and is kept.
-    re.compile(r"(?i)^execute\s+[`'\"]?/\w+.*\d{4}-\d{2}-\d{2}"),
-    # A one-off execution EVENT against an ephemeral /tmp path, including the
-    # reworded-into-prose form a small model produces when it paraphrases rather
-    # than echoes. The ephemeral path plus a deletion verb is the discriminator --
-    # "Run cleanup with rm -rf only inside the generated build directory" is a
-    # durable rule with no /tmp path and is kept BY THIS FILTER.
-    #
-    # It does NOT survive a create today: _lacks_specificity, which runs EARLIER
-    # in this same is_create block, rejects that exact string (65 chars, no
-    # specificity signal, no proper noun), so the node dies before this filter is
-    # reached. That is a separate pre-existing precision defect, tracked on its
-    # own. A keep guarantee on ONE filter is not a keep guarantee for the pipeline.
-    re.compile(r"(?i)/tmp/\S+.*\b(wiped|deleted|removed|rm\s+-rf)\b"),
-    re.compile(r"(?i)\brm\s+-rf\b\s+/tmp/\S+"),
-]
+# ---- THE AXIS THIS FILTER DISCRIMINATES ON --------------------------------
+#
+# NOT "does this string contain a session hash, an ISO date, or a temp path".
+# Those are TOKENS, and every one of them occurs in genuinely durable facts:
+#
+#   "Session deadbeef is the stable OAuth replay fixture used to verify rotation"
+#   "Execute /migrate on 2027-01-15 only after the backup has completed"
+#   "CI must never run rm -rf /tmp/shared-cache -- concurrent jobs share it"
+#
+# The first version of this filter matched exactly those tokens and ate all
+# three. That is the same defect _lacks_specificity has, one layer over: it
+# measures specificity TOKENS rather than specificity. Widening a pattern set
+# cannot fix a discriminator that is pointed at the wrong quantity, and the
+# false positives a reviewer happens to find are a SAMPLE of that surface, not
+# its population.
+#
+# The property actually being filtered is:
+#
+#       does this content RECORD AN OCCURRENCE, or STATE A RULE?
+#
+# A record of one session, one command, one deletion is worthless months later.
+# A rule ABOUT sessions, commands or deletions is exactly what memory is for.
+#
+# So each check below is TWO-PART:
+#
+#   1. a SHAPE gate   -- "this content is about a session id / a slash-command
+#                         invocation / an ephemeral filesystem path"
+#   2. a GRAMMAR test -- "...and it reports an occurrence rather than stating
+#                         something that still holds"
+#
+# Shape alone is never a verdict. The burden of proof sits on the REJECT side,
+# because a false reject destroys real memory silently while reporting a
+# cleanliness win, whereas a false keep leaves one junk node behind. Every
+# element below is EARNED by a reject case pinned in
+# tests/recall/test_consolidate_noise.py; speculative additions can only widen
+# the over-rejection surface, so they are not made.
+
+# Positive evidence that content states something still in force: deontic
+# modality, quantification over occasions, conditional structure, hedged
+# tendency, product-change framing, or explicit rule vocabulary. A hit here
+# OUTRANKS every shape gate below -- this is the burden-of-proof asymmetry made
+# mechanical.
+#
+# THE MAINTENANCE RULE, and it is the whole reason this is split in two:
+#
+#   * ADDING to this keep-list needs no ceremony. Its worst case is that one
+#     junk node survives. Add a grammatical CLASS (a quantifier, a conditional,
+#     a modality), never a string lifted from one example -- fitting to
+#     individual sentences rebuilds the token filter this design replaces.
+#   * ADDING a reject shape below requires a pinned reject case FIRST. Its
+#     worst case is silent deletion of real memory, which nothing downstream
+#     can detect.
+#
+# The lists are therefore deliberately lopsided: three narrow reject shapes
+# against an open-ended keep vocabulary. That is the design, not an imbalance
+# to tidy up.
+_STANDING_RULE_RE = re.compile(
+    r"(?i)(?:"
+    # deontic modality -- what is permitted, required or forbidden
+    r"\b(?:must|should|shall|ought\s+to|has\s+to|have\s+to|may\s+not"
+    r"|cannot|can't|won't|never|always|forbidden|prohibited|require[sd]?"
+    r"|reserved|expected\s+to|supposed\s+to|allowed\s+to)\b"
+    # universal / negative quantification over occasions or instances
+    r"|\b(?:every|each|any|anything|anyone|all|none|nothing|neither|nor"
+    r"|ever|whenever|wherever)\b"
+    r"|\bno\s+(?:\w+\s+){0,2}(?:may|must|should|can|will|is|are)\b"
+    r"|\bno\s+permission\b"
+    # plain sentential negation. A negated deletion is the OPPOSITE of a
+    # deletion event ("the cache is not removed between runs"), and a filter
+    # hunting deletion events that cannot see negation reads every safety rule
+    # as the hazard it forbids.
+    r"|\bnot\b|n't\b"
+    # habitual frequency
+    r"|\b(?:nightly|hourly|daily|weekly|monthly|routinely|automatically)\b"
+    r"|\bper\s+\w+"
+    r"|\bby\s+default\b|\bdefaults?\s+to\b"
+    # conditional / restrictive structure -- a rule carrying its own scope
+    r"|\b(?:if|when|once|while|unless|until|only)\b"
+    r"|\bas\s+long\s+as\b|\bso\s+long\s+as\b|\bprovided\s+that\b"
+    r"|\b(?:at|on)\s+(?:boot|startup|shutdown)\b"
+    # explicit rule vocabulary
+    r"|\b(?:convention|policy|invariant|canonical)\b"
+    # HEDGED / EMPIRICAL TENDENCY. Calibrated observations are durable memory and
+    # carry no modal and no quantifier at all ("in practice /tmp/build-cache is
+    # removed within a second of a green build, but on the ARM runners the reaper
+    # is niced so heavily it can linger"). A modality-and-quantification-only
+    # override misfiles this whole class as episodic.
+    r"|\bin\s+practice\b|\b(?:usually|typically|generally|normally|often|rarely"
+    r"|seldom|routinely|occasionally)\b|\btends?\s+to\b|\b(?:can|may|might)\b"
+    # PRODUCT-CHANGE / DEPRECATION sense of the deletion verbs. "Support for the
+    # /tmp/legacy-scratch override was removed in agent 2.4" deletes a FEATURE,
+    # not a directory: the grammatical object of "removed" is "support", and the
+    # path only sits inside the noun phrase naming it. Shape 3 sees a path and a
+    # deletion verb co-occurring and cannot see that they are unrelated -- which
+    # is the same co-occurrence-without-relation defect as the token filter this
+    # design replaces, one level down. Without a parser the honest fix is to
+    # name the construction rather than pretend the relation is checked.
+    r"|\b(?:deprecated|superseded|retired|replacement)\b"
+    r"|\bno\s+longer\b|\bused\s+to\b"
+    r"|\bsupport\s+for\b|\bremoved\s+(?:in|upstream)\b|\bdropped\s+in\b"
+    # An interrogative is never a journal record. Bookkeeping asserts; a
+    # question that survived extraction is prose someone wrote to be answered.
+    r"|\?"
+    r")"
+)
+
+# ---- Shape 1: journal session record ---------------------------------------
+# "Session <hex-id>" where the id is a real session hash (6+ hex chars). NOT
+# "Session 30" / "Session v2" / "Session 7", where "session" is a domain noun
+# and the token is not a hash.
+_SESSION_ID_RE = re.compile(r"(?i)\bsession\s+[0-9a-f]{6,}\b")
+
+# The whole content is the id and a timestamp -- a two-field record with no
+# predicate about the world at all: "Session a1b2c3d4, 2020-01-02".
+_SESSION_RECORD_TUPLE_RE = re.compile(
+    r"(?i)^\W*session\s+[0-9a-f]{6,}"
+    r"(?:\s*[,;:-]?\s*(?:\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}(?::\d{2})?))*"
+    r"\W*$"
+)
+
+# The predicate is about the SESSION-AS-EVENT -- when it ran, how long, what it
+# was about -- rather than about anything in the world. Past tense throughout,
+# because that IS the axis: a present-tense predicate ("Session deadbeef uses
+# AES-GCM", "Session deadbeef is the replay fixture") states a standing property
+# of a thing that merely happens to be named with a hex id.
+_SESSION_EVENT_PREDICATE_RE = re.compile(
+    r"(?i)(?:\b(?:"
+    r"occurred|took\s+place|happened|began|ended|finished|"
+    r"lasted|concluded|focused|focussed|was\s+about|was\s+spent"
+    # journal-row vocabulary: the fields a session log actually carries. These
+    # are safe INSIDE the id shape gate in a way they would never be outside it
+    # -- "Focus: visible focus rings are required" is a durable accessibility
+    # rule and reaches this predicate only if it also names a session hash.
+    r"|stated\s+focus|focus\s+for|duration|spanned|elapsed"
+    r"|attendance|closing\s+summary|start\s+time|end\s+time"
+    r")\b"
+    r"|\bfrom\s+\d{4}-\d{2}-\d{2}"
+    r"|\bdated\s+\d{4}-\d{2}-\d{2})"
+)
+
+
+def _is_session_record(content: str) -> bool:
+    """Shape 1: a journal record of one session, not a fact about a session."""
+    if not _SESSION_ID_RE.search(content):
+        return False
+    return bool(
+        _SESSION_RECORD_TUPLE_RE.match(content)
+        or _SESSION_EVENT_PREDICATE_RE.search(content)
+    )
+
+
+# ---- Shape 2: slash-command invocation log ---------------------------------
+# "Execute `/clear` command on 2020-01-02" -- a transcript echo of one command
+# run once. The slash token must be a COMMAND, not a path segment, so it is
+# required not to be followed by another "/" and "/tmp" is excluded outright.
+_SLASH_COMMAND_RE = re.compile(r"(?i)(?:^|[\s`'\"(\[])/(?!tmp\b)\w[\w-]*(?![/\w])")
+_EXECUTION_VERB_RE = re.compile(
+    r"(?i)\b(?:execute[ds]?|executing|ran|run|invoked|issued|command)\b"
+)
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _is_command_invocation_log(content: str) -> bool:
+    """Shape 2: a slash-command echo bound to a date, with no standing structure.
+
+    The DATE is part of the shape gate, not the discriminator -- "Execute
+    /migrate on 2027-01-15 only after the backup completes" is a future-dated
+    durable instruction and is kept by the standing-rule override above.
+    """
+    return bool(
+        _SLASH_COMMAND_RE.search(content)
+        and _EXECUTION_VERB_RE.search(content)
+        and _ISO_DATE_RE.search(content)
+    )
+
+
+# ---- Shape 3: one-off execution event against an ephemeral path ------------
+# Cross-platform on purpose. recall is public and runs on POSIX, macOS and
+# Windows; a /tmp-only pattern passes the byte-identical Windows event
+# ("...\AppData\Local\Temp\scratch-run ... removed with Remove-Item"), which
+# would make the stated class narrower than the claim made for it.
+#
+# The leading boundary group is load-bearing, not decoration: without it
+# "/tmp/" matches as a SUBSTRING of an unrelated durable path such as
+# /var/lib/nginx/tmp/client_body, which is a stable server directory and not a
+# scratch tree at all. Anchoring to a real path start is the difference between
+# "this content names an ephemeral location" and "these six characters occur".
+_EPHEMERAL_PATH_RE = re.compile(
+    r"(?i)(?:^|[\s'\"`(\[=])(?:"
+    r"/tmp/\S+"                                # POSIX
+    r"|/var/folders/\S+"                       # macOS per-user temp
+    r"|\$TMPDIR\S*|%TEMP%\S*|%TMP%\S*"         # env-var forms
+    r"|[a-z]:\\(?:[^\\\s]+\\)*Temp\\\S+"       # Windows ...\Local\Temp\...
+    r")"
+)
+_DELETION_RE = re.compile(
+    r"(?i)(?:\brm\s+-[rf]{1,2}\b|\bRemove-Item\b|\brmdir\b"
+    r"|\b(?:wiped|deleted|removed|purged|cleared|unlinked)\b)"
+)
+
+
+def _is_ephemeral_execution_event(content: str) -> bool:
+    """Shape 3: a deletion against a scratch path, with no standing structure.
+
+    "The /tmp/build-cache directory is removed only after artifact upload
+    succeeds" carries the same two tokens and is a lifecycle RULE; the
+    standing-rule override above keeps it.
+    """
+    return bool(
+        _EPHEMERAL_PATH_RE.search(content) and _DELETION_RE.search(content)
+    )
 
 
 def _is_metadata_noise(content: str) -> bool:
-    """Return True if *content* is session/command bookkeeping or a one-off
-    execution event dressed up as a durable fact.
+    """Return True if *content* RECORDS AN OCCURRENCE -- one session, one command
+    invocation, one deletion -- rather than stating something that still holds.
 
-    HONEST LIMITATION: this is a shape-based backstop. A model that rewords a
-    transient event into novel declarative prose can slip past any fixed pattern
-    set, so a low rejection count is NOT evidence of clean output -- verify
-    quality by READING nodes, never by this filter's own counter, which is
-    circular.
+    See the axis note above ``_STANDING_RULE_RE`` for why this is not a keyword
+    or token filter, and why the burden of proof sits on the reject side.
+
+    HONEST LIMITATIONS, in the order they will bite:
+
+    1. Grammar is approximated LEXICALLY, with no parser, so the keep-override
+       cannot tell quantification over OCCASIONS ("every schema upgrade") from
+       quantification INSIDE ONE occasion ("every entry logged during session
+       5517903"). The second is bookkeeping and is KEPT.
+
+       MEASURED, on an adversarial corpus built to exploit exactly this: of 14
+       bookkeeping items falling inside the three shapes, 8 are rejected and 6
+       survive -- and all 6 survivors carry a modal or quantifier scoped to a
+       single episode. That is the accepted cost, not a gap to close by
+       demoting the override: making a session-event predicate outrank it was
+       tried and measured, and it bought 4 more rejections at the price of
+       deleting 5 durable facts, including "time to first byte is measured from
+       the edge log line where session 9c4e1f occurred, never from the client
+       clock". Deleting five real memories to catch four junk nodes is the
+       wrong side of the trade, so the override keeps its precedence.
+    2. A model that rewords a transient event into rule-shaped declarative prose
+       slips past any fixed pattern set. So a low rejection count is NOT evidence
+       of clean output -- verify quality by READING nodes, never by this filter's
+       own counter, which is circular.
+    3. The three shapes are the ones this layer has observed. Content that is
+       bookkeeping in some fourth shape is not covered, and adding a shape
+       requires a pinned reject case first.
 
     Note on where the primary defence belongs: suppressing this class at the
     PROMPT is strictly better than filtering it after the fact, but recall no
@@ -499,10 +703,15 @@ def _is_metadata_noise(content: str) -> bool:
     produced_by and capabilities. So until that forbid-list exists upstream,
     this filter is the sole defence at this layer rather than a second one.
     """
-    for pattern in _METADATA_NOISE_PATTERNS:
-        if pattern.search(content):
-            return True
-    return False
+    # A rule that still holds is not bookkeeping, whatever tokens it carries.
+    # Checked FIRST, and it outranks every shape below.
+    if _STANDING_RULE_RE.search(content):
+        return False
+    return (
+        _is_session_record(content)
+        or _is_command_invocation_log(content)
+        or _is_ephemeral_execution_event(content)
+    )
 
 
 # Pattern for section header prefixes that 3B models inject before content:
@@ -566,6 +775,10 @@ def _create_content_passes_filters(
     ``action == "create"`` so corroborate/contradict keep their exact prior behavior
     (contamination-checked, generic/specificity/garbled-exempt).
 
+    ``_is_metadata_noise`` is the second UNCONDITIONAL check, for the reason spelled out at
+    its call site below: ``is_create`` is the model's action LABEL, not a statement about
+    whether this path lets the candidate become, replace, or corroborate knowledge.
+
     Assumes *content* is ALREADY normalized (``_normalize_create_content``) and non-empty —
     callers run that + the empty check themselves (B3 already does, unconditionally, for
     every action, not just create; see ``_evaluate_create_content`` for B4's full pipeline).
@@ -594,8 +807,31 @@ def _create_content_passes_filters(
         logger.info("Rejected garbled node: %s", content[:80])
         return False
 
-    if is_create and _is_metadata_noise(content):
-        logger.info("Rejected metadata-noise node: %s", content[:80])
+    # UNCONDITIONAL, unlike its three neighbours above, and deliberately so.
+    #
+    # ``is_create`` names the action the MODEL chose for this candidate. It does
+    # NOT name whether this code path lets the candidate's text become knowledge,
+    # and those are independent: the create fallthroughs below reach
+    # ``action = "create"`` only AFTER this function has already run with
+    # ``is_create=False``, so a missing corroborate/contradict target persists the
+    # candidate verbatim through a gate that declined to look at it. Legacy
+    # (no-DB) contradiction persists it as the new ACTIVE node; DB contradiction
+    # queues it as ``new_content``; corroborate-with-target lets it raise a real
+    # node's confidence as if it were evidence.
+    #
+    # Gating a CONTENT-QUALITY property on a ROUTING label is the category error,
+    # so the fix is to drop the condition rather than repeat the check on each
+    # branch -- one gate that cannot be routed around beats four that can.
+    #
+    # The three neighbours stay create-only on purpose: specificity and
+    # genericness are judged against creation, and contradictions legitimately
+    # reference existing project-specific nodes (see the explicit
+    # ``_is_generic_node`` re-check in the contradict branch). Bookkeeping is
+    # different in kind -- content that must never BECOME knowledge must also
+    # never REPLACE it or COUNT AS EVIDENCE for it, whichever action the model
+    # picked. Consistency with the neighbours is not a reason here.
+    if _is_metadata_noise(content):
+        logger.info("Rejected metadata-noise node (action-independent): %s", content[:80])
         return False
     return True
 
