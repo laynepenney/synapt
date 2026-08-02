@@ -25,6 +25,13 @@ def _make_gripspace(tmp_path: Path) -> Path:
     return grip
 
 
+def _make_gr2_workspace(tmp_path: Path) -> Path:
+    """Create the marker shared by every gr2-managed workspace."""
+    workspace = tmp_path / "gr2-workspace"
+    (workspace / ".grip").mkdir(parents=True)
+    return workspace
+
+
 def _make_git_repo(parent: Path, name: str) -> Path:
     """Create a directory that looks like a git repo."""
     repo = parent / name
@@ -54,6 +61,24 @@ class TestFindGripspaceRoot:
         deep = grip / "repo" / "src" / "pkg"
         deep.mkdir(parents=True)
         assert _find_gripspace_root(deep) == grip
+
+    def test_finds_gr2_workspace_from_spawned_unit_home(self, tmp_path):
+        workspace = _make_gr2_workspace(tmp_path)
+        unit_home = workspace / "units" / "u_one" / "home"
+        unit_home.mkdir(parents=True)
+
+        assert _find_gripspace_root(unit_home) == workspace
+
+    def test_gr2_units_share_the_workspace_recall_root(self, tmp_path):
+        workspace = _make_gr2_workspace(tmp_path)
+        first = workspace / "units" / "u_one" / "home"
+        second = workspace / "units" / "u_two" / "home"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+
+        expected = workspace / ".synapt" / "recall"
+        assert project_data_dir(first) == expected
+        assert project_data_dir(second) == expected
 
     def test_returns_none_outside_gripspace(self, tmp_path):
         # No .gitgrip anywhere under tmp_path
