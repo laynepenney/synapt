@@ -162,10 +162,20 @@ class TestIsMetadataNoiseKeeps(unittest.TestCase):
         # unanchored "/tmp/" matches it as a SUBSTRING -- the ephemeral-path
         # shape has to anchor to a real path start or it fires on any path with
         # a "tmp" component.
+        #
+        # DELIBERATELY MARKER-FREE. The natural way to write this fixture ("...
+        # removed by nginx itself ONCE a request completes") carries a
+        # conditional, so the standing-rule override rescues it and the
+        # assertion holds whether or not the anchor exists -- it would pass
+        # against the very bug it names. Mutating the anchor away was run and
+        # left this test green until the marker was removed. A precision control
+        # has to fail for the reason it claims, so every keep-marker is stripped
+        # and the anchor is the ONLY thing standing between this string and
+        # deletion.
         self.assertFalse(_is_metadata_noise(
-            "Files in /var/lib/nginx/tmp/client_body are removed by nginx itself "
-            "once a request completes, so a cron sweeper pointed at that directory "
-            "will race the worker and produce spurious 400s"))
+            "Files in /var/lib/nginx/tmp/client_body are removed by the worker "
+            "process itself, immediately after the response body is flushed to "
+            "the client socket"))
 
     def test_keeps_deprecation_sense_of_removed(self):
         # "removed" here deletes a FEATURE, not a directory: the object of the
