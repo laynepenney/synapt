@@ -4245,13 +4245,14 @@ _GRIPSPACE_CACHE_TTL = 60.0  # seconds
 
 
 def _find_gripspace_root(path: Path) -> Path | None:
-    """Walk up from *path* to find the GitGrip **gripspace root**.
+    """Walk up from *path* to find the gr1 or gr2 workspace root.
 
     Returns the gripspace root path, or *None* if not inside a gripspace.
     Analogous to ``_git_main_worktree_root`` but for multi-repo gripspaces.
 
-    Distinguishes between a **gripspace root** (has ``.gitgrip/griptrees.json``)
-    and a **linked griptree** (has ``.gitgrip/griptree.json`` — singular).
+    A gr2 workspace is marked by ``.grip/``. For gr1, distinguishes between a
+    **gripspace root** (has ``.gitgrip/griptrees.json``) and a **linked
+    griptree** (has ``.gitgrip/griptree.json`` — singular).
     When a linked griptree is found, resolves back to the gripspace root via
     the git worktree pointer in any sub-repo.
 
@@ -4272,6 +4273,13 @@ def _find_gripspace_root(path: Path) -> Path | None:
 
     home = Path.home().resolve()
     while current != current.parent:
+        # gr2 owns one .grip/ namespace at the workspace root. Spawned units
+        # live beneath it, so recognizing that marker makes their shared index
+        # and knowledge land at the containing workspace instead of at each
+        # unit cwd. This composes with the existing gr1 detector below.
+        if (current / ".grip").is_dir():
+            _gripspace_cache[cache_key] = (current, time.monotonic())
+            return current
         gitgrip = current / ".gitgrip"
         if gitgrip.is_dir():
             # Linked griptree has griptree.json (singular) — always resolve
