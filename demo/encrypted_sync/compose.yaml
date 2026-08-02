@@ -1,0 +1,63 @@
+services:
+  agent-a:
+    build:
+      context: ../..
+      dockerfile: demo/encrypted_sync/Dockerfile
+    command: ["sleep", "infinity"]
+    working_dir: /workspace
+    networks: [agent_a_relay]
+    volumes: [agent_a_data:/workspace]
+    secrets: [team_identity]
+    depends_on:
+      relay:
+        condition: service_healthy
+
+  agent-b:
+    build:
+      context: ../..
+      dockerfile: demo/encrypted_sync/Dockerfile
+    command: ["sleep", "infinity"]
+    working_dir: /workspace
+    networks: [agent_b_relay]
+    volumes: [agent_b_data:/workspace]
+    secrets: [team_identity]
+    depends_on:
+      relay:
+        condition: service_healthy
+
+  relay:
+    build:
+      context: ../..
+      dockerfile: demo/encrypted_sync/Dockerfile
+    command:
+      - python
+      - -m
+      - demo.encrypted_sync.relay
+      - --store
+      - /relay-data
+    networks: [agent_a_relay, agent_b_relay]
+    volumes: [relay_data:/relay-data]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=2)"
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+networks:
+  agent_a_relay:
+    internal: true
+  agent_b_relay:
+    internal: true
+
+volumes:
+  agent_a_data:
+  agent_b_data:
+  relay_data:
+
+secrets:
+  team_identity:
+    file: ${SYNAPT_TEAM_IDENTITY_FILE:-./.state/team-identity.txt}
