@@ -30,6 +30,7 @@ from synapt.recall.consolidate import (
     _is_metadata_noise,
     _has_unsplit_boundary_residue,
     _lacks_specificity,
+    _PROPOSITION_SPLIT_RE,
     _split_into_propositions,
 )
 from synapt.recall.journal import JournalEntry
@@ -561,6 +562,139 @@ class TestEverySentencePunctuationAndClosingGlyphSplits(unittest.TestCase):
                     len(_split_into_propositions(content)), 2,
                     "this closing character is not absorbed by the "
                     "sentence-punctuation rule")
+
+
+def _count_top_level_alternation_branches(pattern: str) -> int:
+    """Count the alternation branches at the depth of the OUTERMOST group.
+
+    Deliberately reads the compiled pattern rather than a hand-maintained list.
+    See TestEveryBranchOfTheSplitterHasARow for why that distinction is the
+    whole point of this helper.
+    """
+    depth = 0
+    target_depth = None
+    branches = 1
+    i = 0
+    while i < len(pattern):
+        char = pattern[i]
+        if char == "\\":
+            i += 2
+            continue
+        if char == "[":                      # character class: | inside is literal
+            i += 1
+            while i < len(pattern) and pattern[i] != "]":
+                i += 2 if pattern[i] == "\\" else 1
+        elif char == "(":
+            depth += 1
+            if target_depth is None:
+                target_depth = depth
+        elif char == ")":
+            depth -= 1
+        elif char == "|" and depth == target_depth:
+            branches += 1
+        i += 1
+    return branches
+
+
+class TestEveryBranchOfTheSplitterHasARow(unittest.TestCase):
+    """One split-asserting row per branch of the splitter, with the BRANCH COUNT
+    itself asserted against the compiled pattern.
+
+    WHY THE COUNT IS AN ASSERTION AND NOT A COMMENT. The previous round closed
+    what looked like the last open space: six literal word alternatives, six
+    rows, none unaccounted. That enumeration was complete -- over LITERAL word
+    alternatives. The participial branch is a word-FORM branch, `\\w+ing`, and it
+    sat outside the category while looking like a member of it. Deleting it left
+    the whole spec green.
+
+    So the enumeration was true of the space AS DRAWN, and the space was drawn
+    one member short. That is the failure mode of an exhaustiveness claim, and
+    it is not the one anyone was guarding against: we checked whether the
+    enumeration covered its category and nobody checked whether the CATEGORY
+    covered the mechanism. A boundary is chosen by the same understanding that
+    missed the gap, which is why a claim of completeness cannot be verified by
+    the person drawing the boundary.
+
+    The remedy is to stop drawing it. This class derives its obligation from the
+    SPLITTER'S OWN ALTERNATION: count the top-level branches in the compiled
+    pattern, and require exactly one row per branch. A seventh branch added
+    later fails this spec until someone gives it a row -- the enumeration is now
+    closed against the CODE rather than against a human's idea of the category,
+    and it stays closed without anyone remembering to re-draw it.
+
+    ------------------------------------------------------------------------
+    UNFINISHED: THIS PATTERN IS DONE, THREE OTHERS ARE NOT. READ THIS FIRST.
+    ------------------------------------------------------------------------
+
+    THE DIAGNOSIS, which is what makes the remaining work obvious rather than
+    open-ended. Witnesses in this file were historically written PER BEHAVIOUR;
+    degrees of freedom live PER PATTERN. Those two do not line up. A test set
+    that is complete over behaviours can therefore leave an arbitrary number of
+    pattern DOFs unpinned, and only a mutation sweep finds them. Five rounds of
+    review found that same class at five granularities -- branch, glyph,
+    quantifier, word-alternative, and regex-internal grammar -- because each
+    round pinned the DOFs someone happened to sweep. It is a units mismatch, not
+    a carelessness story, which is why more care never closed it.
+
+    THIS CLASS IS THE WORKING EXAMPLE of the fix, proven in both directions:
+    deleting a branch reds only its row, and adding an unwitnessed branch reds
+    the count assertion. Apply the same shape to the three patterns below.
+
+      _SESSION_RECORD_TUPLE_RE  -- DOFs are its separator character class, the
+          optional-ness of the separator, each timestamp alternative
+          (YYYY-MM-DD, HH:MM, the optional :SS), and the repetition allowing
+          zero, one or many timestamp fields. A reviewer found five of these
+          mutable with the whole spec green. NOTE: whether a BARE ID with zero
+          timestamp fields should bypass at all is an OPEN CONTRACT QUESTION,
+          not a coverage gap -- the regex accepts it while the source prose says
+          "an id and a timestamp". Do not pin it until that is ruled on.
+      _BOUNDARY_RESIDUE_RE      -- DOFs are its two alternatives, the closing
+          character class, and the quantifier on that class.
+      _EPHEMERAL_PATH_RE        -- DOFs are its platform alternatives and the
+          leading boundary group. The platform alternatives already have rows in
+          TestEveryEphemeralPathBranchIsPinned; what is missing is the COUNT
+          ASSERTION tying that row set to the pattern's own structure.
+
+    THE COUNT ASSERTION IS THE LOAD-BEARING PART. Rows alone close the DOFs that
+    exist today; the count is what makes a NEW DOF fail the spec until someone
+    pins it. Without it this is one refactor away from starting over, and the
+    class reopens in whatever pattern nobody swept.
+    """
+
+    OCC = "Session deadbeef concluded the migration from SHA-1 to SHA-256"
+    RES = "production rejects SHA-1 signatures across API endpoints"
+
+    # One entry per top-level branch of _PROPOSITION_SPLIT_RE, in pattern order.
+    BRANCH_ROWS = {
+        "semicolon": "; ",
+        "sentence punctuation": ". ",
+        "newline": "\n",
+        "dash family": " — ",
+        "relative or causal comma": ", because ",
+        # The branch the literal-word enumeration did not cover. NOTE THE
+        # FIXTURE CARRIES NO `and`: with one, a later coordination split creates
+        # an unknown clause and the string keeps for the WRONG REASON, passing
+        # the row while this branch is deleted.
+        "participial comma": ", exposing a defect in ",
+        "coordination": " and ",
+    }
+
+    def test_the_row_set_matches_the_compiled_branch_count(self):
+        actual = _count_top_level_alternation_branches(_PROPOSITION_SPLIT_RE.pattern)
+        self.assertEqual(
+            actual, len(self.BRANCH_ROWS),
+            f"the splitter has {actual} top-level branches and this class has "
+            f"{len(self.BRANCH_ROWS)} rows. A branch without a row is a claim "
+            f"without a witness; add the row rather than adjusting this count.")
+
+    def test_each_branch_separates_an_occurrence_from_its_residue(self):
+        for name, joiner in self.BRANCH_ROWS.items():
+            with self.subTest(branch=name):
+                content = f"{self.OCC}{joiner}{self.RES}"
+                self.assertGreater(
+                    len(_split_into_propositions(content)), 1,
+                    "this branch is not splitting")
+                self.assertFalse(_is_metadata_noise(content))
 
 
 class TestEveryWordBranchSplits(unittest.TestCase):
