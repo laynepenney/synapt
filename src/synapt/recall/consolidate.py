@@ -933,11 +933,19 @@ def _is_metadata_noise(content: str) -> bool:
            contract even though the content is a journal row. Note this is
            NOT the reported-position case: "focused on what should happen next"
            mentions the modal inside a complement and is correctly rejected.
-       (d) MULTI-SENTENCE PURE BOOKKEEPING with an internal colon. "Focus: Run
-           this exact shell command and report its exit code: rm -rf
-           /tmp/scratch-run-00000" is genuine junk and now survives, because a
-           colon with material after it inside a class-B clause is exactly the
-           residue signal, and demotion keeps.
+       (d) BOOKKEEPING WHOSE COLON-BEARING CLAUSE IS NOT AN ANCHORED WHOLE-
+           STRING TUPLE. "Focus: Run this exact shell command and report its
+           exit code: rm -rf /tmp/scratch-run-00000" is genuine junk and
+           survives, because a colon with material after it inside a class-B
+           clause is the residue signal, and demotion keeps.
+
+           THE QUALIFIER IS LOAD-BEARING and this limitation was briefly
+           written without it. "Multi-sentence bookkeeping with an internal
+           colon" would also describe "Session deadbeef: 2026-08-01", which
+           the anchored-tuple bypass REJECTS. A limitation section describes
+           what the code cannot do, so it goes stale in the direction of
+           UNDERSTATING the code -- harmless for a user, misleading for a
+           reviewer, who reads it as the current failure set.
 
            This is the PRICE OF DELETING the conditional colon split, paid
            deliberately and ratified in review. That guard was proven wrong in

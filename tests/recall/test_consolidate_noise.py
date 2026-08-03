@@ -525,6 +525,34 @@ class TestEverySentencePunctuationAndClosingGlyphSplits(unittest.TestCase):
                     "would still keep the string, so a verdict assertion here "
                     "would pass over a missing boundary")
 
+    def test_a_RUN_of_stacked_closers_is_absorbed(self):
+        # THE QUANTIFIER IS ITSELF A CLAIM. The rule absorbs closers with `*`,
+        # meaning arbitrarily many -- but every row above supplies exactly ONE,
+        # so `*` could be weakened to `?` with all 59 tests and 55 subtests
+        # staying green. Under that mutant an occurrence followed by stacked
+        # `.")` and a durable residue stays FUSED, and the residue fallback
+        # masks the verdict so nothing reds.
+        #
+        # Evidence about one is not evidence about many. This is the same
+        # unpinned-claim defect found at the glyph level and the branch level,
+        # now at the level of a repetition operator.
+        for name, closers in {
+            "quote then paren": '")',
+            "quote then bracket": '"]',
+            "curly quote then paren": "”)",
+            "three stacked": "\"')",
+            # A reviewer's own fixture, and the strongest of the set: a MIXED
+            # run exercises the quantifier and the character class at once, so
+            # one row covers both claims rather than assuming the other holds.
+            "mixed run, quote paren bracket": '")]',
+        }.items():
+            with self.subTest(closers=name):
+                content = f"{self.OCC}.{closers} {self.RES}"
+                self.assertEqual(
+                    len(_split_into_propositions(content)), 2,
+                    "a run of closers was not absorbed; the residue detector "
+                    "would still keep this, so only a split assertion can see it")
+
     def test_each_closing_character_is_absorbed_after_a_terminator(self):
         for name, closer in self.CLOSERS.items():
             with self.subTest(closer=name):
