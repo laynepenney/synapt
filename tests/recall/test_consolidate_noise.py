@@ -28,6 +28,7 @@ from synapt.recall.consolidate import (
     _is_garbled_content,
     _is_generic_node,
     _is_metadata_noise,
+    _has_unsplit_boundary_residue,
     _lacks_specificity,
     _split_into_propositions,
 )
@@ -54,8 +55,28 @@ class TestIsMetadataNoiseRejects(unittest.TestCase):
         self.assertTrue(_is_metadata_noise("Execute `/clear` command on 2020-01-02"))
         self.assertTrue(_is_metadata_noise("Execute `/exit` command on 2020-01-03"))
 
-    def test_rejects_raw_focus_command_echo(self):
-        self.assertTrue(_is_metadata_noise(
+    def test_a_multi_colon_command_echo_is_now_a_DOCUMENTED_FALSE_KEEP(self):
+        # THIS TEST ASSERTED THE OPPOSITE UNTIL ROUND 6, AND THE CHANGE IS
+        # RATIFIED RATHER THAN CONCEDED.
+        #
+        # This string is genuine bookkeeping and it now survives. It carries a
+        # colon with material after it INSIDE a clause that would otherwise be
+        # class B, which is exactly the signal that says the segmenter may have
+        # missed a proposition boundary -- so the clause is demoted to unknown,
+        # and unknown keeps.
+        #
+        # The alternative was retaining a conditional colon-split rule that a
+        # reviewer proved wrong in BOTH directions: it refused to split
+        # lowercase prose after a colon (deleting a durable production
+        # invariant) and it DID split a plural noun read as a finite verb
+        # (rescuing pure bookkeeping). Trading one junk node for a class of
+        # silent deletions is the wrong side of the asymmetry, and the reviewer
+        # said so explicitly: "do not preserve three reject counts by retaining
+        # a discriminator that demonstrably deletes durable clauses."
+        #
+        # Recorded here as a limitation, not left to be rediscovered as a
+        # regression. See limitation (d) in the _is_metadata_noise docstring.
+        self.assertFalse(_is_metadata_noise(
             "Focus: Run this exact shell command and report its exit code: "
             "rm -rf /tmp/scratch-run-00000"))
 
@@ -372,9 +393,19 @@ class TestEveryClaimedPropositionBoundarySplits(unittest.TestCase):
         # deleted. That is the same defect as an unpinned platform branch,
         # committed inside the test written to prevent it.
         "bare newline": "\n",
-        "colon": ": ",
         "em dash": " — ",
+        # Closing quotes are absorbed by the sentence-punctuation rule. This row
+        # asserts the SPLIT, not merely the keep: without it the residue
+        # detector still rescues this string by demotion, so removing quote
+        # absorption from the split pattern would change no observable outcome
+        # and the claim would sit unpinned behind a mechanism that happens to
+        # cover for it. The clause-count assertion below is what isolates it.
+        "period then closing quote": '." ',
     }
+    # The COLON is deliberately absent from this table as of round 6. It is no
+    # longer a split at all; a residue-bearing colon reaches the same outcome by
+    # DEMOTION instead, which the next test pins. Leaving it here would claim a
+    # mechanism the code does not have.
 
     def test_a_residue_across_each_boundary_survives_the_real_pipeline(self):
         for name, sep in self.SEPARATORS.items():
@@ -390,6 +421,36 @@ class TestEveryClaimedPropositionBoundarySplits(unittest.TestCase):
                 self.assertIsNotNone(
                     _evaluate_create_content(content),
                     "the durable production invariant is deleted at the real seam")
+
+    def test_a_colon_reaches_the_same_outcome_by_demotion_not_by_splitting(self):
+        # Round 6 deleted the conditional colon split after a reviewer proved
+        # the condition wrong in BOTH directions with one probe each. A colon
+        # now survives as a RESIDUE signal: it demotes the clause to unknown,
+        # and unknown keeps. Same outcome for the durable case, reached by a
+        # mechanism that cannot false-split a plural noun into a finite verb.
+        for name, content in {
+            "capitalised subject after the colon": (
+                "Session deadbeef concluded the migration from SHA-1 to SHA-256: "
+                "Production rejects SHA-1 signatures across API endpoints."),
+            # This one is the reason the guard had to go: lowercase prose after
+            # a colon is ordinary, the old capital guard refused to split it,
+            # and the real pipeline deleted a durable production invariant.
+            "lowercase prose after the colon": (
+                "Session deadbeef concluded the migration from SHA-1 to SHA-256: "
+                "production rejects SHA-1 signatures across API endpoints."),
+        }.items():
+            with self.subTest(case=name):
+                self.assertFalse(_is_metadata_noise(content))
+                self.assertIsNotNone(_evaluate_create_content(content))
+
+    def test_a_plural_noun_after_a_colon_no_longer_rescues_bookkeeping(self):
+        # The other direction the old guard failed. "records" satisfies a
+        # finite-verb approximation while being a plural NOUN, so the colon
+        # split a reported topic into an asserted-looking fragment and rescued
+        # pure session bookkeeping. With no colon split, it stays bookkeeping.
+        self.assertTrue(_is_metadata_noise(
+            "Session deadbeef focused on the production incident archive: "
+            "Production records from the incident"))
 
     def test_a_colon_introducing_a_label_complement_is_not_a_boundary(self):
         # The other half of the colon rule, and the reason it is conditional.
@@ -421,6 +482,151 @@ class TestEveryClaimedPropositionBoundarySplits(unittest.TestCase):
                     first_word_after_colon, starts,
                     "the colon was treated as a proposition boundary; the label's "
                     "complement was stranded as its own clause")
+
+
+class TestResidueDemotionIsOneDirectionalAndDownstream(unittest.TestCase):
+    """The residue detector: when boundary-shaped material remains inside a
+    clause about to be called B, the clause is demoted to unknown, and unknown
+    keeps.
+
+    It exists because the set of punctuation forms that can separate two
+    propositions has no bound a lexical layer can enumerate. Reviewers produced
+    closing quotes, U+2015, a closed em dash, non-Latin capitals and lowercase
+    prose after a colon, and there is no reason to think that list is finished.
+    Chasing forms one at a time is a race with no finish line where every miss
+    deletes a durable fact silently; this makes segmentation failure fail-open
+    in the direction the contract already chose.
+    """
+
+    def test_a_clean_class_B_clause_with_no_residue_still_rejects(self):
+        # THE CONTROL THAT STOPS THE DETECTOR BEING A BLANKET DEMOTION. Without
+        # it, a mechanism that demoted EVERY clause would satisfy every keep
+        # case in this file and look like a triumph.
+        for name, content in {
+            "bare tuple": "Session a1b2c3d4, 2020-01-02",
+            "occurrence predicate": (
+                "Session beef1234 occurred on 2020-01-02 with focus on clearing "
+                "a command"),
+            "dated command echo": "Execute `/clear` command on 2020-01-02",
+        }.items():
+            with self.subTest(case=name):
+                self.assertFalse(
+                    _has_unsplit_boundary_residue(content),
+                    "clean class-B content must carry no residue signal")
+                self.assertTrue(_is_metadata_noise(content))
+
+    def test_residue_only_ever_turns_a_reject_into_a_keep(self):
+        # One-directional by construction: the detector is consulted ONLY on the
+        # class-B branch. A clause that was already going to keep cannot be
+        # pushed into a reject by it, whatever residue it carries.
+        already_keeps = "The indexer consumes the tokenizer package as of 2020-01-02"
+        self.assertFalse(_is_metadata_noise(already_keeps))
+        self.assertFalse(_is_metadata_noise(already_keeps + ": And more prose."))
+
+    def test_the_detector_runs_downstream_of_segmentation_not_as_a_pre_scan(self):
+        # A pre-scan over the RAW string would see boundaries the segmenter
+        # would have split cleanly and demote content that was never at risk.
+        # This string has a semicolon the segmenter handles perfectly; both
+        # resulting clauses are clean, so nothing is demoted and the verdict
+        # comes from the clause classes rather than from raw punctuation.
+        # Both clauses carry a predicate on purpose: a bare "Session <id>, <date>"
+        # tuple is verbless by construction and would be folded back into its
+        # neighbour, which would test the fold rather than the pre-scan question.
+        content = ("Session beef1234 occurred on 2020-01-02; "
+                   "Session cafe5678 occurred on 2020-01-03")
+        self.assertEqual(len(_split_into_propositions(content)), 2)
+        for clause in _split_into_propositions(content):
+            self.assertFalse(_has_unsplit_boundary_residue(clause))
+        self.assertTrue(
+            _is_metadata_noise(content),
+            "two clean class-B clauses must still reject; a pre-scan would have "
+            "seen the semicolon in the raw string and wrongly demoted this")
+
+
+class TestNonAsciiClausesAreNotFoldedBackIntoOccurrences(unittest.TestCase):
+    """The verbless-fold heuristic reads ASCII suffixes, so it must not judge
+    text it cannot read.
+
+    A reviewer's Greek probe kept fusing back into its occurrence clause and the
+    SPLITTER was innocent -- it split correctly and the FOLD undid it. Any
+    non-Latin clause looks verbless to a -ed/-ing/-s test, gets folded backwards,
+    and its durable residue is deleted with the occurrence. The ASCII assumption
+    sat one layer below the [A-Z] guards that were being examined.
+    """
+
+    def test_a_non_latin_residue_clause_stands_on_its_own(self):
+        content = ("Session deadbeef concluded the migration from SHA-1 to "
+                   "SHA-256. Παραγωγή απορρίπτει SHA-1.")
+        self.assertEqual(len(_split_into_propositions(content)), 2,
+                         "the non-Latin clause was folded back into the occurrence")
+        self.assertFalse(_is_metadata_noise(content))
+        self.assertIsNotNone(_evaluate_create_content(content))
+
+    def test_an_ascii_verbless_fragment_is_still_folded(self):
+        # The control. Folding is correct for ASCII noun coordination -- without
+        # it, "the first and last recorded events" strands a verbless fragment
+        # that keeps a journal row alive.
+        self.assertTrue(_is_metadata_noise(
+            "The duration between the first and last recorded events of session "
+            "e91b6d3a spanned just under two hours on the evening of 2024-03-22."))
+
+
+class TestEveryDashGlyphIsPinnedSeparately(unittest.TestCase):
+    """One witness per dash glyph, and per spacing form.
+
+    Reviewer finding: the en dash and the double hyphen were each removable from
+    the pattern with all 46 tests and 26 subtests staying green. Both were
+    pristine survivors behind a single em-dash witness -- the same
+    one-witness-for-many-claims collapse found in the platform branches, and it
+    was read as a nit by two people before being proved a blocker.
+    """
+
+    OCC = "Session deadbeef concluded the migration from SHA-1 to SHA-256"
+    RES = "Production rejects SHA-1 signatures across API endpoints."
+
+    GLYPHS = {
+        "em dash spaced": " — ",
+        "em dash CLOSED": "—",          # the common form; it false-rejected before
+        "en dash spaced": " – ",
+        "U+2015 horizontal bar": " ― ",
+        "U+2012 figure dash": " ‒ ",
+        "double hyphen spaced": " -- ",
+    }
+
+    def test_each_dash_form_separates_an_occurrence_from_its_residue(self):
+        for name, glyph in self.GLYPHS.items():
+            with self.subTest(dash=name):
+                content = f"{self.OCC}{glyph}{self.RES}"
+                self.assertGreater(len(_split_into_propositions(content)), 1)
+                self.assertFalse(_is_metadata_noise(content))
+                self.assertIsNotNone(_evaluate_create_content(content))
+
+
+class TestCoordinatorsSplitRegardlessOfCase(unittest.TestCase):
+    """Locally scoped case-insensitivity on the word branches.
+
+    A pattern-wide (?i) was dropped so `[A-Z]` guards would work, and it
+    silently made the PRE-EXISTING coordinator and relative branches
+    case-sensitive too -- so generated prose that capitalised "AND" or "Which"
+    stopped splitting and the durable residue behind it was deleted. Disclosed
+    as benign; proved concrete by both reviewers.
+    """
+
+    def test_uppercase_and_capitalised_coordinators_still_split(self):
+        for name, content in {
+            "uppercase AND": (
+                "Session deadbeef occurred on 2026-08-01 AND Production rejects "
+                "SHA-1 signatures across API endpoints."),
+            "capitalised Which": (
+                "Session deadbeef concluded the migration, Which now rejects "
+                "SHA-1 signatures."),
+            "lowercase control": (
+                "Session deadbeef occurred on 2026-08-01 and production rejects "
+                "SHA-1 signatures across API endpoints."),
+        }.items():
+            with self.subTest(case=name):
+                self.assertFalse(_is_metadata_noise(content))
+                self.assertIsNotNone(_evaluate_create_content(content))
 
 
 class TestEveryEphemeralPathBranchIsPinned(unittest.TestCase):

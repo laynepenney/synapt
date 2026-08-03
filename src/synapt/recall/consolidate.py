@@ -727,36 +727,44 @@ def _is_ephemeral_execution_event(content: str) -> bool:
 _PROPOSITION_SPLIT_RE = re.compile(
     r"(?:"
     r"\s*[;]\s*"                              # semicolon
-    r"|\s*\.\s+(?=[A-Z])"                     # SENTENCE period
+    r"|\s*[.!?][\"'”’\)\]]*\s+"               # sentence punctuation + closing quotes
     r"|\s*\n+\s*"                             # newline
-    r"|\s*(?:[—–]|--)\s+"           # em dash / en dash / double hyphen
-    r"|\s*:\s+(?=[A-Z]\w*\s+(?!this\b|these\b|those\b|its\b|his\b|thus\b)"
-    r"\w+(?:s|ed)\b)"                         # colon, see the note below
-    r"|\s*,\s*(?=which\b|that\b|so\b|because\b)"   # relative / causal
+    r"|\s*(?:[—–―‒]|--)\s*"                   # dash family, spaced OR CLOSED
+    r"|\s*,\s*(?i:(?=which\b|that\b|so\b|because\b))"   # relative / causal
     r"|\s*,\s*(?=\w+ing\b)"                   # participial: ", exposing ..."
-    r"|\s+(?:and|but)\s+"                     # coordination
+    r"|\s+(?i:and|but)\s+"                    # coordination
     r")"
 )
-# THE COLON IS CONDITIONAL, and the condition is doing real work.
+# THREE THINGS ABOUT THIS SET ARE DELIBERATE AND WERE EACH EARNED BY A FINDING.
 #
-# A colon introduces a new PROPOSITION only when what follows carries its own
-# subject and predicate. Far more often in this corpus it introduces a LABEL'S
-# COMPLEMENT, which is class C and must stay attached to the label:
+# 1. THE COLON IS NOT HERE AT ALL. A conditional colon split was tried, and a
+#    reviewer proved the condition wrong in BOTH directions with one probe each:
+#      false reject -- "...concluded the migration: production rejects SHA-1"
+#                      (lowercase prose after a colon is ordinary; the capital
+#                      guard refused to split, the residue stayed fused, and the
+#                      real pipeline deleted the whole string)
+#      false KEEP   -- "...focused on the incident archive: Production records"
+#                      ("records" satisfies a finite-verb approximation while
+#                      being a plural NOUN, so a reported topic split into an
+#                      asserted-looking fragment and rescued pure bookkeeping)
+#    "Capitalised token plus a word ending in s/ed" is not a subject-plus-finite
+#    -verb discriminator, and no lexical test at this layer is. A guard wrong in
+#    both directions is not a threshold miss, so it is DELETED rather than
+#    retuned. Colons now inform the residue check below instead of splitting.
 #
-#   split:     "...concluded the migration: Production rejects SHA-1 signatures"
-#   NOT split: "Focus: visible focus rings are required for keyboard access"
-#   NOT split: "Focus for session b7d2c904: recap the previous session"
-#   NOT split: "...report its exit code: rm -rf /tmp/scratch-run-00000"
+# 2. NO CAPITAL GUARD ON SENTENCE PUNCTUATION, and closing quotes are absorbed.
+#    The earlier `(?=[A-Z])` was ASCII-only, so a Greek or Cyrillic sentence
+#    start fused back into the occurrence, and a closing quote before the
+#    capital did the same. Over-splitting produces more unclassifiable clauses,
+#    and unknown keeps -- the safe direction. Version numbers and decimals carry
+#    no space after the period, so they still never match.
 #
-# Splitting the last three unconditionally would strand a bare label or an
-# imperative fragment as an unclassifiable clause, and unknown keeps -- so an
-# unconditional colon rule would convert three pinned REJECTS into keeps while
-# fixing one. The guard `[A-Z]\w*\s+\w+(?:s|ed)\b` approximates "capitalised
-# subject followed by a finite verb", which is what distinguishes them.
-#
-# The period rule needs no such guard: a period followed by whitespace and a
-# capital is an unambiguous sentence boundary, and version numbers ("v1.2.3")
-# and decimals carry no space so they never match.
+# 3. CASE-INSENSITIVITY IS LOCAL, NOT PATTERN-WIDE. An earlier revision dropped
+#    a pattern-level `(?i)` to make `[A-Z]` guards work and silently made the
+#    PRE-EXISTING word branches case-sensitive too, so an uppercase "AND" or a
+#    capitalised "Which" stopped splitting and deleted durable residue behind
+#    them. Inline `(?i:...)` restores those branches without weakening anything
+#    that needs case.
 
 
 # A proposition needs a predicate. Coordination joins NOUNS at least as often as
@@ -771,17 +779,38 @@ _VERBISH_RE = re.compile(
 )
 
 
+_ASCII_ONLY_RE = re.compile(r"^[\x00-\x7f]*$")
+
+
+def _looks_verbless(fragment: str) -> bool:
+    """True if *fragment* has no predicate AND this heuristic can actually read it.
+
+    THE ASCII CONDITION IS THE POINT, and it was found by measurement rather than
+    by reading the code. A reviewer's Greek probe kept fusing back into its
+    occurrence clause, and the splitter was innocent -- it split correctly and
+    the FOLD undid it. ``_VERBISH_RE`` recognises predicates by ASCII suffixes
+    (-ed, -ing, -es, -s), so any non-Latin clause looks verbless, gets folded
+    backwards into the occurrence, and its durable residue is deleted with it.
+    The ASCII assumption sat one layer BELOW the ``[A-Z]`` guards everyone was
+    looking at.
+
+    So a fragment this heuristic cannot read is not judged by it: no fold, the
+    fragment stands as its own clause, and an unclassifiable clause keeps.
+    """
+    return bool(_ASCII_ONLY_RE.match(fragment)) and not _VERBISH_RE.search(fragment)
+
+
 def _split_into_propositions(content: str) -> list[str]:
     """Approximate the propositions in *content*. See the bias note above."""
     parts = [c.strip() for c in _PROPOSITION_SPLIT_RE.split(content) if c and c.strip()]
     merged: list[str] = []
     for part in parts:
-        if merged and not _VERBISH_RE.search(part):
+        if merged and _looks_verbless(part):
             merged[-1] = f"{merged[-1]} {part}"
         else:
             merged.append(part)
     # A leading verbless fragment has no earlier neighbour to join; fold it forward.
-    while len(merged) > 1 and not _VERBISH_RE.search(merged[0]):
+    while len(merged) > 1 and _looks_verbless(merged[0]):
         merged[1] = f"{merged[0]} {merged[1]}"
         merged.pop(0)
     return merged
@@ -829,6 +858,41 @@ def _is_reported_complement_only(clause: str) -> bool:
     return bool(m and not _asserted_part(clause).strip(" :,-"))
 
 
+# Boundary-shaped material that should NOT still be sitting inside a clause the
+# segmenter is about to call pure occurrence metadata.
+_BOUNDARY_RESIDUE_RE = re.compile(r":\s+\S|[.!?][\"'”’\)\]]*\s+\S")
+
+
+def _has_unsplit_boundary_residue(clause: str) -> bool:
+    """True if *clause* still contains material that looks like a boundary.
+
+    THE POINT IS TO KNOW WHEN WE MIGHT BE WRONG, not to split everything. The
+    set of punctuation forms that can separate two propositions has no bound a
+    lexical layer can enumerate -- reviewers produced closing quotes, a U+2015
+    horizontal bar, a closed em dash, non-Latin capitals, and lowercase prose
+    after a colon, and there is no reason to believe that list is finished.
+    Chasing forms one at a time is a race with no finish line, and every form
+    missed deletes a durable fact silently.
+
+    So the segmenter splits only what it is confident about, and this asks the
+    other question: does anything boundary-SHAPED remain inside a clause that is
+    about to be judged pure occurrence metadata? If so the clause may be two
+    propositions wearing one coat, its class-B reading is unsafe, and it is
+    demoted to unknown -- which keeps. Segmentation failure becomes FAIL-OPEN in
+    the direction the contract already chose.
+
+    STRICTLY ONE-DIRECTIONAL. This runs DOWNSTREAM of segmentation, on residual
+    clauses, never as a pre-scan over the raw string, and it can only turn a
+    reject into a keep. A pre-scan would be a different function with different
+    failure modes: it could see a boundary the segmenter WOULD have split and
+    demote content that was never at risk.
+
+    The cost is real and measured: a multi-sentence pure bookkeeping string with
+    an internal colon now survives. See limitation (d) in ``_is_metadata_noise``.
+    """
+    return bool(_BOUNDARY_RESIDUE_RE.search(_asserted_part(clause)))
+
+
 def _is_occurrence_metadata(clause: str) -> bool:
     """CLASS B: positively identified occurrence metadata -- time, duration,
     topic, command execution -- with no durable result.
@@ -869,6 +933,21 @@ def _is_metadata_noise(content: str) -> bool:
            contract even though the content is a journal row. Note this is
            NOT the reported-position case: "focused on what should happen next"
            mentions the modal inside a complement and is correctly rejected.
+       (d) MULTI-SENTENCE PURE BOOKKEEPING with an internal colon. "Focus: Run
+           this exact shell command and report its exit code: rm -rf
+           /tmp/scratch-run-00000" is genuine junk and now survives, because a
+           colon with material after it inside a class-B clause is exactly the
+           residue signal, and demotion keeps.
+
+           This is the PRICE OF DELETING the conditional colon split, paid
+           deliberately and ratified in review. That guard was proven wrong in
+           BOTH directions: it refused to split lowercase prose after a colon
+           (deleting a durable production invariant) and it DID split a plural
+           noun read as a finite verb (rescuing bookkeeping). Keeping it to
+           preserve this one rejection would have retained a discriminator that
+           demonstrably deletes durable clauses -- the wrong side of the
+           asymmetry, one case smaller.
+
        (c) A PARTICIPIAL ADJUNCT that is shaped like a residue but carries
            none. "...was removed at the close of the run, leaving no residual
            files behind" separates into a clause this layer cannot classify,
@@ -909,6 +988,12 @@ def _is_metadata_noise(content: str) -> bool:
     saw_occurrence_metadata = False
     for clause in _split_into_propositions(content):
         if _is_occurrence_metadata(clause):
+            if _has_unsplit_boundary_residue(clause):
+                # The segmenter may have missed a split inside this clause, so
+                # its class-B reading is unsafe. Demote to UNKNOWN, and unknown
+                # keeps. Never the reverse: residue can only turn a REJECT into
+                # a keep, never a keep into a reject.
+                return False
             saw_occurrence_metadata = True
         elif _is_reported_complement_only(clause):
             continue  # class C is inert: it neither rescues nor condemns
