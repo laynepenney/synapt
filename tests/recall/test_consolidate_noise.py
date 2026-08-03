@@ -293,6 +293,101 @@ class TestMetadataNoiseIsWiredIntoCreateEvaluation(unittest.TestCase):
             "Session a1b2c3d4, 2020-01-02", is_create=False))
 
 
+class TestResultBearingOccurrencesSurvive(unittest.TestCase):
+    """An occurrence can carry a durable residue, and when it does the residue
+    IS the memory.
+
+    This is the class the whole-string version destroyed: it saw a dated command
+    echo or a temp-path deletion in ONE clause and deleted every clause,
+    including clauses recording a migration result, a schema state, and an
+    incident root cause. A shape match on one clause is evidence about that
+    clause only.
+
+    Asserted at the PIPELINE level with the sibling filters also checked, so a
+    keep here cannot be credited to this filter when another one earned it.
+    """
+
+    CASES = {
+        "migration result": (
+            "Session deadbeef concluded the migration from SHA-1 to SHA-256; "
+            "production rejects SHA-1 signatures across API endpoints and stores "
+            "SHA-256 digests for audit verification."),
+        "persistent schema state": (
+            "The /migrate command ran on 2026-08-01 and permanently upgraded the "
+            "tenant schema to version 12, which fixes the lock-order defect in "
+            "account creation."),
+        "incident root cause": (
+            "/tmp/build-cache was removed after artifact upload failed, exposing "
+            "the cleanup race that truncated release manifests and corrupted "
+            "checksum records for build 42."),
+        # The residue's grammatical subject is the SESSION. Class A is about
+        # what outlives the occurrence, never about who the subject is --
+        # durable facts routinely arrive wearing occurrence clothing.
+        "residue with an occurrence subject": (
+            "Session deadbeef focused on migration and exposed a lock-order bug."),
+    }
+
+    def test_every_result_bearing_occurrence_survives_the_real_pipeline(self):
+        for name, content in self.CASES.items():
+            with self.subTest(case=name):
+                self.assertFalse(_is_generic_node(content), "sibling _is_generic_node")
+                self.assertFalse(_lacks_specificity(content), "sibling _lacks_specificity")
+                self.assertFalse(_is_garbled_content(content), "sibling _is_garbled_content")
+                self.assertFalse(_is_metadata_noise(content), "this filter")
+                self.assertIsNotNone(
+                    _evaluate_create_content(content),
+                    "survives the predicate but dies in the real create pipeline")
+
+
+class TestMentionedVocabularyCannotRescueBookkeeping(unittest.TestCase):
+    """Vocabulary inside what a session merely focused ON is MENTIONED, not
+    asserted, and licenses nothing about the matrix claim.
+
+    Both strings below are pure journal rows. Each was rescued by a keep-word
+    sitting inside the reported topic -- "policy" in one, "should" in the other.
+    Neither is anyone asserting a policy or an obligation.
+
+    Contrast the documented false keep in the predicate docstring: "Session
+    9ab4f012 concluded at 17:42; any remaining follow-up items should be picked
+    up" asserts its modal in a clause of its own and is therefore kept. The
+    difference is POSITION, which is the whole distinction this class pins.
+    """
+
+    def test_keep_vocabulary_in_a_reported_topic_does_not_rescue(self):
+        for name, content in {
+            "rule noun in the topic": "Session a1b2c3d4 focused on the policy review.",
+            "modal in the topic": "Session a1b2c3d4 focused on what should happen next.",
+        }.items():
+            with self.subTest(case=name):
+                self.assertTrue(_is_metadata_noise(content))
+                self.assertIsNone(_evaluate_create_content(content))
+
+    def test_the_same_words_asserted_outside_a_topic_do_rescue(self):
+        # The control that makes the test above mean POSITION rather than
+        # vocabulary. Same words, asserted rather than reported: kept.
+        self.assertFalse(_is_metadata_noise(
+            "Session a1b2c3d4 is governed by the retention policy."))
+        self.assertFalse(_is_metadata_noise(
+            "Session a1b2c3d4 should be replayed before every release."))
+
+
+class TestReportedContentAloneCannotCondemn(unittest.TestCase):
+    """Class C is inert. Rejection needs a POSITIVELY identified occurrence
+    clause; a reported topic on its own is not evidence that anything is
+    bookkeeping."""
+
+    def test_a_topic_label_on_a_durable_rule_is_kept(self):
+        self.assertFalse(_is_metadata_noise(
+            "Focus: visible focus rings are required for keyboard accessibility"))
+
+    def test_an_occurrence_with_no_durable_clause_still_rejects(self):
+        # The other half: C is inert, but B is not. This one has a real
+        # occurrence clause, so it dies.
+        self.assertTrue(_is_metadata_noise(
+            "Focus for session b7d2c904: recap the previous session and write "
+            "the journal entry."))
+
+
 class TestMetadataNoiseRejectsOnEveryPersistingRoute(unittest.TestCase):
     """The four routes through ``_apply_consolidation_result`` that let a
     non-create candidate reach durable knowledge.
