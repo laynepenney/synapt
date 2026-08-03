@@ -725,13 +725,38 @@ def _is_ephemeral_execution_event(content: str) -> bool:
 # an occurrence with its residue and would delete the residue, so it is the
 # failure worth avoiding.
 _PROPOSITION_SPLIT_RE = re.compile(
-    r"(?i)(?:"
+    r"(?:"
     r"\s*[;]\s*"                              # semicolon
+    r"|\s*\.\s+(?=[A-Z])"                     # SENTENCE period
+    r"|\s*\n+\s*"                             # newline
+    r"|\s*(?:[—–]|--)\s+"           # em dash / en dash / double hyphen
+    r"|\s*:\s+(?=[A-Z]\w*\s+(?!this\b|these\b|those\b|its\b|his\b|thus\b)"
+    r"\w+(?:s|ed)\b)"                         # colon, see the note below
     r"|\s*,\s*(?=which\b|that\b|so\b|because\b)"   # relative / causal
     r"|\s*,\s*(?=\w+ing\b)"                   # participial: ", exposing ..."
-    r"|\s+\band\b\s+|\s+\bbut\b\s+"           # coordination
+    r"|\s+(?:and|but)\s+"                     # coordination
     r")"
 )
+# THE COLON IS CONDITIONAL, and the condition is doing real work.
+#
+# A colon introduces a new PROPOSITION only when what follows carries its own
+# subject and predicate. Far more often in this corpus it introduces a LABEL'S
+# COMPLEMENT, which is class C and must stay attached to the label:
+#
+#   split:     "...concluded the migration: Production rejects SHA-1 signatures"
+#   NOT split: "Focus: visible focus rings are required for keyboard access"
+#   NOT split: "Focus for session b7d2c904: recap the previous session"
+#   NOT split: "...report its exit code: rm -rf /tmp/scratch-run-00000"
+#
+# Splitting the last three unconditionally would strand a bare label or an
+# imperative fragment as an unclassifiable clause, and unknown keeps -- so an
+# unconditional colon rule would convert three pinned REJECTS into keeps while
+# fixing one. The guard `[A-Z]\w*\s+\w+(?:s|ed)\b` approximates "capitalised
+# subject followed by a finite verb", which is what distinguishes them.
+#
+# The period rule needs no such guard: a period followed by whitespace and a
+# capital is an unambiguous sentence boundary, and version numbers ("v1.2.3")
+# and decimals carry no space so they never match.
 
 
 # A proposition needs a predicate. Coordination joins NOUNS at least as often as

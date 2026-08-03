@@ -29,6 +29,7 @@ from synapt.recall.consolidate import (
     _is_generic_node,
     _is_metadata_noise,
     _lacks_specificity,
+    _split_into_propositions,
 )
 from synapt.recall.journal import JournalEntry
 from synapt.recall.knowledge import KnowledgeNode, append_node, read_nodes
@@ -337,6 +338,128 @@ class TestResultBearingOccurrencesSurvive(unittest.TestCase):
                 self.assertIsNotNone(
                     _evaluate_create_content(content),
                     "survives the predicate but dies in the real create pipeline")
+
+
+class TestEveryClaimedPropositionBoundarySplits(unittest.TestCase):
+    """One witness per punctuation form the segmenter claims to treat as a
+    proposition boundary.
+
+    A boundary the segmenter does NOT split fuses a durable residue back into
+    the occurrence clause and recreates the whole-string false reject the clause
+    contract exists to remove -- so the boundary set is not documentation, it is
+    load-bearing, and each member needs its own kill-witness. Removing any one
+    split must red exactly its own case; a table of six that only four tests can
+    detect is four guarantees wearing six names.
+
+    The semicolon row is the CONTROL: it was already supported and already
+    passing, so it proves the fixture shape detects a working boundary rather
+    than passing for some unrelated reason.
+    """
+
+    # Same 141-character fact either side of each separator: an occurrence
+    # clause, then a durable production invariant.
+    OCCURRENCE = "Session deadbeef concluded the migration from SHA-1 to SHA-256"
+    RESIDUE = "Production rejects SHA-1 signatures across API endpoints for signed requests."
+
+    SEPARATORS = {
+        "semicolon (control, already supported)": "; ",
+        "sentence period": ". ",
+        # BARE newline, deliberately with NO period. ".\n" would split on the
+        # PERIOD rule, whose trailing \s+ already matches a newline -- so a
+        # ".\n" fixture leaves the newline branch entirely unpinned while
+        # appearing to cover it. Caught by the kill-witness battery below: the
+        # first version of this row stayed green with the newline pattern
+        # deleted. That is the same defect as an unpinned platform branch,
+        # committed inside the test written to prevent it.
+        "bare newline": "\n",
+        "colon": ": ",
+        "em dash": " — ",
+    }
+
+    def test_a_residue_across_each_boundary_survives_the_real_pipeline(self):
+        for name, sep in self.SEPARATORS.items():
+            content = f"{self.OCCURRENCE}{sep}{self.RESIDUE}"
+            with self.subTest(boundary=name):
+                self.assertGreater(
+                    len(_split_into_propositions(content)), 1,
+                    "the segmenter did not treat this as a proposition boundary")
+                self.assertFalse(_is_generic_node(content), "sibling _is_generic_node")
+                self.assertFalse(_lacks_specificity(content), "sibling _lacks_specificity")
+                self.assertFalse(_is_garbled_content(content), "sibling _is_garbled_content")
+                self.assertFalse(_is_metadata_noise(content), "this filter")
+                self.assertIsNotNone(
+                    _evaluate_create_content(content),
+                    "the durable production invariant is deleted at the real seam")
+
+    def test_a_colon_introducing_a_label_complement_is_not_a_boundary(self):
+        # The other half of the colon rule, and the reason it is conditional.
+        # A colon far more often introduces a LABEL'S COMPLEMENT than a new
+        # proposition. Splitting these would strand a bare label or an
+        # imperative fragment as an unclassifiable clause -- and unknown keeps,
+        # so an unconditional colon rule would turn three pinned REJECTS into
+        # keeps while fixing one.
+        # Asserted as "no proposition BEGINS at the colon", not as a clause
+        # count: these strings also contain coordination, which is a separate
+        # and legitimate boundary. Counting clauses would test the wrong thing
+        # and fail for a reason this case is not about.
+        for name, content, first_word_after_colon in [
+            ("label on a durable rule",
+             "Focus: visible focus rings are required for keyboard accessibility",
+             "visible"),
+            ("label on a journal row",
+             "Focus for session b7d2c904: recap the previous session and write "
+             "the journal entry.",
+             "recap"),
+            ("imperative command echo",
+             "Focus: Run this exact shell command and report its exit code: "
+             "rm -rf /tmp/scratch-run-00000",
+             "Run"),
+        ]:
+            with self.subTest(case=name):
+                starts = [p.split()[0] for p in _split_into_propositions(content)]
+                self.assertNotIn(
+                    first_word_after_colon, starts,
+                    "the colon was treated as a proposition boundary; the label's "
+                    "complement was stranded as its own clause")
+
+
+class TestEveryEphemeralPathBranchIsPinned(unittest.TestCase):
+    """One witness per platform branch of the cross-platform claim.
+
+    Reviewer finding: the macOS /var/folders branch could be DELETED outright
+    and every test stayed green. A claim covering six platform forms that only
+    two tests can detect is two guarantees wearing six names, and the four
+    undetected branches can rot silently -- which is exactly the failure mode
+    that made the original POSIX-only gap invisible.
+
+    The fixture text is otherwise identical across rows so the PATH is the only
+    variable, and the same-shaped control below shows a non-ephemeral path is
+    not caught by accident.
+    """
+
+    SUFFIX = " directory was wiped with rm -rf after the trial run"
+
+    PATHS = {
+        "POSIX /tmp": "The /tmp/scratch-run-00000",
+        "macOS /var/folders": "The /var/folders/aa/bbbbb/T/scratch-run",
+        "$TMPDIR": "The $TMPDIR/scratch-run-00000",
+        "%TEMP%": "The %TEMP%\\scratch-run-00000",
+        "%TMP%": "The %TMP%\\scratch-run-00000",
+        "Windows AppData Temp": r"The C:\Users\runner\AppData\Local\Temp\scratch-run",
+    }
+
+    def test_each_platform_branch_rejects_its_own_execution_event(self):
+        for name, head in self.PATHS.items():
+            with self.subTest(platform=name):
+                content = head + self.SUFFIX
+                self.assertTrue(_is_metadata_noise(content), "predicate")
+                self.assertIsNone(_evaluate_create_content(content), "real create path")
+
+    def test_a_stable_path_with_the_same_sentence_shape_is_not_caught(self):
+        # The control. Without it, a mutation making the path pattern match
+        # EVERYTHING would satisfy all six rows above.
+        self.assertFalse(_is_metadata_noise(
+            "The /var/lib/postgres/data" + self.SUFFIX))
 
 
 class TestMentionedVocabularyCannotRescueBookkeeping(unittest.TestCase):
