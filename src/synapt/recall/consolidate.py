@@ -988,7 +988,28 @@ def _is_metadata_noise(content: str) -> bool:
     saw_occurrence_metadata = False
     for clause in _split_into_propositions(content):
         if _is_occurrence_metadata(clause):
-            if _has_unsplit_boundary_residue(clause):
+            # BYPASS: an EXACT whole-string journal tuple is not ambiguous, so
+            # there is nothing for the detector to be uncertain about.
+            #
+            # Residue demotion reopened the round-1 core case:
+            # "Session deadbeef, 2026-08-01" rejected while
+            # "Session deadbeef: 2026-08-01" kept, same clause, because a colon
+            # fired the detector. A safety net that opens the case it was built
+            # over is worse than the gap it covered.
+            #
+            # The fix is NOT a lexical test for what follows the colon. That
+            # approximation was already proven wrong in both directions as a
+            # split discriminator, and moving it into demotion would preserve
+            # its destructive failure direction while changing where it lives.
+            # There is deliberately NO short-token exemption either: length is
+            # not evidence that something is metadata.
+            #
+            # What licenses the bypass is that _SESSION_RECORD_TUPLE_RE is
+            # ANCHORED at both ends. A whole-string match means the clause is
+            # ENTIRELY an id and a timestamp, with no unaccounted material for a
+            # missed boundary to be hiding in. Every ambiguous colon still keeps.
+            if not _SESSION_RECORD_TUPLE_RE.match(clause) and \
+                    _has_unsplit_boundary_residue(clause):
                 # The segmenter may have missed a split inside this clause, so
                 # its class-B reading is unsafe. Demote to UNKNOWN, and unknown
                 # keeps. Never the reverse: residue can only turn a REJECT into

@@ -484,6 +484,101 @@ class TestEveryClaimedPropositionBoundarySplits(unittest.TestCase):
                     "complement was stranded as its own clause")
 
 
+class TestEverySentencePunctuationAndClosingGlyphSplits(unittest.TestCase):
+    """One split-asserting row per claimed glyph.
+
+    EVERY ROW ASSERTS THE SPLIT COUNT, NOT THE VERDICT, and that is the whole
+    design of this class. The residue detector demotes on unsplit sentence
+    punctuation, so a `!` fixture whose split silently disappeared would STILL
+    keep -- via demotion -- and a verdict-shaped assertion would stay green over
+    a boundary that no longer exists. Reviewers proved this by deleting `!`,
+    `?`, and the curly closing quote and finding everything still passing.
+
+    That is the third time in this PR that a general mechanism has masked the
+    specific claims it overlaps. A row that can be satisfied by the fallback is
+    not a witness for the thing it names.
+    """
+
+    OCC = "Session deadbeef concluded the migration from SHA-1 to SHA-256"
+    RES = "Production rejects SHA-1 signatures across API endpoints."
+
+    # The full character class the splitter claims: sentence punctuation, then
+    # any run of closing characters, then whitespace.
+    TERMINATORS = {"period": ".", "exclamation": "!", "question": "?"}
+    CLOSERS = {
+        "none": "",
+        "ASCII double quote": '"',
+        "ASCII single quote": "'",
+        "curly double quote": "”",
+        "curly single quote": "’",
+        "closing paren": ")",
+        "closing bracket": "]",
+    }
+
+    def test_each_terminator_splits(self):
+        for name, mark in self.TERMINATORS.items():
+            with self.subTest(terminator=name):
+                content = f"{self.OCC}{mark} {self.RES}"
+                self.assertEqual(
+                    len(_split_into_propositions(content)), 2,
+                    "this terminator is not splitting; the residue detector "
+                    "would still keep the string, so a verdict assertion here "
+                    "would pass over a missing boundary")
+
+    def test_each_closing_character_is_absorbed_after_a_terminator(self):
+        for name, closer in self.CLOSERS.items():
+            with self.subTest(closer=name):
+                content = f"{self.OCC}.{closer} {self.RES}"
+                self.assertEqual(
+                    len(_split_into_propositions(content)), 2,
+                    "this closing character is not absorbed by the "
+                    "sentence-punctuation rule")
+
+
+class TestExactJournalTuplesBypassDemotion(unittest.TestCase):
+    """An anchored whole-string journal tuple is not ambiguous, so the detector
+    does not get to be uncertain about it.
+
+    Residue demotion reopened the round-1 core case: the comma tuple rejected
+    while the colon tuple kept, same content, because a colon fired the
+    detector. A safety net that opens the case it was built over is worse than
+    the gap it covered.
+
+    The bypass is licensed by ANCHORING, not by length. `_SESSION_RECORD_TUPLE_RE`
+    matches at both ends, so a whole-string match means the clause is entirely
+    an id and a timestamp with no unaccounted material for a missed boundary to
+    hide in. There is deliberately no short-token exemption: length is not
+    evidence that something is metadata.
+    """
+
+    def test_a_colon_separated_tuple_rejects_like_its_comma_twin(self):
+        for name, content in {
+            "colon + date": "Session deadbeef: 2026-08-01",
+            "comma + date (the twin)": "Session deadbeef, 2026-08-01",
+            "colon + time": "Session a1b2c3d4: 09:03",
+        }.items():
+            with self.subTest(case=name):
+                self.assertTrue(_is_metadata_noise(content))
+                self.assertIsNone(_evaluate_create_content(content))
+
+    def test_the_bypass_does_not_leak_to_anything_unanchored(self):
+        # The control that keeps the bypass narrow. Real content after a colon
+        # is NOT a whole-string tuple, so the tuple never matches, demotion
+        # still applies, and ambiguity still keeps. Without this, a bypass that
+        # widened to "starts with a session id" would pass the tests above while
+        # deleting durable facts.
+        for name, content in {
+            "durable clause after the colon": (
+                "Session deadbeef: the gateway now rejects SHA-1 across every "
+                "endpoint"),
+            "residue-bearing occurrence": (
+                "Session deadbeef concluded the migration: production rejects "
+                "SHA-1 signatures"),
+        }.items():
+            with self.subTest(case=name):
+                self.assertFalse(_is_metadata_noise(content))
+
+
 class TestResidueDemotionIsOneDirectionalAndDownstream(unittest.TestCase):
     """The residue detector: when boundary-shaped material remains inside a
     clause about to be called B, the clause is demoted to unknown, and unknown
