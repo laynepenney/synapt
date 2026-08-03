@@ -563,6 +563,50 @@ class TestEverySentencePunctuationAndClosingGlyphSplits(unittest.TestCase):
                     "sentence-punctuation rule")
 
 
+class TestEveryWordBranchSplits(unittest.TestCase):
+    """One split-asserting row per word alternative in the splitter.
+
+    THE SPACE IS CLOSED, and that is what makes this class different from the
+    ones above. The splitter offers exactly six word alternatives -- `and` and
+    `but` for coordination, `which`, `that`, `so` and `because` for relative
+    and causal clauses. Two were pinned; a reviewer swept the remaining four and
+    found each removable with all 60 tests and 60 subtests green, while each
+    removal flipped a durable residue from keep to REJECT.
+
+    Six alternatives, six rows, none unaccounted. Enumerating a small closed
+    space is what turns "no more were found" into "none remain" -- the
+    difference between a search that stopped and a search that finished.
+
+    Every row asserts SPLIT COUNT, because these branches are exactly where the
+    residue detector cannot rescue the outcome: removing one FUSES an occurrence
+    with a durable residue and the fused clause has no boundary-shaped material
+    left in asserted position, so it rejects silently.
+    """
+
+    OCC = "Session deadbeef concluded the migration from SHA-1 to SHA-256"
+    RES = "production rejects SHA-1 signatures across API endpoints"
+
+    JOINERS = {
+        "and (coordination)": " and ",
+        "but (coordination)": " but ",
+        "which (relative)": ", which means ",
+        "that (relative)": ", that is why ",
+        "so (causal)": ", so ",
+        "because (causal)": ", because ",
+    }
+
+    def test_each_word_alternative_separates_occurrence_from_residue(self):
+        for name, joiner in self.JOINERS.items():
+            with self.subTest(joiner=name):
+                content = f"{self.OCC}{joiner}{self.RES}"
+                self.assertGreater(
+                    len(_split_into_propositions(content)), 1,
+                    "this word alternative is not splitting; the residue "
+                    "detector cannot rescue it, so the durable residue is "
+                    "deleted with the occurrence and nothing reds")
+                self.assertFalse(_is_metadata_noise(content))
+
+
 class TestExactJournalTuplesBypassDemotion(unittest.TestCase):
     """An anchored whole-string journal tuple is not ambiguous, so the detector
     does not get to be uncertain about it.

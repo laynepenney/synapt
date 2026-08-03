@@ -887,8 +887,10 @@ def _has_unsplit_boundary_residue(clause: str) -> bool:
     failure modes: it could see a boundary the segmenter WOULD have split and
     demote content that was never at risk.
 
-    The cost is real and measured: a multi-sentence pure bookkeeping string with
-    an internal colon now survives. See limitation (d) in ``_is_metadata_noise``.
+    The cost is stated as a MECHANISM in limitation (d) of ``_is_metadata_noise``
+    rather than as a list of surviving cases. A case list is a property of one
+    MOMENT wearing a durable costume: it is accurate the day it is written and
+    silently false the next time anything changes which cases qualify.
     """
     return bool(_BOUNDARY_RESIDUE_RE.search(_asserted_part(clause)))
 
@@ -933,28 +935,28 @@ def _is_metadata_noise(content: str) -> bool:
            contract even though the content is a journal row. Note this is
            NOT the reported-position case: "focused on what should happen next"
            mentions the modal inside a complement and is correctly rejected.
-       (d) BOOKKEEPING WHOSE COLON-BEARING CLAUSE IS NOT AN ANCHORED WHOLE-
-           STRING TUPLE. "Focus: Run this exact shell command and report its
-           exit code: rm -rf /tmp/scratch-run-00000" is genuine junk and
-           survives, because a colon with material after it inside a class-B
-           clause is the residue signal, and demotion keeps.
+       (d) BOOKKEEPING CARRYING BOUNDARY RESIDUE IN ASSERTED POSITION.
+           Content survives when a clause the shape gates would call class B
+           still contains boundary-shaped material -- a colon or sentence
+           punctuation followed by more text -- in the part of the clause that
+           is ASSERTED. The detector cannot tell a missed proposition boundary
+           from an internal one, so it demotes to unknown, and unknown keeps.
 
-           THE QUALIFIER IS LOAD-BEARING and this limitation was briefly
-           written without it. "Multi-sentence bookkeeping with an internal
-           colon" would also describe "Session deadbeef: 2026-08-01", which
-           the anchored-tuple bypass REJECTS. A limitation section describes
-           what the code cannot do, so it goes stale in the direction of
-           UNDERSTATING the code -- harmless for a user, misleading for a
-           reviewer, who reads it as the current failure set.
+           TWO THINGS ARE OUTSIDE IT, both structural rather than enumerated:
+           residue inside a REPORTED complement never reaches the detector,
+           because ``_asserted_part`` strips it first; and an anchored
+           whole-string journal tuple bypasses demotion entirely, because
+           matching at both ends is a proof that nothing is hiding.
 
-           This is the PRICE OF DELETING the conditional colon split, paid
-           deliberately and ratified in review. That guard was proven wrong in
-           BOTH directions: it refused to split lowercase prose after a colon
-           (deleting a durable production invariant) and it DID split a plural
-           noun read as a finite verb (rescuing bookkeeping). Keeping it to
-           preserve this one rejection would have retained a discriminator that
-           demonstrably deletes durable clauses -- the wrong side of the
-           asymmetry, one case smaller.
+           STATED AS A MECHANISM ON PURPOSE, after three failures to state it
+           as a case list. It read "multi-sentence bookkeeping with an internal
+           colon", then "not an anchored tuple", then "not a whole-string
+           tuple" -- each one accurate when written and false after the next
+           round changed which cases qualified. A limitation section describes
+           what the code CANNOT do, so it goes stale toward UNDERSTATING the
+           code: harmless for a user, misleading for a reviewer who reads it as
+           the current failure set. A mechanism goes stale only if the
+           mechanism changes.
 
        (c) A PARTICIPIAL ADJUNCT that is shaped like a residue but carries
            none. "...was removed at the close of the run, leaving no residual
