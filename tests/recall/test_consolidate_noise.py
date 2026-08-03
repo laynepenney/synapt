@@ -644,10 +644,26 @@ class TestEveryBranchOfTheSplitterHasARow(unittest.TestCase):
           optional-ness of the separator, each timestamp alternative
           (YYYY-MM-DD, HH:MM, the optional :SS), and the repetition allowing
           zero, one or many timestamp fields. A reviewer found five of these
-          mutable with the whole spec green. NOTE: whether a BARE ID with zero
-          timestamp fields should bypass at all is an OPEN CONTRACT QUESTION,
-          not a coverage gap -- the regex accepts it while the source prose says
-          "an id and a timestamp". Do not pin it until that is ruled on.
+          mutable with the whole spec green.
+
+          THE BARE-ID QUESTION IS RULED, NOT OPEN -- implement it, do not
+          re-litigate it. The regex accepted a bare "Session deadbeef" with zero
+          timestamp fields while the source prose said "an id AND a timestamp".
+          Contract author's ruling: THE REGEX IS RIGHT AND THE PROSE IS WRONG. A
+          bare id SHOULD reject, because _SESSION_ID_RE positively identifies
+          pure session bookkeeping and whole-string anchoring independently
+          proves no hidden asserted residue -- THE TIMESTAMP WAS NEVER THE
+          LICENSE, the anchoring was. Required prose: "entirely a session ID,
+          optionally followed by date/time fields." Pin at ZERO, ONE and MANY
+          fields. Safety argument, worth keeping: a durable predicate breaks the
+          whole-string match, so real content keeps through ordinary handling
+          and never reaches the bypass at all.
+
+          NOTE THE SHAPE, because it is the same defect as the limitation
+          section this file already carries. Nobody wrote a bug: someone wrote a
+          DESCRIPTION, and the description narrowed the mechanism. "An id and a
+          timestamp" is a field layout -- a case list. "Whole-string anchoring
+          proves nothing is hiding" is the mechanism. State the mechanism.
       _BOUNDARY_RESIDUE_RE      -- DOFs are its two alternatives, the closing
           character class, and the quantifier on that class.
       _EPHEMERAL_PATH_RE        -- DOFs are its platform alternatives and the
