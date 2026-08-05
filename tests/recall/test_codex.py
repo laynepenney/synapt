@@ -13,6 +13,7 @@ from synapt.recall.codex import (
     _extract_file_paths,
 )
 from synapt.recall.core import build_index
+from synapt.recall.codex import _has_buildable_transcripts
 from synapt.recall.journal import auto_extract_entry, extract_session_id
 
 
@@ -337,3 +338,100 @@ class TestExtractFilePaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCodexOnlyProjectCanBootstrap(unittest.TestCase):
+    """A project whose ONLY history is Codex sessions must be buildable.
+
+    The build's "no transcripts found" pre-check counted live Claude transcript
+    directories and archived transcripts, and nothing else -- so a codex-only
+    project exited before ``archive_codex_transcripts`` ever ran, and the Codex
+    sessions that WOULD have satisfied the build were never discovered.
+
+    That is a pre-check disagreeing with the thing it gates: the build could
+    have succeeded, and the guard said there was nothing to build. Passing
+    ``--source <empty dir>`` routed around the guard and the rest of the path
+    archived and indexed the session correctly, which is what proved the defect
+    was the guard rather than the ingestion.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.project = Path(self.tmpdir) / "project"
+        self.project.mkdir()
+        self.sessions = Path(self.tmpdir) / "sessions" / "2026" / "08" / "05"
+        self.sessions.mkdir(parents=True)
+
+    def test_a_matching_codex_session_counts_as_a_transcript(self):
+        _write_codex_transcript(
+            str(self.sessions),
+            [{"type": "session_meta",
+              "payload": {"id": "s1", "cwd": str(self.project / "sub")}}],
+            name="rollout-match.jsonl",
+        )
+        self.assertTrue(
+            _has_buildable_transcripts(self.project, sessions_dir=self.sessions),
+            "a discoverable Codex session matching the project must satisfy the "
+            "pre-check; without this the build refuses work it could do")
+
+    def test_a_session_from_another_project_does_not_count(self):
+        # The control. Without it, a pre-check that counted ANY rollout on disk
+        # would pass this class while letting an unrelated project's sessions
+        # authorise a build that then finds nothing.
+        other = Path(self.tmpdir) / "other"
+        other.mkdir()
+        _write_codex_transcript(
+            str(self.sessions),
+            [{"type": "session_meta",
+              "payload": {"id": "s2", "cwd": str(other / "sub")}}],
+            name="rollout-other.jsonl",
+        )
+        self.assertFalse(
+            _has_buildable_transcripts(self.project, sessions_dir=self.sessions))
+
+    def test_no_sessions_at_all_still_reports_nothing_to_build(self):
+        self.assertFalse(
+            _has_buildable_transcripts(self.project, sessions_dir=self.sessions))
+
+
+class TestTheBuildPreCheckReadsTheCodexArm(unittest.TestCase):
+    """The predicate existing is not the fix -- the fix is that cmd_build READS it.
+
+    A guard whose result nothing consumes does not exist, so this drives the real
+    pre-check branch rather than poking the helper.
+    """
+
+    def _run_precheck(self, has_codex: bool):
+        """Drive cmd_build's pre-check with everything downstream stubbed."""
+        import argparse
+        from unittest import mock
+        from synapt.recall import cli
+
+        args = argparse.Namespace(
+            source=None, hf=None, chatgpt_archive=None,
+            no_embeddings=True, incremental=False,
+        )
+        fake_index = mock.Mock()
+        fake_index.stats.return_value = {"chunk_count": 1, "session_count": 1}
+        with mock.patch.object(cli, "project_transcript_dirs", return_value=[]), \
+             mock.patch.object(cli, "all_worktree_archive_dirs", return_value=[]), \
+             mock.patch.object(cli, "_check_legacy_index", return_value=None), \
+             mock.patch.object(cli, "_archive_and_build", return_value=fake_index), \
+             mock.patch("synapt.recall.codex._has_buildable_transcripts",
+                        return_value=has_codex):
+            try:
+                cli.cmd_build(args)
+            except SystemExit as exc:
+                return int(exc.code or 0)
+        return 0
+
+    def test_codex_only_project_is_allowed_to_build(self):
+        self.assertEqual(
+            self._run_precheck(has_codex=True), 0,
+            "the pre-check still refuses a codex-only project; the helper is "
+            "not being consulted at the real call site")
+
+    def test_a_project_with_nothing_at_all_still_exits(self):
+        # The control. Without it, deleting the guard entirely would satisfy the
+        # test above while letting an empty project proceed to a no-op build.
+        self.assertEqual(self._run_precheck(has_codex=False), 1)

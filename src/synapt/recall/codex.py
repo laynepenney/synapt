@@ -151,6 +151,29 @@ def list_codex_transcripts(
     return [path for path in files if _matches_project(path, project_dir)]
 
 
+def _has_buildable_transcripts(
+    project_dir: Path,
+    sessions_dir: Path | None = None,
+) -> bool:
+    """True when at least one discoverable Codex session belongs to *project_dir*.
+
+    Exists so the build's "no transcripts found" pre-check can ask the SAME
+    question the ingestion step will answer, rather than a narrower one.
+
+    The pre-check previously counted live Claude transcript directories and
+    archived transcripts only. A project whose entire history is Codex sessions
+    therefore failed the guard and exited before ``archive_codex_transcripts``
+    ran -- so the sessions that would have satisfied the build were never
+    discovered. The guard and the thing it gates disagreed, and the guard won.
+
+    Deliberately reuses ``list_codex_transcripts`` rather than reimplementing
+    discovery. A second copy of "which sessions belong to this project" would
+    be free to drift from the one that actually does the archiving, and a
+    pre-check that drifts from its subject is how this defect existed at all.
+    """
+    return bool(list_codex_transcripts(sessions_dir, project_dir=project_dir))
+
+
 def archive_codex_transcripts(
     project_dir: Path,
     sessions_dir: Path | None = None,
