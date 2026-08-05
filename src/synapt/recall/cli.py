@@ -720,6 +720,8 @@ def cmd_build(args: argparse.Namespace) -> None:
         print(f"[build] New location: {project_index_dir()}")
         print()
 
+    from synapt.recall.codex import _has_buildable_transcripts
+
     source_dirs: list[Path] = []
     if args.source:
         for src in args.source:
@@ -736,8 +738,15 @@ def cmd_build(args: argparse.Namespace) -> None:
             source_dirs = auto_dirs
             for td in auto_dirs:
                 print(f"[build] Found project transcripts at {td}")
-        elif not all_worktree_archive_dirs(project):
-            # No live transcripts AND no archived transcripts — nothing to build
+        elif not all_worktree_archive_dirs(project) and not _has_buildable_transcripts(project):
+            # No live Claude transcripts, no archived transcripts, AND no
+            # discoverable Codex sessions for this project — nothing to build.
+            #
+            # The Codex arm is the one this guard was missing. `_archive_and_build`
+            # runs `archive_codex_transcripts` unconditionally, so a codex-only
+            # project HAD work to do and this pre-check refused it before the
+            # sweep ever ran. A guard must ask the same question as the step it
+            # gates; this one asked a narrower one and won.
             print("Error: no transcripts found for current project.", file=sys.stderr)
             print("Specify --source, --hf, or --chatgpt-archive explicitly.", file=sys.stderr)
             sys.exit(1)
