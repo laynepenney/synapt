@@ -200,6 +200,26 @@ def test_blame_subrange_keeps_file_coordinates(blamed_repo: dict[str, object]) -
     ]
 
 
+def test_blame_reports_final_line_numbers_after_insertion(repo: Path) -> None:
+    """Spans carry FINAL (current-file) line numbers, not original ones.
+
+    Porcelain headers hold both; after a prepend the two diverge for every
+    shifted line, so a parser reading the wrong field fails here and only
+    here — in the other fixtures the numbers happen to coincide.
+    """
+    sha_a = _commit_file(repo, "d.py", "alpha\nbeta\n", "original", ts=BASE_TS)
+    sha_b = _commit_file(
+        repo, "d.py", "NEW\nalpha\nbeta\n", "prepend", ts=BASE_TS + 50
+    )
+
+    spans = blame_range(repo, "d.py", 1, 3)
+
+    assert [(s.sha, s.line_start, s.line_end) for s in spans] == [
+        (sha_b, 1, 1),
+        (sha_a, 2, 3),
+    ]
+
+
 def test_blame_merges_adjacent_lines_from_same_commit(repo: Path) -> None:
     sha = _commit_file(repo, "c.py", "l1\nl2\nl3\nl4\n", "all at once")
 
@@ -208,9 +228,28 @@ def test_blame_merges_adjacent_lines_from_same_commit(repo: Path) -> None:
     assert [(s.sha, s.line_start, s.line_end) for s in spans] == [(sha, 1, 4)]
 
 
-def test_blame_range_beyond_eof_raises(blamed_repo: dict[str, object]) -> None:
+def test_blame_end_beyond_eof_clamps_to_real_lines(
+    blamed_repo: dict[str, object]
+) -> None:
+    """git clamps an end past EOF; we expose that: real blame for real lines.
+
+    A stale caller range (file shrank since it was recorded) still gets
+    honest data for the lines that exist rather than an error or padding.
+    """
+    repo = blamed_repo["repo"]
+    sha_a, sha_b = blamed_repo["a"], blamed_repo["b"]
+
+    spans = blame_range(repo, "b.py", 2, 99)
+
+    assert [(s.sha, s.line_start, s.line_end) for s in spans] == [
+        (sha_b, 2, 2),
+        (sha_a, 3, 3),
+    ]
+
+
+def test_blame_start_beyond_eof_raises(blamed_repo: dict[str, object]) -> None:
     with pytest.raises(ValueError, match="has only"):
-        blame_range(blamed_repo["repo"], "b.py", 1, 99)
+        blame_range(blamed_repo["repo"], "b.py", 50, 99)
 
 
 def test_blame_untracked_path_raises(repo: Path) -> None:
