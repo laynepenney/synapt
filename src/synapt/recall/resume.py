@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from synapt.recall.freshness import IndexFreshness
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.journal import JournalEntry, read_entries
 
@@ -99,6 +100,10 @@ class ResumeView:
     total_turns: int = 0
     excluded_count: int = 0
     omitted_between: int = 0
+    # Whether the index this view was read from is current, and over which
+    # surface that was decided. ``None`` means NOT CHECKED -- which is not the
+    # same as fresh, and the renderer must not treat it as such.
+    freshness: "IndexFreshness | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +405,77 @@ def _format_journal(view: ResumeView) -> list[str]:
     return lines
 
 
+
+
+def _describe_behind(f) -> str:
+    """Say WHICH way the index is behind — unseen files and grown ones differ.
+
+    Calling a grown transcript "not yet indexed" is wrong and sends the reader
+    looking for a file the index already knows about. The two conditions have
+    the same remedy but not the same meaning, and a reader debugging one should
+    not be told the other.
+    """
+    parts = []
+    if f.new_files:
+        n = len(f.new_files)
+        parts.append(f"{n} file{'' if n == 1 else 's'} not yet indexed")
+    if f.changed_files:
+        n = len(f.changed_files)
+        parts.append(f"{n} indexed file{'' if n == 1 else 's'} grown since the build")
+    return " and ".join(parts) if parts else "behind"
+
+
+def _format_freshness(view: ResumeView) -> list[str]:
+    """Disclose a stale index whether or not turns rendered.
+
+    Turns shown from a stale index are still real; they may simply be missing
+    the newest ones. Silence here would let a partial answer read as complete.
+    """
+    f = view.freshness
+    if f is None or not f.stale:
+        return []
+    detail = f" ({_describe_behind(f)})" if (f.new_files or f.changed_files) else ""
+    return [
+        "",
+        f"⚠ The index is STALE{detail} — built {f.build_timestamp or 'at an unrecorded time'}, "
+        f"checked against: {f.scanned}.",
+        f"  Newer turns may exist that this view cannot see. To index them:  {f.remedy}",
+    ]
+
+
+def _format_empty(view: ResumeView) -> list[str]:
+    """Render an empty view WITH its provenance.
+
+    The original text here read "every indexed chunk was harness output or
+    empty" unconditionally. That names a CAUSE the renderer had not
+    established: when the index is stale the session may have no chunks in the
+    index at all, and this function would report a property of the SESSION
+    having observed only a property of the INDEX. The three branches below are
+    three different answers and must never print the same words.
+    """
+    f = view.freshness
+    if f is not None and f.stale:
+        return [
+            "No turns found — but the index is STALE, so this is not an answer "
+            "about the session.",
+            f"  {_describe_behind(f)} "
+            f"(built {f.build_timestamp or 'at an unrecorded time'}, checked: {f.scanned}).",
+            f"  Index them, then ask again:  {f.remedy}",
+        ]
+    if f is None:
+        return [
+            "No conversational turns found in the index for this session.",
+            "  Index freshness was not checked, so this does not establish that "
+            "the session is empty.",
+        ]
+    return [
+        "No conversational turns in this session — every indexed chunk was "
+        "harness output or empty.",
+        f"  The index is current (checked: {f.scanned}), so this is an answer "
+        f"about the session, not about the index.",
+    ]
+
+
 def format_resume(view: ResumeView, max_chars: int = 600) -> str:
     """Render a resume view for a terminal, oldest turn first."""
     date = view.turns[0].timestamp[:10] if view.turns else ""
@@ -422,14 +498,12 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
         header += f" ({view.excluded_count} harness turns filtered)"
 
     lines = [header]
+    lines.extend(_format_freshness(view))
     lines.extend(_format_journal(view))
 
     if not view.turns:
         lines.append("")
-        lines.append(
-            "No conversational turns in this session — every indexed chunk was "
-            "harness output or empty."
-        )
+        lines.extend(_format_empty(view))
         return "\n".join(lines)
 
     for position, turn in enumerate(view.turns):
