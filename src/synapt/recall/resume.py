@@ -26,6 +26,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from synapt.recall.freshness import IndexFreshness
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.journal import JournalEntry, read_entries
 
@@ -99,6 +100,10 @@ class ResumeView:
     total_turns: int = 0
     excluded_count: int = 0
     omitted_between: int = 0
+    # Whether the index this view was read from is current, and over which
+    # surface that was decided. ``None`` means NOT CHECKED -- which is not the
+    # same as fresh, and the renderer must not treat it as such.
+    freshness: "IndexFreshness | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +403,8 @@ def _format_journal(view: ResumeView) -> list[str]:
             lines.append(f"  {label}:")
             lines.extend(f"    - {item}" for item in items)
     return lines
+
+
 
 
 def format_resume(view: ResumeView, max_chars: int = 600) -> str:
