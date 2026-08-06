@@ -327,3 +327,121 @@ def test_a_stale_index_is_disclosed_even_when_turns_render(store):
 
     assert "stale" in out.lower(), "a stale index is disclosed whether or not turns render"
     assert "hello" in out, "disclosure must not replace the content"
+
+
+# ---------------------------------------------------------------------------
+# The wiring itself, at the CLI boundary
+#
+# Reviewer-2's probe: severing `view = _attach_freshness(view, args)` in
+# cmd_resume red NOTHING — 95 tests passed with the feature completely dead.
+# Every test above exercises the seam or the renderer directly, so the one line
+# that connects them was unwitnessed, and the whole feature sat one deletion
+# from silent removal.
+#
+# That is the defect this change's own commit message records ("the tests were
+# green while the feature was dead"), recurring one layer up. Finding it twice
+# in one change is the argument for testing the CALL, not only the callee.
+# ---------------------------------------------------------------------------
+
+
+import contextlib  # noqa: E402
+import io  # noqa: E402
+import sqlite3 as _sqlite3  # noqa: E402
+from argparse import Namespace  # noqa: E402
+
+from synapt.recall.core import TranscriptChunk  # noqa: E402
+
+
+def _run_resume_cli(project: Path):
+    """Run cmd_resume against *project*, returning stdout."""
+    from synapt.recall.cli import cmd_resume
+
+    args = Namespace(
+        index=str(_index_dir(project)), session=None, turns=10, project=project
+    )
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            cmd_resume(args)
+    except SystemExit:
+        pass
+    return out.getvalue()
+
+
+def _real_index(project: Path) -> None:
+    """Persist an index the way a build does, with one resumable turn."""
+    from synapt.recall.storage import RecallDB
+
+    chunk = TranscriptChunk(
+        id="aaaaaaaa:t0", session_id="aaaaaaaa-0000-0000-0000-000000000000",
+        timestamp="2026-08-06T10:00:00Z", turn_index=0,
+        user_text="a real question", assistant_text="a real answer",
+        tools_used=[], files_touched=[], tool_content="",
+        transcript_path="", byte_offset=0, byte_length=0,
+    )
+    index_dir = _index_dir(project)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    db = RecallDB(index_dir / "recall.db")
+    db.save_chunks([chunk])
+    db.close()
+
+
+def _set_manifest(project: Path, source_files: list[dict]) -> None:
+    con = _sqlite3.connect(_index_dir(project) / "recall.db")
+    con.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('source_files', ?)",
+                (json.dumps(source_files),))
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('build_timestamp', '2026-08-05T22:50:20')")
+    con.commit()
+    con.close()
+
+
+def test_cmd_resume_prints_the_stale_banner(store):
+    """The wiring, end to end: a stale store must say so in stdout."""
+    _real_index(store)
+    _archive_file(_archive_dir(store), "rollout-unindexed.jsonl", "turns nobody indexed")
+    _set_manifest(store, [])          # archive holds a file the manifest does not
+
+    out = _run_resume_cli(store)
+
+    assert "STALE" in out.upper(), "cmd_resume did not disclose a stale index"
+    assert "recall build" in out, "the banner must carry its remedy"
+
+
+def test_cmd_resume_stays_quiet_when_the_index_is_current(store):
+    """Control: the banner is conditional, not unconditional decoration."""
+    _real_index(store)
+    f = _archive_file(_archive_dir(store), "rollout-indexed.jsonl", "turns")
+    _set_manifest(store, [_entry(f)])
+
+    out = _run_resume_cli(store)
+
+    assert "STALE" not in out.upper()
+    assert "a real question" in out, "the turns must still render"
+
+
+def test_cmd_resume_runs_the_deep_leg_only_when_cheap_is_fresh_and_view_empty(store, monkeypatch):
+    """The deep-trigger path, pinned at the call site rather than described."""
+    import synapt.recall.freshness as fresh_mod
+
+    calls: list[bool] = []
+    fresh = IndexFreshness(stale=False, build_timestamp="t", scanned="archive")
+
+    def record(project_dir, *, deep=False):
+        calls.append(deep)
+        return fresh
+
+    monkeypatch.setattr(fresh_mod, "check_index_freshness", record)
+
+    _real_index(store)
+    _set_manifest(store, [])
+    _run_resume_cli(store)
+    assert calls == [False], "a view with turns must not pay for the deep leg"
+
+    calls.clear()
+    monkeypatch.setattr(
+        "synapt.recall.resume.build_resume_view",
+        lambda index, **kw: ResumeView(session_id="aaaaaaaa", turns=[], total_turns=0),
+    )
+    _run_resume_cli(store)
+    assert calls == [False, True], "an empty view with a fresh cheap leg must run deep"
