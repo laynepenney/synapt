@@ -1095,7 +1095,41 @@ def cmd_resume(args: argparse.Namespace) -> None:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # Freshness is attached AFTER the view is built, so build_resume_view keeps
+    # its no-implicit-I/O contract and the check can never change what is shown
+    # -- only what the reader is told about it.
+    #
+    # The deep leg runs on the SUSPICIOUS COMBINATION: the cheap leg says fresh
+    # and the view is empty. That is exactly when the deep leg's cost (~1.2 s on
+    # the store it was measured against) is worth spending,
+    # because it is the moment an "empty" verdict either becomes load-bearing
+    # or turns out to be an un-archived session. Everywhere else the cheap leg
+    # (~24 ms there) answers, and a stale verdict needs no second opinion.
+    view = _attach_freshness(view, args)
+
     print(format_resume(view))
+
+
+def _attach_freshness(view, args):
+    """Return *view* with an index-freshness verdict attached.
+
+    Never raises: a failure to compute freshness must not break the command it
+    annotates. On failure the verdict stays ``None``, which the renderer treats
+    as NOT CHECKED rather than as fresh.
+    """
+    import dataclasses
+
+    from synapt.recall.freshness import check_index_freshness
+
+    project = getattr(args, "project", None)
+    try:
+        result = check_index_freshness(project)
+        if not result.stale and not view.turns:
+            deep = check_index_freshness(project, deep=True)
+            result = deep
+    except Exception:
+        return view
+    return dataclasses.replace(view, freshness=result)
 
 
 def cmd_rebuild(args: argparse.Namespace) -> None:
