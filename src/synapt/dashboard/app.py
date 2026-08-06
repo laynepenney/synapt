@@ -1686,6 +1686,116 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
             out.append({"who": who, "ts": ts, "text": text})
         return {"messages": out[-int(limit):]}
 
+    # --- pane switcher: the bound session's REAL topology ------------------
+    # The console's roster is a fixed team list; the switcher generalizes it
+    # to every window and pane the bound session actually has. Discovery
+    # deliberately does NOT consume the registry's advertised tmux_target
+    # (recall#923 r2: discovery advertises unscoped targets) — the only
+    # source of truth here is `tmux list-panes` scoped to the bound session.
+    _PANES_FMT = (
+        "#{window_index}\t#{pane_index}\t#{window_name}"
+        "\t#{pane_active}\t#{pane_current_command}\t#{pane_title}"
+    )
+    # Window.pane COORDINATES only. A tmux `%id` handle resolves across
+    # sessions, so accepting one would be an escape hatch around the bound
+    # scope; the shape gate rejects it before any subprocess runs.
+    _PANE_ID_RE = re.compile(r"^(\d+)\.(\d+)$")
+
+    def _enumerate_session_panes(session: str) -> list[dict] | None:
+        """All panes of *session*, or None when tmux is unreachable."""
+        try:
+            result = subprocess.run(
+                ["tmux", "list-panes", "-s", "-t", session, "-F", _PANES_FMT],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        panes: list[dict] = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t", 5)
+            if len(parts) < 6:
+                continue
+            w_raw, p_raw, window_name, active, command, title = parts
+            try:
+                w, p = int(w_raw), int(p_raw)
+            except ValueError:
+                continue
+            agent = window_name if window_name in _MEMENTO_NAMES else None
+            panes.append({
+                "id": f"{w}.{p}",
+                "window": w,
+                "pane": p,
+                "window_name": window_name,
+                "active": active == "1",
+                "command": command,
+                "title": title,
+                "agent": agent,
+                "accent": _CONSOLE_ACCENT.get(agent, "#0f97a6") if agent else "#48423a",
+            })
+        return panes
+
+    @app.get("/console/panes")
+    async def console_panes():
+        """Enumerate the bound session's windows and panes for the switcher."""
+        try:
+            session = _require_tmux_session(tmux_session)
+        except TmuxTargetScopeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        panes = await asyncio.to_thread(_enumerate_session_panes, session)
+        if panes is None:
+            return {"session": session, "reachable": False, "panes": []}
+        return {"session": session, "reachable": True, "panes": panes}
+
+    @app.get("/console/pane/{pane_id}")
+    async def console_pane(pane_id: str, lines: int = 400):
+        """Capture one pane of the bound session, by validated coordinates.
+
+        The client's string never reaches ``-t``: the id must match the
+        strict shape, must be a member of a FRESH enumeration of the bound
+        session, and the target is rebuilt from the re-parsed integers —
+        then re-checked at the use site like every other tmux surface.
+        """
+        m = _PANE_ID_RE.match(pane_id)
+        if not m:
+            raise HTTPException(status_code=404, detail="unknown pane")
+        try:
+            session = _require_tmux_session(tmux_session)
+        except TmuxTargetScopeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        panes = await asyncio.to_thread(_enumerate_session_panes, session)
+        w, p = int(m.group(1)), int(m.group(2))
+        wanted = f"{w}.{p}"
+        row = next((pn for pn in panes or [] if pn["id"] == wanted), None)
+        if row is None:
+            raise HTTPException(status_code=404, detail="unknown pane")
+        target = _assert_tmux_target_in_session(f"{session}:{w}.{p}", session)
+        cap = min(max(int(lines), 10), 2000)
+        cmd = ["tmux", "capture-pane", "-t", target, "-p", "-e", "-S", f"-{cap}"]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=4,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return {
+                "id": wanted, "window_name": row["window_name"],
+                "reachable": False, "content_html": "",
+            }
+        if result.returncode != 0:
+            return {
+                "id": wanted, "window_name": row["window_name"],
+                "reachable": False, "content_html": "",
+            }
+        return {
+            "id": wanted,
+            "window_name": row["window_name"],
+            "reachable": True,
+            "content_html": _ansi_to_html(result.stdout),
+        }
+
     @app.get("/console", response_class=HTMLResponse)
     async def console_page():
         """The live console — the demo stage, built entirely on live endpoints."""
@@ -1723,6 +1833,19 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
   .topo-dots{display:inline-flex; gap:6px; align-items:center; margin-left:4px}
   .con-status{margin-left:auto; color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums}
   .con-status b{color:var(--mem)}
+  /* pane switcher strip — the bound session's real topology */
+  .pane-strip{display:flex; gap:6px; align-items:center; padding:7px 18px;
+    border-bottom:1px solid var(--line); overflow-x:auto; scrollbar-width:thin;
+    flex:0 0 auto; background:#0e0c09}
+  .pane-strip .ps-label{font-size:10px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--muted); flex:0 0 auto; margin-right:4px}
+  .ps-chip{flex:0 0 auto; display:inline-flex; align-items:center; gap:6px;
+    font:11px ui-monospace,Menlo,monospace; color:var(--muted);
+    border:1px solid var(--line); border-radius:14px; padding:3px 10px;
+    cursor:pointer; transition:all .15s; background:rgba(180,170,150,.03)}
+  .ps-chip:hover{color:var(--ink); border-color:var(--ac,#0f97a6)}
+  .ps-chip.sel{color:#06232a; background:var(--ac,#0f97a6); border-color:var(--ac,#0f97a6); font-weight:700}
+  .ps-chip .psdot{width:6px; height:6px; border-radius:50%; background:var(--ac,#48423a); flex:0 0 auto}
   /* presence dot */
   .dot{width:9px; height:9px; border-radius:50%; background:#48423a; flex:0 0 auto;
     transition:background .3s, box-shadow .3s}
@@ -1799,6 +1922,8 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
     <div class="con-status"><span id="clock">&ndash;</span> &nbsp;&middot;&nbsp; <b id="up-count">0</b> online</div>
   </div>
 
+  <div class="pane-strip" id="pane-strip"><span class="ps-label">panes</span></div>
+
   <div class="con-grid">
     <section class="hero">
       <div class="hero-head">
@@ -1834,6 +1959,7 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
   var ROSTER = __ROSTER__;
   var COORD = ROSTER.filter(function(a){return a.coordinator;})[0] || {name:"opus",label:"OPUS",accent:"#9b7ff0",note:"coordinator"};
   var FEATURED = COORD;                       // whoever occupies the main hero pane (click a teammate to swap)
+  var RAWPANE = null;                         // a non-agent tmux pane featured from the switcher strip
   function railAgents(){ return ROSTER.filter(function(a){ return a.name !== FEATURED.name; }); }
   function avatar(a){ return '<img class="tav" src="/memento/portrait/'+a.name+'" alt="" onerror="this.remove()">'; }
   function renderHero(){
@@ -1888,18 +2014,72 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
     });
   }
   function feature(a){
-    if(a.name === FEATURED.name) return;
+    if(RAWPANE === null && a.name === FEATURED.name) return;
+    RAWPANE = null;
     FEATURED = a;
-    renderHero(); buildRail();
+    renderHero(); buildRail(); renderStrip();
     pollCoord(); pollCoordChips(); pollTeam(); pollTeamMem();
   }
   buildRail();
+
+  // --- pane switcher strip: the bound session's real windows and panes ---
+  var STRIP_PANES = [];
+  var stripBox = document.getElementById('pane-strip');
+  function featureRawPane(p){
+    RAWPANE = p;
+    document.documentElement.style.setProperty('--coord', p.accent);
+    document.getElementById('coord-title').textContent = p.window_name + ' · ' + p.id;
+    document.getElementById('coord-name').textContent = p.window_name;
+    document.getElementById('coord-role').textContent = 'tmux pane' + (p.command ? ' · ' + p.command : '');
+    var ml = document.querySelector('.mem-label'); if(ml) ml.textContent = 'live pane';
+    document.getElementById('coord-chips').innerHTML = '<span class="none">raw pane — no memory strip</span>';
+    renderStrip();
+    pollCoord();
+  }
+  function renderStrip(){
+    var frag = ['<span class="ps-label">panes</span>'];
+    STRIP_PANES.forEach(function(p, i){
+      var sel = RAWPANE ? RAWPANE.id === p.id
+                        : (p.agent && p.agent === FEATURED.name && p.active !== false);
+      var label = p.window_name + (p.id.slice(-2) !== '.0' || multiWindow(p.window) ? ' ' + p.id : '');
+      frag.push('<span class="ps-chip'+(sel?' sel':'')+'" data-i="'+i+'" style="--ac:'+p.accent+'">'
+        + '<span class="psdot"></span>' + esc(label) + '</span>');
+    });
+    stripBox.innerHTML = frag.join('');
+    stripBox.querySelectorAll('.ps-chip').forEach(function(el){
+      el.addEventListener('click', function(){
+        var p = STRIP_PANES[+el.getAttribute('data-i')];
+        if(!p) return;
+        var agent = p.agent && ROSTER.filter(function(a){return a.name===p.agent;})[0];
+        if(agent){ feature(agent); } else { featureRawPane(p); }
+      });
+    });
+  }
+  function multiWindow(w){
+    return STRIP_PANES.filter(function(p){return p.window === w;}).length > 1;
+  }
+  function pollStrip(){
+    jget('/console/panes').then(function(d){
+      if(!d || !d.panes){ return; }
+      STRIP_PANES = d.panes;
+      renderStrip();
+    });
+  }
 
   var coordPane = document.getElementById('coord-pane');
   var coordDot  = document.getElementById('coord-dot');
   var coordLive = document.getElementById('coord-live');
 
   function pollCoord(){
+    if(RAWPANE){
+      var rp = RAWPANE;
+      return jget('/console/pane/'+rp.id+'?lines=400').then(function(d){
+        if(!d || RAWPANE !== rp) return;
+        var changed = setPane(coordPane, d.content_html, d.reachable, false);
+        markDot(coordDot, d.reachable, changed, rp.accent);
+        coordLive.classList.toggle('on', d.reachable);
+      });
+    }
     return jget('/memento/pane/'+FEATURED.name+'?full=1').then(function(d){
       if(!d) return;
       var changed = setPane(coordPane, d.content_html, d.reachable, false);
