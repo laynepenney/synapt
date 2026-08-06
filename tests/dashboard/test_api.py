@@ -255,8 +255,8 @@ class TestDashboardAgentIO(unittest.TestCase):
 
         shutil.rmtree(tmpdir)
 
-    def test_tmux_discovery_scans_all_sessions(self):
-        """Dashboard agent discovery should not hardcode a single tmux session."""
+    def test_tmux_discovery_reads_only_the_bound_session(self):
+        """Dashboard agent discovery stays inside its explicit tmux session."""
         from synapt.dashboard.app import _tmux_window_agents
 
         mock_run = MagicMock()
@@ -264,10 +264,17 @@ class TestDashboardAgentIO(unittest.TestCase):
 
         with patch("synapt.dashboard.app.subprocess.run", mock_run), \
              patch.dict("synapt.dashboard.app._KNOWN_AGENTS", {"opus": {}, "atlas": {}}, clear=True):
-            agents = _tmux_window_agents()
+            agents = _tmux_window_agents("workspace-session")
 
         mock_run.assert_called_once_with(
-            ["tmux", "list-windows", "-a", "-F", "#{window_name}"],
+            [
+                "tmux",
+                "list-windows",
+                "-t",
+                "workspace-session",
+                "-F",
+                "#{window_name}",
+            ],
             capture_output=True,
             text=True,
             timeout=3,

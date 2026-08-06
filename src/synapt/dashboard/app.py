@@ -102,11 +102,14 @@ def _load_agents_toml() -> None:
 _load_agents_toml()
 
 
-def _tmux_window_agents() -> dict[str, str]:
-    """Return {window_name: status} for agent windows in the tmux session."""
+def _tmux_window_agents(tmux_session: str | None) -> dict[str, str]:
+    """Return known agent windows from one explicitly bound tmux session."""
+    if tmux_session is None:
+        return {}
+    session = _require_tmux_session(tmux_session)
     try:
         result = subprocess.run(
-            ["tmux", "list-windows", "-a", "-F", "#{window_name}"],
+            ["tmux", "list-windows", "-t", session, "-F", "#{window_name}"],
             capture_output=True, text=True, timeout=3,
         )
         if result.returncode != 0:
@@ -116,57 +119,70 @@ def _tmux_window_agents() -> dict[str, str]:
     except Exception:
         return {}
 
-_TMUX_SESSION: str = "synapt"
+class TmuxTargetScopeError(RuntimeError):
+    """A dashboard tmux target is absent or outside its explicit session scope."""
+
+    def __init__(self, message: str, *, status_code: int) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
-def _load_tmux_session() -> None:
-    """Load tmux session name from spawn config."""
-    global _TMUX_SESSION
-    from synapt.recall.core import _find_gripspace_root
+def _require_tmux_session(tmux_session: str | None) -> str:
+    """Return one explicit session component or refuse control availability.
 
-    grip_root = _find_gripspace_root(Path.cwd())
-    if grip_root is None:
-        return
-    for candidate in [
-        grip_root / ".gitgrip" / "spawn.toml",
-        grip_root / "config" / "spawn.toml",
-    ]:
-        if candidate.is_file():
-            try:
-                with open(candidate, "rb") as f:
-                    cfg = tomllib.load(f)
-                name = cfg.get("spawn", {}).get("session_name", "")
-                if name:
-                    _TMUX_SESSION = name
-                return
-            except (OSError, tomllib.TOMLDecodeError):
-                pass
-
-
-_load_tmux_session()
-
-
-def _resolve_tmux_target(name: str) -> str:
-    """Resolve a qualified tmux target for an agent (recall#692 fix 3).
-
-    Checks cached agent data for a stored tmux_target. Falls back to
-    {session}:{name} to avoid ambiguity when multiple sessions exist.
+    OSS owns only this neutral capability boundary.  Choosing which session a
+    workspace may control belongs to the caller.  No working-directory lookup,
+    registry value, or built-in session name may manufacture that authority.
     """
+    if tmux_session is None:
+        raise TmuxTargetScopeError(
+            "tmux controls require an explicitly bound session",
+            status_code=503,
+        )
+    session = str(tmux_session)
+    if (
+        not session
+        or session != session.strip()
+        or ":" in session
+        or any(ord(char) < 32 or ord(char) == 127 for char in session)
+    ):
+        raise TmuxTargetScopeError("invalid tmux session scope", status_code=503)
+    return session
+
+
+def _assert_tmux_target_in_session(target: str, tmux_session: str) -> str:
+    """Return *target* only when its session is exactly the bound session."""
+    session = target.split(":", 1)[0]
+    if not target or ":" not in target or session != tmux_session:
+        raise TmuxTargetScopeError(
+            f"tmux target is outside the dashboard session scope: {target!r}",
+            status_code=403,
+        )
+    return target
+
+
+def _resolve_tmux_target(name: str, *, tmux_session: str | None) -> str:
+    """Resolve an agent only within an explicitly supplied tmux session.
+
+    A registry row is a coordinate, not authority.  A stored target naming any
+    other session is refused rather than trusted or replaced by a fallback.
+    """
+    session = _require_tmux_session(tmux_session)
     org_id = _resolve_org_id(None)
     if org_id:
         db_path = Path.home() / ".synapt" / "orgs" / org_id / "team.db"
         if db_path.exists():
             try:
                 agents = _registry_list_agents(org_id, db_path=db_path)
-                for agent in agents:
-                    if agent.get("display_name") == name:
-                        stored = agent.get("tmux_target")
-                        if stored:
-                            return stored
-                        break
             except Exception:
-                pass
-    return f"{_TMUX_SESSION}:{name.lower()}"
+                agents = []
+            for agent in agents:
+                if str(agent.get("display_name", "")).casefold() == name.casefold():
+                    stored = agent.get("tmux_target")
+                    if stored:
+                        return _assert_tmux_target_in_session(str(stored), session)
+                    break
+    return f"{session}:{name.casefold()}"
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +227,7 @@ def _is_pid_alive(pid: int) -> bool:
         return False
 
 
-def _combined_agents_json_sync() -> list[dict]:
+def _combined_agents_json_sync(tmux_session: str | None = None) -> list[dict]:
     """Return agents from both team.db (process tracking) and channel presence.
 
     Scoped to the current org only (recall#692) to avoid SQLite lock
@@ -267,7 +283,7 @@ def _combined_agents_json_sync() -> list[dict]:
                         existing["tmux_target"] = tmux_target
 
     # Discover agents from tmux windows that match agents.toml
-    for window_name, status in _tmux_window_agents().items():
+    for window_name, status in _tmux_window_agents(tmux_session).items():
         display = window_name.capitalize()
         if display not in agents_by_name and window_name not in agents_by_name:
             agent_cfg = _KNOWN_AGENTS.get(window_name, {})
@@ -279,15 +295,17 @@ def _combined_agents_json_sync() -> list[dict]:
                 "status": status,
                 "last_seen": "",
                 "channels": [],
-                "tmux_target": f"{_TMUX_SESSION}:{window_name}",
+                "tmux_target": (
+                    f"{tmux_session}:{window_name}" if tmux_session else ""
+                ),
             }
 
     return sorted(agents_by_name.values(), key=lambda a: a.get("display_name", ""))
 
 
-async def _combined_agents_json() -> list[dict]:
+async def _combined_agents_json(tmux_session: str | None = None) -> list[dict]:
     """Async wrapper — runs SQLite reads off the event loop (recall#692 fix 2)."""
-    return await asyncio.to_thread(_combined_agents_json_sync)
+    return await asyncio.to_thread(_combined_agents_json_sync, tmux_session)
 
 
 def _render_agent_tile(agent: dict) -> str:
@@ -512,9 +530,14 @@ def _stop_dashboard(project_dir: Path | None = None) -> bool:
     return True
 
 
-def _background_command(host: str, port: int) -> list[str]:
+def _background_command(
+    host: str,
+    port: int,
+    *,
+    tmux_session: str | None = None,
+) -> list[str]:
     """Build the detached child command for the dashboard server."""
-    return [
+    command = [
         sys.executable,
         "-m",
         "synapt.cli",
@@ -526,6 +549,9 @@ def _background_command(host: str, port: int) -> list[str]:
         str(port),
         "--no-open",
     ]
+    if tmux_session is not None:
+        command.extend(("--tmux-session", tmux_session))
+    return command
 
 
 def _start_dashboard_background(
@@ -533,6 +559,7 @@ def _start_dashboard_background(
     port: int,
     no_open: bool,
     project_dir: Path | None = None,
+    tmux_session: str | None = None,
 ) -> int:
     """Spawn the dashboard server in the background and persist its PID."""
     synapt_dir = project_data_dir(project_dir).parent
@@ -549,7 +576,7 @@ def _start_dashboard_background(
             webbrowser.open(f"http://{host}:{port}")
         return existing_pid
 
-    cmd = _background_command(host, port)
+    cmd = _background_command(host, port, tmux_session=tmux_session)
     with log_path.open("ab") as log:
         proc = subprocess.Popen(
             cmd,
@@ -637,8 +664,29 @@ def _channels_dir_for(org: str | None, project: str | None) -> "Path | None":
     return Path.home() / ".synapt" / "channels" / org / project
 
 
-def create_app() -> FastAPI:
+def create_app(*, tmux_session: str | None = None) -> FastAPI:
+    """Build the dashboard with an optional, explicit tmux control capability.
+
+    Without ``tmux_session`` the dashboard remains useful for channels and
+    status, but every route that would read from or write to tmux fails closed.
+    The value is captured at construction so a later cwd/config change cannot
+    silently move the control surface to another session.
+    """
     app = FastAPI(title="synapt dashboard", docs_url=None, redoc_url=None)
+
+    def scoped_tmux_target(name: str) -> str:
+        session = _require_tmux_session(tmux_session)
+        target = _resolve_tmux_target(name, tmux_session=session)
+        # Use-site floor: a resolver regression must still be unable to hand a
+        # foreign coordinate to subprocess.  This deliberately re-checks the
+        # value about to leave the process rather than trusting resolution.
+        return _assert_tmux_target_in_session(target, session)
+
+    def resolve_tmux_target(name: str) -> str:
+        try:
+            return scoped_tmux_target(name)
+        except TmuxTargetScopeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -646,7 +694,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/agents")
     async def api_agents():
-        return await _combined_agents_json()
+        return await _combined_agents_json(tmux_session)
 
     @app.get("/api/org")
     async def api_org():
@@ -787,7 +835,7 @@ def create_app() -> FastAPI:
 
         If text is empty, sends a bare Enter (for confirming selections).
         """
-        target = _resolve_tmux_target(name)
+        target = resolve_tmux_target(name)
         is_codex = name in _CODEX_AGENTS
         try:
             if text.strip():
@@ -834,6 +882,7 @@ def create_app() -> FastAPI:
         read it.  The absolute file path is sent as text input to the
         agent's tmux pane.
         """
+        target = resolve_tmux_target(name)
         if not file.filename:
             raise HTTPException(status_code=400, detail="No file provided")
         suffix = Path(file.filename).suffix
@@ -845,7 +894,6 @@ def create_app() -> FastAPI:
             shutil.copyfileobj(file.file, f)
 
         # Send the file path to the agent's tmux pane
-        target = _resolve_tmux_target(name)
         file_path = str(dest)
         is_codex = name in _CODEX_AGENTS
         try:
@@ -885,7 +933,7 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail=f"Key not allowed: {key}. Allowed: {sorted(_ALLOWED_KEYS)}",
             )
-        target = _resolve_tmux_target(name)
+        target = resolve_tmux_target(name)
         try:
             result = subprocess.run(
                 ["tmux", "send-keys", "-t", target, key],
@@ -940,7 +988,7 @@ def create_app() -> FastAPI:
         includes cursor_x, cursor_y, pane_width, pane_height for cursor
         rendering.
         """
-        target = _resolve_tmux_target(name)
+        target = resolve_tmux_target(name)
         try:
             cmd = ["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"]
             if ansi:
@@ -2716,8 +2764,12 @@ __CARDS__
     @app.websocket("/ws/terminal/{name}")
     async def terminal_ws(websocket: WebSocket, name: str):
         """WebSocket bridge: tmux capture-pane -> client, client input -> tmux send-keys."""
+        try:
+            target = scoped_tmux_target(name)
+        except TmuxTargetScopeError as exc:
+            await websocket.close(code=1008, reason=str(exc))
+            return
         await websocket.accept()
-        target = _resolve_tmux_target(name)
         is_codex = name in _CODEX_AGENTS
 
         async def send_snapshots():
@@ -3035,6 +3087,13 @@ def main():
     parser.add_argument("--port", type=int, default=8420)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open browser")
+    parser.add_argument(
+        "--tmux-session",
+        help=(
+            "Explicit tmux session the dashboard may control. "
+            "Without it, tmux routes are disabled."
+        ),
+    )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--foreground", action="store_true", help="Run server in the terminal")
     group.add_argument("--stop", action="store_true", help="Stop the background dashboard server")
@@ -3058,13 +3117,19 @@ def main():
 
         import uvicorn
 
-        uvicorn.run(create_app(), host=args.host, port=args.port, log_level="warning")
+        uvicorn.run(
+            create_app(tmux_session=args.tmux_session),
+            host=args.host,
+            port=args.port,
+            log_level="warning",
+        )
         return
 
     pid = _start_dashboard_background(
         host=args.host,
         port=args.port,
         no_open=args.no_open,
+        tmux_session=args.tmux_session,
     )
     print(f"synapt dashboard: {url} (pid {pid})")
 
