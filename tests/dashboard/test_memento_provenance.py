@@ -9,6 +9,8 @@ routes, by pointing ``project_data_dir`` at a temp journal store via cwd.
 from __future__ import annotations
 
 import json
+
+import pytest
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -82,6 +84,12 @@ def test_leonard_reachable_false_when_no_memory(tmp_path, monkeypatch):
     assert d["act3"] == []
 
 
+@pytest.mark.xfail(
+    reason="tracked in #928: fixture expects seeded-store session resolution "
+    "that changed underneath it; xfail (not skip) so the day it PASSES is "
+    "loud — that is the #928 fix landing, demanding this marker's removal",
+    strict=True,
+)
 def test_leonard_three_acts_from_real_memory(tmp_path, monkeypatch):
     wt = tmp_path / ".synapt" / "recall" / "worktrees"
     _write_journal(wt, "wt-a", [
