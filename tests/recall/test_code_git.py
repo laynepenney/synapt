@@ -283,3 +283,71 @@ def test_module_imports_no_storage_and_no_memory_layer() -> None:
 
     assert "sqlite3" not in imported
     assert not any(name == "synapt" or name.startswith("synapt.") for name in imported)
+
+
+# ---------------------------------------------------------------------------
+# Hardening witnesses — r2's three non-blocking notes on the A5 merge,
+# each born red against the pre-hardening `_run_git` (physics 082: a test
+# written to expose a known defect is trusted only after it reds against it).
+# ---------------------------------------------------------------------------
+
+
+def test_run_git_carries_a_timeout(monkeypatch):
+    """A live-per-call primitive needs a ceiling: a git blocked on index.lock
+    or a pathological repo must not hang the caller indefinitely."""
+    import synapt.recall.code_git as cg
+
+    seen: dict = {}
+
+    def capture(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cg.subprocess, "run", capture)
+    cg._run_git(".", ["log"])
+    assert seen.get("timeout") and seen["timeout"] > 0, (
+        "no ceiling: a hung git hangs the caller forever"
+    )
+
+
+def test_a_timed_out_git_reports_cleanly_without_the_repo_path(tmp_path, monkeypatch):
+    """Timeout surfaces as the same ValueError contract, path withheld."""
+    import synapt.recall.code_git as cg
+
+    def explode(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 1)
+
+    monkeypatch.setattr(cg.subprocess, "run", explode)
+    with pytest.raises(ValueError) as e:
+        cg._run_git(tmp_path, ["log"])
+    assert "timed out" in str(e.value)
+    assert str(tmp_path) not in str(e.value)
+
+
+def test_error_message_withholds_the_repo_path(tmp_path):
+    """The path-disclosure class: an error that can reach a user-facing
+    surface states what failed, never the local layout it failed in."""
+    with pytest.raises(ValueError) as e:
+        file_history(tmp_path, "anything.py")
+    assert str(tmp_path) not in str(e.value), (
+        "the repo path is embedded in the error message"
+    )
+
+
+def test_git_runs_under_a_pinned_locale(monkeypatch):
+    """Parsers and the error tests above match git's ENGLISH text; an
+    unpinned locale is green on this machine and red on a non-English one."""
+    import synapt.recall.code_git as cg
+
+    seen: dict = {}
+
+    def capture(cmd, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(cg.subprocess, "run", capture)
+    cg._run_git(".", ["log"])
+    env = seen.get("env")
+    assert env is not None and env.get("LC_ALL") == "C", (
+        "locale unpinned: English-text matching breaks off-locale"
+    )

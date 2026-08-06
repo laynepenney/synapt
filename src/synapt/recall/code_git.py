@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import subprocess
 
 __all__ = ["BlameSpan", "FileCommit", "blame_range", "file_history"]
@@ -62,16 +63,32 @@ class BlameSpan:
     line_end: int
 
 
+# A live-per-call primitive needs a ceiling: a git blocked on an index.lock or
+# a pathological repository would otherwise hang the caller indefinitely.
+_GIT_TIMEOUT_SECONDS = 30.0
+
+
 def _run_git(repo: str | Path, args: list[str]) -> str:
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode != 0:
-        raise ValueError(
-            f"git {args[0]} failed in {repo}: {proc.stderr.strip()}"
+    # LC_ALL=C pins git's message text: the parsers and error assertions match
+    # English strings, and an unpinned locale is green on this machine and red
+    # on a non-English one.
+    env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            capture_output=True,
+            text=True,
+            timeout=_GIT_TIMEOUT_SECONDS,
+            env=env,
         )
+    except subprocess.TimeoutExpired:
+        raise ValueError(
+            f"git {args[0]} timed out after {_GIT_TIMEOUT_SECONDS:g}s"
+        ) from None
+    if proc.returncode != 0:
+        # The repository path stays out of the message: an error that reaches a
+        # user-facing surface must not disclose local layout.
+        raise ValueError(f"git {args[0]} failed: {proc.stderr.strip()}")
     return proc.stdout
 
 
