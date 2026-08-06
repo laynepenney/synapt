@@ -4167,6 +4167,25 @@ class TranscriptIndex:
 
         return results
 
+    def session_tail(self, session_id: str) -> list[TranscriptChunk]:
+        """Return one session's conversation turns, hydrated, oldest-first.
+
+        Hydration is the point of this method. :meth:`load` returns *headers
+        only* (``lazy_chunks=True``), so reading ``user_text`` off
+        ``self.sessions[sid]`` yields empty strings rather than raising — a
+        caller that skips hydration reports an empty session instead of failing.
+
+        Chunks with a negative ``turn_index`` are excluded: that value is the
+        sentinel for synthesized journal content, not conversation.
+        """
+        turns = [
+            self._get_chunk(self._id_to_idx[header.id])
+            for header in self.sessions.get(session_id, [])
+            if header.turn_index >= 0
+        ]
+        turns.sort(key=lambda c: c.turn_index)
+        return turns
+
     # -------------------------------------------------------------------
     # Stats
     # -------------------------------------------------------------------
