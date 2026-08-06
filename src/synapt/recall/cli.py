@@ -1121,12 +1121,16 @@ def _attach_freshness(view, args):
 
     from synapt.recall.freshness import check_index_freshness
 
+    # Bind to the index the RENDER loaded, not to a separately-resolved
+    # project. `resume` has no --project, so resolving one here meant freshness
+    # answered about the cwd's store while the view came from --index: a real
+    # stale index could be reported as fine.
+    index_dir = _resolve_index_dir(args)
     project = getattr(args, "project", None)
     try:
-        result = check_index_freshness(project)
+        result = check_index_freshness(project, index_dir=index_dir)
         if not result.stale and not view.turns:
-            deep = check_index_freshness(project, deep=True)
-            result = deep
+            result = check_index_freshness(project, index_dir=index_dir, deep=True)
     except Exception:
         return view
     return dataclasses.replace(view, freshness=result)

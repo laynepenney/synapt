@@ -407,6 +407,24 @@ def _format_journal(view: ResumeView) -> list[str]:
 
 
 
+def _describe_behind(f) -> str:
+    """Say WHICH way the index is behind — unseen files and grown ones differ.
+
+    Calling a grown transcript "not yet indexed" is wrong and sends the reader
+    looking for a file the index already knows about. The two conditions have
+    the same remedy but not the same meaning, and a reader debugging one should
+    not be told the other.
+    """
+    parts = []
+    if f.new_files:
+        n = len(f.new_files)
+        parts.append(f"{n} file{'' if n == 1 else 's'} not yet indexed")
+    if f.changed_files:
+        n = len(f.changed_files)
+        parts.append(f"{n} indexed file{'' if n == 1 else 's'} grown since the build")
+    return " and ".join(parts) if parts else "behind"
+
+
 def _format_freshness(view: ResumeView) -> list[str]:
     """Disclose a stale index whether or not turns rendered.
 
@@ -416,9 +434,7 @@ def _format_freshness(view: ResumeView) -> list[str]:
     f = view.freshness
     if f is None or not f.stale:
         return []
-    behind = len(f.new_files) + len(f.changed_files)
-    noun = "file" if behind == 1 else "files"
-    detail = f" ({behind} {noun} not yet indexed)" if behind else ""
+    detail = f" ({_describe_behind(f)})" if (f.new_files or f.changed_files) else ""
     return [
         "",
         f"⚠ The index is STALE{detail} — built {f.build_timestamp or 'at an unrecorded time'}, "
@@ -439,12 +455,10 @@ def _format_empty(view: ResumeView) -> list[str]:
     """
     f = view.freshness
     if f is not None and f.stale:
-        behind = len(f.new_files) + len(f.changed_files)
-        noun = "file" if behind == 1 else "files"
         return [
-            f"No turns found — but the index is STALE, so this is not an answer "
-            f"about the session.",
-            f"  {behind} archived {noun} {'is' if behind == 1 else 'are'} not in the index "
+            "No turns found — but the index is STALE, so this is not an answer "
+            "about the session.",
+            f"  {_describe_behind(f)} "
             f"(built {f.build_timestamp or 'at an unrecorded time'}, checked: {f.scanned}).",
             f"  Index them, then ask again:  {f.remedy}",
         ]

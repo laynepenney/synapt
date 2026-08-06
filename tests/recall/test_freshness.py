@@ -427,7 +427,7 @@ def test_cmd_resume_runs_the_deep_leg_only_when_cheap_is_fresh_and_view_empty(st
     calls: list[bool] = []
     fresh = IndexFreshness(stale=False, build_timestamp="t", scanned="archive")
 
-    def record(project_dir, *, deep=False):
+    def record(project_dir=None, *, index_dir=None, deep=False):
         calls.append(deep)
         return fresh
 
@@ -445,3 +445,125 @@ def test_cmd_resume_runs_the_deep_leg_only_when_cheap_is_fresh_and_view_empty(st
     )
     _run_resume_cli(store)
     assert calls == [False, True], "an empty view with a fresh cheap leg must run deep"
+
+
+# ---------------------------------------------------------------------------
+# r2's findings. All three share one root: something downstream was described
+# rather than driven, so a fixture supplied what reality does not.
+# ---------------------------------------------------------------------------
+
+
+def _run_real_cli(argv: list[str]) -> str:
+    """Drive the REAL parser and dispatch — sys.argv through cli.main().
+
+    The wiring test above built a Namespace by hand and passed `project=`,
+    a field the resume subparser never produces (it defines only `session`,
+    `--index` and `--turns`). The fixture invented reality, so the test could
+    not see that freshness was resolving a different store than the render.
+    Nothing short of the real parser catches that class.
+    """
+    import sys as _sys
+
+    from synapt.recall import cli as _cli
+
+    out = io.StringIO()
+    old = _sys.argv
+    _sys.argv = argv
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            _cli.main()
+    except SystemExit:
+        pass
+    finally:
+        _sys.argv = old
+    return out.getvalue()
+
+
+def test_f1_freshness_follows_the_index_the_render_loaded(store, tmp_path, monkeypatch):
+    """F1: `--index` must bind freshness too, not just the render.
+
+    `resume` has no `--project`, so freshness resolved the CWD while the render
+    followed `--index`. Pointed at another project's index from a clean cwd,
+    the stale banner vanished — a true stale index reported as fine.
+    """
+    _real_index(store)
+    _archive_file(_archive_dir(store), "rollout-unindexed.jsonl", "turns nobody indexed")
+    _set_manifest(store, [])
+
+    # The cwd must be a store that is genuinely FRESH. Otherwise a
+    # cwd-resolving implementation reports stale for its own reason -- finding
+    # no index there -- and the test passes while proving nothing. Verified:
+    # with an empty directory as cwd this test passed against the DEFECT.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    _index_dir(elsewhere).mkdir(parents=True, exist_ok=True)
+    _archive_dir(elsewhere).mkdir(parents=True, exist_ok=True)
+    other = _archive_file(_archive_dir(elsewhere), "other.jsonl", "indexed")
+    _write_index(_index_dir(elsewhere), [_entry(other)])
+    assert check_index_freshness(elsewhere).stale is False, "control: cwd store must be fresh"
+
+    monkeypatch.chdir(elsewhere)
+
+    out = _run_real_cli(["synapt", "resume", "--index", str(_index_dir(store))])
+
+    assert "STALE" in out.upper(), (
+        "freshness followed the cwd (which is fresh), not the --index the render loaded"
+    )
+
+
+def test_f2_a_non_list_manifest_fails_closed(store):
+    """F2: `source_files` JSON null raised TypeError, swallowed to freshness=None.
+
+    The module contract says unreadable means STALE. Anything that is not a
+    list of entries is unreadable, and must never arrive as 'not checked'.
+    """
+    _archive_file(_archive_dir(store), "a.jsonl", "one")
+    index_dir = _index_dir(store)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    con = _sqlite3.connect(index_dir / "recall.db")
+    con.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('source_files', 'null')")
+    con.commit()
+    con.close()
+
+    result = check_index_freshness(store)
+
+    assert result.stale is True, "a null manifest must fail closed, not raise"
+
+
+def test_f2_a_scalar_manifest_fails_closed(store):
+    """The same contract for any non-list shape, not just null."""
+    _archive_file(_archive_dir(store), "a.jsonl", "one")
+    index_dir = _index_dir(store)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    con = _sqlite3.connect(index_dir / "recall.db")
+    con.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('source_files', '42')")
+    con.commit()
+    con.close()
+
+    assert check_index_freshness(store).stale is True
+
+
+def test_f3_a_grown_file_does_not_read_as_missing(store):
+    """F3: 'not yet indexed' is wrong for a file the index already knows.
+
+    A grown transcript and an unseen one need different fixes in the reader's
+    head; calling both 'not in the index' sends one of them down the wrong path.
+    """
+    f = _archive_file(_archive_dir(store), "a.jsonl", "one")
+    recorded = _entry(f)
+    f.write_text("one plus considerably more")
+    _set_manifest_for_render = None  # noqa: F841  (readability marker)
+    _write_index(_index_dir(store), [recorded])
+
+    view = ResumeView(session_id="s", turns=[], total_turns=0,
+                      freshness=check_index_freshness(store))
+    out = format_resume(view)
+
+    assert "not yet indexed" not in out.lower(), (
+        "a changed file is not a missing one"
+    )
+    assert "grown" in out.lower() or "changed" in out.lower(), (
+        "the banner must say which of the two happened"
+    )

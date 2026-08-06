@@ -93,14 +93,35 @@ def _live_source_files(project_dir: Path) -> list[Path]:
     return files
 
 
-def _archived_files(project_dir: Path) -> dict[str, tuple[float, int]]:
+def _archive_dirs_for(data_dir: Path) -> list[Path]:
+    """Archive directories under an explicit data root.
+
+    Used when the caller has bound an index directory: the data root is that
+    directory's parent, and the archives the build reads live beside it. Going
+    back through project resolution here would re-derive a root the caller has
+    already decided, which is the F1 defect.
+    """
+    root = data_dir / "worktrees"
+    dirs: list[Path] = []
+    if root.is_dir():
+        for wt in sorted(root.iterdir()):
+            archive = wt / "transcripts"
+            if archive.is_dir():
+                dirs.append(archive)
+    return dirs
+
+
+def _archived_files(project_dir: Path, data_dir: Path | None = None) -> dict[str, tuple[float, int]]:
     """``{name: (mtime, size)}`` for every archived transcript the build reads."""
     from synapt.recall.core import all_worktree_archive_dirs, project_archive_dir
 
-    dirs = list(all_worktree_archive_dirs(project_dir))
-    own = project_archive_dir(project_dir)
-    if own not in dirs:
-        dirs.append(own)
+    if data_dir is not None:
+        dirs = _archive_dirs_for(data_dir)
+    else:
+        dirs = list(all_worktree_archive_dirs(project_dir))
+        own = project_archive_dir(project_dir)
+        if own not in dirs:
+            dirs.append(own)
 
     found: dict[str, tuple[float, int]] = {}
     for d in dirs:
@@ -117,7 +138,9 @@ def _archived_files(project_dir: Path) -> dict[str, tuple[float, int]]:
     return found
 
 
-def _read_manifest(project_dir: Path) -> tuple[dict[str, tuple[float, int]], str] | None:
+def _read_manifest(
+    project_dir: Path, index_dir: Path | None = None
+) -> tuple[dict[str, tuple[float, int]], str] | None:
     """``({name: (mtime, size)}, build_timestamp)``, or ``None`` if unreadable.
 
     ``None`` is not "empty" — it means we could not compute an answer, and the
@@ -128,7 +151,7 @@ def _read_manifest(project_dir: Path) -> tuple[dict[str, tuple[float, int]], str
 
     from synapt.recall.core import project_index_dir
 
-    db = project_index_dir(project_dir) / "recall.db"
+    db = (index_dir or project_index_dir(project_dir)) / "recall.db"
     if not db.is_file():
         return None
     try:
@@ -148,6 +171,14 @@ def _read_manifest(project_dir: Path) -> tuple[dict[str, tuple[float, int]], str
     except (TypeError, ValueError):
         return None
 
+    # Anything that is not a list of entries is unreadable, and the module
+    # contract says unreadable means STALE. `null` and scalars used to raise a
+    # TypeError here that the CLI swallowed into freshness=None -- "not
+    # checked" -- which is the one verdict the contract forbids for an
+    # uncomputable answer.
+    if not isinstance(entries, list):
+        return None
+
     known: dict[str, tuple[float, int]] = {}
     for e in entries:
         if isinstance(e, dict) and e.get("name"):
@@ -155,7 +186,12 @@ def _read_manifest(project_dir: Path) -> tuple[dict[str, tuple[float, int]], str
     return known, rows.get("build_timestamp") or ""
 
 
-def check_index_freshness(project_dir: Path, *, deep: bool = False) -> IndexFreshness:
+def check_index_freshness(
+    project_dir: Path | None = None,
+    *,
+    index_dir: Path | None = None,
+    deep: bool = False,
+) -> IndexFreshness:
     """Return whether the index is behind its sources, and over which surface.
 
     ``deep=False`` compares the index manifest against the archive. ``deep=True``
@@ -168,7 +204,13 @@ def check_index_freshness(project_dir: Path, *, deep: bool = False) -> IndexFres
     """
     scanned = "archive+sources" if deep else "archive"
 
-    manifest = _read_manifest(project_dir)
+    # When the caller has bound an index directory, everything is derived from
+    # it. `resume` renders whatever `--index` names, and freshness must answer
+    # about THAT store; resolving the project independently let the two follow
+    # different stores and suppressed a true stale banner.
+    data_dir = index_dir.parent if index_dir is not None else None
+
+    manifest = _read_manifest(project_dir, index_dir)
     if manifest is None:
         # No index, or one we cannot read. Either way we have not established
         # that it is current, and "we could not tell" must never render as
@@ -177,11 +219,11 @@ def check_index_freshness(project_dir: Path, *, deep: bool = False) -> IndexFres
             stale=True,
             build_timestamp="",
             scanned=scanned,
-            new_files=sorted(_archived_files(project_dir)),
+            new_files=sorted(_archived_files(project_dir, data_dir)),
         )
     known, build_timestamp = manifest
 
-    archived = _archived_files(project_dir)
+    archived = _archived_files(project_dir, data_dir)
     new = sorted(n for n in archived if n not in known)
     changed = sorted(n for n in archived if n in known and archived[n] != known[n])
 
