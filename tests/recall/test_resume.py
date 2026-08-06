@@ -868,3 +868,195 @@ class TestTopLevelWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# recall#935 / #937 — what the author's own cold run surfaced
+#
+# `synapt resume` shipped, and the first use of it from a genuinely empty
+# context served a session two weeks stale with a journal made of harness
+# markup. Three defects, and two of them masked each other: the ordering bug
+# hid the fact that the newest thing in the index was a CHANNEL, so repairing
+# ordering alone would have moved the default from "stale session" to "#dev",
+# which looks more plausible and is more wrong.
+# ---------------------------------------------------------------------------
+
+
+CHANNEL_ID = "channel_dev"
+
+
+def _journal_chunk(session_id: str, timestamp: str) -> TranscriptChunk:
+    """A journal chunk: turn_index -1, timestamp = when the journal was WRITTEN."""
+    return _chunk(session_id, -1, user_text="journal", timestamp=timestamp)
+
+
+class TestSessionOrderingIgnoresJournalWriteTime(unittest.TestCase):
+    """Recency must mean *activity*, not when a journal was written about it.
+
+    Journal chunks carry write time. Indexing stamps them at build time, so a
+    dead session acquires a timestamp of "now" and floats above a live one —
+    which is exactly how a 2026-07-22 session won a "newest session" contract
+    on 2026-08-06.
+    """
+
+    def test_journal_write_time_does_not_make_a_dead_session_newest(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "old work", "old answer",
+                   timestamp="2026-07-22T07:36:29Z"),
+            _journal_chunk(SESSION_A, "2026-08-06T03:46:56Z"),  # build stamped it
+            _chunk(SESSION_B, 0, "tonight's work", "tonight's answer",
+                   timestamp="2026-08-06T03:14:44Z"),
+        ])
+        self.assertEqual(resolve_session(index, None), SESSION_B)
+
+    def test_a_session_of_only_journal_chunks_is_still_resolvable(self):
+        """Having no real turns must not make a session vanish from the index."""
+        index = _index([_journal_chunk(SESSION_A, "2026-08-06T03:46:56Z")])
+        self.assertEqual(resolve_session(index, None), SESSION_A)
+
+
+class TestChannelsAreNotTheDefaultResumeTarget(unittest.TestCase):
+    """A channel is not a session, and must never be the silent default.
+
+    This defect was invisible until the ordering bug above was diagnosed: with
+    journal chunks excluded, the newest entry in a real index was `channel_dev`.
+    """
+
+    def test_newest_channel_does_not_win_the_default(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "real work", "real answer",
+                   timestamp="2026-08-06T03:14:44Z"),
+            _chunk(CHANNEL_ID, 0, "a channel post", "another post",
+                   timestamp="2026-08-06T03:27:20Z"),
+        ])
+        self.assertEqual(resolve_session(index, None), SESSION_A)
+
+    def test_a_channel_may_still_be_resumed_when_named_explicitly(self):
+        """Asking for it by name is not the failure mode; defaulting to it is."""
+        index = _index([
+            _chunk(SESSION_A, 0, "real work", "real answer",
+                   timestamp="2026-08-06T03:14:44Z"),
+            _chunk(CHANNEL_ID, 0, "a channel post", "another post",
+                   timestamp="2026-08-06T03:27:20Z"),
+        ])
+        self.assertEqual(resolve_session(index, CHANNEL_ID), CHANNEL_ID)
+
+    def test_an_index_of_only_channels_says_so_rather_than_resuming_one(self):
+        index = _index([
+            _chunk(CHANNEL_ID, 0, "a channel post", "another post",
+                   timestamp="2026-08-06T03:27:20Z"),
+        ])
+        with self.assertRaises(ResumeError):
+            resolve_session(index, None)
+
+    def test_channel_ids_are_rendered_in_full_so_they_are_tellable(self):
+        """Truncated to eight characters, every channel renders as `channel_`."""
+        index = _index([
+            _chunk(CHANNEL_ID, 0, "a channel post", "another post",
+                   timestamp="2026-08-06T03:27:20Z"),
+        ])
+        view = build_resume_view(index, session_id=CHANNEL_ID)
+        self.assertIn(CHANNEL_ID, format_resume(view))
+
+
+class TestStubJournalDoesNotShadowTheRealEntry(unittest.TestCase):
+    """A file list is not a journal, and harness markup is not a focus.
+
+    The auto-extractor writes a stub whose `focus` is the raw `/clear` command
+    block and whose done/decisions/next_steps are empty. Because it carried a
+    matching session id, it won the exact-match branch outright — so the
+    "inferred" path, which exists precisely to surface rich entries whose
+    session id is empty, was never reached.
+    """
+
+    def _stub(self, session_id: str) -> JournalEntry:
+        return JournalEntry(
+            timestamp="2026-08-06T03:00:00Z",
+            session_id=session_id,
+            focus="<command-name>/clear</command-name>\n<command-args></command-args>",
+            done=[], decisions=[], next_steps=[],
+            files_modified=["src/synapt/recall/resume.py"],
+            auto=True,
+        )
+
+    def _real(self, session_id: str = "") -> JournalEntry:
+        return JournalEntry(
+            timestamp="2026-08-06T03:28:30Z",
+            session_id=session_id,
+            focus="recall#927 shipped — the session-tail verb merged",
+            done=["merged the verb"],
+            decisions=["strict xfail over skip"],
+            next_steps=["rerun the nightly benchmark"],
+            auto=False,
+        )
+
+    def _view_with(self, entries: list[JournalEntry], tmp: Path):
+        path = tmp / "journal.jsonl"
+        for entry in entries:
+            append_entry(entry, path)
+        index = _index([
+            _chunk(SESSION_A, 0, "work", "answer", timestamp="2026-08-06T03:14:44Z"),
+        ])
+        return build_resume_view(index, journal_path=path)
+
+    def test_a_files_only_stub_is_not_treated_as_a_journal(self):
+        with tempfile.TemporaryDirectory() as td:
+            view = self._view_with([self._stub(SESSION_A)], Path(td))
+            self.assertIsNone(view.journal)
+
+    def test_the_rich_unbound_entry_wins_over_a_matching_stub(self):
+        with tempfile.TemporaryDirectory() as td:
+            view = self._view_with(
+                [self._stub(SESSION_A), self._real(session_id="")], Path(td)
+            )
+            self.assertIsNotNone(view.journal)
+            self.assertEqual(view.journal.next_steps, ["rerun the nightly benchmark"])
+
+    def test_a_genuinely_bound_rich_entry_still_binds(self):
+        with tempfile.TemporaryDirectory() as td:
+            view = self._view_with([self._real(session_id=SESSION_A)], Path(td))
+            self.assertEqual(view.journal_provenance, "bound")
+
+    def test_harness_markup_alone_is_not_intent_content(self):
+        """Focus made only of a runtime control block carries no intent."""
+        entry = JournalEntry(
+            timestamp="2026-08-06T03:00:00Z", session_id=SESSION_A,
+            focus="<command-name>/clear</command-name>",
+            done=[], decisions=[], next_steps=[], auto=True,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            view = self._view_with([entry], Path(td))
+            self.assertIsNone(view.journal)
+
+    def test_an_auto_entry_is_not_labelled_as_written_by_the_session(self):
+        """`auto=True` means the extractor wrote it, not the session."""
+        entry = self._real(session_id=SESSION_A)
+        entry.auto = True
+        with tempfile.TemporaryDirectory() as td:
+            view = self._view_with([entry], Path(td))
+            self.assertIsNotNone(view.journal)
+            self.assertNotIn("written by this session", format_resume(view))
+
+
+class TestTimestampFormatDoesNotDecideOrdering(unittest.TestCase):
+    """Identical instants must not order by spelling.
+
+    Timestamps are compared as strings, and the index mixes `Z` with `+00:00`.
+    `'Z'` (0x5A) sorts above `'+'` (0x2B), so the same moment written two ways
+    compares unequal — a latent ordering landmine as `+00:00` writers grow.
+    """
+
+    def test_a_later_offset_timestamp_beats_an_earlier_z_timestamp(self):
+        """The discriminating case, not a comfortable one.
+
+        ``2026-08-06T03:00:00.500000+00:00`` is half a second AFTER
+        ``2026-08-06T03:00:00Z``. Compared as text the fractional form loses,
+        because ``'Z'`` (0x5A) outranks the ``'.'`` (0x2E) that begins the
+        fraction — so the earlier moment wins on spelling alone.
+        """
+        index = _index([
+            _chunk(SESSION_A, 0, "a", "b",
+                   timestamp="2026-08-06T03:00:00.500000+00:00"),
+            _chunk(SESSION_B, 0, "c", "d", timestamp="2026-08-06T03:00:00Z"),
+        ])
+        self.assertEqual(resolve_session(index, None), SESSION_A)

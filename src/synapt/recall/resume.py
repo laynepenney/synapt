@@ -155,6 +155,40 @@ def _is_continuation(chunk: TranscriptChunk) -> bool:
     return chunk.user_text.lstrip().startswith(_CONTEXT_PREFIX)
 
 
+#: Channel chunks are grouped under pseudo-session ids with this prefix.
+_CHANNEL_PREFIX = "channel_"
+
+
+def is_channel_session(session_id: str) -> bool:
+    """True when an id names a channel rather than a working session."""
+    return session_id.startswith(_CHANNEL_PREFIX)
+
+
+def _carries_intent(entry: JournalEntry) -> bool:
+    """True when an entry records what someone MEANT, not just what was touched.
+
+    Two things are deliberately not intent:
+
+    * **A file list alone.** ``files_modified`` records what was touched, never
+      why. An entry carrying only that is a record of activity, and presenting
+      it as the session's journal tells a returning reader nothing they can act
+      on — while looking exactly like a real answer.
+    * **A focus made only of harness markup.** The auto-extractor takes the
+      session's first user message as the focus, and after a ``/clear`` that
+      message is the runtime's own control block. The same residue rule used to
+      filter harness turns applies here, so the two stay consistent.
+    """
+    if entry.done or entry.decisions or entry.next_steps:
+        return True
+    focus = (entry.focus or "").strip()
+    if not focus:
+        return False
+    residue = _HARNESS_OPEN_RE.sub("", _HARNESS_BLOCK_RE.sub("", focus)).strip()
+    if residue == focus:
+        return True  # no marker found — ordinary prose
+    return bool(residue)
+
+
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
@@ -170,13 +204,27 @@ def resolve_session(index: TranscriptIndex, session_id: str | None) -> str:
     An unresolvable id raises rather than falling back to the newest session.
     Silently resuming a *different* session is the worst failure available here:
     nothing in the output would look wrong.
+
+    The default skips channel pseudo-sessions. Channels share the session
+    namespace but are not sessions, and #dev is written to constantly — so the
+    newest thing in the index is very often a channel. Naming one explicitly
+    still works, because the failure this guards against is a silent wrong
+    default, not a reader who asked for a channel on purpose. (recall#935: this
+    was invisible until the ordering defect above it was fixed, and repairing
+    ordering alone would have moved the default from a stale session to #dev.)
     """
     order = index._session_order
     if not order:
         raise ResumeError("No sessions indexed yet. Nothing to resume.")
 
     if not session_id:
-        return order[0]
+        for sid in order:
+            if not is_channel_session(sid):
+                return sid
+        raise ResumeError(
+            "Only channels are indexed — no session to resume. "
+            "Name a channel explicitly to read its tail."
+        )
 
     if session_id in index.sessions:
         return session_id
@@ -217,16 +265,20 @@ def _select_journal(
 
     entries = read_entries(journal_path, n=50)
 
+    # An id match that carries no intent is a stub. It must not END the search:
+    # the entry a reader actually needs is often the unbound rich one below, and
+    # letting a stub win on a technicality is how a real journal with 188
+    # next-steps went unseen behind a file list (recall#937). So this scans every
+    # id match for one that carries intent before giving up on binding at all.
     for entry in entries:
-        if entry.session_id and entry.session_id == session_id:
-            if entry.has_content():
-                return entry, "bound"
+        if entry.session_id and entry.session_id == session_id and _carries_intent(entry):
+            return entry, "bound"
 
     if not is_newest:
         return None, None
 
     for entry in entries:
-        if not entry.session_id and entry.has_rich_content():
+        if not entry.session_id and _carries_intent(entry):
             return entry, "inferred"
 
     return None, None
@@ -320,7 +372,13 @@ def _format_journal(view: ResumeView) -> list[str]:
     if entry is None:
         return []
 
-    if view.journal_provenance == "bound":
+    if view.journal_provenance == "bound" and getattr(entry, "auto", False):
+        # `auto` means the extractor wrote this, not the session. The id still
+        # binds it to the right session, so the entry is worth showing — but
+        # claiming authorship it does not have would misrepresent how much a
+        # reader should trust it.
+        header = "JOURNAL (auto-extracted for this session, not written by it)"
+    elif view.journal_provenance == "bound":
         header = "JOURNAL (written by this session)"
     else:
         header = (
@@ -347,7 +405,16 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
     date = view.turns[0].timestamp[:10] if view.turns else ""
     shown = len(view.turns)
 
-    header = f"Session {view.session_id[:8]}"
+    # Channel ids are shown in full. Truncated to eight characters every one of
+    # them renders as "channel_", so the header names a channel without saying
+    # WHICH — and `channel_dev` and `channel_dm--atlas--opus` become
+    # indistinguishable at exactly the moment the reader needs to tell them
+    # apart. Session UUIDs stay short: eight characters identify those.
+    label = (
+        view.session_id if is_channel_session(view.session_id)
+        else view.session_id[:8]
+    )
+    header = f"Session {label}"
     if date:
         header += f" · {date}"
     header += f" · showing {shown} of {view.total_turns} turns"
