@@ -947,6 +947,60 @@ def parse_transcript(
 
 
 # ---------------------------------------------------------------------------
+# Session recency
+# ---------------------------------------------------------------------------
+
+#: Chunks with this turn index are journal entries rather than conversation.
+JOURNAL_TURN_INDEX = -1
+
+
+def normalize_timestamp(value: str) -> tuple[int, str]:
+    """Return a sort key that compares timestamps by instant, not spelling.
+
+    Timestamps reach the index in more than one ISO-8601 spelling — most end in
+    ``Z``, a few carry an explicit ``+00:00`` offset, and some carry fractional
+    seconds. Compared as raw text those spellings interleave wrongly: ``'Z'``
+    (0x5A) outranks the ``'.'`` (0x2E) that opens a fraction, so
+    ``03:00:00.500000+00:00`` sorts BELOW ``03:00:00Z`` despite being half a
+    second later.
+
+    Parsed values sort ahead of unparseable ones so that a malformed timestamp
+    degrades to "oldest" rather than winning by accident. On the unparseable
+    branch the raw string is the second element, so malformed values still order
+    deterministically among themselves; two *parsed* values at the same instant
+    tie outright and fall to the caller's sort stability, which is correct —
+    they name the same moment, and inventing a winner between them would be
+    ordering by spelling again.
+    """
+    if not value:
+        return (0, "")
+    try:
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (1, f"{parsed.timestamp():020.6f}")
+    except (ValueError, TypeError):
+        return (0, value)
+
+
+def _session_activity_key(chunks: list) -> tuple[int, str]:
+    """Newest ACTIVITY in a session, ignoring when journals were written."""
+    activity = [
+        c.timestamp for c in chunks
+        if getattr(c, "turn_index", 0) != JOURNAL_TURN_INDEX and c.timestamp
+    ]
+    if not activity:
+        # Journal-only session: fall back so it still orders somewhere.
+        activity = [c.timestamp for c in chunks if c.timestamp]
+    if not activity:
+        return (0, "")
+    return max(normalize_timestamp(t) for t in activity)
+
+
+# ---------------------------------------------------------------------------
 # TranscriptIndex
 # ---------------------------------------------------------------------------
 
@@ -975,10 +1029,20 @@ class TranscriptIndex:
         for chunk in self.chunks:
             self.sessions.setdefault(chunk.session_id, []).append(chunk)
 
-        # Session order: most recent first (by latest timestamp in session)
+        # Session order: most recent first, by latest ACTIVITY in the session.
+        #
+        # Journal chunks (turn_index -1) are excluded from the comparison: their
+        # timestamp is when the journal was WRITTEN, and indexing stamps
+        # auto-synthesised ones at build time. Including them lets a session
+        # that has been dead for weeks acquire a timestamp of "now" and sort
+        # above a live one — which is how a 2026-07-22 session won a
+        # "newest session" contract on 2026-08-06 (recall#935).
+        #
+        # A session with nothing BUT journal chunks falls back to those, so it
+        # still orders somewhere rather than disappearing.
         self._session_order = sorted(
             self.sessions.keys(),
-            key=lambda sid: max(c.timestamp for c in self.sessions[sid]),
+            key=lambda sid: _session_activity_key(self.sessions[sid]),
             reverse=True,
         )
 
