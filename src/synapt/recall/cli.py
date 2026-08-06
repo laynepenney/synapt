@@ -1061,6 +1061,43 @@ def cmd_sessions(args: argparse.Namespace) -> None:
         )
 
 
+def cmd_resume(args: argparse.Namespace) -> None:
+    """Print the tail of a session so a fresh session can pick up where it stopped.
+
+    Three outcomes are kept distinguishable because they have different fixes:
+    no index at all (exit 1 — build one), an index with no sessions (exit 0 —
+    nothing to resume), and a session id that does not resolve (exit 1 — the
+    request was wrong). Collapsing them would send the reader down the wrong path.
+    """
+    from synapt.recall.journal import _journal_path
+    from synapt.recall.resume import ResumeError, build_resume_view, format_resume
+
+    index_dir = _resolve_index_dir(args)
+    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+        print(f"Error: no index found at {index_dir}", file=sys.stderr)
+        print("Run 'synapt recall build' or 'synapt init' first.", file=sys.stderr)
+        sys.exit(1)
+
+    index = TranscriptIndex.load(index_dir, use_embeddings=False)
+
+    try:
+        view = build_resume_view(
+            index,
+            session_id=getattr(args, "session", None),
+            limit=getattr(args, "turns", None) or 10,
+            journal_path=_journal_path(),
+        )
+    except ResumeError as exc:
+        # An empty index is an honest empty state, not a failure to act on.
+        if not index._session_order:
+            print("No sessions indexed yet. Nothing to resume.")
+            return
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(format_resume(view))
+
+
 def cmd_rebuild(args: argparse.Namespace) -> None:
     """Incremental rebuild triggered by hooks. Auto-discovers current project."""
     project = Path.cwd().resolve()
@@ -2717,6 +2754,16 @@ def main():
     sessions_parser.add_argument("--after", default=None, help="Only sessions after this date (ISO 8601)")
     sessions_parser.add_argument("--before", default=None, help="Only sessions before this date (ISO 8601)")
 
+    # Resume (session tail — pick up after an unclean stop)
+    resume_parser = subparsers.add_parser(
+        "resume", help="Show the tail of the most recent session (pick up where it stopped)"
+    )
+    resume_parser.add_argument("session", nargs="?", default=None,
+                               help="Session id or unique prefix (default: newest session)")
+    resume_parser.add_argument("--index", default=None, help="Index directory (default: per-project)")
+    resume_parser.add_argument("--turns", type=int, default=10,
+                               help="How many trailing turns to show (default: 10)")
+
     # Rebuild (hook-triggered)
     rebuild_parser = subparsers.add_parser("rebuild", help="Incremental rebuild (for hooks)")
     rebuild_parser.add_argument("--out", default=None, help="Output directory (default: per-project)")
@@ -2883,6 +2930,8 @@ def main():
         cmd_stats(args)
     elif args.command == "sessions":
         cmd_sessions(args)
+    elif args.command == "resume":
+        cmd_resume(args)
     elif args.command == "rebuild":
         cmd_rebuild(args)
     elif args.command == "sync":

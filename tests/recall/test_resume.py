@@ -1,0 +1,870 @@
+"""Tests for synapt.recall.resume — the session-tail surface behind `synapt resume`.
+
+recall#927. The feature answers "what were the last things the previous session
+did and intended?" after an unclean stop, so nearly every test here is about a
+*silent* failure: an answer that is confidently wrong reads exactly like an
+answer that is right.
+
+Three hazards get first-class witnesses rather than footnotes:
+
+1. ``TranscriptIndex.load`` returns HEADERS ONLY. Code that reads ``user_text``
+   straight off ``index.sessions[sid]`` gets empty strings and reports "no
+   meaningful turns" without erroring. ``TestLazyHydration`` proves the hazard
+   is real (control) before proving the code avoids it.
+2. The noise filter can delete the single most load-bearing turn in the output —
+   a final user message with no reply, which is what a dropped baton looks like.
+   ``TestHarnessNoiseDiscriminator`` pins both halves of the conjunction that
+   prevents it.
+3. Journal binding can pair one session's tail with another session's intent.
+   ``TestJournalBinding`` pins the three provenance states separately.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import tempfile
+import unittest
+from argparse import Namespace
+from pathlib import Path
+from unittest import mock
+
+from synapt.recall.core import TranscriptChunk, TranscriptIndex
+from synapt.recall.journal import JournalEntry, append_entry
+from synapt.recall.resume import (
+    ResumeError,
+    build_resume_view,
+    format_resume,
+    is_harness_authored,
+    resolve_session,
+)
+
+SESSION_A = "aaaaaaaa-1111-2222-3333-444444444444"
+SESSION_B = "bbbbbbbb-5555-6666-7777-888888888888"
+
+CONTINUATION_PREAMBLE = (
+    "This session is being continued from a previous conversation that ran out "
+    "of context. The summary below covers the earlier portion."
+)
+
+
+def _chunk(
+    session_id: str,
+    turn_index: int,
+    user_text: str = "",
+    assistant_text: str = "",
+    tools_used: list[str] | None = None,
+    timestamp: str = "2026-08-05T10:00:00Z",
+    tool_content: str = "",
+) -> TranscriptChunk:
+    """Build a chunk the way the parsers do (short-id prefix, ``:t<n>`` suffix)."""
+    return TranscriptChunk(
+        id=f"{session_id[:8]}:t{turn_index}",
+        session_id=session_id,
+        timestamp=timestamp,
+        turn_index=turn_index,
+        user_text=user_text,
+        assistant_text=assistant_text,
+        tools_used=list(tools_used or []),
+        tool_content=tool_content,
+    )
+
+
+def _index(chunks: list[TranscriptChunk]) -> TranscriptIndex:
+    return TranscriptIndex(chunks, use_embeddings=False)
+
+
+def _save_sqlite_index(chunks: list[TranscriptChunk], directory: Path) -> None:
+    """Persist an index the way a real build does — SQLite, not chunks.jsonl.
+
+    This distinction is the whole point of ``TestLazyHydration``. Saving an
+    index that has no ``RecallDB`` attached writes only ``chunks.jsonl``, and
+    loading that migrates EAGERLY (``lazy_chunks=False``), so the headers arrive
+    already carrying their text. A fixture built that way cannot tell a
+    hydrating implementation from a broken one — verified 2026-08-05, when the
+    control below caught exactly that.
+    """
+    from synapt.recall.storage import RecallDB
+
+    db = RecallDB(directory / "recall.db")
+    try:
+        TranscriptIndex(chunks, use_embeddings=False, db=db).save(directory)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Session selection
+# ---------------------------------------------------------------------------
+
+
+class TestSessionSelection(unittest.TestCase):
+    """Which session gets resumed, and what happens when the answer is unclear.
+
+    The load-bearing case is the unknown id. Falling back to the newest session
+    would hand a reader another session's tail while they believe it is theirs —
+    strictly worse than an error, because nothing about the output would look
+    wrong.
+    """
+
+    def setUp(self):
+        # B is newer than A, so "newest" and "named A" are distinguishable.
+        self.index = _index([
+            _chunk(SESSION_A, 0, "old question", "old answer",
+                   timestamp="2026-08-01T10:00:00Z"),
+            _chunk(SESSION_B, 0, "new question", "new answer",
+                   timestamp="2026-08-05T10:00:00Z"),
+        ])
+
+    def test_default_resolves_to_newest_session(self):
+        self.assertEqual(resolve_session(self.index, None), SESSION_B)
+
+    def test_control_newest_is_not_the_named_session(self):
+        """Without this the selection tests could pass by coincidence."""
+        self.assertNotEqual(SESSION_A, resolve_session(self.index, None))
+
+    def test_exact_session_id_resolves(self):
+        self.assertEqual(resolve_session(self.index, SESSION_A), SESSION_A)
+
+    def test_unique_prefix_resolves(self):
+        """`recall sessions` prints 8 characters, so prefixes are the real input."""
+        self.assertEqual(resolve_session(self.index, SESSION_A[:8]), SESSION_A)
+
+    def test_ambiguous_prefix_errors_and_names_candidates(self):
+        index = _index([
+            _chunk("dup-1111", 0, "q", "a"),
+            _chunk("dup-2222", 0, "q", "a"),
+        ])
+        with self.assertRaises(ResumeError) as ctx:
+            resolve_session(index, "dup-")
+        message = str(ctx.exception)
+        self.assertIn("dup-1111", message)
+        self.assertIn("dup-2222", message)
+
+    def test_unknown_session_errors_rather_than_falling_back(self):
+        with self.assertRaises(ResumeError) as ctx:
+            resolve_session(self.index, "nosuchsession")
+        self.assertIn("nosuchsession", str(ctx.exception))
+
+    def test_unknown_session_does_not_return_the_newest(self):
+        """The failure this guards is silent, so assert the fallback never happens."""
+        with contextlib.suppress(ResumeError):
+            result = resolve_session(self.index, "nosuchsession")
+            self.fail(f"expected ResumeError, silently resolved to {result}")
+
+    def test_empty_index_errors(self):
+        with self.assertRaises(ResumeError):
+            resolve_session(_index([]), None)
+
+
+# ---------------------------------------------------------------------------
+# The noise discriminator
+# ---------------------------------------------------------------------------
+
+
+class TestHarnessNoiseDiscriminator(unittest.TestCase):
+    """Exclusion requires POSITIVE identification of harness authorship.
+
+    The rule is a conjunction: the user text is entirely a harness control block
+    AND nothing responded to it. Each half alone has a known false-reject, and
+    both false-rejects are witnessed here so that weakening the AND to an OR reds
+    a specific row rather than passing quietly.
+    """
+
+    def test_slash_command_echo_is_harness_authored(self):
+        chunk = _chunk(
+            SESSION_A, 5,
+            user_text=(
+                "<command-name>/compact</command-name>\n"
+                "<command-message>compact</command-message>\n"
+                "<command-args>some directive</command-args>"
+            ),
+        )
+        self.assertTrue(is_harness_authored(chunk))
+
+    def test_local_command_stdout_is_harness_authored(self):
+        chunk = _chunk(
+            SESSION_A, 6,
+            user_text="<local-command-stdout>Compacted (ctrl+o)</local-command-stdout>",
+        )
+        self.assertTrue(is_harness_authored(chunk))
+
+    def test_continuation_preamble_is_harness_authored(self):
+        chunk = _chunk(SESSION_A, 7, user_text=CONTINUATION_PREAMBLE)
+        self.assertTrue(is_harness_authored(chunk))
+
+    def test_final_user_turn_with_no_reply_is_kept(self):
+        """A dropped baton looks exactly like this. Deleting it defeats the feature."""
+        chunk = _chunk(SESSION_A, 8, user_text="ship the release when CI goes green")
+        self.assertFalse(is_harness_authored(chunk))
+
+    def test_prose_mentioning_a_marker_is_kept_when_something_responded(self):
+        """Kill-witness for the marker half: the marker ALONE must not reject."""
+        chunk = _chunk(
+            SESSION_A, 9,
+            user_text="why does <command-name> leak into the index?",
+            assistant_text="because scrub.py does not cover it",
+        )
+        self.assertFalse(is_harness_authored(chunk))
+
+    def test_prose_mentioning_a_marker_is_kept_even_with_no_reply(self):
+        """The residue outside the block is participant text, so it cannot be harness-only."""
+        chunk = _chunk(
+            SESSION_A, 10,
+            user_text="look at <command-name>/compact</command-name> please",
+        )
+        self.assertFalse(is_harness_authored(chunk))
+
+    def test_unanswered_turn_without_any_marker_is_kept(self):
+        """Kill-witness for the emptiness half: emptiness ALONE must not reject."""
+        chunk = _chunk(SESSION_A, 11, user_text="one last thought before I go")
+        self.assertFalse(is_harness_authored(chunk))
+
+    def test_harness_block_that_got_a_reply_is_kept(self):
+        """A participant responded, so the turn is part of the conversation."""
+        chunk = _chunk(
+            SESSION_A, 12,
+            user_text="<local-command-stdout>output</local-command-stdout>",
+            assistant_text="I see the command output",
+        )
+        self.assertFalse(is_harness_authored(chunk))
+
+    def test_harness_block_with_tools_is_kept(self):
+        chunk = _chunk(
+            SESSION_A, 13,
+            user_text="<local-command-stdout>output</local-command-stdout>",
+            tools_used=["Bash"],
+        )
+        self.assertFalse(is_harness_authored(chunk))
+
+    def test_raw_slash_command_typed_by_a_participant_is_kept(self):
+        """`/compact <directive>` is authored by a person; only its ECHO is harness text.
+
+        Rejecting it would be widening the filter until the tail looks tidy,
+        which is the failure mode recall#919 was about.
+        """
+        chunk = _chunk(SESSION_A, 14, user_text="/compact keep what matters")
+        self.assertFalse(is_harness_authored(chunk))
+
+    def test_empty_chunk_is_not_classified_as_harness_authored(self):
+        """Emptiness is a separate reason for exclusion; the two must not be conflated."""
+        self.assertFalse(is_harness_authored(_chunk(SESSION_A, 15)))
+
+    def test_view_excludes_harness_turns_and_reports_how_many(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "real question", "real answer"),
+            _chunk(SESSION_A, 1, user_text=CONTINUATION_PREAMBLE),
+            _chunk(SESSION_A, 2,
+                   user_text="<command-name>/compact</command-name>"),
+            _chunk(SESSION_A, 3, "last words"),
+        ])
+        view = build_resume_view(index, limit=10, journal_path=None)
+        self.assertEqual([t.chunk_id for t in view.turns],
+                         [f"{SESSION_A[:8]}:t0", f"{SESSION_A[:8]}:t3"])
+        self.assertEqual(view.excluded_count, 2)
+
+    def test_view_excludes_content_free_chunks(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "question", "answer"),
+            _chunk(SESSION_A, 1),  # no user, no assistant, no tools
+        ])
+        view = build_resume_view(index, limit=10, journal_path=None)
+        self.assertEqual(len(view.turns), 1)
+
+
+# ---------------------------------------------------------------------------
+# Ordering, limit, traceability
+# ---------------------------------------------------------------------------
+
+
+class TestOrderingAndLimit(unittest.TestCase):
+    def setUp(self):
+        self.index = _index([
+            _chunk(SESSION_A, i, f"q{i}", f"a{i}") for i in range(6)
+        ])
+
+    def test_turns_are_newest_last(self):
+        view = build_resume_view(self.index, limit=3, journal_path=None)
+        self.assertEqual([t.turn_index for t in view.turns], [3, 4, 5])
+
+    def test_limit_takes_the_tail_not_the_head(self):
+        view = build_resume_view(self.index, limit=2, journal_path=None)
+        self.assertEqual([t.turn_index for t in view.turns], [4, 5])
+
+    def test_limit_larger_than_available_returns_everything(self):
+        view = build_resume_view(self.index, limit=100, journal_path=None)
+        self.assertEqual(len(view.turns), 6)
+
+    def test_ordering_is_by_turn_index_not_storage_order(self):
+        shuffled = _index([
+            _chunk(SESSION_A, 2, "q2", "a2"),
+            _chunk(SESSION_A, 0, "q0", "a0"),
+            _chunk(SESSION_A, 1, "q1", "a1"),
+        ])
+        view = build_resume_view(shuffled, limit=10, journal_path=None)
+        self.assertEqual([t.turn_index for t in view.turns], [0, 1, 2])
+
+    def test_journal_chunks_are_not_treated_as_turns(self):
+        """Journal chunks carry turn_index=-1 as a sentinel; they are not conversation."""
+        index = _index([
+            _chunk(SESSION_A, -1, "journal chunk text", "x"),
+            _chunk(SESSION_A, 0, "q0", "a0"),
+        ])
+        view = build_resume_view(index, limit=10, journal_path=None)
+        self.assertEqual([t.turn_index for t in view.turns], [0])
+
+    def test_invalid_limit_errors_rather_than_returning_empty(self):
+        """A zero limit returning "nothing to resume" would misreport an empty session."""
+        with self.assertRaises(ResumeError):
+            build_resume_view(self.index, limit=0, journal_path=None)
+
+
+class TestChunkTraceability(unittest.TestCase):
+    """"Each traceable to its chunk" is a contract term, so the ids must be real."""
+
+    def test_every_turn_carries_its_chunk_id(self):
+        index = _index([_chunk(SESSION_A, i, f"q{i}", f"a{i}") for i in range(3)])
+        view = build_resume_view(index, limit=10, journal_path=None)
+        self.assertEqual(
+            [t.chunk_id for t in view.turns],
+            [f"{SESSION_A[:8]}:t0", f"{SESSION_A[:8]}:t1", f"{SESSION_A[:8]}:t2"],
+        )
+
+    def test_chunk_ids_appear_in_rendered_output(self):
+        index = _index([_chunk(SESSION_A, 0, "q", "a")])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn(f"{SESSION_A[:8]}:t0", text)
+
+
+# ---------------------------------------------------------------------------
+# Journal binding
+# ---------------------------------------------------------------------------
+
+
+class TestJournalBinding(unittest.TestCase):
+    """Which journal entry, if any, belongs with this session's tail.
+
+    Provenance has three states and they are rendered differently, because a
+    pairing that is inferred must not read like one that is proven. Entries
+    written when no transcript was discoverable carry ``session_id=""`` (verified
+    against real journals, 2026-08-05), so an exact-match-only rule would fail
+    to bind in the most common case while every constructed test still passed.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.journal = Path(self.tmp.name) / "journal.jsonl"
+        self.index = _index([
+            _chunk(SESSION_A, 0, "old", "old", timestamp="2026-08-01T10:00:00Z"),
+            _chunk(SESSION_B, 0, "new", "new", timestamp="2026-08-05T10:00:00Z"),
+        ])
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, session_id: str, focus: str, timestamp: str):
+        append_entry(
+            JournalEntry(timestamp=timestamp, session_id=session_id, focus=focus),
+            self.journal,
+        )
+
+    def test_matching_session_id_binds(self):
+        self._write(SESSION_B, "shipping the resume verb", "2026-08-05T11:00:00Z")
+        view = build_resume_view(self.index, limit=10, journal_path=self.journal)
+        self.assertIsNotNone(view.journal)
+        self.assertEqual(view.journal.focus, "shipping the resume verb")
+        self.assertEqual(view.journal_provenance, "bound")
+
+    def test_entry_from_a_different_session_is_never_shown(self):
+        """Positive contradiction. Showing it would pair one session's tail with another's intent."""
+        self._write(SESSION_A, "a completely different session", "2026-08-05T11:00:00Z")
+        view = build_resume_view(self.index, limit=10, journal_path=self.journal)
+        self.assertIsNone(view.journal)
+        self.assertIsNone(view.journal_provenance)
+
+    def test_entry_without_a_session_id_is_shown_but_labelled_inferred(self):
+        """Absence of evidence cannot contradict, so it is disclosed rather than hidden."""
+        self._write("", "unbound entry", "2026-08-05T11:00:00Z")
+        view = build_resume_view(self.index, limit=10, journal_path=self.journal)
+        self.assertIsNotNone(view.journal)
+        self.assertEqual(view.journal_provenance, "inferred")
+
+    def test_inferred_binding_is_visible_in_the_output(self):
+        """An inferred pairing that renders identically to a proven one is a fabrication."""
+        self._write("", "unbound entry", "2026-08-05T11:00:00Z")
+        view = build_resume_view(self.index, limit=10, journal_path=self.journal)
+        self.assertIn("inferred", format_resume(view).lower())
+
+    def test_named_older_session_never_takes_an_unbound_entry(self):
+        """Inference is only defensible for the newest session; a named one must be exact."""
+        self._write("", "unbound entry", "2026-08-05T11:00:00Z")
+        view = build_resume_view(
+            self.index, session_id=SESSION_A, limit=10, journal_path=self.journal
+        )
+        self.assertIsNone(view.journal)
+
+    def test_named_older_session_binds_on_exact_match(self):
+        self._write(SESSION_A, "the older session", "2026-08-01T11:00:00Z")
+        view = build_resume_view(
+            self.index, session_id=SESSION_A, limit=10, journal_path=self.journal
+        )
+        self.assertEqual(view.journal.focus, "the older session")
+        self.assertEqual(view.journal_provenance, "bound")
+
+    def test_exact_match_wins_over_an_unbound_entry(self):
+        self._write("", "unbound and newer", "2026-08-05T12:00:00Z")
+        self._write(SESSION_B, "bound and older", "2026-08-05T11:00:00Z")
+        view = build_resume_view(self.index, limit=10, journal_path=self.journal)
+        self.assertEqual(view.journal.focus, "bound and older")
+        self.assertEqual(view.journal_provenance, "bound")
+
+    def test_missing_journal_file_is_not_an_error(self):
+        view = build_resume_view(
+            self.index, limit=10, journal_path=Path(self.tmp.name) / "absent.jsonl"
+        )
+        self.assertIsNone(view.journal)
+
+
+# ---------------------------------------------------------------------------
+# Lazy hydration
+# ---------------------------------------------------------------------------
+
+
+class TestLazyHydration(unittest.TestCase):
+    """A saved index loads HEADERS ONLY, so text must be hydrated on read.
+
+    The control matters more than the assertion. An index built in memory from
+    full chunks cannot distinguish hydrated from unhydrated, so a test that skips
+    the disk round-trip would pass against a broken implementation.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        _save_sqlite_index([
+            _chunk(SESSION_A, 0, "the seeded question", "the seeded answer"),
+            _chunk(SESSION_A, 1, "second question", "second answer"),
+        ], self.dir)
+        self.loaded = TranscriptIndex.load(self.dir, use_embeddings=False)
+
+    def tearDown(self):
+        # Close the DB handle BEFORE removing the directory. ``load()`` opens a
+        # connection to recall.db and holds it for as long as the index lives,
+        # which here is the lifetime of this TestCase — so tearDown runs while
+        # the file is still open. POSIX happily unlinks an open file; Windows
+        # raises PermissionError (WinError 32) and the temp-dir cleanup fails,
+        # reddening all four tests in this class for a reason that has nothing
+        # to do with what they assert. Found on Windows CI, 2026-08-06; it
+        # cannot reproduce on macOS or Linux.
+        if self.loaded._db is not None:
+            self.loaded._db.close()
+        self.tmp.cleanup()
+
+    def test_control_the_fixture_actually_loads_lazily(self):
+        """If the index is not lazy, every assertion in this class is vacuous."""
+        self.assertTrue(
+            self.loaded._lazy_chunks,
+            "fixture loaded eagerly — the hydration tests measure nothing",
+        )
+
+    def test_a_loaded_index_holds_a_db_handle_that_can_be_released(self):
+        """Partial, platform-honest witness for a Windows-only failure.
+
+        The failure itself — ``PermissionError`` when the temp directory is
+        removed while ``recall.db`` is still open — cannot occur on POSIX, which
+        unlinks open files happily. So **no assertion in this file can red on
+        macOS or Linux when the tearDown close is removed**; Windows CI is the
+        only instrument that detects it, and this test does not pretend
+        otherwise.
+
+        What IS assertable everywhere is the property whose absence caused it:
+        loading opens a handle, and closing it actually releases it. That much
+        is worth pinning, because a close that silently did nothing would look
+        identical here and on macOS alike.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _save_sqlite_index([_chunk(SESSION_A, 0, "q", "a")], directory)
+            index = TranscriptIndex.load(directory, use_embeddings=False)
+
+            self.assertIsNotNone(index._db, "load did not open a DB handle")
+            index._db.close()
+            with self.assertRaises(Exception):
+                index._db.load_chunk_headers()
+
+    def test_control_headers_really_are_empty_before_hydration(self):
+        """Proves the hazard exists. If this ever fails, the witness below is inert."""
+        headers = self.loaded.sessions[SESSION_A]
+        self.assertTrue(
+            all(not h.user_text and not h.assistant_text for h in headers),
+            "headers already carry text — the hydration witness no longer measures anything",
+        )
+
+    def test_resume_returns_hydrated_text(self):
+        view = build_resume_view(self.loaded, limit=10, journal_path=None)
+        joined = " ".join(t.user_text + t.assistant_text for t in view.turns)
+        self.assertIn("the seeded question", joined)
+        self.assertIn("the seeded answer", joined)
+
+    def test_hydrated_turns_survive_the_noise_filter(self):
+        """Unhydrated chunks look content-free, so a broken read reports an empty session."""
+        view = build_resume_view(self.loaded, limit=10, journal_path=None)
+        self.assertEqual(len(view.turns), 2)
+
+
+# ---------------------------------------------------------------------------
+# Continuation segments
+# ---------------------------------------------------------------------------
+
+
+class TestContinuationSegments(unittest.TestCase):
+    """One question can span several chunks; later ones restate it synthetically.
+
+    Rendering that restatement as user speech would report a question the person
+    never asked a second time.
+    """
+
+    CONTEXT_PREFIX = "(context: User previously asked: how do I ship this?...)"
+
+    def test_continuation_segment_is_flagged(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "how do I ship this?", "first part"),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "second part"),
+        ])
+        view = build_resume_view(index, limit=10, journal_path=None)
+        self.assertFalse(view.turns[0].is_continuation)
+        self.assertTrue(view.turns[1].is_continuation)
+
+    def test_continuation_text_is_suppressed_in_the_VIEW_not_only_the_rendering(self):
+        """Two independent layers claim this; each needs its own witness.
+
+        ``format_resume`` checks ``is_continuation`` before it ever looks at
+        ``user_text``, so the rendering test below passes even when the view
+        still carries the synthetic restatement — found by mutation, 2026-08-05.
+        The view is a data surface, and a programmatic consumer reading
+        ``turn.user_text`` would get a question nobody asked.
+        """
+        index = _index([
+            _chunk(SESSION_A, 0, "how do I ship this?", "first part"),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "second part"),
+        ])
+        view = build_resume_view(index, limit=10, journal_path=None)
+        self.assertEqual(view.turns[1].user_text, "")
+
+    def test_continuation_text_is_not_rendered_as_a_user_message(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "how do I ship this?", "first part"),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "second part"),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertNotIn("User previously asked", text)
+        self.assertIn("second part", text)
+
+    def test_continuation_is_marked_so_the_reader_knows_why_no_question_appears(self):
+        """A separate claim from suppression: silence without a marker reads as a bug."""
+        index = _index([
+            _chunk(SESSION_A, 0, "how do I ship this?", "first part"),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "second part"),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn("continues the previous question", text)
+
+    def test_window_opening_mid_reply_is_anchored_to_its_question(self):
+        """The defect this fixes was invisible to constructed tests and obvious in the fruit.
+
+        On a real 324-chunk session every turn in the default window was a
+        continuation, so the output carried no user message at all — the reader
+        could not tell what was being answered. Verified 2026-08-05 by running
+        the command against a real index rather than a fixture.
+        """
+        index = _index(
+            [_chunk(SESSION_A, 0, "the question that started it", "part 0")]
+            + [_chunk(SESSION_A, i, self.CONTEXT_PREFIX, f"part {i}") for i in range(1, 8)]
+        )
+        view = build_resume_view(index, limit=3, journal_path=None)
+        self.assertFalse(view.turns[0].is_continuation)
+        self.assertEqual(view.turns[0].user_text, "the question that started it")
+
+    def test_the_anchor_costs_exactly_one_turn_however_long_the_reply_ran(self):
+        """Bounded by construction: a 200-segment reply must not drag 200 turns in."""
+        index = _index(
+            [_chunk(SESSION_A, 0, "q", "part 0")]
+            + [_chunk(SESSION_A, i, self.CONTEXT_PREFIX, f"part {i}") for i in range(1, 200)]
+        )
+        view = build_resume_view(index, limit=3, journal_path=None)
+        self.assertEqual(len(view.turns), 4)
+
+    def test_the_gap_created_by_anchoring_is_disclosed(self):
+        """A tail that reads as contiguous while skipping turns misreports the session."""
+        index = _index(
+            [_chunk(SESSION_A, 0, "q", "part 0")]
+            + [_chunk(SESSION_A, i, self.CONTEXT_PREFIX, f"part {i}") for i in range(1, 8)]
+        )
+        view = build_resume_view(index, limit=3, journal_path=None)
+        self.assertEqual(view.omitted_between, 4)
+        self.assertIn("4 intermediate turns omitted", format_resume(view))
+
+    def test_no_anchoring_when_the_window_already_starts_at_a_question(self):
+        """The anchor must not fire when it is not needed, or every window grows by one."""
+        index = _index([_chunk(SESSION_A, i, f"q{i}", f"a{i}") for i in range(6)])
+        view = build_resume_view(index, limit=3, journal_path=None)
+        self.assertEqual(len(view.turns), 3)
+        self.assertEqual(view.omitted_between, 0)
+
+    def test_all_continuations_with_no_question_available_does_not_crash(self):
+        """A session whose indexed head is already a continuation has no anchor to find."""
+        index = _index([
+            _chunk(SESSION_A, i, self.CONTEXT_PREFIX, f"part {i}") for i in range(4)
+        ])
+        view = build_resume_view(index, limit=2, journal_path=None)
+        self.assertEqual(len(view.turns), 2)
+        self.assertEqual(view.omitted_between, 0)
+
+    def test_continuation_segments_are_still_kept(self):
+        """They carry real assistant work; only their synthetic user line is suppressed."""
+        index = _index([
+            _chunk(SESSION_A, 0, "how do I ship this?", "first part"),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "second part"),
+        ])
+        view = build_resume_view(index, limit=10, journal_path=None)
+        self.assertEqual(len(view.turns), 2)
+
+
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+class TestFormatting(unittest.TestCase):
+    def test_long_text_is_truncated_with_an_explicit_marker(self):
+        index = _index([_chunk(SESSION_A, 0, "q", "y" * 5000)])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None),
+                             max_chars=200)
+        self.assertIn("truncated", text.lower())
+        self.assertLess(len(text), 2000)
+
+    def test_short_text_is_not_marked_truncated(self):
+        index = _index([_chunk(SESSION_A, 0, "q", "a short answer")])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None),
+                             max_chars=200)
+        self.assertNotIn("truncated", text.lower())
+
+    def test_tools_are_surfaced(self):
+        index = _index([_chunk(SESSION_A, 0, "q", "a", tools_used=["Bash", "Edit"])])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn("Bash", text)
+
+    def test_session_id_appears_in_the_header(self):
+        index = _index([_chunk(SESSION_A, 0, "q", "a")])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn(SESSION_A[:8], text)
+
+
+# ---------------------------------------------------------------------------
+# Empty and error states at the CLI boundary
+# ---------------------------------------------------------------------------
+
+
+def _run_cli(index_dir: Path, session: str | None = None, turns: int = 10):
+    """Run cmd_resume, returning (stdout, stderr, exit_code)."""
+    from synapt.recall.cli import cmd_resume
+
+    args = Namespace(index=str(index_dir), session=session, turns=turns)
+    out, err, code = io.StringIO(), io.StringIO(), 0
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cmd_resume(args)
+    except SystemExit as exc:
+        code = exc.code or 0
+    return out.getvalue(), err.getvalue(), code
+
+
+class TestEmptyAndErrorStates(unittest.TestCase):
+    """Three states that must stay distinguishable.
+
+    "You never built an index", "you built one and it is empty", and "that
+    session does not exist" have different fixes, so collapsing them into one
+    message sends the reader down the wrong path.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_index_exits_nonzero_and_says_how_to_fix(self):
+        _, err, code = _run_cli(self.dir / "does-not-exist")
+        self.assertEqual(code, 1)
+        self.assertIn("build", err.lower())
+
+    def test_empty_index_is_an_honest_empty_state_not_an_error(self):
+        _save_sqlite_index([], self.dir)
+        out, _, code = _run_cli(self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn("no session", (out).lower())
+
+    def test_unknown_session_exits_nonzero(self):
+        _save_sqlite_index([_chunk(SESSION_A, 0, "q", "a")], self.dir)
+        _, err, code = _run_cli(self.dir, session="nope")
+        self.assertEqual(code, 1)
+        self.assertIn("nope", err)
+
+    def test_session_of_only_harness_turns_reports_that_distinctly(self):
+        """Not the same as an empty index: the session exists, its tail is noise."""
+        _save_sqlite_index([
+            _chunk(SESSION_A, 0, user_text=CONTINUATION_PREAMBLE),
+            _chunk(SESSION_A, 1, user_text="<command-name>/x</command-name>"),
+        ], self.dir)
+        out, _, code = _run_cli(self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn(SESSION_A[:8], out)
+
+    def test_cli_reads_the_real_journal_path(self):
+        """The library takes ``journal_path=None`` to mean "no journal".
+
+        That default is deliberate — it keeps implicit I/O out of a library
+        function — but it means the CLI is the ONLY thing that supplies a real
+        path. Without this witness the journal could silently never appear in
+        production while every library test above stayed green.
+        """
+        _save_sqlite_index([_chunk(SESSION_A, 0, "q", "a")], self.dir)
+        journal = Path(self.tmp.name) / "real-journal.jsonl"
+        append_entry(
+            JournalEntry(timestamp="2026-08-05T11:00:00Z", session_id=SESSION_A,
+                         focus="the intent that must survive"),
+            journal,
+        )
+        with mock.patch("synapt.recall.journal._journal_path", return_value=journal):
+            out, _, code = _run_cli(self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn("the intent that must survive", out)
+
+    def test_happy_path_prints_turns_oldest_first(self):
+        """Named for what it measures. With two turns and a limit of ten it pins
+        ORDERING, not tail-selection — the tail is pinned in TestOrderingAndLimit,
+        and a mutation run showed this row stayed green under a head/tail swap."""
+        _save_sqlite_index([
+            _chunk(SESSION_A, 0, "first question", "first answer"),
+            _chunk(SESSION_A, 1, "last question", "last answer"),
+        ], self.dir)
+        out, _, code = _run_cli(self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn("last answer", out)
+        self.assertLess(out.index("first answer"), out.index("last answer"),
+                        "turns must read oldest-first so the tail ends at the newest")
+
+
+# ---------------------------------------------------------------------------
+# Cross-runtime
+# ---------------------------------------------------------------------------
+
+
+class TestCrossRuntime(unittest.TestCase):
+    """Codex support holds by construction: resume reads chunks, never a parser.
+
+    This is the relay's dropped-baton beat, gated by recall#926.
+    """
+
+    def test_codex_parsed_session_resumes(self):
+        from synapt.recall.codex import parse_codex_transcript
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout-2026-08-05T10-00-00-abc.jsonl"
+            entries = [
+                {"type": "session_meta",
+                 "payload": {"id": "codex-session-1", "cwd": tmp,
+                             "timestamp": "2026-08-05T10:00:00Z"}},
+                {"type": "response_item", "timestamp": "2026-08-05T10:01:00Z",
+                 "payload": {"type": "message", "role": "user",
+                             "content": [{"type": "input_text",
+                                          "text": "what is left to do?"}]}},
+                {"type": "response_item", "timestamp": "2026-08-05T10:02:00Z",
+                 "payload": {"type": "message", "role": "assistant",
+                             "content": [{"type": "output_text",
+                                          "text": "finish the migration"}]}},
+            ]
+            with open(path, "w", encoding="utf-8") as fh:
+                for entry in entries:
+                    fh.write(json.dumps(entry) + "\n")
+
+            chunks = parse_codex_transcript(path)
+            self.assertTrue(chunks, "codex fixture produced no chunks — test is inert")
+
+            view = build_resume_view(_index(chunks), limit=10, journal_path=None)
+            joined = " ".join(t.user_text + t.assistant_text for t in view.turns)
+            self.assertIn("finish the migration", joined)
+
+
+# ---------------------------------------------------------------------------
+# Wiring
+# ---------------------------------------------------------------------------
+
+
+class TestTopLevelWiring(unittest.TestCase):
+    """`synapt resume` is a front-door verb (ruled on recall#927, 2026-08-05).
+
+    It routes through the same dispatcher `init` uses, so the long form
+    `synapt recall resume` exists without a second code path.
+    """
+
+    def test_top_level_resume_dispatches_into_recall(self):
+        import synapt.cli as top
+
+        with mock.patch("synapt.recall.cli.main") as recall_main:
+            with mock.patch.object(top.sys, "argv", ["synapt", "resume"]):
+                top.main()
+        recall_main.assert_called_once()
+
+    def test_top_level_resume_forwards_its_arguments(self):
+        import synapt.cli as top
+        seen = {}
+
+        def capture():
+            seen["argv"] = list(top.sys.argv)
+
+        with mock.patch("synapt.recall.cli.main", side_effect=capture):
+            with mock.patch.object(top.sys, "argv",
+                                   ["synapt", "resume", "abc123", "--turns", "3"]):
+                top.main()
+        self.assertIn("resume", seen["argv"])
+        self.assertIn("abc123", seen["argv"])
+        self.assertIn("--turns", seen["argv"])
+
+    def test_resume_is_listed_in_top_level_help(self):
+        import synapt.cli as top
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            top._print_help({})
+        self.assertIn("resume", out.getvalue())
+
+    def test_long_form_reaches_the_same_command(self):
+        """`synapt recall resume` must reach cmd_resume, not a parallel implementation.
+
+        Driven through the real argparse + dispatch path rather than a parser
+        extracted for the test, so the wiring itself is what gets witnessed.
+        """
+        import synapt.recall.cli as recall_cli
+
+        with mock.patch.object(recall_cli, "cmd_resume") as cmd:
+            with mock.patch.object(recall_cli.sys, "argv",
+                                   ["synapt recall", "resume", "--turns", "4"]):
+                recall_cli.main()
+        cmd.assert_called_once()
+        self.assertEqual(cmd.call_args[0][0].turns, 4)
+
+    def test_long_form_forwards_a_named_session(self):
+        import synapt.recall.cli as recall_cli
+
+        with mock.patch.object(recall_cli, "cmd_resume") as cmd:
+            with mock.patch.object(recall_cli.sys, "argv",
+                                   ["synapt recall", "resume", "abc123"]):
+                recall_cli.main()
+        self.assertEqual(cmd.call_args[0][0].session, "abc123")
+
+
+if __name__ == "__main__":
+    unittest.main()
