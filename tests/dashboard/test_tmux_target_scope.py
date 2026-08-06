@@ -175,6 +175,90 @@ def test_websocket_refuses_a_foreign_target_before_tmux(monkeypatch, tmp_path):
     assert calls == []
 
 
+# Apollo's witness (recall#923 r2, non-blocking finding): dropping the
+# `not session` disjunct in _require_tmux_session left this suite green while
+# create_app(tmux_session="") sent `tmux send-keys -t ':alpha'` — tmux's
+# CURRENT session, the exact ambient inference the scope change removed. The
+# trigger is the ordinary case: a launcher passing --tmux-session "$SESSION"
+# with the variable unset.
+#
+# The parametrization spans EVERY route family that can reach tmux, not just
+# the guard's original caller — because the first cut of this witness pinned
+# only /api/agent input, and a memento route re-opened the identical escape
+# while the suite stayed byte-identically green (Apollo's gate BLOCK on the
+# composed-scope fix). A witness pins a path, not a rule; a rule enforced on
+# one path and assumed on the others is enforced on one path.
+@pytest.mark.parametrize("session", ["", "   ", " ws ", "a:b", "ws\n"])
+@pytest.mark.parametrize(
+    ("method", "path", "kwargs", "refusal"),
+    [
+        ("post", "/api/agent/alpha/input", {"data": {"text": "hi"}}, 503),
+        ("post", "/memento/say/opus", {"data": {"text": "hi"}}, 503),
+        ("get", "/memento/pane/opus", {}, 404),
+    ],
+)
+def test_invalid_scope_refuses_before_tmux(
+    monkeypatch, session, method, path, kwargs, refusal
+):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dashboard.subprocess, "run", _must_not_run(calls))
+    client = TestClient(dashboard.create_app(tmux_session=session))
+
+    assert getattr(client, method)(path, **kwargs).status_code == refusal
+    assert calls == []
+
+
+def test_create_app_constructs_with_and_without_a_session():
+    """The witness the #923 merge lacked.
+
+    Both merge parents were green at their own heads; the COMPOSED tree
+    raised NameError on the first constructor call, because a demo-era
+    block still named the ambient session global the scope change deleted.
+    A review binds to a head; a merge composes trees nobody ran. This is
+    the one-second check that makes the composed tree run at all.
+    """
+    assert dashboard.create_app() is not None
+    assert dashboard.create_app(tmux_session="workspace-session") is not None
+
+
+def test_memento_say_refuses_without_bound_session(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dashboard.subprocess, "run", _must_not_run(calls))
+    client = TestClient(dashboard.create_app())
+
+    response = client.post("/memento/say/opus", data={"text": "hi"})
+
+    assert response.status_code == 503
+    assert calls == []
+
+
+def test_memento_pane_never_reaches_tmux_without_bound_session(monkeypatch):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(dashboard.subprocess, "run", _must_not_run(calls))
+    client = TestClient(dashboard.create_app())
+
+    response = client.get("/memento/pane/opus")
+
+    assert response.status_code == 404
+    assert calls == []
+
+
+def test_memento_targets_derive_from_the_bound_session(monkeypatch):
+    calls: list[list[str]] = []
+
+    def succeed(args, **_kwargs):
+        calls.append(list(args))
+        return SimpleNamespace(returncode=0, stdout="", stderr=b"")
+
+    monkeypatch.setattr(dashboard.subprocess, "run", succeed)
+    client = TestClient(dashboard.create_app(tmux_session="workspace-session"))
+
+    response = client.post("/memento/say/opus", data={"text": "hi"})
+
+    assert response.status_code == 200
+    assert calls[0][:4] == ["tmux", "send-keys", "-t", "workspace-session:opus"]
+
+
 def test_background_child_receives_the_explicit_scope():
     command = dashboard._background_command(
         "127.0.0.1", 8420, tmux_session="workspace-session"

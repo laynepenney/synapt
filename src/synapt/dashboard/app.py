@@ -1030,9 +1030,14 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
     # Teams: each agent carries a tmux session (the two teams live in two
     # sessions) and an `authored` flag. Unauthored beings render as an
     # "undeveloped polaroid" — the mark is theirs to author, never assigned.
+    #
+    # The session is the ONE bound at construction — never an ambient global.
+    # This block predates the tmux-scope change and merged in still naming the
+    # deleted `_TMUX_SESSION`; both parents were green at their own heads and
+    # every `create_app()` call on the composed tree raised NameError.
     _MEMENTO_TEAMS = [
         {
-            "team": "synapt", "label": "synapt", "session": _TMUX_SESSION,
+            "team": "synapt", "label": "synapt", "session": tmux_session,
             "sub": "the core team",
             "agents": [
                 {"name": "opus", "label": "OPUS", "note": "the coordinator. remembers for the team.", "tilt": -2.4, "authored": True},
@@ -1043,10 +1048,32 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
         },
     ]
     _MEMENTO_CODEX = {"atlas", "sentinel"}
+    # Two different questions, deliberately two different sets ("can we import
+    # our client?" vs "is MLX present?" taught the cost of sharing one flag):
+    #
+    # _MEMENTO_NAMES answers "is this a being on the team?" — it gates
+    # journal-sourced surfaces (provenance, timerange, leonard), which read
+    # files and never touch tmux, so they work with no session bound.
+    #
+    # _MEMENTO_TARGETS answers "may we reach this being's pane?" — built
+    # THROUGH _require_tmux_session, because that guard is the only piece
+    # that can reject an empty or malformed binding: an `is not None` check
+    # admits "", the targets become ":name", and containment cannot refuse
+    # them since the empty prefix equals the empty session. On refusal the
+    # map is empty and every tmux surface degrades to its unreachable or
+    # unknown path; journal surfaces never consult this map.
+    _MEMENTO_NAMES = {
+        _ag["name"] for _tm in _MEMENTO_TEAMS for _ag in _tm["agents"]
+    }
+    try:
+        _bound_session: str | None = _require_tmux_session(tmux_session)
+    except TmuxTargetScopeError:
+        _bound_session = None
     _MEMENTO_TARGETS: dict[str, str] = {}
-    for _tm in _MEMENTO_TEAMS:
-        for _ag in _tm["agents"]:
-            _MEMENTO_TARGETS[_ag["name"]] = f'{_tm["session"]}:{_ag["name"]}'
+    if _bound_session is not None:
+        for _tm in _MEMENTO_TEAMS:
+            for _ag in _tm["agents"]:
+                _MEMENTO_TARGETS[_ag["name"]] = f'{_bound_session}:{_ag["name"]}'
     _GHOST_OWL = (
         '<svg class="ghostowl" viewBox="0 0 100 118">'
         '<path d="M28 20 L40 40 M72 20 L60 40"/>'
@@ -1200,6 +1227,10 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
         target = _MEMENTO_TARGETS.get(name)
         if target is None:
             raise HTTPException(status_code=404, detail="unknown agent")
+        try:
+            target = _assert_tmux_target_in_session(target, tmux_session)
+        except TmuxTargetScopeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         if full:
             # fullscreen: the whole live screen (input box + hint bar + refs),
             # plus generous scrollback above it, in colour, unstripped.
@@ -1224,9 +1255,14 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
         Same map-based target resolution as ``memento_pane``.  Codex agents
         (their names in ``_MEMENTO_CODEX``) get the second confirming Enter.
         """
-        target = _MEMENTO_TARGETS.get(name)
-        if target is None:
-            raise HTTPException(status_code=404, detail="unknown agent")
+        try:
+            session = _require_tmux_session(tmux_session)
+            target = _MEMENTO_TARGETS.get(name)
+            if target is None:
+                raise HTTPException(status_code=404, detail="unknown agent")
+            target = _assert_tmux_target_in_session(target, session)
+        except TmuxTargetScopeError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
         text = (text or "").strip()
         try:
             # empty text sends a bare Enter — confirm a prompt / poke the agent
@@ -1292,7 +1328,7 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
         ``[{what, kind, who, when, when_label, where}]`` newest first, or an
         empty list when the being has authored nothing here — honest silence.
         """
-        if name not in _MEMENTO_TARGETS:
+        if name not in _MEMENTO_NAMES:
             return []
         try:
             wt_dir = project_data_dir(None) / "worktrees"
@@ -1368,7 +1404,7 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
             wt_dir = project_data_dir(None) / "worktrees"
         except Exception:
             return {"min": None, "max": None}
-        valid = set(_MEMENTO_TARGETS)
+        valid = set(_MEMENTO_NAMES)
         lo = hi = None
         if wt_dir.exists():
             for jf in wt_dir.glob("*/journal.jsonl"):
@@ -1485,7 +1521,7 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
         return qa
 
     def _memento_leonard(name: str, asof: str | None = None, smart: bool = True) -> dict:
-        if name not in _MEMENTO_TARGETS:
+        if name not in _MEMENTO_NAMES:
             return {"agent": name, "reachable": False, "act1": None, "act3": []}
         try:
             wt_dir = project_data_dir(None) / "worktrees"
