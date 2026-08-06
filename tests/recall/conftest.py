@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from synapt.recall.core import TranscriptChunk
 
 
@@ -201,3 +203,15 @@ def make_test_chunks() -> list[TranscriptChunk]:
             tools_used=["Bash"],
         ),
     ]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_recall_root_env(monkeypatch):
+    """Recall tests measure path INFERENCE unless a test sets the override
+    itself. An ambient SYNAPT_RECALL_ROOT from the invoking shell would
+    redirect every cwd-based fixture into a live store — green in CI, where
+    nothing sets it, and red or silently store-polluting on any configured
+    dev machine: the green-where-checked inversion, prevented at birth.
+    """
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
