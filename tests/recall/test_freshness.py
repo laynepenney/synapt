@@ -554,7 +554,6 @@ def test_f3_a_grown_file_does_not_read_as_missing(store):
     f = _archive_file(_archive_dir(store), "a.jsonl", "one")
     recorded = _entry(f)
     f.write_text("one plus considerably more")
-    _set_manifest_for_render = None  # noqa: F841  (readability marker)
     _write_index(_index_dir(store), [recorded])
 
     view = ResumeView(session_id="s", turns=[], total_turns=0,
@@ -566,4 +565,49 @@ def test_f3_a_grown_file_does_not_read_as_missing(store):
     )
     assert "grown" in out.lower() or "changed" in out.lower(), (
         "the banner must say which of the two happened"
+    )
+
+
+def test_f1b_deep_leg_enumerates_the_index_stores_live_files_not_the_cwds(store, tmp_path, monkeypatch):
+    """The other half of F1: the DEEP leg must follow the bound index too.
+
+    Binding the archive side alone left `_live_source_files` resolving
+    independently. Under `--index A` from cwd B — which is the deep trigger's
+    guaranteed path, since the trigger fires on cheap-fresh-and-empty — it
+    compared A's archive against B's live files and appended them as unseen,
+    producing a STALE verdict over A that names another project's files and a
+    remedy no rebuild of A can satisfy.
+    """
+    f = _archive_file(_archive_dir(store), "a.jsonl", "one")
+    _write_index(_index_dir(store), [_entry(f)])
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    monkeypatch.chdir(foreign)
+
+    seen: list[Path] = []
+
+    def live_for(project_dir):
+        seen.append(project_dir)
+        # Faithful to the real function: it answers about the root it is GIVEN.
+        # A stub that returned the foreign file unconditionally could not tell a
+        # bound call from an unbound one -- it would fail against the fix as
+        # readily as against the defect, which is no test at all.
+        if project_dir is not None and Path(project_dir) == foreign:
+            return [foreign / "rollout-foreign.jsonl"]
+        return []
+
+    (foreign / "rollout-foreign.jsonl").write_text("a live session over here")
+    monkeypatch.setattr("synapt.recall.freshness._live_source_files", live_for)
+
+    result = check_index_freshness(index_dir=_index_dir(store), deep=True)
+
+    assert "rollout-foreign.jsonl" not in result.new_files + result.changed_files, (
+        "the deep leg enumerated the cwd's live files against the bound index's archive"
+    )
+    assert seen and seen[0] is not None, (
+        "the deep leg passed project_dir=None, so enumeration resolved the cwd"
+    )
+    assert Path(seen[0]) == store, (
+        f"the deep leg enumerated {seen[0]}, not the bound index's own root"
     )

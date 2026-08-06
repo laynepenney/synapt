@@ -210,6 +210,18 @@ def check_index_freshness(
     # different stores and suppressed a true stale banner.
     data_dir = index_dir.parent if index_dir is not None else None
 
+    # The live enumeration follows the bound index too. Binding only the
+    # ARCHIVE side left this resolving independently, so under `--index A` from
+    # cwd B -- the deep trigger's guaranteed path, since it fires on
+    # cheap-fresh-and-empty -- it compared A's archive against B's live files
+    # and appended them as unseen: a STALE verdict over A naming another
+    # project's files, with a remedy no rebuild of A could satisfy.
+    #
+    # `<root>/.synapt/recall/index` is the index dir, so the project root is
+    # three parents up. Derived rather than passed so there is one binding, not
+    # two that can disagree.
+    live_root = index_dir.parents[2] if index_dir is not None else project_dir
+
     manifest = _read_manifest(project_dir, index_dir)
     if manifest is None:
         # No index, or one we cannot read. Either way we have not established
@@ -234,7 +246,7 @@ def check_index_freshness(
         # every archived transcript as changed, forever. Size is also exactly
         # what ``archive_codex_transcripts`` uses to decide whether to re-copy,
         # so this leg asks the same question the archiver answers.
-        for live in _live_source_files(project_dir):
+        for live in _live_source_files(live_root):
             try:
                 live_size = live.stat().st_size
             except OSError:
