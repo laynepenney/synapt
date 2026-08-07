@@ -1,10 +1,15 @@
 """Parse Codex CLI transcripts into TranscriptChunks.
 
 Codex CLI stores sessions at ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
+The path date is the session start date, not its most recent activity: a live
+session can append to the same rollout file for days. Determine recency and
+liveness from content mtime or offsets, never the path date. Path sorting is
+start-order, not recency-order.
 The format differs from Claude Code:
   - session_meta entry has session ID and cwd
   - response_item entries with role: user/developer/assistant
-  - function_call / function_call_output for tool use
+  - function_call / function_call_output and custom_tool_call /
+    custom_tool_call_output for tool use
   - Content blocks use input_text/output_text types
 
 This module converts Codex transcripts into the same TranscriptChunk format
@@ -32,6 +37,9 @@ _FILE_RE = re.compile(
     r')'
     r'(?=[\s"\'`:,)]|$)'
 )
+
+_CUSTOM_TOOL_SUMMARY_LIMIT = 160
+_CUSTOM_TOOL_SUMMARY_COUNT = 4
 
 
 def _extract_file_paths(text: str) -> list[str]:
@@ -139,7 +147,12 @@ def list_codex_transcripts(
     sessions_dir: Path | None = None,
     project_dir: Path | None = None,
 ) -> list[Path]:
-    """List project-relevant Codex transcript JSONL files, sorted by name."""
+    """List project-relevant Codex transcript JSONL files, sorted by name.
+
+    Scan every rollout path. Its YYYY/MM/DD directories record session start
+    date, while live sessions append to that file. Date filtering or path-based
+    recency would hide an active long-lived session.
+    """
     if sessions_dir is None:
         sessions_dir = discover_codex_sessions()
     if sessions_dir is None:
@@ -149,6 +162,29 @@ def list_codex_transcripts(
     if project_dir is None:
         return files
     return [path for path in files if _matches_project(path, project_dir)]
+
+
+def _has_buildable_transcripts(
+    project_dir: Path,
+    sessions_dir: Path | None = None,
+) -> bool:
+    """True when at least one discoverable Codex session belongs to *project_dir*.
+
+    Exists so the build's "no transcripts found" pre-check can ask the SAME
+    question the ingestion step will answer, rather than a narrower one.
+
+    The pre-check previously counted live Claude transcript directories and
+    archived transcripts only. A project whose entire history is Codex sessions
+    therefore failed the guard and exited before ``archive_codex_transcripts``
+    ran -- so the sessions that would have satisfied the build were never
+    discovered. The guard and the thing it gates disagreed, and the guard won.
+
+    Deliberately reuses ``list_codex_transcripts`` rather than reimplementing
+    discovery. A second copy of "which sessions belong to this project" would
+    be free to drift from the one that actually does the archiving, and a
+    pre-check that drifts from its subject is how this defect existed at all.
+    """
+    return bool(list_codex_transcripts(sessions_dir, project_dir=project_dir))
 
 
 def archive_codex_transcripts(
@@ -206,13 +242,51 @@ def parse_codex_transcript(
     # Accumulator for current turn
     current_user_text = ""
     current_assistant_texts: list[str] = []
+    current_commentary_texts: list[str] = []
     current_tools: list[str] = []
     current_files: list[str] = []
     current_timestamp = ""
     current_tool_summaries: list[str] = []
+    current_custom_tool_summaries = 0
+    current_custom_tool_summaries_omitted = 0
     turn_index = 0
     turn_start_offset = 0
     current_offset = 0
+
+    def _record_custom_tool_call(payload: dict) -> None:
+        """Record a custom Codex tool-call envelope with an input summary."""
+        nonlocal current_custom_tool_summaries, current_custom_tool_summaries_omitted
+        tool_name = payload.get("name", "unknown")
+        current_tools.append(tool_name)
+        args = payload.get("arguments", payload.get("input", ""))
+        if not isinstance(args, str):
+            return
+
+        summary = args[:_CUSTOM_TOOL_SUMMARY_LIMIT]
+        if len(args) < 500:
+            try:
+                args_parsed = json.loads(args)
+                cmd = args_parsed.get("cmd", "")
+                if cmd:
+                    summary = cmd[:_CUSTOM_TOOL_SUMMARY_LIMIT]
+                    current_files.extend(_extract_file_paths(cmd))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if current_custom_tool_summaries < _CUSTOM_TOOL_SUMMARY_COUNT:
+            current_tool_summaries.append(f"[{tool_name}] {summary}")
+            current_custom_tool_summaries += 1
+        else:
+            current_custom_tool_summaries_omitted += 1
+
+    def _append_assistant_text(text: str) -> None:
+        """Retain each assistant message once, regardless of its producer."""
+        if text and text not in current_assistant_texts:
+            current_assistant_texts.append(text)
+
+    def _append_commentary_text(text: str) -> None:
+        """Retain each commentary message outside the primary retrieval text."""
+        if text and text not in current_commentary_texts:
+            current_commentary_texts.append(text)
 
     def _flush_turn(end_offset: int = 0):
         nonlocal turn_index
@@ -230,8 +304,16 @@ def parse_codex_transcript(
         assistant_text = "\n".join(current_assistant_texts).strip()
         if len(assistant_text) > 5000:
             assistant_text = assistant_text[:5000] + "..."
+        commentary_text = "\n".join(current_commentary_texts).strip()
+        if len(commentary_text) > 5000:
+            commentary_text = commentary_text[:5000] + "..."
 
-        tool_content = "\n".join(current_tool_summaries).strip()
+        tool_summary_lines = list(current_tool_summaries)
+        if current_custom_tool_summaries_omitted:
+            tool_summary_lines.append(
+                f"+{current_custom_tool_summaries_omitted} more tool calls"
+            )
+        tool_content = "\n".join(tool_summary_lines).strip()
         if len(tool_content) > 3000:
             tool_content = tool_content[:3000] + "..."
 
@@ -246,6 +328,7 @@ def parse_codex_transcript(
             turn_index=turn_index,
             user_text=current_user_text.strip(),
             assistant_text=assistant_text,
+            commentary_text=commentary_text,
             tools_used=list(dict.fromkeys(current_tools)),
             files_touched=files[:20],  # Cap to avoid bloat
             tool_content=tool_content,
@@ -290,6 +373,7 @@ def parse_codex_transcript(
 
                     # Handle function calls first (no role field)
                     if payload_type == "function_call":
+                        # Keep legacy function-call summary semantics unchanged.
                         tool_name = payload.get("name", "unknown")
                         current_tools.append(tool_name)
                         args = payload.get("arguments", "")
@@ -305,8 +389,14 @@ def parse_codex_transcript(
                         current_offset += line_bytes
                         continue
 
-                    if payload_type == "function_call_output":
-                        # Tool output — could extract file paths but skip for now
+                    if payload_type == "custom_tool_call":
+                        _record_custom_tool_call(payload)
+                        current_offset += line_bytes
+                        continue
+
+                    if payload_type in {"function_call_output", "custom_tool_call_output"}:
+                        # Tool output is deliberately handled as a no-op: call metadata
+                        # above is enough for transcript recall, while output can be noisy.
                         current_offset += line_bytes
                         continue
 
@@ -315,9 +405,12 @@ def parse_codex_transcript(
                         _flush_turn(current_offset)
                         current_user_text = ""
                         current_assistant_texts = []
+                        current_commentary_texts = []
                         current_tools = []
                         current_files = []
                         current_tool_summaries = []
+                        current_custom_tool_summaries = 0
+                        current_custom_tool_summaries_omitted = 0
                         current_timestamp = timestamp
                         turn_start_offset = current_offset
 
@@ -339,8 +432,9 @@ def parse_codex_transcript(
                             if block.get("type") == "output_text" and text:
                                 # Skip commentary phase — it's intermediate thinking
                                 if phase == "commentary":
+                                    _append_commentary_text(text)
                                     continue
-                                current_assistant_texts.append(text)
+                                _append_assistant_text(text)
 
                     elif role == "developer":
                         # Developer role = system prompts — skip (too noisy)
@@ -355,11 +449,20 @@ def parse_codex_transcript(
                             _flush_turn(current_offset)
                             current_user_text = text
                             current_assistant_texts = []
+                            current_commentary_texts = []
                             current_tools = []
                             current_files = []
                             current_tool_summaries = []
+                            current_custom_tool_summaries = 0
+                            current_custom_tool_summaries_omitted = 0
                             current_timestamp = timestamp
                             turn_start_offset = current_offset
+                    elif msg_type == "agent_message":
+                        text = payload.get("message", "")
+                        if payload.get("phase") == "commentary":
+                            _append_commentary_text(text)
+                        else:
+                            _append_assistant_text(text)
 
                 current_offset += line_bytes
 

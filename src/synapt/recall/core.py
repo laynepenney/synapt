@@ -142,6 +142,7 @@ class TranscriptChunk:
     turn_index: int  # 0-based within session
     user_text: str  # Cleaned user message
     assistant_text: str  # Concatenated assistant text blocks
+    commentary_text: str = ""  # Intermediate assistant commentary, not searchable
     tools_used: list[str] = field(default_factory=list)
     files_touched: list[str] = field(default_factory=list)
     tool_content: str = ""  # Summarized tool inputs + results
@@ -184,6 +185,7 @@ class TranscriptChunk:
             "turn_index": self.turn_index,
             "user_text": self.user_text,
             "assistant_text": self.assistant_text,
+            "commentary_text": self.commentary_text,
             "tools_used": self.tools_used,
             "files_touched": self.files_touched,
             "tool_content": self.tool_content,
@@ -202,6 +204,7 @@ class TranscriptChunk:
             turn_index=d["turn_index"],
             user_text=d["user_text"],
             assistant_text=d["assistant_text"],
+            commentary_text=d.get("commentary_text", ""),
             tools_used=d.get("tools_used", []),
             files_touched=d.get("files_touched", []),
             tool_content=d.get("tool_content", ""),
@@ -947,6 +950,60 @@ def parse_transcript(
 
 
 # ---------------------------------------------------------------------------
+# Session recency
+# ---------------------------------------------------------------------------
+
+#: Chunks with this turn index are journal entries rather than conversation.
+JOURNAL_TURN_INDEX = -1
+
+
+def normalize_timestamp(value: str) -> tuple[int, str]:
+    """Return a sort key that compares timestamps by instant, not spelling.
+
+    Timestamps reach the index in more than one ISO-8601 spelling — most end in
+    ``Z``, a few carry an explicit ``+00:00`` offset, and some carry fractional
+    seconds. Compared as raw text those spellings interleave wrongly: ``'Z'``
+    (0x5A) outranks the ``'.'`` (0x2E) that opens a fraction, so
+    ``03:00:00.500000+00:00`` sorts BELOW ``03:00:00Z`` despite being half a
+    second later.
+
+    Parsed values sort ahead of unparseable ones so that a malformed timestamp
+    degrades to "oldest" rather than winning by accident. On the unparseable
+    branch the raw string is the second element, so malformed values still order
+    deterministically among themselves; two *parsed* values at the same instant
+    tie outright and fall to the caller's sort stability, which is correct —
+    they name the same moment, and inventing a winner between them would be
+    ordering by spelling again.
+    """
+    if not value:
+        return (0, "")
+    try:
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (1, f"{parsed.timestamp():020.6f}")
+    except (ValueError, TypeError):
+        return (0, value)
+
+
+def _session_activity_key(chunks: list) -> tuple[int, str]:
+    """Newest ACTIVITY in a session, ignoring when journals were written."""
+    activity = [
+        c.timestamp for c in chunks
+        if getattr(c, "turn_index", 0) != JOURNAL_TURN_INDEX and c.timestamp
+    ]
+    if not activity:
+        # Journal-only session: fall back so it still orders somewhere.
+        activity = [c.timestamp for c in chunks if c.timestamp]
+    if not activity:
+        return (0, "")
+    return max(normalize_timestamp(t) for t in activity)
+
+
+# ---------------------------------------------------------------------------
 # TranscriptIndex
 # ---------------------------------------------------------------------------
 
@@ -975,10 +1032,20 @@ class TranscriptIndex:
         for chunk in self.chunks:
             self.sessions.setdefault(chunk.session_id, []).append(chunk)
 
-        # Session order: most recent first (by latest timestamp in session)
+        # Session order: most recent first, by latest ACTIVITY in the session.
+        #
+        # Journal chunks (turn_index -1) are excluded from the comparison: their
+        # timestamp is when the journal was WRITTEN, and indexing stamps
+        # auto-synthesised ones at build time. Including them lets a session
+        # that has been dead for weeks acquire a timestamp of "now" and sort
+        # above a live one — which is how a 2026-07-22 session won a
+        # "newest session" contract on 2026-08-06 (recall#935).
+        #
+        # A session with nothing BUT journal chunks falls back to those, so it
+        # still orders somewhere rather than disappearing.
         self._session_order = sorted(
             self.sessions.keys(),
-            key=lambda sid: max(c.timestamp for c in self.sessions[sid]),
+            key=lambda sid: _session_activity_key(self.sessions[sid]),
             reverse=True,
         )
 
@@ -4167,6 +4234,25 @@ class TranscriptIndex:
 
         return results
 
+    def session_tail(self, session_id: str) -> list[TranscriptChunk]:
+        """Return one session's conversation turns, hydrated, oldest-first.
+
+        Hydration is the point of this method. :meth:`load` returns *headers
+        only* (``lazy_chunks=True``), so reading ``user_text`` off
+        ``self.sessions[sid]`` yields empty strings rather than raising — a
+        caller that skips hydration reports an empty session instead of failing.
+
+        Chunks with a negative ``turn_index`` are excluded: that value is the
+        sentinel for synthesized journal content, not conversation.
+        """
+        turns = [
+            self._get_chunk(self._id_to_idx[header.id])
+            for header in self.sessions.get(session_id, [])
+            if header.turn_index >= 0
+        ]
+        turns.sort(key=lambda c: c.turn_index)
+        return turns
+
     # -------------------------------------------------------------------
     # Stats
     # -------------------------------------------------------------------
@@ -4245,13 +4331,14 @@ _GRIPSPACE_CACHE_TTL = 60.0  # seconds
 
 
 def _find_gripspace_root(path: Path) -> Path | None:
-    """Walk up from *path* to find the GitGrip **gripspace root**.
+    """Walk up from *path* to find the gr1 or gr2 workspace root.
 
     Returns the gripspace root path, or *None* if not inside a gripspace.
     Analogous to ``_git_main_worktree_root`` but for multi-repo gripspaces.
 
-    Distinguishes between a **gripspace root** (has ``.gitgrip/griptrees.json``)
-    and a **linked griptree** (has ``.gitgrip/griptree.json`` — singular).
+    A gr2 workspace is marked by ``.grip/``. For gr1, distinguishes between a
+    **gripspace root** (has ``.gitgrip/griptrees.json``) and a **linked
+    griptree** (has ``.gitgrip/griptree.json`` — singular).
     When a linked griptree is found, resolves back to the gripspace root via
     the git worktree pointer in any sub-repo.
 
@@ -4272,6 +4359,13 @@ def _find_gripspace_root(path: Path) -> Path | None:
 
     home = Path.home().resolve()
     while current != current.parent:
+        # gr2 owns one .grip/ namespace at the workspace root. Spawned units
+        # live beneath it, so recognizing that marker makes their shared index
+        # and knowledge land at the containing workspace instead of at each
+        # unit cwd. This composes with the existing gr1 detector below.
+        if (current / ".grip").is_dir():
+            _gripspace_cache[cache_key] = (current, time.monotonic())
+            return current
         gitgrip = current / ".gitgrip"
         if gitgrip.is_dir():
             # Linked griptree has griptree.json (singular) — always resolve
@@ -4353,7 +4447,24 @@ def _worktree_name(project_dir: Path | None = None) -> str:
 
     For the main worktree at ``/Users/me/Development/rd``, returns ``rd``.
     For a linked worktree at ``/Users/me/Development/poe``, returns ``poe``.
+
+    ``SYNAPT_RECALL_WORKTREE`` overrides the basename when set and no explicit
+    *project_dir* was passed. It exists as the companion to
+    ``SYNAPT_RECALL_ROOT``: redirecting only the store root would file this
+    caller's per-worktree data under its cwd basename inside the shared store —
+    potentially another workspace's namespace, which is cross-attribution
+    rather than sharing.
     """
+    if project_dir is None:
+        env_name = os.environ.get("SYNAPT_RECALL_WORKTREE")
+        if env_name:
+            if "/" in env_name or "\\" in env_name or env_name in (".", ".."):
+                raise ValueError(
+                    f"SYNAPT_RECALL_WORKTREE must be a bare namespace label, "
+                    f"got {env_name!r}. A path component here would relocate "
+                    f"per-worktree files outside worktrees/."
+                )
+            return env_name
     return (project_dir or Path.cwd()).resolve().name
 
 
@@ -4365,28 +4476,57 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
     (transcripts, journal) under ``worktrees/<name>/``.
 
     Root resolution priority:
+      0. ``SYNAPT_RECALL_ROOT`` environment variable — an explicit workspace
+         root for multi-workspace setups, consulted only when *project_dir*
+         is not passed. The directory must already exist: silently minting a
+         fresh store under a mistyped root would present as an empty history
+         that looks exactly like a real answer. Inference below cannot replace
+         this: two workspaces that share a store may be filesystem SIBLINGS,
+         and walking up from inside one can never arrive at the other.
       1. Git worktree → main worktree root
       2. GitGrip gripspace → gripspace root (all constituent repos share
          one index; each sub-repo gets its own ``worktrees/<name>/`` subdir)
       3. CWD as fallback
 
-    Auto-migrates from two legacy locations:
+    Auto-migrates from two legacy locations (under the explicit override
+    too — an overridden root may be a pre-rename workspace):
       1. ``.synapse/recall/``  → ``.synapt/recall/``
       2. ``.synapse-recall/``  → ``.synapt/recall/``
     """
-    root = (project_dir or Path.cwd()).resolve()
+    env_resolved: Path | None = None
+    if project_dir is None:
+        env_root = os.environ.get("SYNAPT_RECALL_ROOT")
+        if env_root:
+            env_resolved = Path(env_root).expanduser().resolve()
+            if not env_resolved.is_dir():
+                raise ValueError(
+                    f"SYNAPT_RECALL_ROOT points at a directory that does not "
+                    f"exist: {env_resolved}. Refusing to mint a fresh store "
+                    f"under a mistyped root — unset the variable or create "
+                    f"the workspace first."
+                )
 
-    # Priority 1: git worktree → resolve to main worktree root
-    main_root = _git_main_worktree_root(root)
-    if main_root is not None:
-        root = main_root
+    if env_resolved is not None:
+        # No early return: the override selects the ROOT and then flows
+        # through the same legacy-migration tail as an inferred root. An
+        # override pointed at a pre-rename workspace would otherwise resolve
+        # to a .synapt path that does not exist while the real history sits
+        # in .synapse — an empty store presenting as an empty history.
+        root = env_resolved
+    else:
+        root = (project_dir or Path.cwd()).resolve()
 
-    # Priority 2: GitGrip gripspace → resolve to gripspace root
-    # If CWD (or resolved root) is inside a gripspace, prefer the gripspace
-    # root so all constituent repos share one recall index.
-    grip_root = _find_gripspace_root(root)
-    if grip_root is not None:
-        root = grip_root
+        # Priority 1: git worktree → resolve to main worktree root
+        main_root = _git_main_worktree_root(root)
+        if main_root is not None:
+            root = main_root
+
+        # Priority 2: GitGrip gripspace → resolve to gripspace root
+        # If CWD (or resolved root) is inside a gripspace, prefer the
+        # gripspace root so all constituent repos share one recall index.
+        grip_root = _find_gripspace_root(root)
+        if grip_root is not None:
+            root = grip_root
 
     new_dir = root / ".synapt" / "recall"
 

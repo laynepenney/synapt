@@ -42,6 +42,10 @@
   header h1 { font-size: 15px; font-weight: 600; color: var(--accent); }
   #org-label { font-size: 12px; color: var(--text-dim); }
   #org-label span { color: var(--text); font-weight: 600; }
+  .mc-nav { display: flex; gap: 4px; }
+  .mc-nav a { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-dim); text-decoration: none; padding: 4px 10px; border: 1px solid var(--border); border-radius: 5px; transition: all .15s ease; }
+  .mc-nav a:hover { color: var(--text); border-color: var(--accent); }
+  .mc-nav a.active { color: #fff; background: var(--accent); border-color: var(--accent); font-weight: 600; }
 
   /* ── 3-column layout ─────────────────────────────────── */
   .layout {
@@ -512,6 +516,12 @@
 
 <header>
   <h1>mission control</h1>
+  <nav class="mc-nav">
+    <a href="/" class="active">mission control</a>
+    <a href="/console">console</a>
+    <a href="/memento?demo=1">demo</a>
+    <a href="/memento">memento</a>
+  </nav>
   <span id="org-label">loading&hellip;</span>
 </header>
 

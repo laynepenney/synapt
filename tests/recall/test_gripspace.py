@@ -5,12 +5,15 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from synapt.recall.core import (
     _find_gripspace_root,
     _gripspace_cache,
     _GRIPSPACE_CACHE_TTL,
     project_data_dir,
     project_slug,
+    project_worktree_dir,
     project_transcript_dirs,
 )
 
@@ -23,6 +26,13 @@ def _make_gripspace(tmp_path: Path) -> Path:
     # griptrees.json (plural) marks this as the gripspace root
     (grip / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
     return grip
+
+
+def _make_gr2_workspace(tmp_path: Path) -> Path:
+    """Create the marker shared by every gr2-managed workspace."""
+    workspace = tmp_path / "gr2-workspace"
+    (workspace / ".grip").mkdir(parents=True)
+    return workspace
 
 
 def _make_git_repo(parent: Path, name: str) -> Path:
@@ -54,6 +64,24 @@ class TestFindGripspaceRoot:
         deep = grip / "repo" / "src" / "pkg"
         deep.mkdir(parents=True)
         assert _find_gripspace_root(deep) == grip
+
+    def test_finds_gr2_workspace_from_spawned_unit_home(self, tmp_path):
+        workspace = _make_gr2_workspace(tmp_path)
+        unit_home = workspace / "units" / "u_one" / "home"
+        unit_home.mkdir(parents=True)
+
+        assert _find_gripspace_root(unit_home) == workspace
+
+    def test_gr2_units_share_the_workspace_recall_root(self, tmp_path):
+        workspace = _make_gr2_workspace(tmp_path)
+        first = workspace / "units" / "u_one" / "home"
+        second = workspace / "units" / "u_two" / "home"
+        first.mkdir(parents=True)
+        second.mkdir(parents=True)
+
+        expected = workspace / ".synapt" / "recall"
+        assert project_data_dir(first) == expected
+        assert project_data_dir(second) == expected
 
     def test_returns_none_outside_gripspace(self, tmp_path):
         # No .gitgrip anywhere under tmp_path
@@ -431,3 +459,145 @@ class TestGripspaceEdgeCases:
 
         # Should return empty list, not crash
         assert isinstance(dirs, list)
+
+
+# ---------------------------------------------------------------------------
+# Explicit root override — SYNAPT_RECALL_ROOT / SYNAPT_RECALL_WORKTREE
+#
+# A CLI invoked from inside one workspace can be told to use another
+# workspace's store. Path inference cannot discover that relationship when the
+# two roots are filesystem SIBLINGS (recall#936): walking up from a caller's
+# tree can never arrive at a root that does not contain it. So the override is
+# EXPLICIT, and only consulted when the caller passes no project_dir.
+# ---------------------------------------------------------------------------
+
+
+def test_env_root_wins_over_gripspace_inference(tmp_path, monkeypatch):
+    grip = _make_gripspace(tmp_path)
+    repo = _make_git_repo(grip, "repo")
+    shared = tmp_path / "shared-workspace"
+    shared.mkdir()
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(shared))
+    assert project_data_dir(None) == shared / ".synapt" / "recall"
+
+
+def test_explicit_arg_beats_env_root(tmp_path, monkeypatch):
+    """A programmatic caller that names a root is more explicit than the
+    environment: tests pass tmp dirs, the server passes resolved dirs, and an
+    env var that hijacked those would fail far from its cause."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(shared))
+    assert project_data_dir(other) == other / ".synapt" / "recall"
+
+
+def test_env_root_that_does_not_exist_raises(tmp_path, monkeypatch):
+    """A typo'd override must fail loudly, never silently mint a fresh store.
+
+    Silently creating an empty store under a mistyped root is the worst
+    failure available here: every read then reports an empty history that
+    looks exactly like a real answer (the recall#936 presentation).
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(tmp_path / "typo"))
+    with pytest.raises(ValueError, match="SYNAPT_RECALL_ROOT"):
+        project_data_dir(None)
+
+
+def test_empty_env_root_is_ignored(tmp_path, monkeypatch):
+    """`VAR=` shell artifacts mean unset, not "use the empty path".
+
+    Run from INSIDE a gripspace, where the two behaviours differ:
+    ``Path("").resolve()`` is the cwd, so in a bare tmp dir empty-as-set and
+    empty-as-unset produce the same path and the test cannot fail (caught by
+    reviewer mutation, 2026-08-06). Inference must win — the gripspace root,
+    not the cwd.
+    """
+    grip = _make_gripspace(tmp_path)
+    repo = _make_git_repo(grip, "repo")
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", "")
+    assert project_data_dir(None) == grip / ".synapt" / "recall"
+
+
+def test_env_worktree_names_the_namespace(tmp_path, monkeypatch):
+    """Store location and worktree identity are SEPARATE overrides.
+
+    Redirecting only the root would file the caller's per-worktree data under
+    its cwd basename inside the shared store — potentially another workspace's
+    namespace. That is cross-attribution (one workspace's journal presented
+    under another's name), not sharing.
+    """
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    caller = tmp_path / "elsewhere" / "repo"
+    caller.mkdir(parents=True)
+    monkeypatch.chdir(caller)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(shared))
+    monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", "unit-b")
+    assert project_worktree_dir(None) == (
+        shared / ".synapt" / "recall" / "worktrees" / "unit-b"
+    )
+
+
+def test_env_worktree_unset_falls_back_to_cwd_basename(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    caller = tmp_path / "elsewhere" / "repo"
+    caller.mkdir(parents=True)
+    monkeypatch.chdir(caller)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(shared))
+    assert project_worktree_dir(None) == (
+        shared / ".synapt" / "recall" / "worktrees" / "repo"
+    )
+
+
+def test_no_override_keeps_inference_unchanged(tmp_path, monkeypatch):
+    """Control: with neither variable set, resolution is the pre-seam behavior."""
+    monkeypatch.chdir(tmp_path)
+    assert project_data_dir(None) == tmp_path / ".synapt" / "recall"
+
+
+def test_explicit_arg_beats_env_worktree(tmp_path, monkeypatch):
+    """The precedence pinned for ROOT holds for WORKTREE too (reviewer
+    mutation survived without this: the guard existed, unwitnessed)."""
+    explicit = tmp_path / "explicit-dir"
+    explicit.mkdir()
+    monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", "hijack")
+    wt = project_worktree_dir(explicit)
+    assert wt.name == "explicit-dir"
+
+
+def test_env_root_with_legacy_store_migrates(tmp_path, monkeypatch):
+    """An overridden root may be a PRE-RENAME workspace (reviewer finding,
+    ran with a control on the inference path): the override must flow through
+    the same legacy migration, or real history sits stranded in .synapse
+    while resume reads an empty .synapt that looks like an empty history.
+    """
+    shared = tmp_path / "old-workspace"
+    legacy = shared / ".synapse" / "recall"
+    legacy.mkdir(parents=True)
+    (legacy / "marker.txt").write_text("real history")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(shared))
+
+    resolved = project_data_dir(None)
+    assert resolved == shared / ".synapt" / "recall"
+    assert (resolved / "marker.txt").read_text() == "real history"
+    assert not (shared / ".synapse").exists()
+
+
+def test_env_worktree_rejects_path_components(tmp_path, monkeypatch):
+    """The namespace label is one path component, never a path. ".." would
+    relocate per-worktree files to the store root."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(shared))
+    for bad in ("..", ".", "a/b", "a\\b"):
+        monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", bad)
+        with pytest.raises(ValueError, match="SYNAPT_RECALL_WORKTREE"):
+            project_worktree_dir(None)

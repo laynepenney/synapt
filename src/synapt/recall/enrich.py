@@ -34,9 +34,26 @@ from synapt.recall._llm_util import truncate_at_word as _tw
 logger = logging.getLogger("synapt.recall.enrich")
 
 from synapt.recall._mlx import MLX_AVAILABLE as _MLX_AVAILABLE, INSTALL_MSG as _INSTALL_MSG  # noqa: F401
-if _MLX_AVAILABLE:
-    from synapt._models.mlx_client import MLXClient, MLXOptions
-    from synapt._models.base import Message
+
+# These BIND unconditionally; the predicate governs USE, not binding.
+#
+# They used to be imported inside `if _MLX_AVAILABLE:`, which was survivable only while
+# that predicate was stuck True on every platform. Conditional binding is the fragile part,
+# and it fails in two directions once the predicate can actually report absence:
+#
+#   * `Message` is backend-NEUTRAL. `_enrich_single_window` builds one for whatever client
+#     it is handed, and the router returns Modal or Ollama clients on hosts with no MLX --
+#     callers that never pass the MLX guard in `enrich_session`. Bound conditionally, it
+#     raises NameError on exactly the platforms MLX cannot serve.
+#   * `MLXClient` must exist as an attribute even where the backend does not, or anything
+#     addressing it by name on this module fails with AttributeError rather than taking the
+#     guarded path.
+#
+# Binding is always safe: mlx_client imports its backend function-locally, so the module
+# itself imports on every platform. That property is the whole subject of this change, and
+# relying on it here is what lets every remaining guard govern behaviour instead of names.
+from synapt._models.base import Message
+from synapt._models.mlx_client import MLXClient, MLXOptions
 
 from synapt.recall._model_router import DEFAULT_DECODER_MODEL as DEFAULT_MODEL
 

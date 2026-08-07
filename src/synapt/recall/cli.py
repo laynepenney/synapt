@@ -720,6 +720,8 @@ def cmd_build(args: argparse.Namespace) -> None:
         print(f"[build] New location: {project_index_dir()}")
         print()
 
+    from synapt.recall.codex import _has_buildable_transcripts
+
     source_dirs: list[Path] = []
     if args.source:
         for src in args.source:
@@ -736,8 +738,15 @@ def cmd_build(args: argparse.Namespace) -> None:
             source_dirs = auto_dirs
             for td in auto_dirs:
                 print(f"[build] Found project transcripts at {td}")
-        elif not all_worktree_archive_dirs(project):
-            # No live transcripts AND no archived transcripts — nothing to build
+        elif not all_worktree_archive_dirs(project) and not _has_buildable_transcripts(project):
+            # No live Claude transcripts, no archived transcripts, AND no
+            # discoverable Codex sessions for this project — nothing to build.
+            #
+            # The Codex arm is the one this guard was missing. `_archive_and_build`
+            # runs `archive_codex_transcripts` unconditionally, so a codex-only
+            # project HAD work to do and this pre-check refused it before the
+            # sweep ever ran. A guard must ask the same question as the step it
+            # gates; this one asked a narrower one and won.
             print("Error: no transcripts found for current project.", file=sys.stderr)
             print("Specify --source, --hf, or --chatgpt-archive explicitly.", file=sys.stderr)
             sys.exit(1)
@@ -1050,6 +1059,81 @@ def cmd_sessions(args: argparse.Namespace) -> None:
             f"{s['turn_count']} turns  {s['files_count']} files  "
             f"\"{s['first_message']}\""
         )
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    """Print the tail of a session so a fresh session can pick up where it stopped.
+
+    Three outcomes are kept distinguishable because they have different fixes:
+    no index at all (exit 1 — build one), an index with no sessions (exit 0 —
+    nothing to resume), and a session id that does not resolve (exit 1 — the
+    request was wrong). Collapsing them would send the reader down the wrong path.
+    """
+    from synapt.recall.journal import _journal_path
+    from synapt.recall.resume import ResumeError, build_resume_view, format_resume
+
+    index_dir = _resolve_index_dir(args)
+    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+        print(f"Error: no index found at {index_dir}", file=sys.stderr)
+        print("Run 'synapt recall build' or 'synapt init' first.", file=sys.stderr)
+        sys.exit(1)
+
+    index = TranscriptIndex.load(index_dir, use_embeddings=False)
+
+    try:
+        view = build_resume_view(
+            index,
+            session_id=getattr(args, "session", None),
+            limit=getattr(args, "turns", None) or 10,
+            journal_path=_journal_path(),
+        )
+    except ResumeError as exc:
+        # An empty index is an honest empty state, not a failure to act on.
+        if not index._session_order:
+            print("No sessions indexed yet. Nothing to resume.")
+            return
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Freshness is attached AFTER the view is built, so build_resume_view keeps
+    # its no-implicit-I/O contract and the check can never change what is shown
+    # -- only what the reader is told about it.
+    #
+    # The deep leg runs on the SUSPICIOUS COMBINATION: the cheap leg says fresh
+    # and the view is empty. That is exactly when the deep leg's cost (~1.2 s on
+    # the store it was measured against) is worth spending,
+    # because it is the moment an "empty" verdict either becomes load-bearing
+    # or turns out to be an un-archived session. Everywhere else the cheap leg
+    # (~24 ms there) answers, and a stale verdict needs no second opinion.
+    view = _attach_freshness(view, args)
+
+    print(format_resume(view))
+
+
+def _attach_freshness(view, args):
+    """Return *view* with an index-freshness verdict attached.
+
+    Never raises: a failure to compute freshness must not break the command it
+    annotates. On failure the verdict stays ``None``, which the renderer treats
+    as NOT CHECKED rather than as fresh.
+    """
+    import dataclasses
+
+    from synapt.recall.freshness import check_index_freshness
+
+    # Bind to the index the RENDER loaded, not to a separately-resolved
+    # project. `resume` has no --project, so resolving one here meant freshness
+    # answered about the cwd's store while the view came from --index: a real
+    # stale index could be reported as fine.
+    index_dir = _resolve_index_dir(args)
+    project = getattr(args, "project", None)
+    try:
+        result = check_index_freshness(project, index_dir=index_dir)
+        if not result.stale and not view.turns:
+            result = check_index_freshness(project, index_dir=index_dir, deep=True)
+    except Exception:
+        return view
+    return dataclasses.replace(view, freshness=result)
 
 
 def cmd_rebuild(args: argparse.Namespace) -> None:
@@ -1380,8 +1464,42 @@ def cmd_journal(args: argparse.Namespace) -> None:
         print(format_entry_full(entries[idx]))
         return
 
+    if getattr(args, "repair", False):
+        from synapt.recall.journal import (
+            _journal_path, format_repair_report, repair_journal, sweep_stores,
+        )
+        from synapt.recall.core import project_data_dir
+
+        dry = getattr(args, "dry_run", False)
+        explicit = getattr(args, "path", None)
+
+        # Every line below names the store it examined. A bare "nothing to
+        # repair" is indistinguishable from having examined the wrong store,
+        # and the data root is resolved from the working directory — so a desk
+        # whose writes land under a different root gets a clean, false report.
+        if getattr(args, "all_stores", False):
+            root = Path(explicit) if explicit else project_data_dir()
+            reports = sweep_stores(root, dry_run=dry)
+        elif explicit:
+            reports = [repair_journal(Path(explicit), dry_run=dry)]
+        else:
+            reports = [repair_journal(_journal_path(), dry_run=dry)]
+
+        for report in reports:
+            print(format_repair_report(report))
+
+        repaired = sum(r["repaired_entries"] for r in reports)
+        if dry and repaired:
+            print(f"\nDry run — nothing written. {repaired} value(s) would be "
+                  f"recovered. Re-run without --dry-run to apply.")
+        return
+
     if not args.write:
-        print("Usage: synapt recall journal [--read | --write | --list | --show N]", file=sys.stderr)
+        print(
+            "Usage: synapt recall journal "
+            "[--read | --write | --list | --show N | --repair]",
+            file=sys.stderr,
+        )
         print("  --write is required to create a journal entry.", file=sys.stderr)
         sys.exit(1)
 
@@ -2708,6 +2826,16 @@ def main():
     sessions_parser.add_argument("--after", default=None, help="Only sessions after this date (ISO 8601)")
     sessions_parser.add_argument("--before", default=None, help="Only sessions before this date (ISO 8601)")
 
+    # Resume (session tail — pick up after an unclean stop)
+    resume_parser = subparsers.add_parser(
+        "resume", help="Show the tail of the most recent session (pick up where it stopped)"
+    )
+    resume_parser.add_argument("session", nargs="?", default=None,
+                               help="Session id or unique prefix (default: newest session)")
+    resume_parser.add_argument("--index", default=None, help="Index directory (default: per-project)")
+    resume_parser.add_argument("--turns", type=int, default=10,
+                               help="How many trailing turns to show (default: 10)")
+
     # Rebuild (hook-triggered)
     rebuild_parser = subparsers.add_parser("rebuild", help="Incremental rebuild (for hooks)")
     rebuild_parser.add_argument("--out", default=None, help="Output directory (default: per-project)")
@@ -2751,6 +2879,15 @@ def main():
     journal_parser.add_argument("--done", default=None, help="What got done (semicolon-separated)")
     journal_parser.add_argument("--decisions", default=None, help="Key decisions (semicolon-separated)")
     journal_parser.add_argument("--next", default=None, help="Next steps (semicolon-separated)")
+    journal_parser.add_argument("--repair", action="store_true",
+                                help="Recover fields swallowed by an unclosed tool-call parameter (append-only)")
+    journal_parser.add_argument("--dry-run", action="store_true",
+                                help="With --repair: report what would change, write nothing")
+    journal_parser.add_argument("--all-stores", action="store_true",
+                                help="With --repair: sweep every worktree journal, not just this one")
+    journal_parser.add_argument("--path", default=None,
+                                help="With --repair: target this store explicitly (or this data root "
+                                     "with --all-stores) instead of resolving from the working directory")
 
     # Enrich
     enrich_parser = subparsers.add_parser("enrich", help="Enrich auto-journal stubs using MLX (local LLM)")
@@ -2874,6 +3011,8 @@ def main():
         cmd_stats(args)
     elif args.command == "sessions":
         cmd_sessions(args)
+    elif args.command == "resume":
+        cmd_resume(args)
     elif args.command == "rebuild":
         cmd_rebuild(args)
     elif args.command == "sync":

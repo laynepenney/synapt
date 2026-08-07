@@ -13,6 +13,7 @@ from synapt.recall.codex import (
     _extract_file_paths,
 )
 from synapt.recall.core import build_index
+from synapt.recall.codex import _has_buildable_transcripts
 from synapt.recall.journal import auto_extract_entry, extract_session_id
 
 
@@ -106,6 +107,94 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertIn("exec_command", chunks[0].tools_used)
         self.assertIn("ls -la", chunks[0].tool_content)
 
+    def test_custom_tool_families_are_captured_without_duplicate_agent_text(self):
+        """Custom tool envelopes retain tool context and deduplicate agent text."""
+        synthetic_file = "/workspace/synthetic.py"
+        oversized_input = "{" + '"payload":"' + ("x" * 600) + '"}'
+        legacy_oversized_args = "{" + '"payload":"' + ("y" * 600) + '"}'
+        assistant_text = "Synthetic assistant response."
+        unique_agent_text = "Synthetic event response."
+        commentary_agent_text = "Synthetic commentary event."
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "custom-tool-session"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "user", "content": [
+                 {"type": "input_text", "text": "inspect synthetic source"}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:02Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "shell_run",
+                         "arguments": json.dumps({"cmd": f"cat {synthetic_file}"})}},
+            {"timestamp": "2026-03-01T10:00:03Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "large_input_tool",
+                         "input": oversized_input}},
+            {"timestamp": "2026-03-01T10:00:04Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call_output", "output": "ignored"}},
+            {"timestamp": "2026-03-01T10:00:05Z", "type": "response_item",
+             "payload": {"type": "function_call", "name": "legacy_large_tool",
+                         "arguments": legacy_oversized_args}},
+            # Agent-message delivery leads the response item in production.
+            {"timestamp": "2026-03-01T10:00:06Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "final_answer",
+                         "message": assistant_text}},
+            {"timestamp": "2026-03-01T10:00:07Z", "type": "response_item",
+             "payload": {"role": "assistant", "content": [
+                 {"type": "output_text", "text": assistant_text}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:08Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "message": unique_agent_text}},
+            {"timestamp": "2026-03-01T10:00:09Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "final_answer",
+                         "message": assistant_text}},
+            {"timestamp": "2026-03-01T10:00:10Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "commentary",
+                         "message": commentary_agent_text}},
+        ]
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        chunks = parse_codex_transcript(path)
+
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(
+            chunk.tools_used,
+            ["shell_run", "large_input_tool", "legacy_large_tool"],
+        )
+        self.assertIn(f"[shell_run] cat {synthetic_file}", chunk.tool_content)
+        self.assertIn(synthetic_file, chunk.files_touched)
+        self.assertIn("[large_input_tool]", chunk.tool_content)
+        self.assertNotIn("[legacy_large_tool]", chunk.tool_content)
+        self.assertEqual(chunk.assistant_text.count(assistant_text), 1)
+        self.assertEqual(chunk.assistant_text.count(unique_agent_text), 1)
+        self.assertNotIn(commentary_agent_text, chunk.assistant_text)
+        self.assertEqual(chunk.commentary_text, commentary_agent_text)
+
+    def test_custom_tool_summary_budget_keeps_all_tool_names(self):
+        """Custom call summaries are bounded without dropping tool identities."""
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "custom-summary-budget"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "user", "content": [
+                 {"type": "input_text", "text": "inspect synthetic tools"}
+             ]}},
+        ]
+        for index in range(10):
+            entries.append(
+                {"timestamp": f"2026-03-01T10:00:{index + 2:02d}Z", "type": "response_item",
+                 "payload": {"type": "custom_tool_call", "name": f"synthetic_tool_{index}",
+                             "input": "x" * 300}},
+            )
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        chunks = parse_codex_transcript(path)
+
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(chunk.tools_used, [f"synthetic_tool_{index}" for index in range(10)])
+        self.assertEqual(chunk.tool_content.count("[synthetic_tool_"), 4)
+        self.assertIn("+6 more tool calls", chunk.tool_content)
+
     def test_skips_system_content(self):
         """Developer role and permissions/env context are filtered out."""
         entries = [
@@ -136,7 +225,7 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertIn("actual user question", chunks[0].user_text)
 
     def test_skips_commentary_phase(self):
-        """Commentary phase assistant messages are filtered out."""
+        """Response-item commentary is segregated from primary assistant text."""
         entries = [
             {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
              "payload": {"id": "commentary-session"}},
@@ -159,6 +248,53 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertNotIn("Looking at", chunks[0].assistant_text)
         self.assertIn("Fixed the null pointer", chunks[0].assistant_text)
+        self.assertEqual(chunks[0].commentary_text, "Looking at the code...")
+        restored = type(chunks[0]).from_dict(chunks[0].to_dict())
+        self.assertEqual(restored.commentary_text, "Looking at the code...")
+
+    def test_commentary_only_turn_does_not_create_a_chunk(self):
+        """Commentary without a user or final response remains non-flushing."""
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "commentary-only-session"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "assistant", "phase": "commentary", "content": [
+                 {"type": "output_text", "text": "Synthetic commentary only."}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:02Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "commentary",
+                         "message": "Synthetic commentary event only."}},
+        ]
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        self.assertEqual(parse_codex_transcript(path), [])
+
+    def test_commentary_text_is_capped(self):
+        """Commentary storage has the same per-turn bound as assistant text."""
+        commentary = "c" * 5001
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "commentary-cap-session"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "user", "content": [
+                 {"type": "input_text", "text": "retain commentary safely"}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:02Z", "type": "response_item",
+             "payload": {"role": "assistant", "phase": "commentary", "content": [
+                 {"type": "output_text", "text": commentary}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:03Z", "type": "response_item",
+             "payload": {"role": "assistant", "content": [
+                 {"type": "output_text", "text": "Synthetic final answer."}
+             ]}},
+        ]
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        chunks = parse_codex_transcript(path)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(len(chunks[0].commentary_text), 5003)
+        self.assertTrue(chunks[0].commentary_text.endswith("..."))
 
     def test_dedup_by_session_id(self):
         """Same session ID parsed twice returns empty on second call."""
@@ -238,6 +374,42 @@ class TestListCodexTranscripts(unittest.TestCase):
         found = list_codex_transcripts(Path(tmpdir))
         self.assertEqual(len(found), 2)
         self.assertTrue(all("rollout-" in p.name for p in found))
+
+    def test_old_date_path_still_discovers_live_appended_rollout(self):
+        """Discovery scans all rollout paths because a path date is start-order."""
+        tmpdir = tempfile.mkdtemp()
+        sessions_root = Path(tmpdir) / "sessions"
+        old_date = sessions_root / "2001" / "01" / "01"
+        old_date.mkdir(parents=True)
+        path = _write_codex_transcript(
+            str(old_date),
+            [
+                {"timestamp": "2001-01-01T10:00:00Z", "type": "session_meta",
+                 "payload": {"id": "long-lived-session"}},
+                {"timestamp": "2001-01-01T10:00:01Z", "type": "response_item",
+                 "payload": {"role": "user", "content": [
+                     {"type": "input_text", "text": "initial request"}
+                 ]}},
+            ],
+            name="rollout-long-lived.jsonl",
+        )
+
+        self.assertEqual(list_codex_transcripts(sessions_root), [path])
+        parse_codex_transcript(path)
+
+        with path.open("a", encoding="utf-8") as transcript:
+            transcript.write(json.dumps({
+                "timestamp": "2026-08-07T10:00:00Z",
+                "type": "response_item",
+                "payload": {"role": "assistant", "content": [
+                    {"type": "output_text", "text": "appended live response"}
+                ]},
+            }) + "\n")
+
+        discovered = list_codex_transcripts(sessions_root)
+        reparsed = parse_codex_transcript(discovered[0])
+        self.assertEqual(discovered, [path])
+        self.assertIn("appended live response", reparsed[0].assistant_text)
 
     def test_empty_dir(self):
         tmpdir = tempfile.mkdtemp()
@@ -337,3 +509,100 @@ class TestExtractFilePaths(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCodexOnlyProjectCanBootstrap(unittest.TestCase):
+    """A project whose ONLY history is Codex sessions must be buildable.
+
+    The build's "no transcripts found" pre-check counted live Claude transcript
+    directories and archived transcripts, and nothing else -- so a codex-only
+    project exited before ``archive_codex_transcripts`` ever ran, and the Codex
+    sessions that WOULD have satisfied the build were never discovered.
+
+    That is a pre-check disagreeing with the thing it gates: the build could
+    have succeeded, and the guard said there was nothing to build. Passing
+    ``--source <empty dir>`` routed around the guard and the rest of the path
+    archived and indexed the session correctly, which is what proved the defect
+    was the guard rather than the ingestion.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.project = Path(self.tmpdir) / "project"
+        self.project.mkdir()
+        self.sessions = Path(self.tmpdir) / "sessions" / "2026" / "08" / "05"
+        self.sessions.mkdir(parents=True)
+
+    def test_a_matching_codex_session_counts_as_a_transcript(self):
+        _write_codex_transcript(
+            str(self.sessions),
+            [{"type": "session_meta",
+              "payload": {"id": "s1", "cwd": str(self.project / "sub")}}],
+            name="rollout-match.jsonl",
+        )
+        self.assertTrue(
+            _has_buildable_transcripts(self.project, sessions_dir=self.sessions),
+            "a discoverable Codex session matching the project must satisfy the "
+            "pre-check; without this the build refuses work it could do")
+
+    def test_a_session_from_another_project_does_not_count(self):
+        # The control. Without it, a pre-check that counted ANY rollout on disk
+        # would pass this class while letting an unrelated project's sessions
+        # authorise a build that then finds nothing.
+        other = Path(self.tmpdir) / "other"
+        other.mkdir()
+        _write_codex_transcript(
+            str(self.sessions),
+            [{"type": "session_meta",
+              "payload": {"id": "s2", "cwd": str(other / "sub")}}],
+            name="rollout-other.jsonl",
+        )
+        self.assertFalse(
+            _has_buildable_transcripts(self.project, sessions_dir=self.sessions))
+
+    def test_no_sessions_at_all_still_reports_nothing_to_build(self):
+        self.assertFalse(
+            _has_buildable_transcripts(self.project, sessions_dir=self.sessions))
+
+
+class TestTheBuildPreCheckReadsTheCodexArm(unittest.TestCase):
+    """The predicate existing is not the fix -- the fix is that cmd_build READS it.
+
+    A guard whose result nothing consumes does not exist, so this drives the real
+    pre-check branch rather than poking the helper.
+    """
+
+    def _run_precheck(self, has_codex: bool):
+        """Drive cmd_build's pre-check with everything downstream stubbed."""
+        import argparse
+        from unittest import mock
+        from synapt.recall import cli
+
+        args = argparse.Namespace(
+            source=None, hf=None, chatgpt_archive=None,
+            no_embeddings=True, incremental=False,
+        )
+        fake_index = mock.Mock()
+        fake_index.stats.return_value = {"chunk_count": 1, "session_count": 1}
+        with mock.patch.object(cli, "project_transcript_dirs", return_value=[]), \
+             mock.patch.object(cli, "all_worktree_archive_dirs", return_value=[]), \
+             mock.patch.object(cli, "_check_legacy_index", return_value=None), \
+             mock.patch.object(cli, "_archive_and_build", return_value=fake_index), \
+             mock.patch("synapt.recall.codex._has_buildable_transcripts",
+                        return_value=has_codex):
+            try:
+                cli.cmd_build(args)
+            except SystemExit as exc:
+                return int(exc.code or 0)
+        return 0
+
+    def test_codex_only_project_is_allowed_to_build(self):
+        self.assertEqual(
+            self._run_precheck(has_codex=True), 0,
+            "the pre-check still refuses a codex-only project; the helper is "
+            "not being consulted at the real call site")
+
+    def test_a_project_with_nothing_at_all_still_exits(self):
+        # The control. Without it, deleting the guard entirely would satisfy the
+        # test above while letting an empty project proceed to a no-op build.
+        self.assertEqual(self._run_precheck(has_codex=False), 1)

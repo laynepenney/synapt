@@ -60,6 +60,12 @@ def main():
         _dispatch_recall(*sys.argv[2:])
     elif subcmd == "init":
         _dispatch_recall("setup", *sys.argv[2:])
+    elif subcmd == "resume":
+        # Front-door verb (ruled on recall#927): resume replaces harness-native
+        # session resumption whenever a boundary is crossed — runtime, vendor,
+        # machine, or an unclean stop. Routing through the recall dispatcher
+        # means `synapt recall resume` is the same entry point, not a second one.
+        _dispatch_recall("resume", *sys.argv[2:])
     elif subcmd == "server":
         # Remove the subcommand from argv so the sub-CLI sees correct args.
         sys.argv = [f"synapt {subcmd}"] + sys.argv[2:]
@@ -96,6 +102,7 @@ def _print_help(extra_commands: dict | None = None):
         "",
         "Commands:",
         "  init      One-command project setup",
+        "  resume    Pick up where the last session stopped",
         "  recall    Search and manage past session transcripts",
         "  dashboard Launch mission control UI",
         "  server    Start the unified MCP server (--dev for auto-reload)",

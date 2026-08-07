@@ -54,7 +54,11 @@ def _env_flag(name: str) -> bool:
     return value not in {"", "0", "false", "no", "off"}
 
 from synapt._models.base import Message
-from synapt.recall._mlx import MLX_AVAILABLE as _MLX_AVAILABLE, INSTALL_MSG as _INSTALL_MSG  # noqa: F401
+from synapt.recall._mlx import (  # noqa: F401
+    MLX_AVAILABLE as _MLX_AVAILABLE,
+    INSTALL_MSG as _INSTALL_MSG,
+    SKIP_REASON as _SKIP_REASON,
+)
 
 from synapt.recall._model_router import DEFAULT_DECODER_MODEL as DEFAULT_MODEL
 MAX_EXISTING_KNOWLEDGE_CHARS = 4000
@@ -442,6 +446,600 @@ def _is_garbled_content(content: str) -> bool:
     return False
 
 
+# Session/command BOOKKEEPING dressed up as durable facts. Distinct from
+# _GARBLED_CONTENT_PATTERNS above, which catches raw LLM *structural* metadata
+# (existing_id:, contradiction_note:) bleeding into the content field. This set
+# catches well-formed prose whose SUBJECT is journal bookkeeping or a one-off
+# command execution -- content that parses cleanly and means nothing later.
+#
+# _lacks_specificity does not catch these: it reads a bare date as a specificity
+# SIGNAL, so a bare "Session <hex-id>, <date>" tuple passes straight through it.
+#
+# ---- THE AXIS THIS FILTER DISCRIMINATES ON --------------------------------
+#
+# NOT "does this string contain a session hash, an ISO date, or a temp path".
+# Those are TOKENS, and every one of them occurs in genuinely durable facts:
+#
+#   "Session deadbeef is the stable OAuth replay fixture used to verify rotation"
+#   "Execute /migrate on 2027-01-15 only after the backup has completed"
+#   "CI must never run rm -rf /tmp/shared-cache -- concurrent jobs share it"
+#
+# The first version of this filter matched exactly those tokens and ate all
+# three. That is the same defect _lacks_specificity has, one layer over: it
+# measures specificity TOKENS rather than specificity. Widening a pattern set
+# cannot fix a discriminator that is pointed at the wrong quantity, and the
+# false positives a reviewer happens to find are a SAMPLE of that surface, not
+# its population.
+#
+# The property actually being filtered is:
+#
+#       does this content RECORD AN OCCURRENCE, or STATE A RULE?
+#
+# A record of one session, one command, one deletion is worthless months later.
+# A rule ABOUT sessions, commands or deletions is exactly what memory is for.
+#
+# So each check below is TWO-PART:
+#
+#   1. a SHAPE gate   -- "this content is about a session id / a slash-command
+#                         invocation / an ephemeral filesystem path"
+#   2. a GRAMMAR test -- "...and it reports an occurrence rather than stating
+#                         something that still holds"
+#
+# Shape alone is never a verdict. The burden of proof sits on the REJECT side,
+# because a false reject destroys real memory silently while reporting a
+# cleanliness win, whereas a false keep leaves one junk node behind. Every
+# element below is EARNED by a reject case pinned in
+# tests/recall/test_consolidate_noise.py; speculative additions can only widen
+# the over-rejection surface, so they are not made.
+
+# Positive evidence that content states something still in force: deontic
+# modality, quantification over occasions, conditional structure, hedged
+# tendency, product-change framing, or explicit rule vocabulary. A hit here
+# OUTRANKS every shape gate below -- this is the burden-of-proof asymmetry made
+# mechanical.
+#
+# THE MAINTENANCE RULE, and it is the whole reason this is split in two:
+#
+#   * ADDING to this keep-list needs no ceremony. Its worst case is that one
+#     junk node survives. Add a grammatical CLASS (a quantifier, a conditional,
+#     a modality), never a string lifted from one example -- fitting to
+#     individual sentences rebuilds the token filter this design replaces.
+#   * ADDING a reject shape below requires a pinned reject case FIRST. Its
+#     worst case is silent deletion of real memory, which nothing downstream
+#     can detect.
+#
+# The lists are therefore deliberately lopsided: three narrow reject shapes
+# against an open-ended keep vocabulary. That is the design, not an imbalance
+# to tidy up.
+_STANDING_RULE_RE = re.compile(
+    r"(?i)(?:"
+    # deontic modality -- what is permitted, required or forbidden
+    r"\b(?:must|should|shall|ought\s+to|has\s+to|have\s+to|may\s+not"
+    r"|cannot|can't|won't|never|always|forbidden|prohibited|require[sd]?"
+    r"|reserved|expected\s+to|supposed\s+to|allowed\s+to)\b"
+    # universal / negative quantification over occasions or instances
+    r"|\b(?:every|each|any|anything|anyone|all|none|nothing|neither|nor"
+    r"|ever|whenever|wherever)\b"
+    r"|\bno\s+(?:\w+\s+){0,2}(?:may|must|should|can|will|is|are)\b"
+    r"|\bno\s+permission\b"
+    # plain sentential negation. A negated deletion is the OPPOSITE of a
+    # deletion event ("the cache is not removed between runs"), and a filter
+    # hunting deletion events that cannot see negation reads every safety rule
+    # as the hazard it forbids.
+    r"|\bnot\b|n't\b"
+    # habitual frequency
+    r"|\b(?:nightly|hourly|daily|weekly|monthly|routinely|automatically)\b"
+    r"|\bper\s+\w+"
+    r"|\bby\s+default\b|\bdefaults?\s+to\b"
+    # conditional / restrictive structure -- a rule carrying its own scope
+    r"|\b(?:if|when|once|while|unless|until|only)\b"
+    r"|\bas\s+long\s+as\b|\bso\s+long\s+as\b|\bprovided\s+that\b"
+    r"|\b(?:at|on)\s+(?:boot|startup|shutdown)\b"
+    # explicit rule vocabulary
+    r"|\b(?:convention|policy|invariant|canonical)\b"
+    # HEDGED / EMPIRICAL TENDENCY. Calibrated observations are durable memory and
+    # carry no modal and no quantifier at all ("in practice /tmp/build-cache is
+    # removed within a second of a green build, but on the ARM runners the reaper
+    # is niced so heavily it can linger"). A modality-and-quantification-only
+    # override misfiles this whole class as episodic.
+    r"|\bin\s+practice\b|\b(?:usually|typically|generally|normally|often|rarely"
+    r"|seldom|routinely|occasionally)\b|\btends?\s+to\b|\b(?:can|may|might)\b"
+    # PRODUCT-CHANGE / DEPRECATION sense of the deletion verbs. "Support for the
+    # /tmp/legacy-scratch override was removed in agent 2.4" deletes a FEATURE,
+    # not a directory: the grammatical object of "removed" is "support", and the
+    # path only sits inside the noun phrase naming it. Shape 3 sees a path and a
+    # deletion verb co-occurring and cannot see that they are unrelated -- which
+    # is the same co-occurrence-without-relation defect as the token filter this
+    # design replaces, one level down. Without a parser the honest fix is to
+    # name the construction rather than pretend the relation is checked.
+    r"|\b(?:deprecated|superseded|retired|replacement)\b"
+    r"|\bno\s+longer\b|\bused\s+to\b"
+    r"|\bsupport\s+for\b|\bremoved\s+(?:in|upstream)\b|\bdropped\s+in\b"
+    # An interrogative is never a journal record. Bookkeeping asserts; a
+    # question that survived extraction is prose someone wrote to be answered.
+    r"|\?"
+    r")"
+)
+
+# ---- Shape 1: journal session record ---------------------------------------
+# "Session <hex-id>" where the id is a real session hash (6+ hex chars). NOT
+# "Session 30" / "Session v2" / "Session 7", where "session" is a domain noun
+# and the token is not a hash.
+_SESSION_ID_RE = re.compile(r"(?i)\bsession\s+[0-9a-f]{6,}\b")
+
+# The whole content is the id and a timestamp -- a two-field record with no
+# predicate about the world at all: "Session a1b2c3d4, 2020-01-02".
+_SESSION_RECORD_TUPLE_RE = re.compile(
+    r"(?i)^\W*session\s+[0-9a-f]{6,}"
+    r"(?:\s*[,;:-]?\s*(?:\d{4}-\d{2}-\d{2}|\d{1,2}:\d{2}(?::\d{2})?))*"
+    r"\W*$"
+)
+
+# The predicate is about the SESSION-AS-EVENT -- when it ran, how long, what it
+# was about -- rather than about anything in the world. Past tense throughout,
+# because that IS the axis: a present-tense predicate ("Session deadbeef uses
+# AES-GCM", "Session deadbeef is the replay fixture") states a standing property
+# of a thing that merely happens to be named with a hex id.
+_SESSION_EVENT_PREDICATE_RE = re.compile(
+    r"(?i)(?:\b(?:"
+    r"occurred|took\s+place|happened|began|ended|finished|"
+    r"lasted|concluded|focused|focussed|was\s+about|was\s+spent"
+    # journal-row vocabulary: the fields a session log actually carries. These
+    # are safe INSIDE the id shape gate in a way they would never be outside it
+    # -- "Focus: visible focus rings are required" is a durable accessibility
+    # rule and reaches this predicate only if it also names a session hash.
+    r"|stated\s+focus|focus\s+for|duration|spanned|elapsed"
+    r"|attendance|closing\s+summary|start\s+time|end\s+time"
+    r")\b"
+    r"|\bfrom\s+\d{4}-\d{2}-\d{2}"
+    r"|\bdated\s+\d{4}-\d{2}-\d{2})"
+)
+
+
+def _is_session_record(content: str) -> bool:
+    """Shape 1: a journal record of one session, not a fact about a session."""
+    if not _SESSION_ID_RE.search(content):
+        return False
+    return bool(
+        _SESSION_RECORD_TUPLE_RE.match(content)
+        or _SESSION_EVENT_PREDICATE_RE.search(content)
+    )
+
+
+# ---- Shape 2: slash-command invocation log ---------------------------------
+# "Execute `/clear` command on 2020-01-02" -- a transcript echo of one command
+# run once. The slash token must be a COMMAND, not a path segment, so it is
+# required not to be followed by another "/" and "/tmp" is excluded outright.
+_SLASH_COMMAND_RE = re.compile(r"(?i)(?:^|[\s`'\"(\[])/(?!tmp\b)\w[\w-]*(?![/\w])")
+_EXECUTION_VERB_RE = re.compile(
+    r"(?i)\b(?:execute[ds]?|executing|ran|run|invoked|issued|command)\b"
+)
+_ISO_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _is_command_invocation_log(content: str) -> bool:
+    """Shape 2: a slash-command echo bound to a date, with no standing structure.
+
+    The DATE is part of the shape gate, not the discriminator -- "Execute
+    /migrate on 2027-01-15 only after the backup completes" is a future-dated
+    durable instruction and is kept by the standing-rule override above.
+    """
+    return bool(
+        _SLASH_COMMAND_RE.search(content)
+        and _EXECUTION_VERB_RE.search(content)
+        and _ISO_DATE_RE.search(content)
+    )
+
+
+# ---- Shape 3: one-off execution event against an ephemeral path ------------
+# Cross-platform on purpose. recall is public and runs on POSIX, macOS and
+# Windows; a /tmp-only pattern passes the byte-identical Windows event
+# ("...\AppData\Local\Temp\scratch-run ... removed with Remove-Item"), which
+# would make the stated class narrower than the claim made for it.
+#
+# The leading boundary group is load-bearing, not decoration: without it
+# "/tmp/" matches as a SUBSTRING of an unrelated durable path such as
+# /var/lib/nginx/tmp/client_body, which is a stable server directory and not a
+# scratch tree at all. Anchoring to a real path start is the difference between
+# "this content names an ephemeral location" and "these six characters occur".
+_EPHEMERAL_PATH_RE = re.compile(
+    r"(?i)(?:^|[\s'\"`(\[=])(?:"
+    r"/tmp/\S+"                                # POSIX
+    r"|/var/folders/\S+"                       # macOS per-user temp
+    r"|\$TMPDIR\S*|%TEMP%\S*|%TMP%\S*"         # env-var forms
+    r"|[a-z]:\\(?:[^\\\s]+\\)*Temp\\\S+"       # Windows ...\Local\Temp\...
+    r")"
+)
+_DELETION_RE = re.compile(
+    r"(?i)(?:\brm\s+-[rf]{1,2}\b|\bRemove-Item\b|\brmdir\b"
+    r"|\b(?:wiped|deleted|removed|purged|cleared|unlinked)\b)"
+)
+
+
+def _is_ephemeral_execution_event(content: str) -> bool:
+    """Shape 3: a deletion against a scratch path, with no standing structure.
+
+    "The /tmp/build-cache directory is removed only after artifact upload
+    succeeds" carries the same two tokens and is a lifecycle RULE; the
+    standing-rule override above keeps it.
+    """
+    return bool(
+        _EPHEMERAL_PATH_RE.search(content) and _DELETION_RE.search(content)
+    )
+
+
+# ---- THE UNIT OF JUDGMENT IS THE CLAUSE, NOT THE STRING --------------------
+#
+# Three review rounds failed here, and they failed the same way: each changed
+# WHICH SIGNALS were consulted, and none changed THE SCOPE A SIGNAL SPEAKS OVER.
+# The defect underneath all three is one error with two faces:
+#
+#       A SIGNAL FOUND ANYWHERE IN THE CONTENT WAS TREATED
+#       AS A VERDICT ABOUT ALL OF IT.
+#
+#   reject side -- a bookkeeping shape in ONE clause deleted EVERY clause,
+#     including clauses asserting durable facts:
+#       "The /migrate command ran on 2026-08-01 and permanently upgraded the
+#        tenant schema to version 12, which fixes the lock-order defect."
+#     The dated command echo is real. So is the schema state and the fix. The
+#     whole fact was deleted on the strength of its first clause.
+#
+#   keep side -- a rule word in a REPORTED clause rescued EVERY clause,
+#     including pure bookkeeping:
+#       "Session a1b2c3d4 focused on what should happen next."
+#     "should" is MENTIONED inside what the session was about. It is not
+#     asserted by anyone, and it rescued a journal row.
+#
+# So occurrence-versus-rule was never the wrong axis; it was evaluated at the
+# wrong GRANULARITY. An occurrence can carry a durable residue, and when it does
+# the residue is the memory.
+#
+# The classes, in the form ratified by review:
+#
+#   CLASS A  standing assertion -- a proposition useful or true AFTER the
+#            occurrence ends, REGARDLESS OF GRAMMATICAL SUBJECT. "Session
+#            deadbeef ... exposed a lock-order bug" is class A: the subject is
+#            the session and the bug outlives it. Durable facts routinely
+#            arrive wearing occurrence clothing.
+#   CLASS B  occurrence metadata ONLY -- time, duration, topic, command
+#            execution, with no durable result.
+#   CLASS C  reported content -- the complement of an attitude or reporting
+#            predicate. Defined SEMANTICALLY, not by a closed verb list: it is
+#            what someone focused on, was about, discussed. Vocabulary there is
+#            MENTIONED, never asserted, so it licenses nothing about the matrix
+#            claim. The recognizer below is necessarily partial; anything it
+#            cannot identify is unknown, and unknown keeps.
+#
+# THE DECISION RULE, and note it is asymmetric on purpose:
+#
+#   REJECT  only if at least one clause is POSITIVELY identified class B
+#           AND every remaining clause is B or C.
+#   KEEP    on any class A clause, any unknown clause, or C-only content.
+#           Class C alone can never condemn.
+#
+# That is the reject-side burden of proof made mechanical: deleting requires
+# establishing that the content carries NO durable residue anywhere, and a
+# shape match on one clause is evidence about THAT CLAUSE ONLY.
+
+
+# Proposition boundaries: coordination, relative clauses, participials, and
+# punctuation. Segmentation without a parser is approximate, and the errors are
+# deliberately biased -- OVER-splitting yields more clauses and therefore more
+# chances to find a class A, which lands on the keep side. UNDER-splitting fuses
+# an occurrence with its residue and would delete the residue, so it is the
+# failure worth avoiding.
+_PROPOSITION_SPLIT_RE = re.compile(
+    r"(?:"
+    r"\s*[;]\s*"                              # semicolon
+    r"|\s*[.!?][\"'”’\)\]]*\s+"               # sentence punctuation + closing quotes
+    r"|\s*\n+\s*"                             # newline
+    r"|\s*(?:[—–―‒]|--)\s*"                   # dash family, spaced OR CLOSED
+    r"|\s*,\s*(?i:(?=which\b|that\b|so\b|because\b))"   # relative / causal
+    r"|\s*,\s*(?=\w+ing\b)"                   # participial: ", exposing ..."
+    r"|\s+(?i:and|but)\s+"                    # coordination
+    r")"
+)
+# THREE THINGS ABOUT THIS SET ARE DELIBERATE AND WERE EACH EARNED BY A FINDING.
+#
+# 1. THE COLON IS NOT HERE AT ALL. A conditional colon split was tried, and a
+#    reviewer proved the condition wrong in BOTH directions with one probe each:
+#      false reject -- "...concluded the migration: production rejects SHA-1"
+#                      (lowercase prose after a colon is ordinary; the capital
+#                      guard refused to split, the residue stayed fused, and the
+#                      real pipeline deleted the whole string)
+#      false KEEP   -- "...focused on the incident archive: Production records"
+#                      ("records" satisfies a finite-verb approximation while
+#                      being a plural NOUN, so a reported topic split into an
+#                      asserted-looking fragment and rescued pure bookkeeping)
+#    "Capitalised token plus a word ending in s/ed" is not a subject-plus-finite
+#    -verb discriminator, and no lexical test at this layer is. A guard wrong in
+#    both directions is not a threshold miss, so it is DELETED rather than
+#    retuned. Colons now inform the residue check below instead of splitting.
+#
+# 2. NO CAPITAL GUARD ON SENTENCE PUNCTUATION, and closing quotes are absorbed.
+#    The earlier `(?=[A-Z])` was ASCII-only, so a Greek or Cyrillic sentence
+#    start fused back into the occurrence, and a closing quote before the
+#    capital did the same. Over-splitting produces more unclassifiable clauses,
+#    and unknown keeps -- the safe direction. Version numbers and decimals carry
+#    no space after the period, so they still never match.
+#
+# 3. CASE-INSENSITIVITY IS LOCAL, NOT PATTERN-WIDE. An earlier revision dropped
+#    a pattern-level `(?i)` to make `[A-Z]` guards work and silently made the
+#    PRE-EXISTING word branches case-sensitive too, so an uppercase "AND" or a
+#    capitalised "Which" stopped splitting and deleted durable residue behind
+#    them. Inline `(?i:...)` restores those branches without weakening anything
+#    that needs case.
+
+
+# A proposition needs a predicate. Coordination joins NOUNS at least as often as
+# it joins clauses ("the first and last recorded events"), and splitting there
+# produces a verbless fragment that is not a proposition at all -- it would be
+# unclassifiable, and unknown keeps, so a journal row would survive on a
+# grammatical accident. Fragments with no verb are re-joined to their neighbour.
+_VERBISH_RE = re.compile(
+    r"(?i)\b(?:is|are|was|were|be|been|being|has|have|had|do|does|did"
+    r"|will|would|can|could|may|might|must|should|shall|ought"
+    r"|\w+ed|\w+ing|\w+es|\w+s)\b"
+)
+
+
+_ASCII_ONLY_RE = re.compile(r"^[\x00-\x7f]*$")
+
+
+def _looks_verbless(fragment: str) -> bool:
+    """True if *fragment* has no predicate AND this heuristic can actually read it.
+
+    THE ASCII CONDITION IS THE POINT, and it was found by measurement rather than
+    by reading the code. A reviewer's Greek probe kept fusing back into its
+    occurrence clause, and the splitter was innocent -- it split correctly and
+    the FOLD undid it. ``_VERBISH_RE`` recognises predicates by ASCII suffixes
+    (-ed, -ing, -es, -s), so any non-Latin clause looks verbless, gets folded
+    backwards into the occurrence, and its durable residue is deleted with it.
+    The ASCII assumption sat one layer BELOW the ``[A-Z]`` guards everyone was
+    looking at.
+
+    So a fragment this heuristic cannot read is not judged by it: no fold, the
+    fragment stands as its own clause, and an unclassifiable clause keeps.
+    """
+    return bool(_ASCII_ONLY_RE.match(fragment)) and not _VERBISH_RE.search(fragment)
+
+
+def _split_into_propositions(content: str) -> list[str]:
+    """Approximate the propositions in *content*. See the bias note above."""
+    parts = [c.strip() for c in _PROPOSITION_SPLIT_RE.split(content) if c and c.strip()]
+    merged: list[str] = []
+    for part in parts:
+        if merged and _looks_verbless(part):
+            merged[-1] = f"{merged[-1]} {part}"
+        else:
+            merged.append(part)
+    # A leading verbless fragment has no earlier neighbour to join; fold it forward.
+    while len(merged) > 1 and _looks_verbless(merged[0]):
+        merged[1] = f"{merged[0]} {merged[1]}"
+        merged.pop(0)
+    return merged
+
+
+# Attitude / reporting predicates. Their COMPLEMENT is class C: mentioned, not
+# asserted. This list is a partial recognizer for a semantic category, not the
+# definition of it -- what it fails to recognize becomes unknown, and unknown
+# keeps, so the list being incomplete is safe in the direction that matters.
+_REPORTING_PREDICATE_RE = re.compile(
+    r"(?i)\b(?:"
+    r"focus(?:ed|sed|es|ing)?\s+on|focus\s*:|focus\s+for"
+    r"|w(?:as|ere)\s+about|discussed|covered|centred\s+on|centered\s+on"
+    r"|regarding|concerning|on\s+the\s+topic\s+of|with\s+focus\s+on"
+    r")"
+)
+
+
+def _asserted_part(clause: str) -> str:
+    """The clause with its reported complement removed.
+
+    THIS IS THE FIX FOR THE KEEP-SIDE LEAK. Scanning a whole clause for
+    standing-rule vocabulary counts words that sit inside what a session merely
+    focused ON. "focused on what should happen next" is not an assertion that
+    anything should happen; the modal belongs to the reported topic. Marker
+    scans run on THIS string, never the raw clause.
+    """
+    m = _REPORTING_PREDICATE_RE.search(clause)
+    return clause[: m.start()] if m else clause
+
+
+def _is_reported_complement_only(clause: str) -> bool:
+    """CLASS C: the clause is a reporting label plus its complement, with no
+    occurrence anchored to it.
+
+    "Focus: visible focus rings are required for keyboard accessibility" is a
+    topic label on a durable accessibility rule -- inert, not condemning, which
+    is why C alone can never reject. Contrast "Session a1b2c3d4 focused on the
+    policy review", where the reporting predicate IS anchored to a session id:
+    that clause is class B, and its complement is stripped rather than scanned.
+    """
+    if _SESSION_ID_RE.search(clause):
+        return False
+    m = _REPORTING_PREDICATE_RE.search(clause)
+    return bool(m and not _asserted_part(clause).strip(" :,-"))
+
+
+# Boundary-shaped material that should NOT still be sitting inside a clause the
+# segmenter is about to call pure occurrence metadata.
+_BOUNDARY_RESIDUE_RE = re.compile(r":\s+\S|[.!?][\"'”’\)\]]*\s+\S")
+
+
+def _has_unsplit_boundary_residue(clause: str) -> bool:
+    """True if *clause* still contains material that looks like a boundary.
+
+    THE POINT IS TO KNOW WHEN WE MIGHT BE WRONG, not to split everything. The
+    set of punctuation forms that can separate two propositions has no bound a
+    lexical layer can enumerate -- reviewers produced closing quotes, a U+2015
+    horizontal bar, a closed em dash, non-Latin capitals, and lowercase prose
+    after a colon, and there is no reason to believe that list is finished.
+    Chasing forms one at a time is a race with no finish line, and every form
+    missed deletes a durable fact silently.
+
+    So the segmenter splits only what it is confident about, and this asks the
+    other question: does anything boundary-SHAPED remain inside a clause that is
+    about to be judged pure occurrence metadata? If so the clause may be two
+    propositions wearing one coat, its class-B reading is unsafe, and it is
+    demoted to unknown -- which keeps. Segmentation failure becomes FAIL-OPEN in
+    the direction the contract already chose.
+
+    STRICTLY ONE-DIRECTIONAL. This runs DOWNSTREAM of segmentation, on residual
+    clauses, never as a pre-scan over the raw string, and it can only turn a
+    reject into a keep. A pre-scan would be a different function with different
+    failure modes: it could see a boundary the segmenter WOULD have split and
+    demote content that was never at risk.
+
+    The cost is stated as a MECHANISM in limitation (d) of ``_is_metadata_noise``
+    rather than as a list of surviving cases. A case list is a property of one
+    MOMENT wearing a durable costume: it is accurate the day it is written and
+    silently false the next time anything changes which cases qualify.
+    """
+    return bool(_BOUNDARY_RESIDUE_RE.search(_asserted_part(clause)))
+
+
+def _is_occurrence_metadata(clause: str) -> bool:
+    """CLASS B: positively identified occurrence metadata -- time, duration,
+    topic, command execution -- with no durable result.
+
+    Positive identification is required, not inferred from the absence of
+    anything else. A clause this function cannot name is unknown, and the
+    caller keeps it.
+    """
+    # A standing-rule marker in ASSERTED position makes this class A. Reported
+    # position does not count -- that is the whole point of _asserted_part.
+    if _STANDING_RULE_RE.search(_asserted_part(clause)):
+        return False
+    return (
+        _is_session_record(clause)
+        or _is_command_invocation_log(clause)
+        or _is_ephemeral_execution_event(clause)
+    )
+
+
+def _is_metadata_noise(content: str) -> bool:
+    """Return True if *content* RECORDS AN OCCURRENCE -- one session, one command
+    invocation, one deletion -- rather than stating something that still holds.
+
+    See the axis note above ``_STANDING_RULE_RE`` for why this is not a keyword
+    or token filter, and why the burden of proof sits on the reject side.
+
+    HONEST LIMITATIONS, in the order they will bite:
+
+    1. Grammar is approximated LEXICALLY, with no parser. Three shapes of false
+       keep follow from that, and all three are the chosen direction:
+
+       (a) Quantification INSIDE one occasion reads like quantification over
+           occasions. "Every entry logged during session 5517903 pertained to
+           the same scratch directory" quantifies over one session's log lines.
+       (b) Embedded rule vocabulary in an EPISODIC clause. "Session 9ab4f012
+           concluded at 17:42; any remaining follow-up items should be picked
+           up" asserts the modal in its own right, so it is class A by the
+           contract even though the content is a journal row. Note this is
+           NOT the reported-position case: "focused on what should happen next"
+           mentions the modal inside a complement and is correctly rejected.
+       (d) BOOKKEEPING CARRYING BOUNDARY RESIDUE IN ASSERTED POSITION.
+           Content survives when a clause the shape gates would call class B
+           still contains boundary-shaped material -- a colon or sentence
+           punctuation followed by more text -- in the part of the clause that
+           is ASSERTED. The detector cannot tell a missed proposition boundary
+           from an internal one, so it demotes to unknown, and unknown keeps.
+
+           TWO THINGS ARE OUTSIDE IT, both structural rather than enumerated:
+           residue inside a REPORTED complement never reaches the detector,
+           because ``_asserted_part`` strips it first; and an anchored
+           whole-string journal tuple bypasses demotion entirely, because
+           matching at both ends is a proof that nothing is hiding.
+
+           STATED AS A MECHANISM ON PURPOSE, after three failures to state it
+           as a case list. It read "multi-sentence bookkeeping with an internal
+           colon", then "not an anchored tuple", then "not a whole-string
+           tuple" -- each one accurate when written and false after the next
+           round changed which cases qualified. A limitation section describes
+           what the code CANNOT do, so it goes stale toward UNDERSTATING the
+           code: harmless for a user, misleading for a reviewer who reads it as
+           the current failure set. A mechanism goes stale only if the
+           mechanism changes.
+
+       (c) A PARTICIPIAL ADJUNCT that is shaped like a residue but carries
+           none. "...was removed at the close of the run, leaving no residual
+           files behind" separates into a clause this layer cannot classify,
+           and unknown keeps.
+
+       (c) is unavoidable given (and worth) the amendment that makes result-
+       bearing occurrences survive: "/tmp/build-cache was removed after upload
+       failed, exposing the cleanup race that truncated release manifests" has
+       the IDENTICAL participial shape and must keep. Letting a participial
+       inherit its host clause's class would reject both. No lexical test
+       separates them without re-introducing the token discriminator this
+       design exists to remove, so the cost is paid deliberately.
+
+       MEASURED on an adversarial corpus built to exploit exactly this: of 14
+       bookkeeping items inside the three shapes, 6 are rejected and 8 survive
+       -- 6 by (a)/(b) and 2 by (c). The earlier whole-string version rejected
+       8, and it bought those two extra rejections by deleting every
+       result-bearing occurrence, which is the defect this revision closes.
+       Demoting the keep evidence was also tried and measured: it bought 4 more
+       rejections at the price of 5 durable facts, including "time to first
+       byte is measured from the edge log line where session 9c4e1f occurred,
+       never from the client clock". Both trades run the wrong way.
+    2. A model that rewords a transient event into rule-shaped declarative prose
+       slips past any fixed pattern set. So a low rejection count is NOT evidence
+       of clean output -- verify quality by READING nodes, never by this filter's
+       own counter, which is circular.
+    3. The three shapes are the ones this layer has observed. Content that is
+       bookkeeping in some fourth shape is not covered, and adding a shape
+       requires a pinned reject case first.
+
+    Note on where the primary defence belongs: suppressing this class at the
+    PROMPT is strictly better than filtering it after the fact, but recall no
+    longer owns the Stage-1 prompt -- ``extract_batch`` builds it from the
+    extract package's own fragments, and recall passes only units, infer,
+    produced_by and capabilities. So until that forbid-list exists upstream,
+    this filter is the sole defence at this layer rather than a second one.
+    """
+    saw_occurrence_metadata = False
+    for clause in _split_into_propositions(content):
+        if _is_occurrence_metadata(clause):
+            # BYPASS: an EXACT whole-string journal tuple is not ambiguous, so
+            # there is nothing for the detector to be uncertain about.
+            #
+            # Residue demotion reopened the round-1 core case:
+            # "Session deadbeef, 2026-08-01" rejected while
+            # "Session deadbeef: 2026-08-01" kept, same clause, because a colon
+            # fired the detector. A safety net that opens the case it was built
+            # over is worse than the gap it covered.
+            #
+            # The fix is NOT a lexical test for what follows the colon. That
+            # approximation was already proven wrong in both directions as a
+            # split discriminator, and moving it into demotion would preserve
+            # its destructive failure direction while changing where it lives.
+            # There is deliberately NO short-token exemption either: length is
+            # not evidence that something is metadata.
+            #
+            # What licenses the bypass is that _SESSION_RECORD_TUPLE_RE is
+            # ANCHORED at both ends. A whole-string match means the clause is
+            # ENTIRELY an id and a timestamp, with no unaccounted material for a
+            # missed boundary to be hiding in. Every ambiguous colon still keeps.
+            if not _SESSION_RECORD_TUPLE_RE.match(clause) and \
+                    _has_unsplit_boundary_residue(clause):
+                # The segmenter may have missed a split inside this clause, so
+                # its class-B reading is unsafe. Demote to UNKNOWN, and unknown
+                # keeps. Never the reverse: residue can only turn a REJECT into
+                # a keep, never a keep into a reject.
+                return False
+            saw_occurrence_metadata = True
+        elif _is_reported_complement_only(clause):
+            continue  # class C is inert: it neither rescues nor condemns
+        else:
+            # Class A, or a clause this layer cannot classify. Both keep.
+            return False
+    # C-only content reaches here with the flag still False and is KEPT: a
+    # reported topic on its own is not evidence that anything is bookkeeping.
+    return saw_occurrence_metadata
+
+
 # Pattern for section header prefixes that 3B models inject before content:
 # "LGBTQ+ Support: Caroline received...", "Art as Self-Expression: ..."
 # Only strip when the prefix is short (2-5 words) and the rest is a sentence.
@@ -503,6 +1101,10 @@ def _create_content_passes_filters(
     ``action == "create"`` so corroborate/contradict keep their exact prior behavior
     (contamination-checked, generic/specificity/garbled-exempt).
 
+    ``_is_metadata_noise`` is the second UNCONDITIONAL check, for the reason spelled out at
+    its call site below: ``is_create`` is the model's action LABEL, not a statement about
+    whether this path lets the candidate become, replace, or corroborate knowledge.
+
     Assumes *content* is ALREADY normalized (``_normalize_create_content``) and non-empty —
     callers run that + the empty check themselves (B3 already does, unconditionally, for
     every action, not just create; see ``_evaluate_create_content`` for B4's full pipeline).
@@ -529,6 +1131,33 @@ def _create_content_passes_filters(
 
     if is_create and _is_garbled_content(content):
         logger.info("Rejected garbled node: %s", content[:80])
+        return False
+
+    # UNCONDITIONAL, unlike its three neighbours above, and deliberately so.
+    #
+    # ``is_create`` names the action the MODEL chose for this candidate. It does
+    # NOT name whether this code path lets the candidate's text become knowledge,
+    # and those are independent: the create fallthroughs below reach
+    # ``action = "create"`` only AFTER this function has already run with
+    # ``is_create=False``, so a missing corroborate/contradict target persists the
+    # candidate verbatim through a gate that declined to look at it. Legacy
+    # (no-DB) contradiction persists it as the new ACTIVE node; DB contradiction
+    # queues it as ``new_content``; corroborate-with-target lets it raise a real
+    # node's confidence as if it were evidence.
+    #
+    # Gating a CONTENT-QUALITY property on a ROUTING label is the category error,
+    # so the fix is to drop the condition rather than repeat the check on each
+    # branch -- one gate that cannot be routed around beats four that can.
+    #
+    # The three neighbours stay create-only on purpose: specificity and
+    # genericness are judged against creation, and contradictions legitimately
+    # reference existing project-specific nodes (see the explicit
+    # ``_is_generic_node`` re-check in the contradict branch). Bookkeeping is
+    # different in kind -- content that must never BECOME knowledge must also
+    # never REPLACE it or COUNT AS EVIDENCE for it, whichever action the model
+    # picked. Consistency with the neighbours is not a reason here.
+    if _is_metadata_noise(content):
+        logger.info("Rejected metadata-noise node (action-independent): %s", content[:80])
         return False
     return True
 

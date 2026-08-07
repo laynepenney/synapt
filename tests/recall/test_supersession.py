@@ -984,7 +984,7 @@ class TestRecallContradictContestResolution:
         assert db.get_knowledge_node("existing-1")["status"] == "contested"
 
     @pytest.mark.skipif(
-        not consolidate._MLX_AVAILABLE, reason="MLX not available (requires Apple Silicon)",
+        not consolidate._MLX_AVAILABLE, reason=consolidate._SKIP_REASON,
     )
     def test_real_contest_then_resolve_then_sync_end_to_end(self, tmp_path, monkeypatch):
         """recall#905 (0.17.0 blocker, Opus 2026-07-22) -- Part 1's primary reproduction, and

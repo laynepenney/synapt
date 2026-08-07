@@ -16,29 +16,70 @@ Run:
 
 from __future__ import annotations
 
+import os
 import time
 import tracemalloc
 
 import pytest
 
-# Skip entire module if MLX is not available
-try:
-    from synapt._models.mlx_client import MLXClient, MLXOptions
-    from synapt._models.base import Message
-    from synapt.recall.clustering import (
-        _MLX_AVAILABLE,
-        _build_cluster_excerpts,
-        generate_llm_summary,
-        CLUSTER_SUMMARY_PROMPT,
-        DEFAULT_MODEL,
-        MAX_SUMMARY_TOKENS,
-    )
-except ImportError:
-    _MLX_AVAILABLE = False
+# Skip entire module if MLX is not available.
+#
+# MLX availability comes from its CANONICAL owner, `synapt.recall._mlx`, and nowhere else.
+# This block used to read `_MLX_AVAILABLE` out of `synapt.recall.clustering`, which has
+# never defined it -- so the import raised, the broad `except ImportError` swallowed it,
+# and the module skipped UNCONDITIONALLY on every platform, including Apple Silicon where
+# MLX works. All 16 tests here reported "skipped" and provided no signal anywhere.
+#
+# The lesson is in the shape, not the typo: a try/except ImportError wrapped around a
+# MULTI-NAME import cannot distinguish "the backend is absent" from "one of these symbols
+# does not exist." It answers an adjacent question and reports the wrong one confidently.
+# So the two concerns are now separate statements: the availability probe may fail softly,
+# but the collaborator imports below must fail LOUDLY if a name ever moves again.
+from synapt.recall._mlx import MLX_AVAILABLE as _MLX_AVAILABLE, SKIP_REASON as _SKIP_REASON
 
-pytestmark = pytest.mark.skipif(
-    not _MLX_AVAILABLE, reason="MLX not available (requires Apple Silicon)"
+from synapt._models.mlx_client import MLXClient, MLXOptions
+from synapt._models.base import Message
+from synapt.recall.clustering import (
+    _build_cluster_excerpts,
+    generate_llm_summary,
+    CLUSTER_SUMMARY_PROMPT,
+    DEFAULT_MODEL,
+    MAX_SUMMARY_TOKENS,
 )
+
+# Availability is necessary but NOT sufficient, and the opt-in is deliberate rather than
+# an accident of the repair above.
+#
+# These are real-model benchmarks: `test_model_load_cold` clears MLXClient._BASE_CACHE to
+# force a genuine download-and-load, and the `warm_client` fixture runs live inference.
+# The module docstring has always said to run them explicitly (`--benchmark-enable -s`).
+#
+# Repairing the availability import alone would have switched all 16 on inside the default
+# CI sweep, because the macOS runners are arm64 and therefore DO install mlx-lm -- turning
+# a predicate fix into a multi-gigabyte model download on three Python versions. Whether
+# to spend that in CI is a cost decision on its own evidence, so it is stated here as a
+# flag instead of arriving as a side effect. Set SYNAPT_RUN_LLM_BENCHMARKS=1 to run them.
+RUN_LLM_BENCHMARKS_ENV = "SYNAPT_RUN_LLM_BENCHMARKS"
+_OPTED_IN = os.environ.get(RUN_LLM_BENCHMARKS_ENV, "").strip().lower() not in {
+    "", "0", "false", "no", "off",
+}
+
+if not _MLX_AVAILABLE:
+    # `or` rather than a bare read: _mlx guarantees a non-empty reason whenever it reports
+    # unavailable, but a guard that silently degrades to "" when that invariant breaks
+    # would stop skipping and run real-model tests with no backend. Do not import an
+    # invariant you can cheaply not depend on.
+    _BENCHMARK_SKIP_REASON = _SKIP_REASON or "requires the MLX backend (`pip install mlx-lm`)"
+elif not _OPTED_IN:
+    _BENCHMARK_SKIP_REASON = (
+        f"real-model LLM benchmarks are opt-in: set {RUN_LLM_BENCHMARKS_ENV}=1 to run "
+        "them (they download and load a model, so they are excluded from the default "
+        "suite by choice, not by a broken guard)"
+    )
+else:
+    _BENCHMARK_SKIP_REASON = ""
+
+pytestmark = pytest.mark.skipif(bool(_BENCHMARK_SKIP_REASON), reason=_BENCHMARK_SKIP_REASON)
 
 
 # ---------------------------------------------------------------------------
