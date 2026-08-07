@@ -373,7 +373,11 @@ def parse_codex_transcript(
                             turn_start_offset = current_offset
                     elif msg_type == "agent_message":
                         text = payload.get("message", "")
-                        if text and (
+                        if payload.get("phase") == "commentary":
+                            # Preserve the existing parser policy: intermediate
+                            # commentary is not primary assistant text.
+                            pass
+                        elif text and (
                             not current_assistant_texts
                             or current_assistant_texts[-1] != text
                         ):
