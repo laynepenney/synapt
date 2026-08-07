@@ -132,12 +132,14 @@ class TestParseCodexTranscript(unittest.TestCase):
             {"timestamp": "2026-03-01T10:00:05Z", "type": "response_item",
              "payload": {"type": "function_call", "name": "legacy_large_tool",
                          "arguments": legacy_oversized_args}},
-            {"timestamp": "2026-03-01T10:00:06Z", "type": "response_item",
+            # Agent-message delivery leads the response item in production.
+            {"timestamp": "2026-03-01T10:00:06Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "final_answer",
+                         "message": assistant_text}},
+            {"timestamp": "2026-03-01T10:00:07Z", "type": "response_item",
              "payload": {"role": "assistant", "content": [
                  {"type": "output_text", "text": assistant_text}
              ]}},
-            {"timestamp": "2026-03-01T10:00:07Z", "type": "event_msg",
-             "payload": {"type": "agent_message", "message": assistant_text}},
             {"timestamp": "2026-03-01T10:00:08Z", "type": "event_msg",
              "payload": {"type": "agent_message", "message": unique_agent_text}},
             {"timestamp": "2026-03-01T10:00:09Z", "type": "event_msg",
@@ -164,6 +166,32 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertEqual(chunk.assistant_text.count(assistant_text), 1)
         self.assertEqual(chunk.assistant_text.count(unique_agent_text), 1)
         self.assertNotIn(commentary_agent_text, chunk.assistant_text)
+
+    def test_custom_tool_summary_budget_keeps_all_tool_names(self):
+        """Custom call summaries are bounded without dropping tool identities."""
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "custom-summary-budget"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "user", "content": [
+                 {"type": "input_text", "text": "inspect synthetic tools"}
+             ]}},
+        ]
+        for index in range(10):
+            entries.append(
+                {"timestamp": f"2026-03-01T10:00:{index + 2:02d}Z", "type": "response_item",
+                 "payload": {"type": "custom_tool_call", "name": f"synthetic_tool_{index}",
+                             "input": "x" * 300}},
+            )
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        chunks = parse_codex_transcript(path)
+
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(chunk.tools_used, [f"synthetic_tool_{index}" for index in range(10)])
+        self.assertEqual(chunk.tool_content.count("[synthetic_tool_"), 8)
+        self.assertIn("+2 more tool calls", chunk.tool_content)
 
     def test_skips_system_content(self):
         """Developer role and permissions/env context are filtered out."""
