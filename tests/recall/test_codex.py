@@ -375,6 +375,42 @@ class TestListCodexTranscripts(unittest.TestCase):
         self.assertEqual(len(found), 2)
         self.assertTrue(all("rollout-" in p.name for p in found))
 
+    def test_old_date_path_still_discovers_live_appended_rollout(self):
+        """Discovery scans all rollout paths because a path date is start-order."""
+        tmpdir = tempfile.mkdtemp()
+        sessions_root = Path(tmpdir) / "sessions"
+        old_date = sessions_root / "2001" / "01" / "01"
+        old_date.mkdir(parents=True)
+        path = _write_codex_transcript(
+            str(old_date),
+            [
+                {"timestamp": "2001-01-01T10:00:00Z", "type": "session_meta",
+                 "payload": {"id": "long-lived-session"}},
+                {"timestamp": "2001-01-01T10:00:01Z", "type": "response_item",
+                 "payload": {"role": "user", "content": [
+                     {"type": "input_text", "text": "initial request"}
+                 ]}},
+            ],
+            name="rollout-long-lived.jsonl",
+        )
+
+        self.assertEqual(list_codex_transcripts(sessions_root), [path])
+        parse_codex_transcript(path)
+
+        with path.open("a", encoding="utf-8") as transcript:
+            transcript.write(json.dumps({
+                "timestamp": "2026-08-07T10:00:00Z",
+                "type": "response_item",
+                "payload": {"role": "assistant", "content": [
+                    {"type": "output_text", "text": "appended live response"}
+                ]},
+            }) + "\n")
+
+        discovered = list_codex_transcripts(sessions_root)
+        reparsed = parse_codex_transcript(discovered[0])
+        self.assertEqual(discovered, [path])
+        self.assertIn("appended live response", reparsed[0].assistant_text)
+
     def test_empty_dir(self):
         tmpdir = tempfile.mkdtemp()
         found = list_codex_transcripts(Path(tmpdir))
