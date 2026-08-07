@@ -219,6 +219,41 @@ class TestTailTurnsClaude(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             tail_turns(Path(self.tmpdir) / "does-not-exist.jsonl")
 
+    def test_claude_secrets_are_redacted_on_both_speakers(self):
+        secret = "sk-" + "a1B2c3D4e5F6g7H8i9J0k1L2"
+        entries = [
+            _claude_user(f"my key is {secret}", "2026-08-07T10:00:00Z", "u1"),
+            _claude_assistant(f"echoing {secret} back", "2026-08-07T10:00:01Z", "a1"),
+        ]
+        path = _write_jsonl(self.tmpdir, "session.jsonl", entries)
+
+        view = tail_turns(path)
+
+        self.assertEqual(len(view.turns), 2)
+        for turn in view.turns:
+            self.assertNotIn(secret, turn.text)
+            self.assertIn("[REDACTED", turn.text)
+
+    def test_raw_line_separator_inside_text_does_not_split_the_line(self):
+        text_with_ls = "before-separator\u2028after-separator"
+        entries = [
+            _claude_user(text_with_ls, "2026-08-07T10:00:00Z", "u1"),
+            _claude_assistant("plain answer", "2026-08-07T10:00:01Z", "a1"),
+        ]
+        path = Path(self.tmpdir) / "session.jsonl"
+        with path.open("w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+        self.assertIn("\u2028".encode("utf-8"), path.read_bytes())
+
+        view = tail_turns(path)
+
+        self.assertEqual(len(view.turns), 2)
+        self.assertIn("after-separator", view.turns[0].text)
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+
 
 class TestTailTurnsCodex(unittest.TestCase):
     def setUp(self):
@@ -267,6 +302,24 @@ class TestTailTurnsCodex(unittest.TestCase):
             [(t.speaker, t.text) for t in view.turns],
             [("user", "typed via event"), ("assistant", "event answer")],
         )
+
+    def test_codex_secrets_are_redacted_on_both_producers(self):
+        secret = "sk-" + "z9Y8x7W6v5U4t3S2r1Q0p9O8"
+        entries = [
+            _codex_meta("tail-scrub"),
+            _codex_user("send the key", "2026-03-01T10:00:01Z"),
+            _codex_assistant(f"the key is {secret}", "2026-03-01T10:00:02Z"),
+            _codex_event("agent_message", f"event echo {secret} differs", "2026-03-01T10:00:03Z"),
+        ]
+        path = _write_jsonl(self.tmpdir, "rollout-scrub.jsonl", entries)
+
+        view = tail_turns(path)
+
+        assistant_turns = [t for t in view.turns if t.speaker == "assistant"]
+        self.assertEqual(len(assistant_turns), 2)
+        for turn in assistant_turns:
+            self.assertNotIn(secret, turn.text)
+            self.assertIn("[REDACTED", turn.text)
 
     def test_commentary_phase_is_included_as_assistant(self):
         entries = [
