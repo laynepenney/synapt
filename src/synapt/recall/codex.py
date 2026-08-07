@@ -35,7 +35,7 @@ _FILE_RE = re.compile(
 )
 
 _CUSTOM_TOOL_SUMMARY_LIMIT = 160
-_CUSTOM_TOOL_SUMMARY_COUNT = 6
+_CUSTOM_TOOL_SUMMARY_COUNT = 4
 
 
 def _extract_file_paths(text: str) -> list[str]:
