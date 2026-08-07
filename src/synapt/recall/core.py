@@ -4468,6 +4468,32 @@ def _worktree_name(project_dir: Path | None = None) -> str:
     return (project_dir or Path.cwd()).resolve().name
 
 
+# ---------------------------------------------------------------------------
+# Data-root policy seam
+# ---------------------------------------------------------------------------
+# A consumer may install a callable consulted with (operation, path) when a
+# recall data root is resolved, before any directory is created or migrated.
+# With no policy installed this is a no-op and behaviour is unchanged.
+
+_data_root_policy = None
+
+
+def set_data_root_policy(policy):
+    """Install a recall data-root policy; returns the previous one."""
+    global _data_root_policy
+    previous = _data_root_policy
+    _data_root_policy = policy
+    return previous
+
+
+def _guard_data_root(operation: str, path: Path) -> Path:
+    """Consult the installed policy, then return *path* unchanged."""
+    policy = _data_root_policy
+    if policy is not None:
+        policy(operation, path)
+    return path
+
+
 def project_data_dir(project_dir: Path | None = None) -> Path:
     """Return the root synapt recall data directory.
 
@@ -4529,6 +4555,11 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
             root = grip_root
 
     new_dir = root / ".synapt" / "recall"
+
+    # Guarded before the legacy-migration tail below, which renames real
+    # directories on disk. A consumer may install a policy that refuses a
+    # resolved data root; with none installed this is a no-op.
+    _guard_data_root("project_data_dir", new_dir)
 
     if not new_dir.exists():
         # Tier 1: .synapse/recall/ (intermediate rename era)

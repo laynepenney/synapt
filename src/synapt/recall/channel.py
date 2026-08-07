@@ -58,6 +58,40 @@ from typing import Callable
 _message_posted_hooks: list[Callable[["ChannelMessage", "Path | None"], None]] = []
 
 
+# ---------------------------------------------------------------------------
+# Store-path policy seam
+# ---------------------------------------------------------------------------
+# A consumer may install a callable that is consulted with (operation, path)
+# immediately before any channel-store directory is created or any channel
+# file is opened for writing. With no policy installed this is a no-op and
+# behaviour is unchanged; the seam exists so a harness can refuse a resolved
+# path *before* the write rather than detect it afterwards.
+#
+# The seam sits at resolution, not only at the write calls, because resolving
+# the global store directory creates it as a side effect — by the time an
+# append is attempted the directory already exists.
+
+_store_path_policy: Callable[[str, "Path"], None] | None = None
+
+
+def set_store_path_policy(
+    policy: Callable[[str, "Path"], None] | None,
+) -> Callable[[str, "Path"], None] | None:
+    """Install a channel-store path policy; returns the previous one."""
+    global _store_path_policy
+    previous = _store_path_policy
+    _store_path_policy = policy
+    return previous
+
+
+def _guard_store_path(operation: str, path: Path) -> Path:
+    """Consult the installed policy, then return *path* unchanged."""
+    policy = _store_path_policy
+    if policy is not None:
+        policy(operation, path)
+    return path
+
+
 def register_message_hook(
     hook: Callable[["ChannelMessage", "Path | None"], None],
 ) -> None:
@@ -196,14 +230,18 @@ def _channels_dir(project_dir: Path | None = None) -> Path:
     # Tier 1: explicit env var override
     shared = _shared_channels_dir()
     if shared:
-        return shared
+        return _guard_store_path("resolve_channels_dir", shared)
     # Tier 2: global store from manifest URL
     global_dir = _global_channels_dir(project_dir)
     if global_dir:
+        # Guarded before the mkdir: resolving this tier creates the directory,
+        # so a check placed after it would be reporting a write, not preventing
+        # one.
+        _guard_store_path("resolve_channels_dir", global_dir)
         global_dir.mkdir(parents=True, exist_ok=True)
         return global_dir
     # Tier 3: local fallback
-    return _local_channels_dir(project_dir)
+    return _guard_store_path("resolve_channels_dir", _local_channels_dir(project_dir))
 
 
 def _channel_to_filename(channel: str) -> str:
@@ -1080,6 +1118,9 @@ def _append_message(
         path = channels_dir / f"{_channel_to_filename(msg.channel)}.jsonl"
     else:
         path = _channel_path(msg.channel, project_dir)
+    # An explicit channels_dir bypasses resolution entirely, so the write
+    # surface is guarded in its own right rather than trusting the resolver.
+    _guard_store_path("append_message", path)
     path.parent.mkdir(parents=True, exist_ok=True)
     from synapt.recall._filelock import lock_exclusive
     with open(path, "a", encoding="utf-8") as f:
@@ -1260,6 +1301,10 @@ def _copy_attachments(
 ) -> list[str]:
     """Copy attachments into the channel store and return relative paths."""
     target_dir = _attachments_dir(project_dir) / message_id
+    # Attachments are a channel-owned write surface. A scrub or audit that
+    # enumerates only *.jsonl misses this tree by construction, so it is
+    # guarded explicitly rather than inheriting the JSONL path's coverage.
+    _guard_store_path("copy_attachments", target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     stored: list[str] = []
@@ -3072,6 +3117,10 @@ def migrate_channels_to_global(
         return
 
     target_dir = global_dir / org_id / project_id
+    # This function composes the store path itself — it neither calls
+    # _channels_dir nor accepts a channels_dir, so it sits outside both of the
+    # forms the other guards cover and needs its own.
+    _guard_store_path("migrate_channels_to_global", target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
 
     # Migrate JSONL channel files
@@ -3134,6 +3183,8 @@ def _migrate_cursors(
 ) -> None:
     """Migrate cursor data from local channels.db to global _state.db."""
     state_db = global_dir / "_state.db"
+    # Reachable directly, not only via migrate_channels_to_global.
+    _guard_store_path("migrate_cursors", state_db)
     state_db.parent.mkdir(parents=True, exist_ok=True)
 
     # Read local cursors

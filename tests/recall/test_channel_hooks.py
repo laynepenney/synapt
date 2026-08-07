@@ -28,7 +28,9 @@ class TestMessageHooks(unittest.TestCase):
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
-        os.environ["SYNAPT_DATA_DIR"] = self._tmp
+        # SYNAPT_DATA_DIR is read nowhere in the package; it isolated nothing and
+        # these tests appended into the real channel store (Ref #955).
+        os.environ["SYNAPT_SHARED_CHANNELS_DIR"] = self._tmp
         # Save original hooks
         self._original_hooks = list(_message_posted_hooks)
 
@@ -37,7 +39,7 @@ class TestMessageHooks(unittest.TestCase):
         _clear_message_hooks()
         for hook in self._original_hooks:
             register_message_hook(hook)
-        os.environ.pop("SYNAPT_DATA_DIR", None)
+        os.environ.pop("SYNAPT_SHARED_CHANNELS_DIR", None)
 
     def test_default_hooks_registered(self):
         """Default mention and wake hooks should be registered at import time."""

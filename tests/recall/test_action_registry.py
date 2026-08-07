@@ -7,8 +7,34 @@ and gated across OSS and premium boundaries.
 All tests are expected to FAIL until the implementation lands.
 """
 
+import os
+import tempfile
 import unittest
+from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+
+@dataclass
+class _ChannelRootPatch:
+    """A restorable ``SYNAPT_SHARED_CHANNELS_DIR`` override."""
+
+    previous: str | None
+
+    def restore(self) -> None:
+        if self.previous is None:
+            os.environ.pop("SYNAPT_SHARED_CHANNELS_DIR", None)
+        else:
+            os.environ["SYNAPT_SHARED_CHANNELS_DIR"] = self.previous
+
+
+def _isolated_channel_root() -> _ChannelRootPatch:
+    """Point channel resolution at a throwaway directory for one test."""
+    previous = os.environ.get("SYNAPT_SHARED_CHANNELS_DIR")
+    os.environ["SYNAPT_SHARED_CHANNELS_DIR"] = str(
+        Path(tempfile.mkdtemp()) / "channels"
+    )
+    return _ChannelRootPatch(previous)
 
 
 # OSS base actions that must always be available
@@ -48,6 +74,12 @@ class TestActionRegistryExists(unittest.TestCase):
 
 class TestOSSBaseActions(unittest.TestCase):
     """OSS base actions must be registered by default."""
+
+    def setUp(self):
+        self._channels = _isolated_channel_root()
+
+    def tearDown(self):
+        self._channels.restore()
 
     def test_oss_actions_registered(self):
         """All OSS base actions should be in the default registry."""
@@ -258,10 +290,17 @@ class TestPremiumStubs(unittest.TestCase):
 class TestRecallChannelIntegration(unittest.TestCase):
     """The live MCP tool should dispatch through the shared action registry."""
 
+    def setUp(self):
+        # These dispatch through the real channel post path. With no override
+        # they resolve to the home-level store and their fixture messages land
+        # in live channels (Ref #955).
+        self._channels = _isolated_channel_root()
+
     def tearDown(self):
         from synapt.recall.actions import reset_action_registry
 
         reset_action_registry()
+        self._channels.restore()
 
     def test_recall_channel_uses_registry_dispatch(self):
         """recall_channel should route OSS actions through the shared registry."""
