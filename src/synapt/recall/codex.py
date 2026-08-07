@@ -1,6 +1,10 @@
 """Parse Codex CLI transcripts into TranscriptChunks.
 
 Codex CLI stores sessions at ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
+The path date is the session start date, not its most recent activity: a live
+session can append to the same rollout file for days. Determine recency and
+liveness from content mtime or offsets, never the path date. Path sorting is
+start-order, not recency-order.
 The format differs from Claude Code:
   - session_meta entry has session ID and cwd
   - response_item entries with role: user/developer/assistant
@@ -143,7 +147,12 @@ def list_codex_transcripts(
     sessions_dir: Path | None = None,
     project_dir: Path | None = None,
 ) -> list[Path]:
-    """List project-relevant Codex transcript JSONL files, sorted by name."""
+    """List project-relevant Codex transcript JSONL files, sorted by name.
+
+    Scan every rollout path. Its YYYY/MM/DD directories record session start
+    date, while live sessions append to that file. Date filtering or path-based
+    recency would hide an active long-lived session.
+    """
     if sessions_dir is None:
         sessions_dir = discover_codex_sessions()
     if sessions_dir is None:
