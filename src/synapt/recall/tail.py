@@ -67,9 +67,10 @@ def tail_turns(
     """Parse the trailing window of a transcript into its last *n* turns.
 
     Reads at most ``window_bytes`` from the end of the file, drops the
-    leading partial line when the window starts mid-file, classifies each
-    remaining line by shape (Claude Code entry or Codex rollout entry),
-    and returns the last *n* utterances oldest-to-newest.
+    leading partial line when the window starts mid-line (a window that
+    starts exactly on a line boundary keeps its complete first line),
+    classifies each remaining line by shape (Claude Code entry or Codex
+    rollout entry), and returns the last *n* utterances oldest-to-newest.
 
     Every producer routes through one guarded append point: a duplicate
     delivery of the same speaker+text inside the window is dropped no
@@ -83,15 +84,22 @@ def tail_turns(
     path = Path(transcript_path)
     size = path.stat().st_size
     start = max(0, size - window_bytes)
+    head_byte = b"\n"
     with path.open("rb") as f:
-        f.seek(start)
+        if start > 0:
+            # One byte of evidence before the window: a newline there means
+            # the window starts exactly on a line boundary and its first
+            # line is complete, not partial — dropping it would deny a turn
+            # the window actually contained.
+            f.seek(start - 1)
+            head_byte = f.read(1)
         raw = f.read()
 
     bytes_scanned = len(raw)
     truncated_head = start > 0
 
     lines = raw.decode("utf-8", errors="replace").splitlines()
-    if truncated_head and lines:
+    if truncated_head and lines and head_byte != b"\n":
         lines = lines[1:]
 
     turns: list[TailTurn] = []
