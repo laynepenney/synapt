@@ -589,16 +589,25 @@ def repair_journal(path: Path | None = None, dry_run: bool = False) -> dict:
     Returns a report; with *dry_run* the report is produced and nothing is
     written.
     """
-    path = path or _journal_path()
+    path = Path(path) if path else _journal_path()
     report = {
         "path": str(path),
+        "root": "",
+        "line_count": 0,
         "total_entries": 0,
         "contaminated_entries": 0,
         "repaired_entries": 0,
         "recovered_fields": {},
+        "dry_run": dry_run,
     }
     if not path.exists():
         return report
+
+    # Raw line count is reported alongside the parsed entry count on purpose.
+    # Unparseable lines are skipped silently, so a store whose line count
+    # exceeds its entry count has lost records that no other number reveals.
+    with open(path, encoding="utf-8") as f:
+        report["line_count"] = sum(1 for line in f if line.strip())
 
     entries = _read_all_entries(path)
     report["total_entries"] = len(entries)
@@ -649,6 +658,72 @@ def repair_journal(path: Path | None = None, dry_run: bool = False) -> dict:
     )
     append_entry(corrective, path, allow_collapsed=True)
     return report
+
+
+def format_repair_report(report: dict) -> str:
+    """Render a repair report — always naming the store it examined.
+
+    The empty case is the one that needs the path most.  A bare "nothing to
+    repair" is indistinguishable from having examined the wrong store, and
+    that is not hypothetical: the command resolves its data root from the
+    working directory, and a desk whose writes land under a different root
+    gets a clean, confident, false report.  Naming the path turns an
+    unfalsifiable claim into an auditable one.
+
+    Line count is reported next to entry count because they can disagree:
+    unparseable lines are skipped silently, so ``lines > entries`` is the only
+    signal that records were dropped.
+    """
+    path = report.get("path") or "<no store>"
+    root = report.get("root")
+    where = f"{path}" if not root else f"{path}  [root {root}]"
+    lines = report.get("line_count", 0)
+    total = report.get("total_entries", 0)
+
+    if not total:
+        return f"{where}: 0 entries ({lines} lines) — nothing examined"
+
+    counted = f"{total} entries / {lines} lines"
+    if lines != total:
+        counted += f" — {lines - total} unparseable line(s) skipped"
+
+    bad = report.get("contaminated_entries", 0)
+    if not bad:
+        return f"{where}: {counted}, 0 contaminated"
+
+    verb = "would recover" if report.get("dry_run") else "recovered"
+    fields = report.get("recovered_fields") or {}
+    return (
+        f"{where}: {counted}, {bad} contaminated, "
+        f"{verb} {report.get('repaired_entries', 0)} value(s) {fields}"
+    ).rstrip()
+
+
+def sweep_stores(root: Path | str, dry_run: bool = False) -> list[dict]:
+    """Repair every per-worktree journal under *root*, naming each one.
+
+    Returns one report per store.  A root holding no stores still returns a
+    single report carrying the root, because "swept and found nothing" and
+    "swept the wrong root" are otherwise the same sentence.
+    """
+    root = Path(root)
+    reports: list[dict] = []
+    for store in sorted((root / "worktrees").glob("*/journal.jsonl")):
+        report = repair_journal(store, dry_run=dry_run)
+        report["root"] = str(root)
+        reports.append(report)
+    if not reports:
+        reports.append({
+            "path": str(root / "worktrees"),
+            "root": str(root),
+            "line_count": 0,
+            "total_entries": 0,
+            "contaminated_entries": 0,
+            "repaired_entries": 0,
+            "recovered_fields": {},
+            "dry_run": dry_run,
+        })
+    return reports
 
 
 def extract_session_id(path: Path | str) -> str:

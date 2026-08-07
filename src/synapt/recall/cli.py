@@ -1465,38 +1465,33 @@ def cmd_journal(args: argparse.Namespace) -> None:
         return
 
     if getattr(args, "repair", False):
-        from synapt.recall.journal import _journal_path, repair_journal
+        from synapt.recall.journal import (
+            _journal_path, format_repair_report, repair_journal, sweep_stores,
+        )
         from synapt.recall.core import project_data_dir
 
-        local = _journal_path()
-        if getattr(args, "all_stores", False):
-            # Journals are per-worktree and, as measured, can live under a
-            # different gripspace root than the one you are standing in — so
-            # sweeping every store is the only way to know a repair is done.
-            stores = sorted(
-                (project_data_dir() / "worktrees").glob("*/journal.jsonl")
-            )
-        else:
-            stores = [local]
-
         dry = getattr(args, "dry_run", False)
-        total = 0
-        for store in stores:
-            report = repair_journal(store, dry_run=dry)
-            if not report["total_entries"]:
-                continue
-            total += report["repaired_entries"]
-            flag = "would repair" if dry else "repaired"
-            print(
-                f"{store.parent.name}: {report['contaminated_entries']}"
-                f"/{report['total_entries']} entries contaminated, "
-                f"{flag} {report['repaired_entries']} value(s) "
-                f"{report['recovered_fields'] or ''}".rstrip()
-            )
-        if not total:
-            print("No collapsed journal fields found." if not dry else "Nothing to repair.")
-        elif dry:
-            print(f"\nDry run — nothing written. Re-run without --dry-run to apply.")
+        explicit = getattr(args, "path", None)
+
+        # Every line below names the store it examined. A bare "nothing to
+        # repair" is indistinguishable from having examined the wrong store,
+        # and the data root is resolved from the working directory — so a desk
+        # whose writes land under a different root gets a clean, false report.
+        if getattr(args, "all_stores", False):
+            root = Path(explicit) if explicit else project_data_dir()
+            reports = sweep_stores(root, dry_run=dry)
+        elif explicit:
+            reports = [repair_journal(Path(explicit), dry_run=dry)]
+        else:
+            reports = [repair_journal(_journal_path(), dry_run=dry)]
+
+        for report in reports:
+            print(format_repair_report(report))
+
+        repaired = sum(r["repaired_entries"] for r in reports)
+        if dry and repaired:
+            print(f"\nDry run — nothing written. {repaired} value(s) would be "
+                  f"recovered. Re-run without --dry-run to apply.")
         return
 
     if not args.write:
@@ -2890,6 +2885,9 @@ def main():
                                 help="With --repair: report what would change, write nothing")
     journal_parser.add_argument("--all-stores", action="store_true",
                                 help="With --repair: sweep every worktree journal, not just this one")
+    journal_parser.add_argument("--path", default=None,
+                                help="With --repair: target this store explicitly (or this data root "
+                                     "with --all-stores) instead of resolving from the working directory")
 
     # Enrich
     enrich_parser = subparsers.add_parser("enrich", help="Enrich auto-journal stubs using MLX (local LLM)")
