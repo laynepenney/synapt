@@ -190,6 +190,50 @@ class TestMLXAvailabilityPredicate(unittest.TestCase):
                 "with the backend absent the skip must name the missing dependency",
             )
 
+    def test_backend_neutral_names_survive_the_backend_being_absent(self):
+        """THE THIRD WITNESS -- a latent defect that only a WORKING guard exposes.
+
+        `enrich` imported `Message` inside `if _MLX_AVAILABLE:`. That survived only while
+        the predicate was stuck True everywhere. `Message` is backend-neutral: it comes
+        from `synapt._models.base` and `_enrich_single_window` builds one for whatever
+        client it is handed -- including the Modal and Ollama clients the router returns on
+        hosts with no MLX, which never pass the MLX guard in `enrich_session`.
+
+        So correcting the predicate without this would have swapped a red matrix for a
+        NameError on the enrichment path of every non-Apple-Silicon install. Fixing a guard
+        can expose defects the broken guard was hiding, and they ship together or not at
+        all.
+        """
+        with patch.dict(sys.modules, {name: None for name in BACKEND_MODULES}):
+            importlib.reload(_mlx)
+            enrich = importlib.reload(importlib.import_module("synapt.recall.enrich"))
+
+            self.assertFalse(
+                enrich._MLX_AVAILABLE,
+                "precondition: the simulated runner must report MLX unavailable",
+            )
+            # Message: backend-neutral, used by every client the router can return.
+            self.assertTrue(
+                hasattr(enrich, "Message"),
+                "Message is unbound with the MLX backend absent -- every non-MLX client "
+                "path through _enrich_single_window raises NameError on this platform",
+            )
+            # MLXClient / MLXOptions: bound even where the backend is absent, because the
+            # predicate governs USE, not binding. Anything addressing them by name on this
+            # module -- including a test that patches them to force the MLX path -- gets
+            # AttributeError instead of the guarded path when binding is conditional.
+            for name in ("MLXClient", "MLXOptions"):
+                self.assertTrue(
+                    hasattr(enrich, name),
+                    f"{name} is unbound with the MLX backend absent. Binding is always "
+                    "safe here: mlx_client imports its backend function-locally, so the "
+                    "module imports on every platform -- which is the very property this "
+                    "change is about.",
+                )
+        # Leave the real module state behind for the rest of the session.
+        importlib.reload(_mlx)
+        importlib.reload(importlib.import_module("synapt.recall.enrich"))
+
     def test_control_a_broken_backend_is_not_disguised_as_an_absent_one(self):
         """Absent and broken are different facts, and only absence is expected here.
 

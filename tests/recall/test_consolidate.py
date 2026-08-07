@@ -2350,9 +2350,7 @@ class TestLocalConflictJudge(unittest.TestCase):
     judge's known mistake only ever drives the escalation to "contest," never a silent
     resolution."""
 
-    @unittest.skipUnless(
-        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
-    )
+    @unittest.skipUnless(consolidate._MLX_AVAILABLE, consolidate._SKIP_REASON)
     def test_real_judge_classifies_the_founding_pair_as_conflict(self):
         """Raw judge accuracy. This one passes: the model correctly classifies the founding
         case, every run."""
@@ -2373,9 +2371,7 @@ class TestLocalConflictJudge(unittest.TestCase):
             f"-- got {result!r}",
         )
 
-    @unittest.skipUnless(
-        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
-    )
+    @unittest.skipUnless(consolidate._MLX_AVAILABLE, consolidate._SKIP_REASON)
     @unittest.expectedFailure
     def test_real_judge_classifies_a_complementary_pair_as_not_conflict(self):
         """KNOWN, TRACKED, NOT SILENTLY HIDDEN: Ministral-3-3B reliably misclassifies this
@@ -2407,9 +2403,7 @@ class TestLocalConflictJudge(unittest.TestCase):
             f"CONFLICT -- got {result!r}",
         )
 
-    @unittest.skipUnless(
-        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
-    )
+    @unittest.skipUnless(consolidate._MLX_AVAILABLE, consolidate._SKIP_REASON)
     def test_real_judge_drives_escalation_to_contest_not_silent_resolution_founding_pair(self):
         """Closes the loop between the fake-judge-tested logic above and production: the REAL
         judge, wired directly (no gate -- section 10.5), driving the full escalation function
@@ -2432,9 +2426,7 @@ class TestLocalConflictJudge(unittest.TestCase):
         )
         self.assertEqual(result, "contest")
 
-    @unittest.skipUnless(
-        consolidate._MLX_AVAILABLE, "MLX not available (requires Apple Silicon)"
-    )
+    @unittest.skipUnless(consolidate._MLX_AVAILABLE, consolidate._SKIP_REASON)
     def test_real_judge_drives_escalation_to_contest_not_silent_resolution_complementary_pair(
         self,
     ):
