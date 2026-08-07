@@ -142,6 +142,7 @@ class TranscriptChunk:
     turn_index: int  # 0-based within session
     user_text: str  # Cleaned user message
     assistant_text: str  # Concatenated assistant text blocks
+    commentary_text: str = ""  # Intermediate assistant commentary, not searchable
     tools_used: list[str] = field(default_factory=list)
     files_touched: list[str] = field(default_factory=list)
     tool_content: str = ""  # Summarized tool inputs + results
@@ -184,6 +185,7 @@ class TranscriptChunk:
             "turn_index": self.turn_index,
             "user_text": self.user_text,
             "assistant_text": self.assistant_text,
+            "commentary_text": self.commentary_text,
             "tools_used": self.tools_used,
             "files_touched": self.files_touched,
             "tool_content": self.tool_content,
@@ -202,6 +204,7 @@ class TranscriptChunk:
             turn_index=d["turn_index"],
             user_text=d["user_text"],
             assistant_text=d["assistant_text"],
+            commentary_text=d.get("commentary_text", ""),
             tools_used=d.get("tools_used", []),
             files_touched=d.get("files_touched", []),
             tool_content=d.get("tool_content", ""),

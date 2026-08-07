@@ -233,6 +233,7 @@ def parse_codex_transcript(
     # Accumulator for current turn
     current_user_text = ""
     current_assistant_texts: list[str] = []
+    current_commentary_texts: list[str] = []
     current_tools: list[str] = []
     current_files: list[str] = []
     current_timestamp = ""
@@ -273,6 +274,11 @@ def parse_codex_transcript(
         if text and text not in current_assistant_texts:
             current_assistant_texts.append(text)
 
+    def _append_commentary_text(text: str) -> None:
+        """Retain each commentary message outside the primary retrieval text."""
+        if text and text not in current_commentary_texts:
+            current_commentary_texts.append(text)
+
     def _flush_turn(end_offset: int = 0):
         nonlocal turn_index
         if not current_user_text and not current_assistant_texts:
@@ -289,6 +295,9 @@ def parse_codex_transcript(
         assistant_text = "\n".join(current_assistant_texts).strip()
         if len(assistant_text) > 5000:
             assistant_text = assistant_text[:5000] + "..."
+        commentary_text = "\n".join(current_commentary_texts).strip()
+        if len(commentary_text) > 5000:
+            commentary_text = commentary_text[:5000] + "..."
 
         tool_summary_lines = list(current_tool_summaries)
         if current_custom_tool_summaries_omitted:
@@ -310,6 +319,7 @@ def parse_codex_transcript(
             turn_index=turn_index,
             user_text=current_user_text.strip(),
             assistant_text=assistant_text,
+            commentary_text=commentary_text,
             tools_used=list(dict.fromkeys(current_tools)),
             files_touched=files[:20],  # Cap to avoid bloat
             tool_content=tool_content,
@@ -386,6 +396,7 @@ def parse_codex_transcript(
                         _flush_turn(current_offset)
                         current_user_text = ""
                         current_assistant_texts = []
+                        current_commentary_texts = []
                         current_tools = []
                         current_files = []
                         current_tool_summaries = []
@@ -412,6 +423,7 @@ def parse_codex_transcript(
                             if block.get("type") == "output_text" and text:
                                 # Skip commentary phase — it's intermediate thinking
                                 if phase == "commentary":
+                                    _append_commentary_text(text)
                                     continue
                                 _append_assistant_text(text)
 
@@ -428,6 +440,7 @@ def parse_codex_transcript(
                             _flush_turn(current_offset)
                             current_user_text = text
                             current_assistant_texts = []
+                            current_commentary_texts = []
                             current_tools = []
                             current_files = []
                             current_tool_summaries = []
@@ -438,9 +451,7 @@ def parse_codex_transcript(
                     elif msg_type == "agent_message":
                         text = payload.get("message", "")
                         if payload.get("phase") == "commentary":
-                            # Preserve the existing parser policy: intermediate
-                            # commentary is not primary assistant text.
-                            pass
+                            _append_commentary_text(text)
                         else:
                             _append_assistant_text(text)
 
