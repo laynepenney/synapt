@@ -171,6 +171,55 @@ def _invalidate_cache() -> None:
     _cached_has_embeddings = False
 
 
+def _resolved_index_dir() -> Path:
+    """The exact index root the MCP server has resolved for this request."""
+    return _cached_dir or project_index_dir()
+
+
+def _label_empty_result(result: str, index_dir: Path) -> str:
+    """Attach scoped freshness to an MCP result that otherwise says nothing.
+
+    A successful search or context read is already evidence about the specific
+    content it returned. An empty result is different: without a freshness
+    verdict it can be read as a claim that the requested history does not
+    exist. Check the archive first and pay for live-source enumeration only
+    when that cheap result is fresh.
+    """
+    from synapt.recall.freshness import check_index_freshness
+
+    try:
+        verdict = check_index_freshness(index_dir=index_dir)
+        if not verdict.stale:
+            verdict = check_index_freshness(index_dir=index_dir, deep=True)
+    except Exception:
+        return (
+            f"{result}\n\n"
+            f"Index freshness was not checked for root: {index_dir}. "
+            "This does not establish that the requested history is absent."
+        )
+
+    if verdict.stale:
+        behind = []
+        if verdict.new_files:
+            behind.append(f"{len(verdict.new_files)} file(s) not yet indexed")
+        if verdict.changed_files:
+            behind.append(f"{len(verdict.changed_files)} indexed file(s) grown since build")
+        detail = "; ".join(behind) if behind else "the index is behind"
+        status = (
+            f"Index freshness: STALE ({detail}). Built "
+            f"{verdict.build_timestamp or 'at an unrecorded time'}, "
+            f"checked: {verdict.scanned}.\n"
+            f"To index newer content: {verdict.remedy}"
+        )
+    else:
+        status = (
+            f"Index freshness: CURRENT. Built "
+            f"{verdict.build_timestamp or 'at an unrecorded time'}, "
+            f"checked: {verdict.scanned}."
+        )
+    return f"{result}\n\nIndex root: {index_dir}\n{status}"
+
+
 # Clean up the DB connection before Python's module teardown begins.
 # Without this, __del__ runs during shutdown when sqlite3 may already
 # be partially torn down, causing a non-zero exit code that Claude Code
@@ -363,8 +412,8 @@ def recall_search(
                     f"\n[Note: Embeddings unavailable — semantic search disabled. "
                     f"{index._embedding_reason}]"
                 )
-            return msg
-        return "No results found."
+            return _label_empty_result(msg, _resolved_index_dir())
+        return _label_empty_result("No results found.", _resolved_index_dir())
     except Exception as exc:
         return f"Search failed: {exc}"
 
@@ -1515,12 +1564,16 @@ def recall_context(
             result = _format_cluster_context(idx, cluster_id)
             if "not found" not in result:
                 _record_context_access(idx, "cluster", cluster_id)
-            return result
+                return result
+            return _label_empty_result(result, _resolved_index_dir())
         if chunk_id:
             result = idx.read_turn_context(chunk_id)
             if result:
                 _record_context_access(idx, "chunk", chunk_id)
-            return result
+                return result
+            return _label_empty_result(
+                f"Chunk {chunk_id} not found.", _resolved_index_dir()
+            )
         return "Provide either chunk_id or cluster_id."
     except Exception as exc:
         return f"Error reading context: {exc}"
