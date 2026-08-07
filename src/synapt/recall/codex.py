@@ -296,6 +296,8 @@ def parse_codex_transcript(
         if len(assistant_text) > 5000:
             assistant_text = assistant_text[:5000] + "..."
         commentary_text = "\n".join(current_commentary_texts).strip()
+        if len(commentary_text) > 5000:
+            commentary_text = commentary_text[:5000] + "..."
 
         tool_summary_lines = list(current_tool_summaries)
         if current_custom_tool_summaries_omitted:
