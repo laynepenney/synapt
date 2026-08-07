@@ -123,8 +123,8 @@ class TestTailTurnsClaude(unittest.TestCase):
     def test_bounded_window_sets_truncated_head(self):
         entries = []
         for i in range(200):
-            entries.append(_claude_user("q" * 200, f"2026-08-07T09:00:{i % 60:02d}Z", f"u{i}"))
-            entries.append(_claude_assistant("a" * 200, f"2026-08-07T09:01:{i % 60:02d}Z", f"a{i}"))
+            entries.append(_claude_user(f"question {i} " * 20, f"2026-08-07T09:00:{i % 60:02d}Z", f"u{i}"))
+            entries.append(_claude_assistant(f"answer {i} " * 20, f"2026-08-07T09:01:{i % 60:02d}Z", f"a{i}"))
         entries.append(_claude_assistant("the newest answer", "2026-08-07T10:00:00Z", "afinal"))
         path = _write_jsonl(self.tmpdir, "session.jsonl", entries)
         self.assertGreater(path.stat().st_size, 4096)
@@ -147,6 +147,27 @@ class TestTailTurnsClaude(unittest.TestCase):
 
         self.assertFalse(view.truncated_head)
         self.assertEqual(view.bytes_scanned, path.stat().st_size)
+
+    def test_window_starting_on_exact_line_boundary_keeps_first_line(self):
+        entries = [
+            _claude_user("older question", "2026-08-07T09:59:00Z", "u0"),
+            _claude_user("boundary question", "2026-08-07T10:00:00Z", "u1"),
+            _claude_assistant("boundary answer", "2026-08-07T10:00:01Z", "a1"),
+        ]
+        path = _write_jsonl(self.tmpdir, "session.jsonl", entries)
+        first_line_len = len(path.read_bytes().split(b"\n")[0]) + 1
+        total = path.stat().st_size
+
+        window_exact = total - first_line_len
+        view = tail_turns(path, n=50, window_bytes=window_exact)
+        self.assertEqual(
+            [t.text for t in view.turns],
+            ["boundary question", "boundary answer"],
+        )
+        self.assertTrue(view.truncated_head)
+
+        view_offcut = tail_turns(path, n=50, window_bytes=window_exact - 1)
+        self.assertEqual([t.text for t in view_offcut.turns], ["boundary answer"])
 
     def test_honest_empty_on_unparseable_window(self):
         path = Path(self.tmpdir) / "garbage.jsonl"
