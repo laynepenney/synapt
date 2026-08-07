@@ -269,6 +269,33 @@ class TestParseCodexTranscript(unittest.TestCase):
 
         self.assertEqual(parse_codex_transcript(path), [])
 
+    def test_commentary_text_is_capped(self):
+        """Commentary storage has the same per-turn bound as assistant text."""
+        commentary = "c" * 5001
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "commentary-cap-session"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "user", "content": [
+                 {"type": "input_text", "text": "retain commentary safely"}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:02Z", "type": "response_item",
+             "payload": {"role": "assistant", "phase": "commentary", "content": [
+                 {"type": "output_text", "text": commentary}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:03Z", "type": "response_item",
+             "payload": {"role": "assistant", "content": [
+                 {"type": "output_text", "text": "Synthetic final answer."}
+             ]}},
+        ]
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        chunks = parse_codex_transcript(path)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(len(chunks[0].commentary_text), 5003)
+        self.assertTrue(chunks[0].commentary_text.endswith("..."))
+
     def test_dedup_by_session_id(self):
         """Same session ID parsed twice returns empty on second call."""
         entries = [
