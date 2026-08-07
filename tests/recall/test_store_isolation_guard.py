@@ -355,6 +355,83 @@ def test_local_to_global_migration_is_covered(
 
 
 # ---------------------------------------------------------------------------
+# The SQLite surfaces — and why exactly one of them is guarded
+# ---------------------------------------------------------------------------
+
+def test_state_db_at_the_store_is_refused_before_the_file_is_created(
+    register_protected_root, store_isolation_error, tmp_path
+):
+    """``_open_state_db`` takes its path from the caller and can reach the store.
+
+    Same shape as an explicit ``channels_dir``: it reaches around resolution
+    entirely, so the resolver guard cannot see it. Found in review — the JSONL
+    surface was covered and this one was not, and nothing said so.
+    """
+    decoy_root = tmp_path / "home" / ".synapt" / "channels"
+    register_protected_root(decoy_root)
+
+    target = decoy_root / "decoy-org" / "decoy-repo" / "_state.db"
+    before = _entries(decoy_root)
+
+    with pytest.raises(store_isolation_error):
+        channel_mod._open_state_db(target)
+
+    assert _entries(decoy_root) == before
+    assert not target.exists()
+
+
+def test_channels_db_is_data_root_surface_not_channel_store_surface(
+    protected_channel_root, tmp_path
+):
+    """``channels.db`` is deliberately outside the channel guard, and must stay so.
+
+    It is composed from ``project_data_dir``, so it can never resolve inside the
+    global channel store — meaning a channel-store check here could not refuse
+    anything. Adding one would look like tightening coverage while installing a
+    check that cannot fail, which is the exact defect this harness exists to
+    prevent.
+
+    Pinned because the asymmetry looks like an oversight to anyone reading the
+    seam list, and the obvious "fix" is the wrong move. The real coverage comes
+    from the data-root policy, which ``project_data_dir`` consults.
+    """
+    resolved = channel_mod._db_path(project_dir=tmp_path).resolve()
+
+    assert protected_channel_root not in resolved.parents
+    assert resolved != protected_channel_root
+
+    consulted = []
+    previous = core_mod.set_data_root_policy(lambda op, p: consulted.append(op))
+    try:
+        channel_mod._db_path(project_dir=tmp_path)
+    finally:
+        core_mod.set_data_root_policy(previous)
+
+    assert consulted, "channels.db must be reachable by the data-root policy"
+
+
+# ---------------------------------------------------------------------------
+# The guard must survive anything that clears the module global
+# ---------------------------------------------------------------------------
+
+def test_guard_is_rearmed_after_a_module_reload_disarms_it(rearm_guard):
+    """``importlib.reload`` rebinds the module dict and silently clears the policy.
+
+    It cannot be fixed where it happens — a reload replaces the module wholesale
+    — so the harness re-arms before each test instead. That closes the whole
+    class rather than the two mechanisms currently known, because the next one
+    will arrive with the same signature: green suite, absent protection.
+    """
+    import importlib
+
+    importlib.reload(channel_mod)
+    assert channel_mod._store_path_policy is None, "reload should clear the policy"
+
+    rearm_guard()
+    assert channel_mod._store_path_policy is not None
+
+
+# ---------------------------------------------------------------------------
 # W6 / W7 — containment is a path property, not a string property
 # ---------------------------------------------------------------------------
 

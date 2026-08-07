@@ -272,6 +272,15 @@ def _db_path(project_dir: Path | None = None) -> Path:
 
     Always uses the local directory — presence, cursors, pins, and mutes
     are per-gripspace even when channels are shared.
+
+    Deliberately NOT guarded by the channel-store policy, and the reason is
+    load-bearing rather than an oversight. This path is composed from
+    ``project_data_dir``, so it can never resolve inside the global channel
+    store; a channel-store check here could not refuse anything, and a check
+    that cannot fail is the defect this seam exists to prevent. It is instead
+    covered by the data-root policy, which ``project_data_dir`` consults —
+    verified by probe, not assumed. See ``_open_state_db`` for the SQLite path
+    that CAN reach the global store and is guarded accordingly.
     """
     return _local_channels_dir(project_dir) / "channels.db"
 
@@ -3235,6 +3244,10 @@ def _migrate_cursors(
 
 def _open_state_db(state_db: Path) -> sqlite3.Connection:
     """Open or create the global _state.db with WAL mode."""
+    # Caller-supplied path, same shape as an explicit channels_dir: it reaches
+    # around resolution entirely, so it is guarded in its own right. This one
+    # can land inside the global store, unlike the per-gripspace channels.db.
+    _guard_store_path("open_state_db", state_db)
     state_db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(state_db))
     conn.row_factory = sqlite3.Row

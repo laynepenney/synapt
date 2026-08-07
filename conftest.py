@@ -185,6 +185,41 @@ def pytest_unconfigure(config):
 
 def pytest_runtest_setup(item):
     POLICY.current_item = item
+    _rearm_if_disarmed(item.config)
+
+
+def _rearm_if_disarmed(config):
+    """Re-install the policy before each test if anything cleared it.
+
+    The guard lives in a module global, so ANY mechanism that replaces or
+    resets that module silently disarms it — and a disarmed guard is invisible:
+    the suite stays green while the protection it advertises is gone. Two such
+    mechanisms are known. A nested in-process pytest run whose unconfigure
+    cleared the global (fixed at its source with save-and-restore), and
+    ``importlib.reload``, which rebinds the module dict wholesale and cannot be
+    fixed at the source at all.
+
+    Enumerating those two and patching each is the weaker move; the next
+    mechanism arrives unannounced with the same silent signature. Re-arming per
+    test closes over the whole class instead — whatever cleared it, the next
+    test starts armed. Cost is one identity check against None.
+
+    SCOPE, stated rather than left to inference: this closes CROSS-test
+    leakage, not intra-test. A disarm that happens *during* a test leaves the
+    guard off for the remainder of THAT test; the next one starts armed. So the
+    blast radius drops from "every test that follows, indefinitely" to "the
+    rest of this one," which is the right trade at this cost — but it is a
+    reduction, not an elimination. Saying "the class is closed" without this
+    sentence would invite exactly the inference this whole harness exists to
+    prevent: reading a partial guarantee as a total one.
+    """
+    from synapt.recall import channel as channel_mod
+    from synapt.recall import core as core_mod
+
+    if channel_mod._store_path_policy is None:
+        channel_mod.set_store_path_policy(POLICY.check_channel_path)
+    if config.getoption("--strict-recall-data-root") and core_mod._data_root_policy is None:
+        core_mod.set_data_root_policy(POLICY.check_data_root)
 
 
 def pytest_runtest_call(item):
@@ -257,6 +292,19 @@ def register_protected_root():
         return Path(root)
 
     return _register
+
+
+@pytest.fixture
+def rearm_guard(request):
+    """The per-test re-arm routine, for the witness that a reload cannot disarm it.
+
+    Exposed as a fixture rather than imported: ``import conftest`` resolves to
+    the nearest conftest on sys.path, which is not this one.
+    """
+    def _rearm():
+        _rearm_if_disarmed(request.config)
+
+    return _rearm
 
 
 @pytest.fixture
