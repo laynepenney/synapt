@@ -52,8 +52,12 @@ class TestDMPostAndRead(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        # SYNAPT_PROJECT_DIR is read nowhere in the package, so it isolated
+        # nothing — these tests resolved to the real home-level channel store.
+        # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
+        # consults (Ref #955).
         self._env_patch = patch.dict(os.environ, {
-            "SYNAPT_PROJECT_DIR": self.tmpdir,
+            "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
         })
         self._env_patch.start()
 
@@ -109,8 +113,12 @@ class TestDMPrivacy(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        # SYNAPT_PROJECT_DIR is read nowhere in the package, so it isolated
+        # nothing — these tests resolved to the real home-level channel store.
+        # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
+        # consults (Ref #955).
         self._env_patch = patch.dict(os.environ, {
-            "SYNAPT_PROJECT_DIR": self.tmpdir,
+            "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
         })
         self._env_patch.start()
 
@@ -174,8 +182,12 @@ class TestDMDiscovery(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        # SYNAPT_PROJECT_DIR is read nowhere in the package, so it isolated
+        # nothing — these tests resolved to the real home-level channel store.
+        # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
+        # consults (Ref #955).
         self._env_patch = patch.dict(os.environ, {
-            "SYNAPT_PROJECT_DIR": self.tmpdir,
+            "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
         })
         self._env_patch.start()
 
@@ -245,8 +257,12 @@ class TestDMInRecallSearch(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        # SYNAPT_PROJECT_DIR is read nowhere in the package, so it isolated
+        # nothing — these tests resolved to the real home-level channel store.
+        # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
+        # consults (Ref #955).
         self._env_patch = patch.dict(os.environ, {
-            "SYNAPT_PROJECT_DIR": self.tmpdir,
+            "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
         })
         self._env_patch.start()
 
