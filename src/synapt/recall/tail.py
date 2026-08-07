@@ -72,9 +72,14 @@ def tail_turns(
     classifies each remaining line by shape (Claude Code entry or Codex
     rollout entry), and returns the last *n* utterances oldest-to-newest.
 
-    Every producer routes through one guarded append point: a duplicate
-    delivery of the same speaker+text inside the window is dropped no
-    matter which entry kind produced it or in which order it arrived.
+    Every producer routes through one guarded append point that owns both
+    redaction (scrub_text on every turn, whichever format produced it)
+    and dedup: a duplicate delivery of the same speaker+text inside the
+    window is dropped no matter which entry kind produced it or in which
+    order it arrived. The trade is deliberate: a genuine identical repeat
+    inside the window is also collapsed — the window is a view, not a
+    ledger. If faithful repeats ever matter to a consumer, key the dedup
+    on the timestamp as well.
 
     A missing file raises ``FileNotFoundError`` — the path is the
     caller's claim, and this function does not soften a claim it can
@@ -98,19 +103,14 @@ def tail_turns(
     bytes_scanned = len(raw)
     truncated_head = start > 0
 
-    lines = raw.decode("utf-8", errors="replace").splitlines()
+    # split("\n"), never splitlines(): U+2028/U+2029/U+0085 are legal
+    # unescaped inside JSON strings but splitlines() treats them as line
+    # breaks, shattering one valid record into unparseable fragments.
+    lines = raw.decode("utf-8", errors="replace").split("\n")
     if truncated_head and lines and head_byte != b"\n":
         lines = lines[1:]
 
     turns: list[TailTurn] = []
-
-    def _append(speaker: str, text: str, when: str) -> None:
-        stripped = text.strip()
-        if not stripped:
-            return
-        if any(t.speaker == speaker and t.text == stripped for t in turns):
-            return
-        turns.append(TailTurn(speaker=speaker, text=stripped, when=when))
 
     def _scrubbed(text: str) -> str:
         try:
@@ -118,6 +118,17 @@ def tail_turns(
         except Exception:
             logger.debug("scrub_text failed on tail text, using raw", exc_info=True)
             return text
+
+    def _append(speaker: str, text: str, when: str) -> None:
+        # The single guarded append point owns BOTH dedup and redaction:
+        # every producer routes through here, so no format branch can
+        # deliver an unscrubbed or duplicate turn to the view.
+        stripped = _scrubbed(text).strip()
+        if not stripped:
+            return
+        if any(t.speaker == speaker and t.text == stripped for t in turns):
+            return
+        turns.append(TailTurn(speaker=speaker, text=stripped, when=when))
 
     for line in lines:
         line = line.strip()
@@ -137,12 +148,12 @@ def tail_turns(
         if entry_type in SKIP_TYPES:
             continue
         if _is_real_user_message(entry):
-            _append("user", _scrubbed(_extract_user_text(entry)), when)
+            _append("user", _extract_user_text(entry), when)
             continue
         if entry_type == "assistant":
             text, _tools, _files, _tool_uses = _extract_assistant_content(entry)
             if text:
-                _append("assistant", _scrubbed(text), when)
+                _append("assistant", text, when)
             continue
 
         # --- Codex rollout shapes ---

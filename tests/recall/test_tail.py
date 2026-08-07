@@ -251,9 +251,6 @@ class TestTailTurnsClaude(unittest.TestCase):
         self.assertEqual(len(view.turns), 2)
         self.assertIn("after-separator", view.turns[0].text)
 
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-
 
 class TestTailTurnsCodex(unittest.TestCase):
     def setUp(self):
