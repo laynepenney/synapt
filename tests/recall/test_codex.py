@@ -106,6 +106,49 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertIn("exec_command", chunks[0].tools_used)
         self.assertIn("ls -la", chunks[0].tool_content)
 
+    def test_custom_tool_families_are_captured_without_duplicate_agent_text(self):
+        """Custom tool envelopes retain tool context and deduplicate agent text."""
+        synthetic_file = "/workspace/synthetic.py"
+        oversized_input = "{" + '"payload":"' + ("x" * 600) + '"}'
+        assistant_text = "Synthetic assistant response."
+        unique_agent_text = "Synthetic event response."
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "custom-tool-session"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "user", "content": [
+                 {"type": "input_text", "text": "inspect synthetic source"}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:02Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "shell_run",
+                         "arguments": json.dumps({"cmd": f"cat {synthetic_file}"})}},
+            {"timestamp": "2026-03-01T10:00:03Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call", "name": "large_input_tool",
+                         "input": oversized_input}},
+            {"timestamp": "2026-03-01T10:00:04Z", "type": "response_item",
+             "payload": {"type": "custom_tool_call_output", "output": "ignored"}},
+            {"timestamp": "2026-03-01T10:00:05Z", "type": "response_item",
+             "payload": {"role": "assistant", "content": [
+                 {"type": "output_text", "text": assistant_text}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:06Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "message": assistant_text}},
+            {"timestamp": "2026-03-01T10:00:07Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "message": unique_agent_text}},
+        ]
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        chunks = parse_codex_transcript(path)
+
+        self.assertEqual(len(chunks), 1)
+        chunk = chunks[0]
+        self.assertEqual(chunk.tools_used, ["shell_run", "large_input_tool"])
+        self.assertIn(f"[shell_run] cat {synthetic_file}", chunk.tool_content)
+        self.assertIn(synthetic_file, chunk.files_touched)
+        self.assertIn("[large_input_tool]", chunk.tool_content)
+        self.assertEqual(chunk.assistant_text.count(assistant_text), 1)
+        self.assertEqual(chunk.assistant_text.count(unique_agent_text), 1)
+
     def test_skips_system_content(self):
         """Developer role and permissions/env context are filtered out."""
         entries = [
