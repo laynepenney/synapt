@@ -54,7 +54,11 @@ def _env_flag(name: str) -> bool:
     return value not in {"", "0", "false", "no", "off"}
 
 from synapt._models.base import Message
-from synapt.recall._mlx import MLX_AVAILABLE as _MLX_AVAILABLE, INSTALL_MSG as _INSTALL_MSG  # noqa: F401
+from synapt.recall._mlx import (  # noqa: F401
+    MLX_AVAILABLE as _MLX_AVAILABLE,
+    INSTALL_MSG as _INSTALL_MSG,
+    SKIP_REASON as _SKIP_REASON,
+)
 
 from synapt.recall._model_router import DEFAULT_DECODER_MODEL as DEFAULT_MODEL
 MAX_EXISTING_KNOWLEDGE_CHARS = 4000
