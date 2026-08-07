@@ -4,7 +4,8 @@ Codex CLI stores sessions at ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
 The format differs from Claude Code:
   - session_meta entry has session ID and cwd
   - response_item entries with role: user/developer/assistant
-  - function_call / function_call_output for tool use
+  - function_call / function_call_output and custom_tool_call /
+    custom_tool_call_output for tool use
   - Content blocks use input_text/output_text types
 
 This module converts Codex transcripts into the same TranscriptChunk format
@@ -214,6 +215,26 @@ def parse_codex_transcript(
     turn_start_offset = 0
     current_offset = 0
 
+    def _record_tool_call(payload: dict) -> None:
+        """Record either supported Codex tool-call envelope."""
+        tool_name = payload.get("name", "unknown")
+        current_tools.append(tool_name)
+        args = payload.get("arguments", payload.get("input", ""))
+        if not isinstance(args, str):
+            return
+
+        summary = args[:200]
+        if len(args) < 500:
+            try:
+                args_parsed = json.loads(args)
+                cmd = args_parsed.get("cmd", "")
+                if cmd:
+                    summary = cmd
+                    current_files.extend(_extract_file_paths(cmd))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        current_tool_summaries.append(f"[{tool_name}] {summary}")
+
     def _flush_turn(end_offset: int = 0):
         nonlocal turn_index
         if not current_user_text and not current_assistant_texts:
@@ -289,24 +310,14 @@ def parse_codex_transcript(
                     phase = payload.get("phase", "")
 
                     # Handle function calls first (no role field)
-                    if payload_type == "function_call":
-                        tool_name = payload.get("name", "unknown")
-                        current_tools.append(tool_name)
-                        args = payload.get("arguments", "")
-                        if isinstance(args, str) and len(args) < 500:
-                            try:
-                                args_parsed = json.loads(args)
-                                cmd = args_parsed.get("cmd", "")
-                                if cmd:
-                                    current_tool_summaries.append(f"[{tool_name}] {cmd}")
-                                    current_files.extend(_extract_file_paths(cmd))
-                            except (json.JSONDecodeError, TypeError):
-                                current_tool_summaries.append(f"[{tool_name}] {args[:200]}")
+                    if payload_type in {"function_call", "custom_tool_call"}:
+                        _record_tool_call(payload)
                         current_offset += line_bytes
                         continue
 
-                    if payload_type == "function_call_output":
-                        # Tool output — could extract file paths but skip for now
+                    if payload_type in {"function_call_output", "custom_tool_call_output"}:
+                        # Tool output is deliberately handled as a no-op: call metadata
+                        # above is enough for transcript recall, while output can be noisy.
                         current_offset += line_bytes
                         continue
 
@@ -360,6 +371,13 @@ def parse_codex_transcript(
                             current_tool_summaries = []
                             current_timestamp = timestamp
                             turn_start_offset = current_offset
+                    elif msg_type == "agent_message":
+                        text = payload.get("message", "")
+                        if text and (
+                            not current_assistant_texts
+                            or current_assistant_texts[-1] != text
+                        ):
+                            current_assistant_texts.append(text)
 
                 current_offset += line_bytes
 
