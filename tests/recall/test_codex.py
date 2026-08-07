@@ -112,6 +112,7 @@ class TestParseCodexTranscript(unittest.TestCase):
         oversized_input = "{" + '"payload":"' + ("x" * 600) + '"}'
         assistant_text = "Synthetic assistant response."
         unique_agent_text = "Synthetic event response."
+        commentary_agent_text = "Synthetic commentary event."
         entries = [
             {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
              "payload": {"id": "custom-tool-session"}},
@@ -135,6 +136,9 @@ class TestParseCodexTranscript(unittest.TestCase):
              "payload": {"type": "agent_message", "message": assistant_text}},
             {"timestamp": "2026-03-01T10:00:07Z", "type": "event_msg",
              "payload": {"type": "agent_message", "message": unique_agent_text}},
+            {"timestamp": "2026-03-01T10:00:08Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "commentary",
+                         "message": commentary_agent_text}},
         ]
         path = _write_codex_transcript(self.tmpdir, entries)
 
@@ -148,6 +152,7 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertIn("[large_input_tool]", chunk.tool_content)
         self.assertEqual(chunk.assistant_text.count(assistant_text), 1)
         self.assertEqual(chunk.assistant_text.count(unique_agent_text), 1)
+        self.assertNotIn(commentary_agent_text, chunk.assistant_text)
 
     def test_skips_system_content(self):
         """Developer role and permissions/env context are filtered out."""
