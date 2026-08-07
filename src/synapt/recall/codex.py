@@ -215,8 +215,8 @@ def parse_codex_transcript(
     turn_start_offset = 0
     current_offset = 0
 
-    def _record_tool_call(payload: dict) -> None:
-        """Record either supported Codex tool-call envelope."""
+    def _record_custom_tool_call(payload: dict) -> None:
+        """Record a custom Codex tool-call envelope with an input summary."""
         tool_name = payload.get("name", "unknown")
         current_tools.append(tool_name)
         args = payload.get("arguments", payload.get("input", ""))
@@ -310,8 +310,25 @@ def parse_codex_transcript(
                     phase = payload.get("phase", "")
 
                     # Handle function calls first (no role field)
-                    if payload_type in {"function_call", "custom_tool_call"}:
-                        _record_tool_call(payload)
+                    if payload_type == "function_call":
+                        # Keep legacy function-call summary semantics unchanged.
+                        tool_name = payload.get("name", "unknown")
+                        current_tools.append(tool_name)
+                        args = payload.get("arguments", "")
+                        if isinstance(args, str) and len(args) < 500:
+                            try:
+                                args_parsed = json.loads(args)
+                                cmd = args_parsed.get("cmd", "")
+                                if cmd:
+                                    current_tool_summaries.append(f"[{tool_name}] {cmd}")
+                                    current_files.extend(_extract_file_paths(cmd))
+                            except (json.JSONDecodeError, TypeError):
+                                current_tool_summaries.append(f"[{tool_name}] {args[:200]}")
+                        current_offset += line_bytes
+                        continue
+
+                    if payload_type == "custom_tool_call":
+                        _record_custom_tool_call(payload)
                         current_offset += line_bytes
                         continue
 
@@ -377,10 +394,7 @@ def parse_codex_transcript(
                             # Preserve the existing parser policy: intermediate
                             # commentary is not primary assistant text.
                             pass
-                        elif text and (
-                            not current_assistant_texts
-                            or current_assistant_texts[-1] != text
-                        ):
+                        elif text and text not in current_assistant_texts:
                             current_assistant_texts.append(text)
 
                 current_offset += line_bytes
