@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -152,6 +153,105 @@ def test_the_guard_is_armed_with_no_per_test_fixture_at_all(
         # Pointed at the protected root explicitly rather than relying on this
         # machine happening to resolve there.
         channel_mod._guard_store_path("witness", protected_channel_root / "dev.jsonl")
+
+
+def test_the_data_root_guard_is_armed_by_default(
+    request, store_isolation_error, monkeypatch
+):
+    """The data-root guard is installed with no flag passed.
+
+    This is the witness the flip rests on, and it is deliberately a DIRECT
+    observation of the policy rather than a comparison between two run modes.
+    Before the burn-down, running with the flag differed from running without
+    it, and that difference was the proof the flag was wired. Now the two agree
+    — which is both the success criterion and the exact signature of a guard
+    that has stopped working. Modal agreement cannot tell those apart any more,
+    so the evidence has to come from here.
+    """
+    if not request.config.getoption("strict_recall_data_root"):
+        # Discriminate on the ARGV signal, not on the resolved option. Those
+        # two agree today and come apart in exactly the case that matters: if
+        # the default is ever silently reverted to off, the resolved option
+        # reads False with no flag passed, and skipping here would announce
+        # "deliberately disarmed" about a disarm nobody requested. That is the
+        # skip LYING rather than merely going quiet — a false reason is worse
+        # than no reason, because it explains away the very thing it should
+        # surface.
+        assert "--no-strict-recall-data-root" in sys.argv, (
+            "the data-root guard is disarmed but nobody passed the flag — the "
+            "default has been reverted; this must fail rather than skip"
+        )
+        pytest.skip("deliberately disarmed via --no-strict-recall-data-root")
+
+    assert core_mod._data_root_policy is not None, (
+        "the data-root guard must be armed without passing any flag"
+    )
+
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    outside = Path(__file__).resolve().parents[2]
+
+    with pytest.raises(store_isolation_error):
+        core_mod.project_data_dir(outside)
+
+
+def test_the_debug_escape_hatch_is_wired_end_to_end(request, install_policy):
+    """``--no-strict-recall-data-root`` reaches the install decision.
+
+    Two links, asserted separately, because either one alone is satisfiable
+    without the other: the option must resolve to the same destination the
+    installer reads, and the installer must actually decline to arm when told
+    not to. An escape hatch nobody has proven works is worse than none — it
+    invites the belief that the guard can be stepped around cleanly, and the
+    first person to need it finds out otherwise under pressure.
+
+    Deliberately not a nested pytest run. ``pytester`` executes in-process and
+    shares module globals, which is how the guard silently disarmed itself
+    once already; a second nested run to test disarming would be the same
+    hazard aimed at the thing it broke before.
+    """
+    # Link 1: the option exists and resolves to the destination the installer
+    # reads. Under --no-strict-recall-data-root that destination is False,
+    # which is itself the proof the flag reaches it.
+    armed = request.config.getoption("strict_recall_data_root")
+    assert armed is ("--no-strict-recall-data-root" not in sys.argv)
+
+    # Link 2: told not to arm, the installer does not arm.
+    previous = core_mod.set_data_root_policy(None)
+    try:
+        install_policy(False)
+        assert core_mod._data_root_policy is None
+        # Link 3: the hatch is SCOPED. It disarms the data-root guard and
+        # nothing else. Without this, the escape could widen into a full
+        # disarm — taking the channel guard, which is #955's contract and was
+        # never opt-in — and every other witness here would still pass, because
+        # they arm their own policy or assert against a decoy. An escape hatch
+        # nobody has bounded is a hatch that grows.
+        assert channel_mod._store_path_policy is not None, (
+            "the data-root escape must not disarm the channel guard"
+        )
+        install_policy(True)
+        assert core_mod._data_root_policy is not None
+    finally:
+        core_mod.set_data_root_policy(previous)
+
+
+def test_passing_both_flags_resolves_last_wins(pytester_precedence):
+    """With both flags given, the LAST one decides — pinned, not inherited.
+
+    Found in review. The behaviour was already last-wins, but by argparse
+    accident rather than by decision: undocumented, untested, and therefore
+    free to change under a dependency bump with nothing going red. That is the
+    same shape as the rest of this file — a behaviour nobody chose, invisible
+    until it decides something.
+
+    The concrete case is a CI base config carrying one flag and a job appending
+    the other, where the outcome is settled by argument order nobody wrote
+    down. Last-wins is the conventional answer and a good one; this makes it a
+    decision by pinning it, and the docstring on the option now says so.
+    """
+    armed_last, disarmed_last = pytester_precedence
+    assert armed_last is True, "--strict last must arm"
+    assert disarmed_last is False, "--no-strict last must disarm"
 
 
 def test_layer_one_covers_the_import_window(isolation_policy):
