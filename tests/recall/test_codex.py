@@ -1,6 +1,7 @@
 """Tests for synapt.recall.codex — Codex CLI transcript parsing."""
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -571,6 +572,27 @@ class TestTheBuildPreCheckReadsTheCodexArm(unittest.TestCase):
     A guard whose result nothing consumes does not exist, so this drives the real
     pre-check branch rather than poking the helper.
     """
+
+    def setUp(self):
+        # cmd_build resolves the recall data root implicitly, so without an
+        # owned root this drives the pre-check against the operator's live
+        # store (Ref #967). unittest.TestCase cannot take the shared fixture,
+        # so the override is set here and restored in tearDown.
+        self._tmp = tempfile.mkdtemp()
+        self._prev = os.environ.get("SYNAPT_RECALL_ROOT")
+        self._prev_wt = os.environ.get("SYNAPT_RECALL_WORKTREE")
+        os.environ["SYNAPT_RECALL_ROOT"] = self._tmp
+        os.environ["SYNAPT_RECALL_WORKTREE"] = "pytest-owned"
+
+    def tearDown(self):
+        for name, prev in (
+            ("SYNAPT_RECALL_ROOT", self._prev),
+            ("SYNAPT_RECALL_WORKTREE", self._prev_wt),
+        ):
+            if prev is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = prev
 
     def _run_precheck(self, has_codex: bool):
         """Drive cmd_build's pre-check with everything downstream stubbed."""

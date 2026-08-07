@@ -1220,7 +1220,7 @@ class TestRecallContradictContestResolution:
         assert candidate_id in historical_ids
         db.close()
 
-    def test_candidate_wins_promotes_candidate_supersedes_existing(self, tmp_path):
+    def test_candidate_wins_promotes_candidate_supersedes_existing(self, owned_recall_root, tmp_path):
         from synapt.recall.server import recall_contradict
         db, index, cid = self._make_contested_pair(tmp_path)
 
@@ -1240,7 +1240,7 @@ class TestRecallContradictContestResolution:
         # Queue entry resolved, no longer pending
         assert db.list_pending_contradictions() == []
 
-    def test_existing_wins_restores_existing_retires_candidate(self, tmp_path):
+    def test_existing_wins_restores_existing_retires_candidate(self, owned_recall_root, tmp_path):
         from synapt.recall.server import recall_contradict
         db, index, cid = self._make_contested_pair(tmp_path)
 
@@ -1259,7 +1259,7 @@ class TestRecallContradictContestResolution:
         assert candidate["status"] == "stale"
         assert db.list_pending_contradictions() == []
 
-    def test_false_positive_restores_both_supersedes_neither(self, tmp_path):
+    def test_false_positive_restores_both_supersedes_neither(self, owned_recall_root, tmp_path):
         from synapt.recall.server import recall_contradict
         db, index, cid = self._make_contested_pair(tmp_path)
 
@@ -2364,9 +2364,17 @@ class TestRecallSave:
         finally:
             db.close()
 
-    def test_recall_save_requires_content(self):
+    def test_recall_save_requires_content(self, tmp_path, monkeypatch):
+        """Ref #967 — recall_save hardcodes ``project = Path.cwd()``.
+
+        There is no project_dir to pass and the env override does not apply to
+        an explicit path, so the isolation here is to move the CWD rather than
+        redirect the root: the inference still runs, just from a directory this
+        test owns instead of the operator's checkout.
+        """
         from synapt.recall.server import recall_save
 
+        monkeypatch.chdir(tmp_path)
         assert "required" in recall_save(content="   ").lower()
 
     def test_recall_save_upserts_stable_node_id(self, tmp_path):
@@ -2457,8 +2465,11 @@ class TestRecallSave:
         finally:
             db.close()
 
-    def test_recall_save_retract_requires_node_id(self):
+    def test_recall_save_retract_requires_node_id(self, tmp_path, monkeypatch):
+        """Ref #967 — same cwd-derived resolution as the sibling above."""
         from synapt.recall.server import recall_save
+
+        monkeypatch.chdir(tmp_path)
 
         result = recall_save(retract=True)
         assert "node_id is required" in result.lower()

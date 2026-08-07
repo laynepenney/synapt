@@ -56,8 +56,16 @@ class TestDMPostAndRead(unittest.TestCase):
         # nothing — these tests resolved to the real home-level channel store.
         # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
         # consults (Ref #955).
+        # Ref #967: the channel override alone leaves the recall DATA root
+        # inferred from cwd, which lands in a real checkout. The data root must
+        # exist before it is pointed at — the override refuses a missing root
+        # rather than mint an empty store that reads like a real answer.
+        recall_root = Path(self.tmpdir) / "recall-root"
+        recall_root.mkdir(parents=True, exist_ok=True)
         self._env_patch = patch.dict(os.environ, {
             "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
+            "SYNAPT_RECALL_ROOT": str(recall_root),
+            "SYNAPT_RECALL_WORKTREE": "pytest-owned",
         })
         self._env_patch.start()
 
@@ -117,8 +125,16 @@ class TestDMPrivacy(unittest.TestCase):
         # nothing — these tests resolved to the real home-level channel store.
         # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
         # consults (Ref #955).
+        # Ref #967: the channel override alone leaves the recall DATA root
+        # inferred from cwd, which lands in a real checkout. The data root must
+        # exist before it is pointed at — the override refuses a missing root
+        # rather than mint an empty store that reads like a real answer.
+        recall_root = Path(self.tmpdir) / "recall-root"
+        recall_root.mkdir(parents=True, exist_ok=True)
         self._env_patch = patch.dict(os.environ, {
             "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
+            "SYNAPT_RECALL_ROOT": str(recall_root),
+            "SYNAPT_RECALL_WORKTREE": "pytest-owned",
         })
         self._env_patch.start()
 
@@ -186,8 +202,16 @@ class TestDMDiscovery(unittest.TestCase):
         # nothing — these tests resolved to the real home-level channel store.
         # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
         # consults (Ref #955).
+        # Ref #967: the channel override alone leaves the recall DATA root
+        # inferred from cwd, which lands in a real checkout. The data root must
+        # exist before it is pointed at — the override refuses a missing root
+        # rather than mint an empty store that reads like a real answer.
+        recall_root = Path(self.tmpdir) / "recall-root"
+        recall_root.mkdir(parents=True, exist_ok=True)
         self._env_patch = patch.dict(os.environ, {
             "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
+            "SYNAPT_RECALL_ROOT": str(recall_root),
+            "SYNAPT_RECALL_WORKTREE": "pytest-owned",
         })
         self._env_patch.start()
 
@@ -261,8 +285,16 @@ class TestDMInRecallSearch(unittest.TestCase):
         # nothing — these tests resolved to the real home-level channel store.
         # SYNAPT_SHARED_CHANNELS_DIR is the override the resolver actually
         # consults (Ref #955).
+        # Ref #967: the channel override alone leaves the recall DATA root
+        # inferred from cwd, which lands in a real checkout. The data root must
+        # exist before it is pointed at — the override refuses a missing root
+        # rather than mint an empty store that reads like a real answer.
+        recall_root = Path(self.tmpdir) / "recall-root"
+        recall_root.mkdir(parents=True, exist_ok=True)
         self._env_patch = patch.dict(os.environ, {
             "SYNAPT_SHARED_CHANNELS_DIR": str(Path(self.tmpdir) / "channels"),
+            "SYNAPT_RECALL_ROOT": str(recall_root),
+            "SYNAPT_RECALL_WORKTREE": "pytest-owned",
         })
         self._env_patch.start()
 

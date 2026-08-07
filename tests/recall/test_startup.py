@@ -72,12 +72,13 @@ class TestGenerateStartupContext:
 
     def test_reminders_surfaced(self, tmp_path):
         """Pending reminders appear in startup context."""
-        from synapt.recall.reminders import add_reminder, _reminders_path
+        from synapt.recall.reminders import add_reminder
 
-        # Point reminders to tmp dir
-        rpath = _reminders_path()
-        rpath.parent.mkdir(parents=True, exist_ok=True)
-
+        # The two lines that used to stand here called the REAL _reminders_path()
+        # and mkdir'd its parent — creating a directory inside the operator's
+        # live store — and then threw the value away, because the patch below
+        # supplies the path that is actually used. Dead code that wrote to a
+        # real location while looking like setup for a temp one (Ref #967).
         with patch("synapt.recall.reminders._reminders_path") as mock_path:
             rfile = tmp_path / ".synapt" / "reminders.json"
             rfile.parent.mkdir(parents=True, exist_ok=True)

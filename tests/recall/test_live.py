@@ -7,6 +7,8 @@ import math
 import tempfile
 import threading
 import unittest
+
+from _isolation_helpers import owned_store
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -493,6 +495,16 @@ class TestCompactJournal(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestRecallSearchLiveIntegration(unittest.TestCase):
+
+    def setUp(self):
+        # Ref #967: recall_search resolves the recall data root implicitly, so
+        # the "unavailable" and "setup" messages these tests assert on could
+        # otherwise be produced against the operator's live store rather than
+        # against the absence this test is constructing.
+        self._store = owned_store()
+
+    def tearDown(self):
+        self._store.restore()
 
     def test_recall_search_combines_live_and_indexed(self):
         """recall_search should join 'Current session context:' and indexed results."""
