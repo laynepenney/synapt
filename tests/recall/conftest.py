@@ -215,3 +215,30 @@ def _isolate_recall_root_env(monkeypatch):
     """
     monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
     monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+
+
+@pytest.fixture
+def owned_recall_root(tmp_path, monkeypatch) -> Path:
+    """Point implicit recall data resolution at a directory this test owns.
+
+    Ref #967. The autouse fixture above strips an *ambient* override so these
+    tests measure inference rather than a value the shell happened to set —
+    that intent is right and is preserved. This fixture is the other half it
+    already anticipated: "unless a test sets the override itself." Requesting
+    it is a test declaring that it needs a store, not that it is measuring
+    where one is inferred from.
+
+    Use this when the test needs recall data to exist somewhere. When the test
+    is genuinely asserting *inference* behaviour, prefer ``monkeypatch.chdir``
+    to an owned directory instead, so the inference still runs — just from a
+    starting point the test owns rather than from the operator's checkout.
+
+    The directory is created before it is handed over, because the override
+    refuses a root that does not exist: silently minting a fresh store under a
+    mistyped path would present an empty history as a real answer.
+    """
+    root = tmp_path / "recall-root"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(root))
+    monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", "pytest-owned")
+    return root

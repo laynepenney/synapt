@@ -8,9 +8,9 @@ Verifies:
 - Hooks are best-effort (exceptions don't break posting)
 """
 
-import os
-import tempfile
 import unittest
+
+from _isolation_helpers import owned_store
 
 from synapt.recall.channel import (
     ChannelMessage,
@@ -27,10 +27,13 @@ class TestMessageHooks(unittest.TestCase):
     """Tests for the message hook registration and dispatch."""
 
     def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        # SYNAPT_DATA_DIR is read nowhere in the package; it isolated nothing and
-        # these tests appended into the real channel store (Ref #955).
-        os.environ["SYNAPT_SHARED_CHANNELS_DIR"] = self._tmp
+        # SYNAPT_DATA_DIR was read nowhere in the package; it isolated nothing
+        # and these tests appended into the real channel store (Ref #955). The
+        # channel override alone still left the recall DATA root inferred from
+        # cwd, which lands in a real checkout (Ref #967) — owned_store covers
+        # both surfaces and restores previous values rather than deleting.
+        self._store = owned_store()
+        self._tmp = str(self._store.root)
         # Save original hooks
         self._original_hooks = list(_message_posted_hooks)
 
@@ -39,7 +42,7 @@ class TestMessageHooks(unittest.TestCase):
         _clear_message_hooks()
         for hook in self._original_hooks:
             register_message_hook(hook)
-        os.environ.pop("SYNAPT_SHARED_CHANNELS_DIR", None)
+        self._store.restore()
 
     def test_default_hooks_registered(self):
         """Default mention and wake hooks should be registered at import time."""

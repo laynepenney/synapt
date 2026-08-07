@@ -26,6 +26,8 @@ import io
 import json
 import tempfile
 import unittest
+
+from _isolation_helpers import owned_store
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
@@ -691,8 +693,14 @@ class TestEmptyAndErrorStates(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmp.name)
+        # Ref #967: the CLI path under test resolves the recall data root
+        # implicitly, so without an owned store these ran against a real
+        # checkout and their "empty" states could come from the operator's
+        # history rather than from the fixtures built here.
+        self._store = owned_store()
 
     def tearDown(self):
+        self._store.restore()
         self.tmp.cleanup()
 
     def test_missing_index_exits_nonzero_and_says_how_to_fix(self):

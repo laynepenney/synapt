@@ -816,8 +816,13 @@ class TestRecallContextCluster:
         assert "1 chunks" in result
         db.close()
 
-    def test_nonexistent_cluster(self, tmp_path):
-        """recall_context with nonexistent cluster_id returns helpful message."""
+    def test_nonexistent_cluster(self, owned_recall_root, tmp_path):
+        """recall_context with nonexistent cluster_id returns helpful message.
+
+        Ref #967 — ``recall_context`` resolves the data root implicitly, so
+        without an owned root the "not found" could come from the operator's
+        store rather than from the empty index this test builds.
+        """
         from unittest.mock import patch
         from synapt.recall.storage import RecallDB
         from synapt.recall.core import TranscriptIndex
