@@ -204,9 +204,22 @@ class TestMLXAvailabilityPredicate(unittest.TestCase):
         can expose defects the broken guard was hiding, and they ship together or not at
         all.
         """
+        # Registered BEFORE the simulation, so restoration runs even when an assertion
+        # below fails. A restore placed after the assertions is cleanup conditional on its
+        # own success: one failure would leave both modules pinned in simulated absence for
+        # the remainder of the session and redden unrelated tests, turning a single honest
+        # failure into a cascade whose origin is no longer visible.
+        #
+        # addCleanup is LIFO, and the order matters: _mlx must be restored BEFORE enrich is
+        # reloaded, or enrich re-reads a predicate that is still simulated and keeps a stale
+        # False. Registering enrich first means it runs second.
+        enrich_module = importlib.import_module("synapt.recall.enrich")
+        self.addCleanup(importlib.reload, enrich_module)
+        self.addCleanup(importlib.reload, _mlx)
+
         with patch.dict(sys.modules, {name: None for name in BACKEND_MODULES}):
             importlib.reload(_mlx)
-            enrich = importlib.reload(importlib.import_module("synapt.recall.enrich"))
+            enrich = importlib.reload(enrich_module)
 
             self.assertFalse(
                 enrich._MLX_AVAILABLE,
@@ -230,9 +243,6 @@ class TestMLXAvailabilityPredicate(unittest.TestCase):
                     "module imports on every platform -- which is the very property this "
                     "change is about.",
                 )
-        # Leave the real module state behind for the rest of the session.
-        importlib.reload(_mlx)
-        importlib.reload(importlib.import_module("synapt.recall.enrich"))
 
     def test_control_a_broken_backend_is_not_disguised_as_an_absent_one(self):
         """Absent and broken are different facts, and only absence is expected here.
