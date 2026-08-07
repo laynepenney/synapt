@@ -190,8 +190,8 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         chunk = chunks[0]
         self.assertEqual(chunk.tools_used, [f"synthetic_tool_{index}" for index in range(10)])
-        self.assertEqual(chunk.tool_content.count("[synthetic_tool_"), 8)
-        self.assertIn("+2 more tool calls", chunk.tool_content)
+        self.assertEqual(chunk.tool_content.count("[synthetic_tool_"), 6)
+        self.assertIn("+4 more tool calls", chunk.tool_content)
 
     def test_skips_system_content(self):
         """Developer role and permissions/env context are filtered out."""
