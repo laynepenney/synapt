@@ -74,13 +74,22 @@ def pytest_addoption(parser):
     parser.addoption(
         "--strict-recall-data-root",
         action="store_true",
-        default=False,
+        default=True,
         help=(
-            "Also refuse implicit recall data paths (journal, index, archive, "
-            "knowledge) that resolve outside a pytest-owned root. Off by "
-            "default: the suite currently has real sites that resolve into the "
-            "operator's live store, and arming this before they are isolated "
-            "would turn a true finding into a red suite."
+            "Accepted and now the default; kept so existing invocations do not "
+            "break. Implicit recall data paths (journal, index, archive, "
+            "knowledge) that resolve outside a pytest-owned root are refused."
+        ),
+    )
+    parser.addoption(
+        "--no-strict-recall-data-root",
+        action="store_false",
+        dest="strict_recall_data_root",
+        help=(
+            "Disable the data-root guard for a debugging run. Not for CI: with "
+            "it off, a test that resolves into a real checkout passes silently, "
+            "which is the condition this guard exists to end. If both this and "
+            "--strict-recall-data-root are given, the LAST one wins."
         ),
     )
 
@@ -122,7 +131,7 @@ def pytest_configure(config):
     # store, which is another workspace's namespace rather than our own.
     os.environ.setdefault("SYNAPT_RECALL_WORKTREE", "pytest-isolated")
 
-    _install_policy(config.getoption("--strict-recall-data-root"))
+    _install_policy(config.getoption("strict_recall_data_root"))
 
 
 def _install_policy(strict_data_root: bool):
@@ -132,23 +141,23 @@ def _install_policy(strict_data_root: bool):
     for. It refuses without redirecting, so it does not change where anything
     legitimately resolves.
 
-    The data-root guard is opt-in *for now*, and the reason is worth stating
-    plainly rather than hiding behind a default. Arming it fails 30 further
-    tests across 10 files, and those failures are TRUE POSITIVES:
+    The data-root guard is now ALSO on by default. It shipped opt-in because
+    arming it failed 30 tests across 10 files — true positives, since
     ``tests/recall`` deliberately strips the root override so tests measure
-    path inference, and that inference currently lands in a real checkout's
-    ``.synapt/recall``. Isolating those sites is real work and a separate
-    reviewable change. Shipping it armed would mean either a red suite or 30
-    edits buried in a guard PR; shipping it absent would lose the mechanism. So
-    it ships built, witnessed, and one flag away — and the count is reported
-    rather than quietly carried.
+    path inference, and that inference resolved into a real checkout. Those 30
+    were isolated and the flag was flipped.
 
-    That count is 30 measured at base 1245f62, not the ~60 an earlier draft
-    carried. The larger figure was taken while this file still installed a
-    session-wide channel override, which was itself breaking 30 tests; half the
-    "true positives" were the harness's own doing. A measurement inherits the
-    configuration it was taken under, and a number quoted after the
-    configuration changed is a stale claim wearing a precise costume.
+    ONE WARNING FOR WHOEVER TOUCHES THIS NEXT, because the obvious evidence is
+    the wrong evidence. Before the burn-down, running with the flag differed
+    from running without it, and THAT DIFFERENCE was the proof the flag was
+    wired. Now the two agree — which is the success criterion and, identically,
+    the signature of a guard that has stopped working. Modal agreement can no
+    longer distinguish them, so it must never be cited as evidence this guard
+    functions. The evidence is the direct witnesses in
+    ``tests/recall/test_store_isolation_guard.py``, which exercise the policy
+    itself rather than observing the flag.
+
+    ``--no-strict-recall-data-root`` exists for debugging and is not for CI.
     """
     from synapt.recall import channel as channel_mod
     from synapt.recall import core as core_mod
@@ -305,6 +314,46 @@ def rearm_guard(request):
         _rearm_if_disarmed(request.config)
 
     return _rearm
+
+
+@pytest.fixture
+def pytester_precedence():
+    """Measure flag precedence in a SEPARATE PROCESS, both orderings.
+
+    Deliberately a subprocess and not ``pytester``'s in-process runner. The
+    hazard that rules out nested in-process runs elsewhere in this file is
+    shared module globals — a nested run can disarm the outer guard, and a
+    green result would then be indistinguishable from the hazard firing. A
+    subprocess has no globals in common, so it is the one shape that can answer
+    an argument-parsing question without risking the thing being asked about.
+
+    Returns (armed_when_strict_last, armed_when_no_strict_last).
+    """
+    import subprocess
+
+    root = Path(__file__).parent
+    probe = "tests/recall/test_store_isolation_guard.py::test_the_data_root_guard_is_armed_by_default"
+
+    def _run(*flags):
+        out = subprocess.run(
+            [sys.executable, "-m", "pytest", probe, *flags, "-q", "--tb=no",
+             "-p", "no:cacheprovider"],
+            cwd=root, capture_output=True, text=True, timeout=300,
+        ).stdout
+        # The witness PASSES when armed and SKIPS when deliberately disarmed,
+        # so the outcome word is the measurement.
+        return "passed" in out and "skipped" not in out
+
+    return (
+        _run("--no-strict-recall-data-root", "--strict-recall-data-root"),
+        _run("--strict-recall-data-root", "--no-strict-recall-data-root"),
+    )
+
+
+@pytest.fixture
+def install_policy():
+    """The real arming routine, for the witness that the escape hatch is wired."""
+    return _install_policy
 
 
 @pytest.fixture
