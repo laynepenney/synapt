@@ -34,6 +34,9 @@ _FILE_RE = re.compile(
     r'(?=[\s"\'`:,)]|$)'
 )
 
+_CUSTOM_TOOL_SUMMARY_LIMIT = 160
+_CUSTOM_TOOL_SUMMARY_COUNT = 8
+
 
 def _extract_file_paths(text: str) -> list[str]:
     """Extract likely file paths from text."""
@@ -211,29 +214,41 @@ def parse_codex_transcript(
     current_files: list[str] = []
     current_timestamp = ""
     current_tool_summaries: list[str] = []
+    current_custom_tool_summaries = 0
+    current_custom_tool_summaries_omitted = 0
     turn_index = 0
     turn_start_offset = 0
     current_offset = 0
 
     def _record_custom_tool_call(payload: dict) -> None:
         """Record a custom Codex tool-call envelope with an input summary."""
+        nonlocal current_custom_tool_summaries, current_custom_tool_summaries_omitted
         tool_name = payload.get("name", "unknown")
         current_tools.append(tool_name)
         args = payload.get("arguments", payload.get("input", ""))
         if not isinstance(args, str):
             return
 
-        summary = args[:200]
+        summary = args[:_CUSTOM_TOOL_SUMMARY_LIMIT]
         if len(args) < 500:
             try:
                 args_parsed = json.loads(args)
                 cmd = args_parsed.get("cmd", "")
                 if cmd:
-                    summary = cmd
+                    summary = cmd[:_CUSTOM_TOOL_SUMMARY_LIMIT]
                     current_files.extend(_extract_file_paths(cmd))
             except (json.JSONDecodeError, TypeError):
                 pass
-        current_tool_summaries.append(f"[{tool_name}] {summary}")
+        if current_custom_tool_summaries < _CUSTOM_TOOL_SUMMARY_COUNT:
+            current_tool_summaries.append(f"[{tool_name}] {summary}")
+            current_custom_tool_summaries += 1
+        else:
+            current_custom_tool_summaries_omitted += 1
+
+    def _append_assistant_text(text: str) -> None:
+        """Retain each assistant message once, regardless of its producer."""
+        if text and text not in current_assistant_texts:
+            current_assistant_texts.append(text)
 
     def _flush_turn(end_offset: int = 0):
         nonlocal turn_index
@@ -252,7 +267,12 @@ def parse_codex_transcript(
         if len(assistant_text) > 5000:
             assistant_text = assistant_text[:5000] + "..."
 
-        tool_content = "\n".join(current_tool_summaries).strip()
+        tool_summary_lines = list(current_tool_summaries)
+        if current_custom_tool_summaries_omitted:
+            tool_summary_lines.append(
+                f"+{current_custom_tool_summaries_omitted} more tool calls"
+            )
+        tool_content = "\n".join(tool_summary_lines).strip()
         if len(tool_content) > 3000:
             tool_content = tool_content[:3000] + "..."
 
@@ -346,6 +366,8 @@ def parse_codex_transcript(
                         current_tools = []
                         current_files = []
                         current_tool_summaries = []
+                        current_custom_tool_summaries = 0
+                        current_custom_tool_summaries_omitted = 0
                         current_timestamp = timestamp
                         turn_start_offset = current_offset
 
@@ -368,7 +390,7 @@ def parse_codex_transcript(
                                 # Skip commentary phase — it's intermediate thinking
                                 if phase == "commentary":
                                     continue
-                                current_assistant_texts.append(text)
+                                _append_assistant_text(text)
 
                     elif role == "developer":
                         # Developer role = system prompts — skip (too noisy)
@@ -386,6 +408,8 @@ def parse_codex_transcript(
                             current_tools = []
                             current_files = []
                             current_tool_summaries = []
+                            current_custom_tool_summaries = 0
+                            current_custom_tool_summaries_omitted = 0
                             current_timestamp = timestamp
                             turn_start_offset = current_offset
                     elif msg_type == "agent_message":
@@ -394,8 +418,8 @@ def parse_codex_transcript(
                             # Preserve the existing parser policy: intermediate
                             # commentary is not primary assistant text.
                             pass
-                        elif text and text not in current_assistant_texts:
-                            current_assistant_texts.append(text)
+                        else:
+                            _append_assistant_text(text)
 
                 current_offset += line_bytes
 
