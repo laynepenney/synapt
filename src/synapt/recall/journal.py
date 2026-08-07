@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
@@ -23,6 +24,108 @@ _NOISE_PATH_SEGMENTS = ("/.claude/", "/private/tmp/")
 def _norm(p: str) -> str:
     """Normalise path separators to forward slash for cross-platform comparison."""
     return p.replace("\\", "/")
+
+
+# --- Field collapse ----------------------------------------------------
+#
+# When a tool-call parameter's closing tag is dropped, the emitter consumes
+# everything downstream into that parameter's value -- the following parameters
+# *including their tags* and the invoke terminator.  The call still succeeds,
+# so the trailing fields simply arrive empty and the entry reads as partially
+# filled rather than malformed.  Nothing goes red anywhere.
+#
+# These literals cannot occur in ordinary prose, which makes the check
+# deterministic rather than heuristic.  The alternative -- "warn when one field
+# is long and the next is empty" -- false-positives on a legitimately empty
+# field, and a check that cries wolf gets ignored.
+COLLAPSE_SIGNATURES: tuple[str, ...] = (
+    "</focus>",
+    "</done>",
+    "</decisions>",
+    "</next_steps>",
+    "</invoke>",
+    "<parameter name=",
+)
+
+# The journal fields a collapse can carry, in schema order.
+_TEXT_FIELDS = ("focus", "done", "decisions", "next_steps")
+
+_HEAD_BOUNDARY = re.compile(r"</(?:focus|done|decisions|next_steps)>")
+
+# Both shapes found in real stored data:
+#   <parameter name="next_steps">VALUE</next_steps>
+#   <next_steps>VALUE</next_steps>
+_SEGMENT = re.compile(
+    r'<parameter\s+name="(?P<pname>[a-z_]+)"\s*>(?P<pval>.*?)</(?P=pname)>'
+    r"|<(?P<tag>[a-z_]+)>(?P<tval>.*?)</(?P=tag)>",
+    re.DOTALL,
+)
+
+
+class JournalFieldCollapse(ValueError):
+    """A journal field carries tool-call markup from an unclosed parameter."""
+
+
+def is_collapsed(text: object) -> bool:
+    """True if *text* carries a tool-call parameter tag."""
+    return isinstance(text, str) and any(sig in text for sig in COLLAPSE_SIGNATURES)
+
+
+def recover_collapsed(text: str) -> tuple[str, dict[str, list[str]]]:
+    """Split a collapsed value back into its parts.
+
+    Returns ``(head, swallowed)`` where *head* is the value the field was
+    actually meant to carry and *swallowed* maps field name to the values that
+    were consumed into it.  Clean text recovers to itself with no swallowed
+    fields, so this is safe to call unconditionally.
+
+    Recovery rather than truncation is deliberate: the swallowed text is real
+    work somebody wrote.  Cutting at the tag would satisfy a "no markup
+    remains" check while silently discarding it.
+    """
+    if not is_collapsed(text):
+        return text, {}
+
+    boundary = _HEAD_BOUNDARY.search(text)
+    if boundary:
+        head, remainder = text[: boundary.start()], text[boundary.end():]
+    else:
+        # No named closing tag -- only a stray "</invoke>" or an opening
+        # parameter tag.  Cut at the first signature we can find.
+        cut = min(text.find(s) for s in COLLAPSE_SIGNATURES if s in text)
+        head, remainder = text[:cut], text[cut:]
+
+    swallowed: dict[str, list[str]] = {}
+    for match in _SEGMENT.finditer(remainder):
+        name = match.group("pname") or match.group("tag")
+        value = match.group("pval") if match.group("pname") else match.group("tval")
+        if name not in _TEXT_FIELDS:
+            continue
+        value = (value or "").strip()
+        if value:
+            swallowed.setdefault(name, []).append(value)
+    return head.strip(), swallowed
+
+
+def _entry_collapses(entry: JournalEntry) -> list[tuple[str, str]]:
+    """Return ``(field_name, value)`` for every collapsed value on *entry*."""
+    found: list[tuple[str, str]] = []
+    for name in _TEXT_FIELDS:
+        raw = getattr(entry, name, None)
+        values = [raw] if isinstance(raw, str) else (raw or [])
+        for value in values:
+            if is_collapsed(value):
+                found.append((name, value))
+    return found
+
+
+def _served(values: list[str]) -> list[str]:
+    """Drop collapsed values from anything about to be displayed.
+
+    A collapsed value stays in the store -- it is the resolution marker that
+    breaks the carry-forward loop -- but it is never shown to anyone.
+    """
+    return [v for v in values if not is_collapsed(v)]
 
 
 def _filter_project_files(
@@ -89,6 +192,7 @@ class JournalEntry:
     enriched: bool = False   # True if LLM-enriched
     griptree: str = ""       # Agent's griptree identity (e.g., "synapt/synapt")
     agent_id: str = ""       # Agent's session-scoped ID (e.g., "s_a1b2c3d4")
+    repair: bool = False     # True if written by repair_journal
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -109,13 +213,38 @@ class JournalEntry:
         return bool(self.focus or self.done or self.decisions or self.next_steps)
 
 
-def append_entry(entry: JournalEntry, path: Path | None = None) -> Path:
+def append_entry(
+    entry: JournalEntry,
+    path: Path | None = None,
+    allow_collapsed: bool = False,
+) -> Path:
     """Append a journal entry to the JSONL file.
 
     Uses exclusive file locking to prevent interleaved writes
     when multiple processes append concurrently (e.g., background enrich
     + SessionEnd hook).
+
+    Raises :class:`JournalFieldCollapse` if any text field carries tool-call
+    markup.  This is the single write point, so no caller can bypass it.
+    Refusing beats accepting: a collapsed value that lands in ``next_steps``
+    can never be matched by a ``done`` item, so carry-forward re-injects it
+    every session and it becomes immortal.  The caller still holds the content
+    and can resend it correctly; the store cannot un-replicate it later.
+
+    *allow_collapsed* exists for :func:`repair_journal`, whose corrective entry
+    must reference the original text verbatim to mark it resolved.
     """
+    if not allow_collapsed:
+        collapses = _entry_collapses(entry)
+        if collapses:
+            field, value = collapses[0]
+            sig = next(s for s in COLLAPSE_SIGNATURES if s in value)
+            raise JournalFieldCollapse(
+                f"journal field {field!r} carries tool-call markup {sig!r} — an "
+                f"unclosed parameter swallowed the fields after it, so the "
+                f"trailing fields are empty rather than missing. Resend with "
+                f"shorter field values."
+            )
     path = path or _journal_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     from synapt.recall._filelock import lock_exclusive
@@ -283,23 +412,19 @@ def format_for_session_start(entry: JournalEntry) -> str:
     lines = []
     ts = entry.timestamp[:16]  # Trim to minute precision
 
-    if entry.focus:
+    # Collapsed values stay in the store as resolution markers but are never
+    # displayed — see _served().
+    if entry.focus and not is_collapsed(entry.focus):
         lines.append(f"Last session ({ts}): {entry.focus}")
 
-    if entry.done:
-        lines.append("Done:")
-        for item in entry.done:
-            lines.append(f"  - {item}")
-
-    if entry.decisions:
-        lines.append("Decisions:")
-        for item in entry.decisions:
-            lines.append(f"  - {item}")
-
-    if entry.next_steps:
-        lines.append("Next steps:")
-        for item in entry.next_steps:
-            lines.append(f"  - {item}")
+    for label, items in (
+        ("Done:", _served(entry.done)),
+        ("Decisions:", _served(entry.decisions)),
+        ("Next steps:", _served(entry.next_steps)),
+    ):
+        if items:
+            lines.append(label)
+            lines.extend(f"  - {item}" for item in items)
 
     return "\n".join(lines) if lines else ""
 
@@ -309,20 +434,16 @@ def format_entry_full(entry: JournalEntry) -> str:
     lines = [f"## {entry.timestamp[:16]}"]
     if entry.branch:
         lines.append(f"**Branch:** {entry.branch}")
-    if entry.focus:
+    if entry.focus and not is_collapsed(entry.focus):
         lines.append(f"**Focus:** {entry.focus}")
-    if entry.done:
-        lines.append("\n### Done")
-        for item in entry.done:
-            lines.append(f"- {item}")
-    if entry.decisions:
-        lines.append("\n### Decisions")
-        for item in entry.decisions:
-            lines.append(f"- {item}")
-    if entry.next_steps:
-        lines.append("\n### Next")
-        for item in entry.next_steps:
-            lines.append(f"- {item}")
+    for heading, items in (
+        ("\n### Done", _served(entry.done)),
+        ("\n### Decisions", _served(entry.decisions)),
+        ("\n### Next", _served(entry.next_steps)),
+    ):
+        if items:
+            lines.append(heading)
+            lines.extend(f"- {item}" for item in items)
     if entry.files_modified:
         lines.append(f"\n### Files ({len(entry.files_modified)})")
         for f in entry.files_modified[:15]:
@@ -390,8 +511,14 @@ def merge_carried_forward_next_steps(
     Carries forward prior next steps unless the current entry already includes
     them or marks them done. New next steps stay first; carried items append.
     """
-    merged = [step.strip() for step in current_next_steps if step and step.strip()]
+    merged = [
+        step.strip()
+        for step in current_next_steps
+        if step and step.strip() and not is_collapsed(step)
+    ]
     seen = {_step_key(step) for step in merged}
+    # Matching still uses the RAW done list: a collapsed value recorded there
+    # by repair_journal is exactly what marks the original step resolved.
     done = {_step_key(item) for item in current_done if item and item.strip()}
 
     if not previous_entry or not previous_entry.next_steps:
@@ -400,6 +527,10 @@ def merge_carried_forward_next_steps(
     for step in previous_entry.next_steps:
         clean = step.strip()
         if not clean:
+            continue
+        if is_collapsed(clean):
+            # The replication vector: a malformed step can never appear in a
+            # done list, so without this it rides forward every session.
             continue
         key = _step_key(clean)
         if key in seen or key in done:
@@ -434,6 +565,8 @@ def pending_next_steps(path: Path | None = None) -> list[str]:
         for step in entry.next_steps:
             if not step or not step.strip():
                 continue
+            if is_collapsed(step):
+                continue  # never serve tool-call markup
             key = _step_key(step)
             if key in all_done or key in seen:
                 continue
@@ -441,6 +574,81 @@ def pending_next_steps(path: Path | None = None) -> list[str]:
             seen.add(key)
 
     return pending
+
+
+def repair_journal(path: Path | None = None, dry_run: bool = False) -> dict:
+    """Recover content swallowed by collapsed fields, append-only.
+
+    Appends ONE corrective entry that carries the recovered text in its proper
+    fields and lists every collapsed value verbatim under ``done``.  That
+    marking is not bookkeeping: ``done`` is the store's own "this is resolved"
+    grammar, and it is what stops carry-forward from re-injecting a malformed
+    step next session.  Nothing is rewritten or deleted — the original lines
+    stay exactly as written.
+
+    Returns a report; with *dry_run* the report is produced and nothing is
+    written.
+    """
+    path = path or _journal_path()
+    report = {
+        "path": str(path),
+        "total_entries": 0,
+        "contaminated_entries": 0,
+        "repaired_entries": 0,
+        "recovered_fields": {},
+    }
+    if not path.exists():
+        return report
+
+    entries = _read_all_entries(path)
+    report["total_entries"] = len(entries)
+
+    # Everything a previous repair pass already accounted for.
+    already = {
+        _step_key(value)
+        for entry in entries
+        if entry.repair
+        for value in entry.done
+    }
+
+    collapsed_values: list[str] = []
+    recovered: dict[str, list[str]] = {}
+    contaminated = 0
+    for entry in entries:
+        if entry.repair:
+            continue
+        hits = _entry_collapses(entry)
+        if not hits:
+            continue
+        contaminated += 1
+        for field, value in hits:
+            if _step_key(value) in already:
+                continue
+            collapsed_values.append(value)
+            head, swallowed = recover_collapsed(value)
+            if head:
+                recovered.setdefault(field, []).append(head)
+            for name, values in swallowed.items():
+                recovered.setdefault(name, []).extend(values)
+
+    report["contaminated_entries"] = contaminated
+    report["repaired_entries"] = len(collapsed_values)
+    report["recovered_fields"] = {k: len(v) for k, v in recovered.items()}
+    if dry_run or not collapsed_values:
+        return report
+
+    # The recovered text must itself be clean — a repair pass that injected
+    # what the guard refuses would be laundering the contamination.
+    corrective = JournalEntry(
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        focus="Journal field-collapse repair",
+        done=collapsed_values,
+        decisions=[v for v in recovered.get("decisions", []) if not is_collapsed(v)],
+        next_steps=[v for v in recovered.get("next_steps", []) if not is_collapsed(v)],
+        repair=True,
+    )
+    append_entry(corrective, path, allow_collapsed=True)
+    return report
 
 
 def extract_session_id(path: Path | str) -> str:

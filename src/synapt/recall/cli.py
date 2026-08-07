@@ -1464,8 +1464,47 @@ def cmd_journal(args: argparse.Namespace) -> None:
         print(format_entry_full(entries[idx]))
         return
 
+    if getattr(args, "repair", False):
+        from synapt.recall.journal import _journal_path, repair_journal
+        from synapt.recall.core import project_data_dir
+
+        local = _journal_path()
+        if getattr(args, "all_stores", False):
+            # Journals are per-worktree and, as measured, can live under a
+            # different gripspace root than the one you are standing in — so
+            # sweeping every store is the only way to know a repair is done.
+            stores = sorted(
+                (project_data_dir() / "worktrees").glob("*/journal.jsonl")
+            )
+        else:
+            stores = [local]
+
+        dry = getattr(args, "dry_run", False)
+        total = 0
+        for store in stores:
+            report = repair_journal(store, dry_run=dry)
+            if not report["total_entries"]:
+                continue
+            total += report["repaired_entries"]
+            flag = "would repair" if dry else "repaired"
+            print(
+                f"{store.parent.name}: {report['contaminated_entries']}"
+                f"/{report['total_entries']} entries contaminated, "
+                f"{flag} {report['repaired_entries']} value(s) "
+                f"{report['recovered_fields'] or ''}".rstrip()
+            )
+        if not total:
+            print("No collapsed journal fields found." if not dry else "Nothing to repair.")
+        elif dry:
+            print(f"\nDry run — nothing written. Re-run without --dry-run to apply.")
+        return
+
     if not args.write:
-        print("Usage: synapt recall journal [--read | --write | --list | --show N]", file=sys.stderr)
+        print(
+            "Usage: synapt recall journal "
+            "[--read | --write | --list | --show N | --repair]",
+            file=sys.stderr,
+        )
         print("  --write is required to create a journal entry.", file=sys.stderr)
         sys.exit(1)
 
@@ -2845,6 +2884,12 @@ def main():
     journal_parser.add_argument("--done", default=None, help="What got done (semicolon-separated)")
     journal_parser.add_argument("--decisions", default=None, help="Key decisions (semicolon-separated)")
     journal_parser.add_argument("--next", default=None, help="Next steps (semicolon-separated)")
+    journal_parser.add_argument("--repair", action="store_true",
+                                help="Recover fields swallowed by an unclosed tool-call parameter (append-only)")
+    journal_parser.add_argument("--dry-run", action="store_true",
+                                help="With --repair: report what would change, write nothing")
+    journal_parser.add_argument("--all-stores", action="store_true",
+                                help="With --repair: sweep every worktree journal, not just this one")
 
     # Enrich
     enrich_parser = subparsers.add_parser("enrich", help="Enrich auto-journal stubs using MLX (local LLM)")
