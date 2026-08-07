@@ -4,7 +4,8 @@ Codex CLI stores sessions at ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl.
 The format differs from Claude Code:
   - session_meta entry has session ID and cwd
   - response_item entries with role: user/developer/assistant
-  - function_call / function_call_output for tool use
+  - function_call / function_call_output and custom_tool_call /
+    custom_tool_call_output for tool use
   - Content blocks use input_text/output_text types
 
 This module converts Codex transcripts into the same TranscriptChunk format
@@ -32,6 +33,9 @@ _FILE_RE = re.compile(
     r')'
     r'(?=[\s"\'`:,)]|$)'
 )
+
+_CUSTOM_TOOL_SUMMARY_LIMIT = 160
+_CUSTOM_TOOL_SUMMARY_COUNT = 4
 
 
 def _extract_file_paths(text: str) -> list[str]:
@@ -233,9 +237,41 @@ def parse_codex_transcript(
     current_files: list[str] = []
     current_timestamp = ""
     current_tool_summaries: list[str] = []
+    current_custom_tool_summaries = 0
+    current_custom_tool_summaries_omitted = 0
     turn_index = 0
     turn_start_offset = 0
     current_offset = 0
+
+    def _record_custom_tool_call(payload: dict) -> None:
+        """Record a custom Codex tool-call envelope with an input summary."""
+        nonlocal current_custom_tool_summaries, current_custom_tool_summaries_omitted
+        tool_name = payload.get("name", "unknown")
+        current_tools.append(tool_name)
+        args = payload.get("arguments", payload.get("input", ""))
+        if not isinstance(args, str):
+            return
+
+        summary = args[:_CUSTOM_TOOL_SUMMARY_LIMIT]
+        if len(args) < 500:
+            try:
+                args_parsed = json.loads(args)
+                cmd = args_parsed.get("cmd", "")
+                if cmd:
+                    summary = cmd[:_CUSTOM_TOOL_SUMMARY_LIMIT]
+                    current_files.extend(_extract_file_paths(cmd))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if current_custom_tool_summaries < _CUSTOM_TOOL_SUMMARY_COUNT:
+            current_tool_summaries.append(f"[{tool_name}] {summary}")
+            current_custom_tool_summaries += 1
+        else:
+            current_custom_tool_summaries_omitted += 1
+
+    def _append_assistant_text(text: str) -> None:
+        """Retain each assistant message once, regardless of its producer."""
+        if text and text not in current_assistant_texts:
+            current_assistant_texts.append(text)
 
     def _flush_turn(end_offset: int = 0):
         nonlocal turn_index
@@ -254,7 +290,12 @@ def parse_codex_transcript(
         if len(assistant_text) > 5000:
             assistant_text = assistant_text[:5000] + "..."
 
-        tool_content = "\n".join(current_tool_summaries).strip()
+        tool_summary_lines = list(current_tool_summaries)
+        if current_custom_tool_summaries_omitted:
+            tool_summary_lines.append(
+                f"+{current_custom_tool_summaries_omitted} more tool calls"
+            )
+        tool_content = "\n".join(tool_summary_lines).strip()
         if len(tool_content) > 3000:
             tool_content = tool_content[:3000] + "..."
 
@@ -313,6 +354,7 @@ def parse_codex_transcript(
 
                     # Handle function calls first (no role field)
                     if payload_type == "function_call":
+                        # Keep legacy function-call summary semantics unchanged.
                         tool_name = payload.get("name", "unknown")
                         current_tools.append(tool_name)
                         args = payload.get("arguments", "")
@@ -328,8 +370,14 @@ def parse_codex_transcript(
                         current_offset += line_bytes
                         continue
 
-                    if payload_type == "function_call_output":
-                        # Tool output — could extract file paths but skip for now
+                    if payload_type == "custom_tool_call":
+                        _record_custom_tool_call(payload)
+                        current_offset += line_bytes
+                        continue
+
+                    if payload_type in {"function_call_output", "custom_tool_call_output"}:
+                        # Tool output is deliberately handled as a no-op: call metadata
+                        # above is enough for transcript recall, while output can be noisy.
                         current_offset += line_bytes
                         continue
 
@@ -341,6 +389,8 @@ def parse_codex_transcript(
                         current_tools = []
                         current_files = []
                         current_tool_summaries = []
+                        current_custom_tool_summaries = 0
+                        current_custom_tool_summaries_omitted = 0
                         current_timestamp = timestamp
                         turn_start_offset = current_offset
 
@@ -363,7 +413,7 @@ def parse_codex_transcript(
                                 # Skip commentary phase — it's intermediate thinking
                                 if phase == "commentary":
                                     continue
-                                current_assistant_texts.append(text)
+                                _append_assistant_text(text)
 
                     elif role == "developer":
                         # Developer role = system prompts — skip (too noisy)
@@ -381,8 +431,18 @@ def parse_codex_transcript(
                             current_tools = []
                             current_files = []
                             current_tool_summaries = []
+                            current_custom_tool_summaries = 0
+                            current_custom_tool_summaries_omitted = 0
                             current_timestamp = timestamp
                             turn_start_offset = current_offset
+                    elif msg_type == "agent_message":
+                        text = payload.get("message", "")
+                        if payload.get("phase") == "commentary":
+                            # Preserve the existing parser policy: intermediate
+                            # commentary is not primary assistant text.
+                            pass
+                        else:
+                            _append_assistant_text(text)
 
                 current_offset += line_bytes
 
