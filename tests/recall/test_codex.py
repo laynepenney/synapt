@@ -167,6 +167,7 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertEqual(chunk.assistant_text.count(assistant_text), 1)
         self.assertEqual(chunk.assistant_text.count(unique_agent_text), 1)
         self.assertNotIn(commentary_agent_text, chunk.assistant_text)
+        self.assertEqual(chunk.commentary_text, commentary_agent_text)
 
     def test_custom_tool_summary_budget_keeps_all_tool_names(self):
         """Custom call summaries are bounded without dropping tool identities."""
@@ -224,7 +225,7 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertIn("actual user question", chunks[0].user_text)
 
     def test_skips_commentary_phase(self):
-        """Commentary phase assistant messages are filtered out."""
+        """Response-item commentary is segregated from primary assistant text."""
         entries = [
             {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
              "payload": {"id": "commentary-session"}},
@@ -247,6 +248,26 @@ class TestParseCodexTranscript(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertNotIn("Looking at", chunks[0].assistant_text)
         self.assertIn("Fixed the null pointer", chunks[0].assistant_text)
+        self.assertEqual(chunks[0].commentary_text, "Looking at the code...")
+        restored = type(chunks[0]).from_dict(chunks[0].to_dict())
+        self.assertEqual(restored.commentary_text, "Looking at the code...")
+
+    def test_commentary_only_turn_does_not_create_a_chunk(self):
+        """Commentary without a user or final response remains non-flushing."""
+        entries = [
+            {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+             "payload": {"id": "commentary-only-session"}},
+            {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+             "payload": {"role": "assistant", "phase": "commentary", "content": [
+                 {"type": "output_text", "text": "Synthetic commentary only."}
+             ]}},
+            {"timestamp": "2026-03-01T10:00:02Z", "type": "event_msg",
+             "payload": {"type": "agent_message", "phase": "commentary",
+                         "message": "Synthetic commentary event only."}},
+        ]
+        path = _write_codex_transcript(self.tmpdir, entries)
+
+        self.assertEqual(parse_codex_transcript(path), [])
 
     def test_dedup_by_session_id(self):
         """Same session ID parsed twice returns empty on second call."""
