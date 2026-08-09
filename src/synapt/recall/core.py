@@ -4359,13 +4359,6 @@ def _find_gripspace_root(path: Path) -> Path | None:
 
     home = Path.home().resolve()
     while current != current.parent:
-        # gr2 owns one .grip/ namespace at the workspace root. Spawned units
-        # live beneath it, so recognizing that marker makes their shared index
-        # and knowledge land at the containing workspace instead of at each
-        # unit cwd. This composes with the existing gr1 detector below.
-        if (current / ".grip").is_dir():
-            _gripspace_cache[cache_key] = (current, time.monotonic())
-            return current
         gitgrip = current / ".gitgrip"
         if gitgrip.is_dir():
             # Linked griptree has griptree.json (singular) — always resolve
@@ -4373,12 +4366,55 @@ def _find_gripspace_root(path: Path) -> Path | None:
             # happens when `gr` clones the full directory structure).
             if (gitgrip / "griptree.json").exists():
                 root = _resolve_griptree_parent(current)
-                _gripspace_cache[cache_key] = (root, time.monotonic())
-                return root
+                if root is not None:
+                    _gripspace_cache[cache_key] = (root, time.monotonic())
+                    return root
+                # Membership is ASSERTED here but could not be VERIFIED. Use
+                # the strongest signal that actually was verified: ".grip" is
+                # positive evidence this directory is a workspace, so fall
+                # through to it rather than reporting nothing.
+                #
+                # Without this, reordering the two markers would make things
+                # WORSE for exactly this population: such a directory used to
+                # short-circuit on ".grip" and resolve to itself, and would
+                # instead resolve to nothing — fragmenting a store that
+                # previously cohered, which is the failure this function is
+                # being changed to prevent.
+                if (current / ".grip").is_dir():
+                    _gripspace_cache[cache_key] = (current, time.monotonic())
+                    return current
+                # No membership we can verify and no locality evidence either.
+                # Return None EXACTLY as before, and deliberately do NOT keep
+                # walking upward. Continuing the walk might well find a better
+                # answer, but it would be a NEW behaviour for a case this
+                # change is not about, and it would break the property that
+                # makes this change checkable: every directory either improves
+                # or is unchanged, and nothing else moves.
+                _gripspace_cache[cache_key] = (None, time.monotonic())
+                return None
             # Gripspace root has only griptrees.json (plural), no singular
             if (gitgrip / "griptrees.json").exists():
                 _gripspace_cache[cache_key] = (current, time.monotonic())
                 return current
+
+        # MEMBERSHIP BEATS LOCALITY. gr2 owns one .grip/ namespace at the
+        # workspace root, and spawned units live beneath it, so recognizing
+        # that marker makes their shared index and knowledge land at the
+        # containing workspace instead of at each unit cwd. That is still
+        # true, and it is why this check exists.
+        #
+        # It is consulted AFTER the gr1 membership markers above, because the
+        # two answer different questions: ".grip" asks "am I a workspace
+        # containing units?", while .gitgrip/griptree.json asks "whose larger
+        # whole am I a part of?". A directory can hold both, and store
+        # resolution needs the second — a member's data belongs to the
+        # workspace it is a member of. Checked first, ".grip" would shadow the
+        # membership claim entirely: the directory resolves to itself, its
+        # data lands where no other surface in that workspace looks, and
+        # nothing anywhere reports a problem.
+        if (current / ".grip").is_dir():
+            _gripspace_cache[cache_key] = (current, time.monotonic())
+            return current
         # Don't walk above $HOME
         if current == home:
             break
