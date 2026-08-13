@@ -293,7 +293,8 @@ def read_previous_meaningful(
 def read_entries(path: Path | None = None, n: int = 5) -> list[JournalEntry]:
     """Read the last N journal entries (most recent first).
 
-    Deduplicates by session_id (keeps the richest entry per session)
+    Deduplicates by session_id (keeps the newest manual/auto entry; richness
+    breaks an exact-timestamp tie)
     and sorts by timestamp descending. Does NOT assume the file is
     chronologically ordered.
     """
@@ -324,18 +325,23 @@ def _read_all_entries(path: Path) -> list[JournalEntry]:
 def _entry_richness(entry: JournalEntry) -> tuple:
     """Score an entry for dedup ranking.
 
-    Returns a tuple that sorts higher for richer entries:
-    (not auto, rich field count, timestamp).
+    Manual entries still beat auto-extracted stubs, but within either class the
+    newest write wins before field count. A resumed runtime can reuse a session
+    id: letting an older, richer entry win there retains completed work and
+    hides the current entry's next steps, which are the continuity handoff.
+
+    Returns a tuple that sorts higher for the retained entry:
+    (not auto, timestamp, rich field count).
     """
     rich_count = sum(bool(f) for f in (entry.focus, entry.done, entry.decisions, entry.next_steps))
-    return (not entry.auto, rich_count, entry.timestamp)
+    return (not entry.auto, entry.timestamp, rich_count)
 
 
 def _dedup_entries(entries: list[JournalEntry]) -> list[JournalEntry]:
     """Keep only the richest entry per session_id.
 
-    Priority: non-auto > auto, then most rich fields
-    (focus/done/decisions/next_steps), then newest timestamp.
+    Priority: non-auto > auto, then newest timestamp, then most rich fields
+    (focus/done/decisions/next_steps).
     Entries without a session_id are kept as-is.
     """
     best: dict[str, JournalEntry] = {}
@@ -353,7 +359,8 @@ def _dedup_entries(entries: list[JournalEntry]) -> list[JournalEntry]:
 def compact_journal(path: Path | None = None) -> int:
     """Physically dedup and sort journal.jsonl.
 
-    Reads all entries, deduplicates by session_id (keeps richest),
+    Reads all entries, deduplicates by session_id (keeps newest within the
+    manual/auto class, with richness as an exact-timestamp tie-breaker),
     sorts chronologically, and rewrites the file in-place.
 
     Uses an exclusive flock on the journal file itself (not a temp file)

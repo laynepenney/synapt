@@ -313,6 +313,29 @@ class TestDedupAndCompact(unittest.TestCase):
         self.assertEqual(entries[0].focus, "manual focus")
         self.assertFalse(entries[0].auto)
 
+    def test_read_entries_keeps_newer_current_next_steps_over_richer_prior_entry(self):
+        """A new session write must not lose its current next step to an older,
+        richer entry that happens to share a session id.
+
+        Session IDs can be reused by a resumed runtime. The current entry is
+        the continuity handoff, so recency must win before richness: otherwise
+        a completed item remains visible and the next step just written drops.
+        """
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T10:00:00", session_id="resumed-session",
+            focus="prior work", done=["completed item"], decisions=["kept"],
+            next_steps=["prior unfinished"], auto=False,
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T11:00:00", session_id="resumed-session",
+            focus="current work", next_steps=["current next step"], auto=False,
+        ), self.path)
+
+        latest = read_latest(self.path)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.next_steps, ["current next step"])
+        self.assertNotIn("completed item", latest.done)
+
     def test_compact_journal_removes_duplicates(self):
         """compact_journal deduplicates and sorts the file."""
         append_entry(JournalEntry(
@@ -406,14 +429,14 @@ class TestDedupAndCompact(unittest.TestCase):
         self.assertIn("A2", foci)
 
     def test_dedup_richness_tiebreaker_by_field_count(self):
-        """Between two auto entries for the same session, the one with more rich fields wins."""
+        """When same-session writes tie on time, richer content breaks the tie."""
         entries = [
             JournalEntry(
                 timestamp="2026-03-01T10:00:00", session_id="sess-A",
                 focus="just focus", auto=True,
             ),
             JournalEntry(
-                timestamp="2026-03-01T11:00:00", session_id="sess-A",
+                timestamp="2026-03-01T10:00:00", session_id="sess-A",
                 focus="focus + done", done=["task"], auto=True,
             ),
         ]
