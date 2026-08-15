@@ -164,6 +164,18 @@ def is_noop(previous: InputSignature | None, current: InputSignature) -> bool:
     must resolve to doing the work, not to skipping it.  Treating an absent
     previous as a match would make the very first build of a store, the one
     that has the most to do, the one that does nothing.
+
+    THE DIGEST IS THE ONLY THING COMPARED, and `file_count` is deliberately
+    not.  The digest is computed over every entry, so the count is derived
+    from the same input rather than independent evidence about it: any change
+    that alters the count necessarily alters the digest.  Comparing it too
+    would look like defence in depth and provide none, because a second check
+    over the same input cannot fail when the first one passes.
+
+    That makes this a real contract rather than an implementation detail.  If
+    the digest ever stops covering the full entry set, this function silently
+    weakens, and nothing here would notice -- so the assumption is pinned by
+    a witness rather than left to this comment.
     """
     if previous is None:
         return False

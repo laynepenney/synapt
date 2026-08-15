@@ -382,6 +382,12 @@ def test_signature_absent_from_manifest_returns_none(tmp_path):
         ("digest is 63 chars", {"version": 1, "digest": "a" * 63, "files": 3}),
         ("digest is 65 chars", {"version": 1, "digest": "a" * 65, "files": 3}),
         ("digest is padded", {"version": 1, "digest": " " + "a" * 64, "files": 3}),
+        # Pins `\Z` against `$`, which are NOT interchangeable: `$` matches
+        # before a trailing newline, so a `$`-anchored pattern accepts this
+        # payload and the digest silently carries the newline into every later
+        # comparison. The suite could not discriminate the two anchors before
+        # this case, so the correct anchor was correct but unpinned.
+        ("digest has a trailing newline", {"version": 1, "digest": "a" * 64 + "\n", "files": 3}),
         # Found by closing the CLASS rather than the three reported instances:
         # the version guard is a bare `!=`, and True == 1 and 1.0 == 1.
         ("version is True", {"version": True, "digest": "a" * 64, "files": 3}),
@@ -439,6 +445,63 @@ def test_a_well_formed_payload_is_still_accepted():
     assert recovered.file_count == 3
     assert type(recovered.file_count) is int
     assert is_noop(recovered, InputSignature(digest="a" * 64, file_count=3)) is True
+
+
+def test_a_zero_file_signature_is_ACCEPTED():
+    """Widens the acceptance control, which previously proved one shape only.
+
+    `files: 0` sits directly against the `files < 0` boundary and is a real
+    state -- a store whose sources are all gone still has a signature, and a
+    build over zero files is a legitimate no-op rather than a corrupt manifest.
+    Nothing pinned it, so a tightening of `< 0` into `<= 0` would have been
+    rejected by no test while looking like a stricter, safer guard.
+
+    The rejection cases bound the guard from one side. Without this, the only
+    acceptance evidence was a single mid-range payload, and a guard that
+    admitted exactly that one shape would have passed the entire suite.
+    """
+    from synapt.recall.build_delta import signature_from_manifest
+
+    recovered = signature_from_manifest(
+        {"input_signature": {"version": 1, "digest": "c" * 64, "files": 0}}
+    )
+
+    assert recovered is not None, "a zero-file signature is well-formed, not malformed"
+    assert recovered.file_count == 0
+    assert type(recovered.file_count) is int
+
+
+def test_is_noop_compares_the_DIGEST_and_not_the_file_count():
+    """Pins the contract `is_noop`'s docstring states, so it cannot drift silently.
+
+    The digest covers every entry, so `file_count` is derived from the same
+    input rather than independent evidence about it -- comparing both would be
+    defence in depth that provides none. This witness makes that a checked
+    claim instead of a comment: same digest, deliberately mismatched counts,
+    still a no-op.
+
+    It is written to fail in BOTH directions. Adding a `file_count` comparison
+    turns the first assertion red; weakening the digest comparison turns the
+    second one red. A future reader who "fixes" this function by making it
+    stricter now has to argue with a test rather than a paragraph.
+    """
+    from synapt.recall.build_delta import InputSignature, is_noop
+
+    same_digest_different_count = is_noop(
+        InputSignature(digest="d" * 64, file_count=3),
+        InputSignature(digest="d" * 64, file_count=99),
+    )
+    assert same_digest_different_count is True, (
+        "file_count was compared; the digest is meant to be authoritative"
+    )
+
+    different_digest_same_count = is_noop(
+        InputSignature(digest="d" * 64, file_count=3),
+        InputSignature(digest="e" * 64, file_count=3),
+    )
+    assert different_digest_same_count is False, (
+        "digests differed and it still claimed a no-op"
+    )
 
 
 # ===========================================================================

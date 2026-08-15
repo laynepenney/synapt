@@ -643,6 +643,11 @@ def _archive_and_build_locked(
             st = fp.stat()
             source_files.append({
                 "name": fp.name,
+                # The source dir scopes the name. This list is FLAT across every
+                # build source, so two worktrees archiving the same session name
+                # produce two entries that are indistinguishable without it, and
+                # a basename-keyed reader silently keeps only one of them.
+                "dir": build_source.name,
                 "mtime": st.st_mtime,
                 "size": st.st_size,
             })
