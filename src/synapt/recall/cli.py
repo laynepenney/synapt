@@ -561,14 +561,38 @@ def _archive_and_build_locked(
     except Exception:
         pass  # Never fail a build due to promotions
 
-    # Upgrade large clusters to LLM summaries (size-based, not access-based)
-    try:
-        from synapt.recall.clustering import upgrade_large_cluster_summaries
-        llm_upgraded = upgrade_large_cluster_summaries(db, min_chunks=5, max_upgrades=5)
-        if llm_upgraded:
-            print(f"  LLM summaries: {llm_upgraded} clusters upgraded")
-    except Exception:
-        pass  # Never fail a build due to LLM summaries
+    # THE SUMMARY GRINDER IS NOT RUN FROM A BUILD.
+    #
+    # `upgrade_large_cluster_summaries` makes LLM calls, so it is unbounded work
+    # of a different KIND from everything else here: the rest of a build is
+    # local and its cost scales with what changed, while this scales with an
+    # external service and runs on every build regardless. It also sat inside a
+    # bare `except: pass`, so a build reported success whether it worked, did
+    # nothing, or failed -- which is the state that makes a cost invisible.
+    #
+    # Its explicit home is the `maintain` subcommand, which does not exist yet.
+    #
+    # WHAT IS AND IS NOT LOST IN THE MEANTIME. Summaries come in TWO TIERS, and
+    # every loose sentence about this change has been wrong by collapsing them:
+    #
+    #   CONCAT is the baseline, and it is unaffected. The clustering step above
+    #   pre-generates a concat summary for EVERY cluster on every build, skipping
+    #   only those that already hold an LLM one. So no cluster is left without a
+    #   summary by this change.
+    #
+    #   LLM is the upgrade, and it has two triggers. `process_build_promotions`
+    #   upgrades by ACCESS TIER and still runs. The removed pass upgraded by
+    #   SIZE, independent of access -- which is why its query looked for
+    #   clusters where `method = 'llm'` was absent.
+    #
+    # So the residual is exactly this: a cluster that is large but rarely
+    # searched keeps its concat summary and waits for `maintain` to be UPGRADED
+    # to LLM quality. It does not go unsummarized.
+    #
+    # Recorded at this length because two earlier drafts of this comment said
+    # "summaries stop being generated" and then "no longer gets a summary" --
+    # the same error twice, from writing "summary" unqualified in a system that
+    # has two tiers of them.
 
     # Maintain adaptive memory: decay, archival, log compaction
     try:
