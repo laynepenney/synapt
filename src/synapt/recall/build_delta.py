@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 import hashlib
+import re
 
 #: Manifest key. Absent means "no previous build to compare against", which is
 #: NOT the same as "nothing changed" -- see `signature_from_manifest`.
@@ -42,6 +43,26 @@ MANIFEST_KEY = "input_signature"
 SIGNATURE_VERSION = 1
 
 _TRANSCRIPT_GLOB = "*.jsonl"
+
+#: What `hashlib.sha256().hexdigest()` produces, and nothing else. Anchored at
+#: both ends so a 64-hex substring inside a longer string does not qualify.
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
+
+
+def _is_plain_int(value: Any) -> bool:
+    """`type(...) is int`, deliberately NOT `isinstance`.
+
+    ``bool`` SUBCLASSES ``int`` in Python, so ``isinstance(True, int)`` is True
+    and ``True == 1``.  An ``isinstance`` guard therefore admits ``True`` and
+    ``False`` into a field the dataclass declares as ``int``, and the same
+    equality makes ``version: True`` compare equal to ``SIGNATURE_VERSION``.
+    ``1.0 == 1`` gets in the same way.
+
+    This is the whole class, not the one field it was first noticed on: any
+    numeric guard written with ``isinstance`` or bare ``==`` in this module has
+    the same hole.
+    """
+    return type(value) is int
 
 
 @dataclass(frozen=True)
@@ -162,16 +183,36 @@ def signature_from_manifest(manifest: dict[str, Any] | None) -> InputSignature |
     `is_noop` turns that into "do the work".  Failing toward work is the only
     safe direction: the cost of a wrong None is one unnecessary build, and the
     cost of a wrong signature is a build that never happens.
+
+    THIS DOCSTRING USED TO OVERSTATE WHAT THE CODE DID, which is the reason the
+    validation below is shape-exact rather than approximate.  The first version
+    accepted six malformed payloads while promising to reject them: `files` as
+    ``True``/``False``/``-1`` (``bool`` subclasses ``int``, and nothing bounded
+    the sign), `digest` as any non-empty string, and -- found while closing the
+    class rather than the reported instances -- `version` as ``True`` or ``1.0``,
+    both of which compare equal to ``1``.
+
+    Stated exactly, because the honest scope matters more than the scary one: no
+    WRONG NO-OP was reachable through those fields, since `is_noop` compares
+    digests and a malformed digest cannot equal a real one.  What was reachable
+    is worse in a quieter way -- a validator reporting "well-formed" over
+    garbage, and a dataclass whose declared ``int`` could hold ``True``.  A gate
+    that certifies what it did not check is the defect this module exists to
+    argue against, so it does not get to have one.
     """
     if not isinstance(manifest, dict):
         return None
     payload = manifest.get(MANIFEST_KEY)
     if not isinstance(payload, dict):
         return None
+    if not _is_plain_int(payload.get("version")):
+        return None
     if payload.get("version") != SIGNATURE_VERSION:
         return None
     digest = payload.get("digest")
     files = payload.get("files")
-    if not isinstance(digest, str) or not digest or not isinstance(files, int):
+    if not isinstance(digest, str) or _HEX64.match(digest) is None:
+        return None
+    if not _is_plain_int(files) or files < 0:
         return None
     return InputSignature(digest=digest, file_count=files)

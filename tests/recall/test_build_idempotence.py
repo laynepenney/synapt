@@ -364,6 +364,83 @@ def test_signature_absent_from_manifest_returns_none(tmp_path):
     assert signature_from_manifest({"source_files": []}) is None
 
 
+@pytest.mark.parametrize(
+    "label,payload",
+    [
+        # `bool` subclasses `int`, so an isinstance guard admits both, and the
+        # dataclass field declared `int` ends up holding True.
+        ("files is True", {"version": 1, "digest": "a" * 64, "files": True}),
+        ("files is False", {"version": 1, "digest": "a" * 64, "files": False}),
+        # Nothing bounded the sign. A negative count is not a count.
+        ("files is -1", {"version": 1, "digest": "a" * 64, "files": -1}),
+        ("files is a float", {"version": 1, "digest": "a" * 64, "files": 3.0}),
+        ("files is a digit string", {"version": 1, "digest": "a" * 64, "files": "3"}),
+        # A digest is what sha256().hexdigest() produces, not any string.
+        ("digest is too short", {"version": 1, "digest": "x", "files": 3}),
+        ("digest is non-hex", {"version": 1, "digest": "z" * 64, "files": 3}),
+        ("digest is uppercase", {"version": 1, "digest": "A" * 64, "files": 3}),
+        ("digest is 63 chars", {"version": 1, "digest": "a" * 63, "files": 3}),
+        ("digest is 65 chars", {"version": 1, "digest": "a" * 65, "files": 3}),
+        ("digest is padded", {"version": 1, "digest": " " + "a" * 64, "files": 3}),
+        # Found by closing the CLASS rather than the three reported instances:
+        # the version guard is a bare `!=`, and True == 1 and 1.0 == 1.
+        ("version is True", {"version": True, "digest": "a" * 64, "files": 3}),
+        ("version is 1.0", {"version": 1.0, "digest": "a" * 64, "files": 3}),
+    ],
+)
+def test_a_malformed_signature_payload_resolves_to_WORK(label, payload):
+    """Rejecting is only half of it: the refusal must reach a BUILD.
+
+    `signature_from_manifest` returning None is an internal fact. What the
+    module promises is that no usable prior state means the work happens, so
+    each case asserts BOTH halves -- the parse refuses, AND `is_noop` turns
+    that refusal into False. A guard that returned None while some caller
+    treated None as "unchanged" would satisfy the first assertion and lose the
+    property the first assertion exists to protect.
+
+    Written after the original validator accepted every payload here while its
+    own docstring said it rejected malformed ones.
+    """
+    from synapt.recall.build_delta import (
+        InputSignature,
+        is_noop,
+        signature_from_manifest,
+    )
+
+    recovered = signature_from_manifest({"input_signature": payload})
+    assert recovered is None, f"malformed payload was accepted: {label}"
+
+    current = InputSignature(digest="b" * 64, file_count=5)
+    assert is_noop(recovered, current) is False, (
+        f"refusal did not resolve to work: {label}"
+    )
+
+
+def test_a_well_formed_payload_is_still_accepted():
+    """The control for the rejection cases above.
+
+    Thirteen tests asserting None would all pass against a validator that
+    rejects everything, including real signatures -- a guard that refuses
+    universally is exactly as broken as one that accepts universally, and it
+    fails in the direction that looks safe. This is the case that would go red
+    if the new checks were tightened past correctness.
+    """
+    from synapt.recall.build_delta import (
+        InputSignature,
+        is_noop,
+        signature_from_manifest,
+    )
+
+    good = {"version": 1, "digest": "a" * 64, "files": 3}
+    recovered = signature_from_manifest({"input_signature": good})
+
+    assert recovered is not None, "a well-formed payload must survive"
+    assert recovered.digest == "a" * 64
+    assert recovered.file_count == 3
+    assert type(recovered.file_count) is int
+    assert is_noop(recovered, InputSignature(digest="a" * 64, file_count=3)) is True
+
+
 # ===========================================================================
 # D. The build must never grind LLM summaries
 # ===========================================================================
