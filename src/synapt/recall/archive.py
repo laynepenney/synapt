@@ -681,9 +681,10 @@ def save_sync_config(project_dir: Path, config: dict) -> Path:
 def archive_transcripts(project_dir: Path, source_dir: Path) -> list[Path]:
     """Copy new transcript files from Claude Code's source dir to the project archive.
 
-    Skips files that already exist with the same size. Overwrites if the
-    source grew since last archive. Preserves larger archives when the
-    source shrinks (e.g., /clear truncated the transcript).
+    Skips files that already exist with the same size AND no newer mtime.
+    Overwrites if the source grew since last archive, or if it was modified
+    without changing length. Preserves larger archives when the source
+    shrinks (e.g., /clear truncated the transcript).
 
     Args:
         project_dir: Root of the project (where .synapt/recall/ lives).
@@ -698,12 +699,34 @@ def archive_transcripts(project_dir: Path, source_dir: Path) -> list[Path]:
     copied = []
     for src_file in sorted(source_dir.glob("*.jsonl")):
         dst_file = archive_dir / src_file.name
-        src_size = src_file.stat().st_size
+        src_stat = src_file.stat()
+        src_size = src_stat.st_size
         if dst_file.exists():
-            dst_size = dst_file.stat().st_size
+            dst_stat = dst_file.stat()
+            dst_size = dst_stat.st_size
             if src_size == dst_size:
-                continue  # No change
-            if src_size < dst_size:
+                # Equal size is NOT equal content. An edit that preserves the
+                # byte count leaves the size identical, so size alone can never
+                # observe it and the file is skipped on every subsequent build,
+                # permanently. mtime is the second, independent signal; compare
+                # it in ns so float rounding cannot make an unchanged file look
+                # newer than itself. copy2 replicates the source mtime as
+                # faithfully as the DESTINATION filesystem allows, which is
+                # exactly where this can degrade: the archive may sit on a
+                # different filesystem than the source, and one storing a
+                # coarser mtime truncates the copied stamp, so the destination
+                # reads as older than its own source and the file re-copies on
+                # every build.
+                #
+                # That degeneration is accepted deliberately, because the two
+                # ways of being wrong are not symmetric. A strict comparison
+                # errs toward WORK: the cost is a bounded, repeated copy. A
+                # tolerance would err toward SKIP, silently treating an edit
+                # inside the tolerance window as unchanged -- which is the
+                # exact defect class this check exists to kill.
+                if src_stat.st_mtime_ns <= dst_stat.st_mtime_ns:
+                    continue
+            elif src_size < dst_size:
                 continue  # Source shrunk (e.g., /clear truncated) — keep larger archive
         shutil.copy2(src_file, dst_file)
         copied.append(dst_file)

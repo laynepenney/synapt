@@ -4911,10 +4911,31 @@ def build_index(
             pass
 
     # Filter for incremental builds — skip files whose mtime AND size match
-    already_indexed: dict[str, tuple[float, int]] = {}
+    # Keyed on (source dir, name), never the basename alone: `source_files` is
+    # ONE flat list spanning every build source, so two worktrees archiving the
+    # same session name yield two entries. Under a basename key the second
+    # overwrites the first, and the loser's stamp can never match its own file —
+    # so it re-parses on every incremental build, forever, with no error.
+    #
+    # The key uses the source dir's BASENAME, which is unique only because the
+    # build sources are siblings under one root. A future multi-root source
+    # list can collide here the same way basenames collide today, and would
+    # need the fuller path. Impossible by topology now; stated so that whoever
+    # adds the second root meets this instead of rediscovering it.
+    already_indexed: dict[tuple[str, str], tuple[float, int]] = {}
+    # Manifests written before entries carried "dir" keep the old flat key.
+    # They cannot distinguish colliding basenames — that is the defect — but a
+    # legacy manifest is better than forcing one full rebuild on upgrade, and
+    # the next build rewrites the manifest in the scoped form.
+    legacy_indexed: dict[str, tuple[float, int]] = {}
     if incremental_manifest:
         for src in incremental_manifest.get("source_files", []):
-            already_indexed[src["name"]] = (src.get("mtime", 0), src.get("size", 0))
+            stamp = (src.get("mtime", 0), src.get("size", 0))
+            src_dir = src.get("dir")
+            if src_dir is None:
+                legacy_indexed[src["name"]] = stamp
+            else:
+                already_indexed[(src_dir, src["name"])] = stamp
 
     from synapt.recall.codex import is_codex_transcript, parse_codex_transcript
 
@@ -4924,8 +4945,11 @@ def build_index(
     parsed_files: list[Path] = []  # Track which files were actually parsed
 
     for filepath in jsonl_files:
-        if filepath.name in already_indexed:
-            stored_mtime, stored_size = already_indexed[filepath.name]
+        stamp = already_indexed.get((filepath.parent.name, filepath.name))
+        if stamp is None:
+            stamp = legacy_indexed.get(filepath.name)
+        if stamp is not None:
+            stored_mtime, stored_size = stamp
             stat = filepath.stat()
             if stat.st_mtime == stored_mtime and stat.st_size == stored_size:
                 skipped += 1
