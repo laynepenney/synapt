@@ -4479,7 +4479,7 @@ def project_slug(project_dir: Path | None = None) -> str:
 
 
 def _worktree_name(project_dir: Path | None = None) -> str:
-    """Return the current worktree's name (its directory basename).
+    """Return the stable worktree or workspace name for per-worktree data.
 
     For the main worktree at ``/Users/me/Development/rd``, returns ``rd``.
     For a linked worktree at ``/Users/me/Development/poe``, returns ``poe``.
@@ -4501,7 +4501,30 @@ def _worktree_name(project_dir: Path | None = None) -> str:
                     f"per-worktree files outside worktrees/."
                 )
             return env_name
-    return (project_dir or Path.cwd()).resolve().name
+
+    current = (project_dir or Path.cwd()).resolve()
+    grip_root = _find_gripspace_root(current)
+    candidate = current
+    while candidate != candidate.parent:
+        # A .git marker identifies the root of either a main checkout or a
+        # linked worktree. It is a directory in the former and a file in the
+        # latter. Keep walking only until the nearest such root so a
+        # constituent repository retains its own bucket inside a shared
+        # gripspace store.
+        if (candidate / ".git").exists():
+            return candidate.name
+        if (candidate / ".gitgrip" / "griptree.json").exists():
+            return candidate.name
+        if candidate == grip_root:
+            break
+        candidate = candidate.parent
+
+    # A non-git directory inside a gripspace still belongs to the workspace.
+    # This mirrors data-root resolution and prevents a cwd subdirectory from
+    # becoming a second, silently partial journal bucket.
+    if grip_root is not None:
+        return grip_root.name
+    return current.name
 
 
 # ---------------------------------------------------------------------------
