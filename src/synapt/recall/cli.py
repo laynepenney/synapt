@@ -1284,7 +1284,10 @@ def cmd_export(args: argparse.Namespace) -> None:
     """Export portable recall state to a .synapt-archive file."""
     from synapt.recall.archive import export_recall_archive
 
-    project = Path.cwd().resolve()
+    # Do NOT default to Path.cwd() here: an explicit root suppresses the
+    # SYNAPT_RECALL_ROOT override inside project_data_dir. None means "resolve
+    # like every other recall verb".
+    project = Path(args.path).expanduser().resolve() if getattr(args, "path", None) else None
     try:
         output_path, manifest = export_recall_archive(
             project,
@@ -1296,7 +1299,10 @@ def cmd_export(args: argparse.Namespace) -> None:
         print(f"Export failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # Name the resolved store (recall#963 reporting contract): a bare count is
+    # exactly the report shape that let a wrong-store export hide.
     print(f"Exported recall archive to {output_path}")
+    print(f"  store={manifest.get('data_dir', '?')}")
     print(
         f"  chunks={manifest.get('chunk_count', 0)} "
         f"knowledge={manifest.get('knowledge_count', 0)} "
@@ -1308,7 +1314,8 @@ def cmd_import(args: argparse.Namespace) -> None:
     """Import portable recall state from a .synapt-archive file."""
     from synapt.recall.archive import import_recall_archive
 
-    project = Path.cwd().resolve()
+    # Same rule as export: None resolves via SYNAPT_RECALL_ROOT + inference.
+    project = Path(args.path).expanduser().resolve() if getattr(args, "path", None) else None
     mode = "merge" if args.merge else "replace"
     try:
         summary = import_recall_archive(
@@ -1324,7 +1331,8 @@ def cmd_import(args: argparse.Namespace) -> None:
     print(
         f"  mode={summary.get('mode', mode)} "
         f"chunks={summary.get('chunk_count', 0)} "
-        f"knowledge={summary.get('knowledge_count', 0)}"
+        f"knowledge={summary.get('knowledge_count', 0)} "
+        f"store={summary.get('data_dir', '?')}"
     )
 
 
@@ -2885,12 +2893,14 @@ def main():
     export_parser.add_argument("output", nargs="?", default=None, help="Output .synapt-archive path (default: <project>.synapt-archive)")
     export_parser.add_argument("--exclude-transcripts", action="store_true", help="Skip raw transcript archives")
     export_parser.add_argument("--exclude-channels", action="store_true", help="Skip channel history files")
+    export_parser.add_argument("--path", default=None, help="Workspace root to export (default: SYNAPT_RECALL_ROOT, else inferred from git/gripspace, else cwd)")
 
     import_parser = subparsers.add_parser("import", help="Import portable recall data from a .synapt-archive file")
     import_parser.add_argument("archive", help="Path to a .synapt-archive file")
     import_mode = import_parser.add_mutually_exclusive_group()
     import_mode.add_argument("--merge", action="store_true", help="Merge imported data into existing recall state")
     import_mode.add_argument("--replace", action="store_true", help="Replace existing recall state (default)")
+    import_parser.add_argument("--path", default=None, help="Workspace root to import into (default: SYNAPT_RECALL_ROOT, else inferred from git/gripspace, else cwd)")
 
     # Transcript (display/save a session)
     transcript_parser = subparsers.add_parser("transcript", help="Display or save a session transcript")

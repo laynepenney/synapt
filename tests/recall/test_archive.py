@@ -1,10 +1,13 @@
 """Tests for transcript archiving and sync configuration."""
 
+import argparse
+import pytest
 import json
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from synapt.recall.archive import (
+    _load_archive_manifest,
     export_recall_archive,
     import_recall_archive,
     archive_transcripts,
@@ -658,3 +661,329 @@ def test_should_sync_true_after_interval(tmp_path):
     ts_path.write_text(str(time_mod.time() - 900))
 
     assert should_sync(project, min_interval_minutes=10) is True
+
+
+# --- store resolution in the export/import CLI verbs -------------------------
+
+def _archive_member_names(archive_path: Path) -> list[str]:
+    import tarfile
+
+    with tarfile.open(archive_path, "r:gz") as tf:
+        return tf.getnames()
+
+
+def test_export_resolves_the_recall_root_override_not_the_cwd(tmp_path, monkeypatch):
+    """`recall export` must export the store SYNAPT_RECALL_ROOT names.
+
+    **Two roots, because one root cannot bind this.** With a single store,
+    "resolved the override" and "resolved the cwd" produce byte-identical
+    archives, so no assertion over that fixture can tell them apart.
+
+    Mechanism under test: ``cmd_export`` computes ``Path.cwd().resolve()`` and
+    passes it to ``export_recall_archive`` -> ``project_data_dir(project_dir)``.
+    ``project_data_dir`` consults the env override ONLY when *project_dir* is
+    None, so passing an explicit cwd does not merely skip the override, it
+    actively suppresses it.
+
+    It fails SILENTLY: an operator exporting what they believe is a fresh,
+    empty store gets the historical corpus instead, and the resulting archive
+    still looks correct.
+    """
+    from synapt.recall import cli as cli_mod
+
+    cwd_root = tmp_path / "cwd-workspace"
+    override_root = tmp_path / "override-workspace"
+    cwd_root.mkdir()
+    override_root.mkdir()
+
+    _seed_recall_project(
+        cwd_root,
+        session_id="sess-cwd",
+        chunk_id="sess-cwd:t0",
+        knowledge_id="know-cwd",
+        journal_focus="cwd focus",
+        channel_id="msg-cwd",
+        reminder_id="rem-cwd",
+    )
+    _seed_recall_project(
+        override_root,
+        session_id="sess-override",
+        chunk_id="sess-override:t0",
+        knowledge_id="know-override",
+        journal_focus="override focus",
+        channel_id="msg-override",
+        reminder_id="rem-override",
+    )
+
+    out = tmp_path / "exported.synapt-archive"
+    monkeypatch.chdir(cwd_root)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(override_root))
+
+    args = argparse.Namespace(
+        output=str(out),
+        exclude_transcripts=False,
+        exclude_channels=False,
+    )
+    cli_mod.cmd_export(args)
+
+    names = "\n".join(_archive_member_names(out))
+
+    # CONTROL: the two stores must actually differ, or this test passes
+    # vacuously no matter which root was resolved.
+    assert "sess-cwd" != "sess-override"
+    assert "sess-cwd" in _seed_marker(cwd_root), "fixture did not seed the cwd root"
+
+    assert "sess-override" in names, (
+        "export resolved the CWD store instead of SYNAPT_RECALL_ROOT.\n"
+        f"archive members:\n{names}"
+    )
+    assert "sess-cwd" not in names, (
+        "export carried the CWD store's content instead of the named store, "
+        "and the archive would still look correct.\n"
+        f"archive members:\n{names}"
+    )
+
+
+def _seed_marker(project: Path) -> str:
+    """Return a string proving *project* actually holds seeded content."""
+    from synapt.recall.core import project_archive_dir
+
+    return "\n".join(p.name for p in project_archive_dir(project).glob("*.jsonl"))
+
+
+def test_import_resolves_the_recall_root_override_not_the_cwd(tmp_path, monkeypatch):
+    """`recall import` must land in the store SYNAPT_RECALL_ROOT names.
+
+    Mirror of the export witness. A fresh workspace receiving an archive is
+    the seeding case: if import resolves the cwd, the archive lands in whatever
+    store the operator happened to be standing in, not the one they named.
+    """
+    from synapt.recall import cli as cli_mod
+    from synapt.recall.core import project_archive_dir
+
+    source = tmp_path / "source"
+    cwd_root = tmp_path / "cwd-workspace"
+    override_root = tmp_path / "override-workspace"
+    for d in (source, cwd_root, override_root):
+        d.mkdir()
+
+    _seed_recall_project(
+        source,
+        session_id="sess-seed",
+        chunk_id="sess-seed:t0",
+        knowledge_id="know-seed",
+        journal_focus="seed focus",
+        channel_id="msg-seed",
+        reminder_id="rem-seed",
+    )
+    archive, _ = export_recall_archive(source, tmp_path / "seed.synapt-archive")
+
+    monkeypatch.chdir(cwd_root)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(override_root))
+    args = argparse.Namespace(archive=str(archive), merge=False, replace=True)
+    cli_mod.cmd_import(args)
+
+    landed_override = list(project_archive_dir(override_root).glob("sess-seed*.jsonl"))
+    landed_cwd = list(project_archive_dir(cwd_root).glob("sess-seed*.jsonl"))
+
+    assert landed_override, (
+        "import did not land in SYNAPT_RECALL_ROOT's store -- the seed went "
+        "somewhere other than the named store"
+    )
+    assert not landed_cwd, (
+        f"import wrote into the CWD store: {[p.name for p in landed_cwd]}"
+    )
+
+
+def test_import_reports_the_destination_store_not_the_archives_source(tmp_path, monkeypatch, capsys):
+    """`recall import` must report the RESOLVED destination store it wrote.
+
+    The archive's manifest carries the SOURCE store's ``data_dir`` (written by
+    export). A report that echoed that field would name where the bytes came
+    from and look like a destination. So the witness seeds the archive from
+    one root, imports under an override root while standing in a third, and
+    asserts the printed store is the override's data dir and neither the
+    source's nor the cwd's. Both output paths are driven: the CLI print and
+    the MCP tool text.
+    """
+    from synapt.recall import cli as cli_mod
+    from synapt.recall import server as server_mod
+    from synapt.recall.core import project_data_dir
+
+    source = tmp_path / "source"
+    cwd_root = tmp_path / "cwd-workspace"
+    override_root = tmp_path / "override-workspace"
+    for d in (source, cwd_root, override_root):
+        d.mkdir()
+
+    _seed_recall_project(
+        source,
+        session_id="sess-seed",
+        chunk_id="sess-seed:t0",
+        knowledge_id="know-seed",
+        journal_focus="seed focus",
+        channel_id="msg-seed",
+        reminder_id="rem-seed",
+    )
+    archive, manifest = export_recall_archive(source, tmp_path / "seed.synapt-archive")
+    source_store = str(project_data_dir(source))
+    # control: the archive really does carry the source store, so echoing it
+    # would be a live trap rather than a hypothetical one
+    assert manifest["data_dir"] == source_store
+
+    monkeypatch.chdir(cwd_root)
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(override_root))
+    dest_store = str(project_data_dir(None))
+    assert dest_store == str(project_data_dir(override_root)), "override not live; witness inert"
+    assert dest_store not in (source_store, str(project_data_dir(cwd_root)))
+
+    # library summary: destination under data_dir, provenance under source_data_dir
+    summary = import_recall_archive(None, archive, mode="replace")
+    assert summary["data_dir"] == dest_store, summary
+    assert summary["source_data_dir"] == source_store, summary
+
+    # CLI print
+    args = argparse.Namespace(archive=str(archive), merge=False, replace=True)
+    cli_mod.cmd_import(args)
+    out = capsys.readouterr().out
+    assert f"store={dest_store}" in out, out
+    assert source_store not in out, f"CLI reported the archive's SOURCE store as destination: {out}"
+
+    # MCP tool text
+    text = server_mod.recall_import(str(archive), mode="replace")
+    assert f"- store: {dest_store}" in text, text
+    assert source_store not in text, f"MCP reported the archive's SOURCE store as destination: {text}"
+
+
+def _rewrite_archive_manifest(archive: Path, out: Path, drop_key: str) -> Path:
+    """Copy *archive* to *out* with *drop_key* removed from manifest.json.
+
+    Builds a pre-provenance archive from a current one, so the legacy shape
+    is real bytes on disk rather than a patched loader.
+    """
+    import io
+    import tarfile
+
+    with tarfile.open(archive, "r:*") as src, tarfile.open(out, "w:gz", format=tarfile.PAX_FORMAT) as dst:
+        for member in src.getmembers():
+            payload = src.extractfile(member) if member.isfile() else None
+            if member.name == "manifest.json" and payload is not None:
+                manifest = json.loads(payload.read().decode("utf-8"))
+                manifest.pop(drop_key, None)
+                data = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+                info = tarfile.TarInfo("manifest.json")
+                info.size = len(data)
+                dst.addfile(info, io.BytesIO(data))
+            else:
+                dst.addfile(member, payload)
+    return out
+
+
+@pytest.mark.parametrize("mode", ["replace", "merge"])
+def test_import_omits_source_data_dir_when_the_archive_carries_no_provenance(tmp_path, monkeypatch, mode):
+    """A pre-provenance archive imports with NO source_data_dir key, in both modes.
+
+    Absent must read as absent: a None here is a value someone later treats
+    as a path. Control: the same import from the current-format archive DOES
+    carry source_data_dir, so the absence comes from the manifest, not the
+    mode. The destination is still reported either way.
+    """
+    from synapt.recall.core import project_data_dir
+
+    source = tmp_path / "source"
+    dest_root = tmp_path / "dest-workspace"
+    source.mkdir()
+    dest_root.mkdir()
+    _seed_recall_project(
+        source,
+        session_id="sess-seed",
+        chunk_id="sess-seed:t0",
+        knowledge_id="know-seed",
+        journal_focus="seed focus",
+        channel_id="msg-seed",
+        reminder_id="rem-seed",
+    )
+    current, manifest = export_recall_archive(source, tmp_path / "current.synapt-archive")
+    assert "data_dir" in manifest  # the current format carries provenance
+    legacy = _rewrite_archive_manifest(current, tmp_path / "legacy.synapt-archive", "data_dir")
+    assert "data_dir" not in _load_archive_manifest(legacy)  # and the legacy one truly does not
+
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(dest_root))
+    dest_store = str(project_data_dir(None))
+    assert dest_store == str(project_data_dir(dest_root)), "override not live; witness inert"
+
+    # control: current archive -> provenance present
+    with_prov = import_recall_archive(None, current, mode=mode)
+    assert with_prov["source_data_dir"] == str(project_data_dir(source)), with_prov
+    assert with_prov["data_dir"] == dest_store
+
+    # legacy archive -> key absent, destination still reported
+    without = import_recall_archive(None, legacy, mode=mode)
+    assert "source_data_dir" not in without, (
+        f"{mode}: legacy import carried source_data_dir={without.get('source_data_dir')!r}; absent must read as absent"
+    )
+    assert without["data_dir"] == dest_store, without
+
+
+def test_export_reports_the_data_dir_it_read_not_the_path_it_was_given(tmp_path, monkeypatch):
+    """The reported store must be the RESOLVED data dir, never the argument.
+
+    ``--path`` hands the resolver an explicit root, but ``project_data_dir``
+    still runs git-worktree inference on it. If the manifest records the
+    argument, an operator who points ``--path`` at a linked worktree sees
+    ``store=<worktree>`` while the bytes come from ``<main>/.synapt/recall``.
+    A plausible path is the same defect as a plausible count.
+
+    Fixture: a real git repo with a linked worktree, so inference is provably
+    LIVE -- the control asserts the two candidate dirs differ before the
+    reporting assertion runs.
+    """
+    import subprocess
+
+    from synapt.recall import cli as cli_mod
+    from synapt.recall.core import project_data_dir
+
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "commit", "-q", "--allow-empty", "-m", "init"],
+                   check=True, env={"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                                    "PATH": "/usr/bin:/bin:/usr/local/bin"})
+    linked = tmp_path / "linked"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(linked), "-b", "wt"],
+                   check=True)
+
+    _seed_recall_project(
+        main,
+        session_id="sess-main",
+        chunk_id="sess-main:t0",
+        knowledge_id="know-main",
+        journal_focus="main focus",
+        channel_id="msg-main",
+        reminder_id="rem-main",
+    )
+
+    # CONTROL: inference must be live, i.e. the linked worktree must resolve
+    # to main's data dir. If this fails the test is inert, not passing.
+    resolved = project_data_dir(linked)
+    assert resolved == project_data_dir(main), "inference is not live; fixture is inert"
+    assert resolved != linked / ".synapt" / "recall"
+
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "wt.synapt-archive"
+    args = argparse.Namespace(path=str(linked), output=str(out),
+                              exclude_transcripts=False, exclude_channels=False)
+    cli_mod.cmd_export(args)
+
+    import json, tarfile
+    with tarfile.open(out, "r:gz") as tf:
+        manifest = json.load(tf.extractfile("manifest.json"))
+
+    assert manifest["data_dir"] == str(resolved), (
+        "manifest named a store it did not read: "
+        f"reported {manifest['data_dir']} but bytes came from {resolved}"
+    )
+    with tarfile.open(out, "r:gz") as tf:
+        assert any("sess-main" in n for n in tf.getnames()), "export did not carry main's store"
