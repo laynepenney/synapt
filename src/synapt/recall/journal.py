@@ -303,7 +303,7 @@ def read_entries(path: Path | None = None, n: int = 5) -> list[JournalEntry]:
         return []
     raw = _read_all_entries(path)
     deduped = _dedup_entries(raw)
-    deduped.sort(key=lambda e: e.timestamp, reverse=True)
+    deduped.sort(key=lambda e: _timestamp_order(e.timestamp), reverse=True)
     return deduped[:n]
 
 
@@ -331,14 +331,36 @@ def _entry_richness(entry: JournalEntry) -> tuple:
     hides the current entry's next steps, which are the continuity handoff.
 
     Returns a tuple that sorts higher for the retained entry:
-    (not auto, timestamp, rich field count).
+    (not auto, normalized timestamp, rich field count).
     """
     rich_count = sum(bool(f) for f in (entry.focus, entry.done, entry.decisions, entry.next_steps))
-    return (not entry.auto, entry.timestamp, rich_count)
+    return (not entry.auto, _timestamp_order(entry.timestamp), rich_count)
+
+
+def _timestamp_order(timestamp: str) -> datetime:
+    """Return a deterministic chronological ordering key for a journal timestamp.
+
+    Offset-aware values are normalized to UTC. Legacy offset-naive values are
+    interpreted as UTC because their original timezone is not recoverable from
+    disk. An unparseable legacy value sorts before any parseable timestamp so
+    it cannot displace a known newer journal entry.
+    """
+    if timestamp.endswith("Z"):
+        timestamp = f"{timestamp[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    try:
+        return parsed.astimezone(timezone.utc)
+    except OverflowError:
+        return datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _dedup_entries(entries: list[JournalEntry]) -> list[JournalEntry]:
-    """Keep only the richest entry per session_id.
+    """Keep the highest-priority entry per session_id.
 
     Priority: non-auto > auto, then newest timestamp, then most rich fields
     (focus/done/decisions/next_steps).
@@ -405,7 +427,7 @@ def compact_journal(path: Path | None = None) -> int:
         removed = len(entries) - len(deduped)
         if removed == 0:
             return 0
-        deduped.sort(key=lambda e: e.timestamp)  # chronological for storage
+        deduped.sort(key=lambda e: _timestamp_order(e.timestamp))
         f.seek(0)
         f.truncate(0)  # explicit arg: truncate to zero bytes regardless of buffer position
         for entry in deduped:
