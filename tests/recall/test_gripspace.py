@@ -408,6 +408,97 @@ class TestProjectDataDirGripspace:
         assert result_root == result_a == result_b
 
 
+def test_worktree_bucket_is_stable_below_a_gr2_workspace(tmp_path):
+    """A subdirectory must read the workspace's journal, not mint a slice.
+
+    The ``.grip`` marker deliberately holds the data root constant.  Before
+    recall#974's fix, only the bucket changed from ``workspace`` to ``server``.
+    """
+    workspace = _make_gr2_workspace(tmp_path)
+    nested = workspace / "server"
+    nested.mkdir()
+
+    root_bucket = project_worktree_dir(workspace)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert root_bucket == nested_bucket
+    assert root_bucket == workspace / ".synapt" / "recall" / "worktrees" / "gr2-workspace"
+
+
+def test_gr2_workspace_boundary_beats_an_enclosing_git_root(tmp_path):
+    """A workspace marker owns its namespace even inside another checkout."""
+    (tmp_path / ".git").mkdir()
+    workspace = _make_gr2_workspace(tmp_path)
+    nested = workspace / "server"
+    nested.mkdir()
+
+    assert project_worktree_dir(nested) == (
+        workspace / ".synapt" / "recall" / "worktrees" / "gr2-workspace"
+    )
+
+
+def test_worktree_bucket_uses_the_repo_root_beneath_a_gripspace(tmp_path):
+    """Constituent repos share the store but retain distinct stable buckets."""
+    grip = _make_gripspace(tmp_path)
+    repo = _make_git_repo(grip, "repo-a")
+    nested = repo / "src" / "synapt"
+    nested.mkdir(parents=True)
+
+    repo_bucket = project_worktree_dir(repo)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert repo_bucket == nested_bucket
+    assert repo_bucket == grip / ".synapt" / "recall" / "worktrees" / "repo-a"
+
+
+def test_worktree_bucket_is_stable_below_a_linked_griptree(tmp_path):
+    """A linked griptree root is its own bucket even without a root .git."""
+    grip = _make_gripspace(tmp_path)
+    main_repo = _make_git_repo(grip, "repo-a")
+    worktree_dir = main_repo / ".git" / "worktrees" / "dev"
+    worktree_dir.mkdir(parents=True)
+
+    griptree = tmp_path / "dev-tree"
+    griptree.mkdir()
+    (griptree / ".gitgrip").mkdir()
+    (griptree / ".gitgrip" / "griptree.json").write_text("{}")
+    linked_repo = griptree / "repo-a"
+    linked_repo.mkdir()
+    (linked_repo / ".git").write_text(f"gitdir: {worktree_dir}\n")
+    nested = griptree / "docs"
+    nested.mkdir()
+
+    root_bucket = project_worktree_dir(griptree)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert root_bucket == nested_bucket
+    assert root_bucket == grip / ".synapt" / "recall" / "worktrees" / "dev-tree"
+
+
+def test_worktree_bucket_uses_a_linked_repo_file_as_its_root(tmp_path):
+    """A linked repository's .git file is a root marker, not a directory."""
+    grip = _make_gripspace(tmp_path)
+    main_repo = _make_git_repo(grip, "repo-a")
+    worktree_dir = main_repo / ".git" / "worktrees" / "dev"
+    worktree_dir.mkdir(parents=True)
+
+    griptree = tmp_path / "dev-tree"
+    griptree.mkdir()
+    (griptree / ".gitgrip").mkdir()
+    (griptree / ".gitgrip" / "griptree.json").write_text("{}")
+    linked_repo = griptree / "repo-a"
+    linked_repo.mkdir()
+    (linked_repo / ".git").write_text(f"gitdir: {worktree_dir}\n")
+    nested = linked_repo / "src" / "synapt"
+    nested.mkdir(parents=True)
+
+    root_bucket = project_worktree_dir(linked_repo)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert root_bucket == nested_bucket
+    assert root_bucket == grip / ".synapt" / "recall" / "worktrees" / "repo-a"
+
+
 class TestProjectTranscriptDirsGripspace:
     """Tests for gripspace-aware transcript discovery."""
 
