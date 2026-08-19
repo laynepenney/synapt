@@ -630,6 +630,43 @@ def test_second_build_reports_that_it_skipped(tmp_path, capsys):
     assert "skip" in out, f"a no-op build did not report skipped stages:\n{out}"
 
 
+def test_the_skip_line_does_not_name_a_stage_that_actually_ran(tmp_path, capsys):
+    """The skip line is load-bearing prose: an operator reads it and stops looking.
+
+    `archive_transcripts` is Step 1 and has ALREADY RUN by the time the no-op
+    check fires. It copied nothing -- which is exactly why the signature matches
+    -- but a stage that executed must not be listed as skipped.
+
+    The test above asserts only that "up to date" and "skip" appear, so it
+    passes on a truthful line and on a false one alike. This pins which stages
+    the line is allowed to name, in both directions: the three that really were
+    skipped must be there, and archive must not be among them.
+    """
+    from synapt.recall.cli import _archive_and_build
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    capsys.readouterr()
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    out = capsys.readouterr().out
+
+    skip_lines = [ln for ln in out.splitlines() if "skipped" in ln.lower()]
+    assert skip_lines, f"no skip line to check:\n{out}"
+    # Only the claim itself, not any parenthetical explaining what DID run.
+    claimed = skip_lines[0].lower().split("(")[0]
+    assert "archive" not in claimed, (
+        f"the skip line claims archive was skipped, but archiving is Step 1 and "
+        f"ran before the check:\n{skip_lines[0]}"
+    )
+    for stage in ("parse", "enrich", "index"):
+        assert stage in claimed, f"skip line does not name {stage}:\n{skip_lines[0]}"
+
+
 def test_second_build_after_a_change_does_not_claim_to_be_up_to_date(tmp_path, capsys):
     """NEGATIVE CONTROL for the message itself.
 
@@ -719,4 +756,502 @@ def test_cli_and_mcp_defaults_agree():
     mcp_default = inspect.signature(recall_build).parameters["incremental"].default
     assert cli_default == mcp_default, (
         f"CLI default ({cli_default}) and MCP default ({mcp_default}) disagree"
+    )
+
+
+# ===========================================================================
+# F. The stored signature must describe what the index actually CONTAINS
+# ===========================================================================
+#
+# The signature is recomputed AFTER the build, because the build mutates one of
+# its own signed inputs (it synthesizes auto-journal stubs), so a pre-build
+# signature could never match on an untouched workspace. That fix opened a
+# window: anything arriving between the index save and the recompute is stat'd
+# into the stored signature while never reaching the index. The next run then
+# compares equal, prints "Up to date", and the content is invisible forever --
+# a false no-op, which is the one direction this whole feature must not fail in.
+#
+# Both witnesses below fail on the v3 implementation. (Atlas, r2 on v3.)
+
+def _chatgpt_conversation(conv_id: str, text: str) -> dict:
+    """A minimal but genuinely parseable ChatGPT export conversation."""
+    from conftest import chatgpt_message
+    return {
+        "id": conv_id,
+        "title": conv_id,
+        "create_time": 1769000000.0,
+        "update_time": 1769000600.0,
+        "current_node": "n2",
+        "mapping": {
+            "n0": {"id": "n0", "parent": None, "children": ["n1"], "message": None},
+            "n1": {"id": "n1", "parent": "n0", "children": ["n2"],
+                   "message": chatgpt_message("user", f"question about {text}")},
+            "n2": {"id": "n2", "parent": "n1", "children": [],
+                   "message": chatgpt_message("assistant", f"answer about {text}")},
+        },
+    }
+
+
+def _chunk_text(chunk) -> str:
+    return f"{chunk.user_text}\n{chunk.assistant_text}"
+
+
+def test_a_transcript_arriving_during_the_build_is_not_certified_as_indexed(
+    tmp_path, capsys, monkeypatch
+):
+    """Content that arrived after the index was written must not be signed for.
+
+    The stored signature is the next run's whole basis for skipping work. If it
+    describes disk at manifest time rather than the input state the index was
+    built from, a file that landed in between is certified as indexed without
+    ever having been read -- and the run that would have caught it is exactly
+    the run that skips.
+    """
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.core import TranscriptIndex
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    real_save = TranscriptIndex.save
+    arrived = {"yet": False}
+
+    def save_then_a_transcript_arrives(self, directory):
+        result = real_save(self, directory)
+        if not arrived["yet"]:
+            arrived["yet"] = True
+            _transcript(source / "late.jsonl", turns=6, prefix="LATEARRIVALSENTINEL")
+        return result
+
+    monkeypatch.setattr(TranscriptIndex, "save", save_then_a_transcript_arrives)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    monkeypatch.undo()
+    assert arrived["yet"], "the arrival never fired; this witness proved nothing"
+    capsys.readouterr()
+
+    index = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    out = capsys.readouterr().out
+
+    hits = [c for c in index.chunks if "LATEARRIVALSENTINEL" in _chunk_text(c)]
+    assert hits, (
+        "a transcript that arrived after the index was saved was folded into the "
+        "stored signature, so the next run reported nothing to do and the content "
+        f"was never indexed:\n{out}"
+    )
+
+
+def test_a_changed_chatgpt_archive_defeats_the_noop(tmp_path, capsys):
+    """Every input the build READS must be an input the signature COVERS.
+
+    `chatgpt_archive` is parsed into the index on every build and was absent
+    from the signature, so replacing the archive wholesale left the digest
+    unchanged and the next run skipped. The sibling of the coverage gap this
+    file already pins for journals: the signature and the build must read the
+    same set, or the no-op is computed over a strict subset of the truth.
+    """
+    from synapt.recall.cli import _archive_and_build
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+    archive = tmp_path / "conversations.json"
+    archive.write_text(json.dumps([_chatgpt_conversation("c1", "the first topic")]))
+
+    _archive_and_build(
+        project, source_dirs=[source], use_embeddings=False, incremental=True,
+        chatgpt_archive=str(archive),
+    )
+    capsys.readouterr()
+
+    archive.write_text(json.dumps([
+        _chatgpt_conversation("c1", "the first topic"),
+        _chatgpt_conversation("c2", "CHATGPTLATESENTINEL"),
+    ]))
+    _set_mtime(archive, time.time() + 10)
+
+    index = _archive_and_build(
+        project, source_dirs=[source], use_embeddings=False, incremental=True,
+        chatgpt_archive=str(archive),
+    )
+    out = capsys.readouterr().out
+
+    assert "up to date" not in out.lower(), (
+        f"the archive changed and the build called itself up to date:\n{out}"
+    )
+    hits = [c for c in index.chunks if "CHATGPTLATESENTINEL" in _chunk_text(c)]
+    assert hits, f"a changed ChatGPT archive was never re-read:\n{out}"
+
+
+def test_a_journal_entry_arriving_during_the_build_is_not_certified_as_indexed(
+    tmp_path, capsys, monkeypatch
+):
+    """The arrival guard must cover journals too, not exclude the class.
+
+    v4 excluded journals from the read-only comparison because the build WRITES
+    them (auto-journal stubs), so they differ by design. Correct about the
+    build's own writes, and it made every GENUINE journal arrival invisible:
+    excluding a class to avoid a false positive surrenders the true positives
+    with it. The distinction the guard needs is not journal-vs-other, it is
+    before-the-read vs after-the-read. (Atlas, r2 on v4.)
+    """
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.core import TranscriptIndex
+    from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    real_save = TranscriptIndex.save
+    arrived = {"yet": False}
+
+    def save_then_a_journal_entry_arrives(self, directory):
+        result = real_save(self, directory)
+        if not arrived["yet"]:
+            arrived["yet"] = True
+            append_entry(
+                JournalEntry(
+                    timestamp="2026-08-19T12:00:00+00:00",
+                    session_id="journal-late-arrival",
+                    focus="JOURNALLATESENTINEL arrived after the index was written",
+                    auto=False,
+                ),
+                _journal_path(project),
+            )
+        return result
+
+    monkeypatch.setattr(TranscriptIndex, "save", save_then_a_journal_entry_arrives)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    monkeypatch.undo()
+    assert arrived["yet"], "the arrival never fired; this witness proved nothing"
+    capsys.readouterr()
+
+    index = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    out = capsys.readouterr().out
+
+    hits = [c for c in index.chunks if "JOURNALLATESENTINEL" in _chunk_text(c)]
+    assert hits, (
+        "a journal entry that arrived after the index was saved was folded into "
+        "the stored signature, so the next run reported nothing to do and the "
+        f"entry was never indexed:\n{out}"
+    )
+
+
+def test_the_persisted_signature_is_the_one_that_was_compared(
+    tmp_path, capsys, monkeypatch
+):
+    """The guard must certify the SAME object it validated.
+
+    v5 compared journals, then compared read-only inputs, then computed a THIRD
+    full signature to persist. Anything arriving after the comparisons and
+    before that third call is absent from the index, present in the stored
+    signature, and certified as indexed on the next run. Two samples of the same
+    quantity are not the same sample, and a guard that checks one while
+    persisting the other has verified nothing about what it wrote.
+
+    The trigger fires on the first signature computation AFTER the index has
+    been written, which exists in both the defective and the corrected shape --
+    so this cannot pass by never having fired. (Atlas, r2 on v5.)
+    """
+    from synapt.recall import build_delta
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.core import TranscriptIndex
+    from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    state = {"index_saved": False, "arrival_fired": False, "calls_after_save": 0}
+    real_save = TranscriptIndex.save
+    real_signature = build_delta.compute_input_signature
+
+    def save_marking_the_boundary(self, directory):
+        result = real_save(self, directory)
+        state["index_saved"] = True
+        return result
+
+    def signature_then_a_late_arrival(*args, **kwargs):
+        result = real_signature(*args, **kwargs)
+        if state["index_saved"]:
+            state["calls_after_save"] += 1
+            if not state["arrival_fired"]:
+                state["arrival_fired"] = True
+                append_entry(
+                    JournalEntry(
+                        timestamp="2026-08-19T13:00:00+00:00",
+                        session_id="post-guard-arrival",
+                        focus="POSTGUARDSENTINEL landed after the guard sampled",
+                        auto=False,
+                    ),
+                    _journal_path(project),
+                )
+        return result
+
+    monkeypatch.setattr(TranscriptIndex, "save", save_marking_the_boundary)
+    monkeypatch.setattr(build_delta, "compute_input_signature", signature_then_a_late_arrival)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    monkeypatch.undo()
+
+    assert state["index_saved"], "the index was never saved; this witness proved nothing"
+    assert state["arrival_fired"], (
+        "no signature was computed after the index was written, so the arrival "
+        "never fired and this witness proved nothing"
+    )
+    capsys.readouterr()
+
+    index = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    out = capsys.readouterr().out
+
+    hits = [c for c in index.chunks if "POSTGUARDSENTINEL" in _chunk_text(c)]
+    assert hits, (
+        "an entry arriving after the guard sampled was written into the stored "
+        "signature by a later, uncompared computation, so the next run reported "
+        f"nothing to do and never indexed it "
+        f"({state['calls_after_save']} signature calls after the index save):\n{out}"
+    )
+
+
+def test_a_transcript_arriving_before_the_read_boundary_is_not_certified(
+    tmp_path, capsys, monkeypatch
+):
+    """The window between build start and the journal read boundary is guarded.
+
+    Found by mutation, not by review: disabling the start-to-read-boundary
+    comparison killed no test, which means that guard was load-bearing and
+    unwitnessed. An arrival while transcripts are being parsed is absent from
+    the index but PRESENT in the read-boundary sample, so it would be persisted
+    as certified and the next run would skip.
+
+    A guard whose removal breaks nothing is indistinguishable from a guard that
+    does nothing, and the difference only shows up in production.
+    """
+    from synapt.recall import core as recall_core
+    from synapt.recall.cli import _archive_and_build
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    state = {"fired": False}
+    real_build_index = recall_core.build_index
+
+    def build_index_then_a_transcript_arrives(*args, **kwargs):
+        result = real_build_index(*args, **kwargs)
+        if not state["fired"]:
+            state["fired"] = True
+            _transcript(source / "midparse.jsonl", turns=6, prefix="MIDPARSESENTINEL")
+        return result
+
+    monkeypatch.setattr(recall_core, "build_index", build_index_then_a_transcript_arrives)
+    monkeypatch.setattr("synapt.recall.cli.build_index", build_index_then_a_transcript_arrives)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    monkeypatch.undo()
+    assert state["fired"], "the arrival never fired; this witness proved nothing"
+    capsys.readouterr()
+
+    index = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    out = capsys.readouterr().out
+
+    hits = [c for c in index.chunks if "MIDPARSESENTINEL" in _chunk_text(c)]
+    assert hits, (
+        "a transcript that arrived while transcripts were being parsed was "
+        "sampled into the read-boundary signature it never reached the index "
+        f"through, so the next run skipped:\n{out}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# G. Sign what the build PARSES, not what it copies FROM
+# ---------------------------------------------------------------------------
+#
+# Step 1 copies transcripts into the project archive; every later stage parses
+# the ARCHIVE (`build_sources`). The signature signed `source_dirs` -- the
+# outside directories it copies from -- so anything that reaches the archive by
+# another route, or after the sample, is parsed without ever being signed.
+# Third instance of the same class this file already pins for journals and for
+# the ChatGPT export. (Stromus, r1 on v6.)
+
+def _codex_rollout(sessions_dir: Path, project_dir: Path, name: str, text: str) -> Path:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    entries = [
+        {"timestamp": "2026-03-01T10:00:00Z", "type": "session_meta",
+         "payload": {"id": name, "cwd": str(project_dir)}},
+        {"timestamp": "2026-03-01T10:00:01Z", "type": "response_item",
+         "payload": {"role": "user", "content": [{"type": "input_text", "text": f"question {text}"}]}},
+        {"timestamp": "2026-03-01T10:00:02Z", "type": "response_item",
+         "payload": {"role": "assistant", "content": [{"type": "output_text", "text": f"answer {text}"}]}},
+    ]
+    path = sessions_dir / f"rollout-{name}.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for e in entries:
+            f.write(json.dumps(e) + "\n")
+    return path
+
+
+def test_a_new_codex_transcript_defeats_the_noop(tmp_path, capsys, monkeypatch):
+    """Codex transcripts reach the archive the build parses, by their own route.
+
+    They are copied in Step 1 from ~/.codex/sessions and were in NO signature,
+    so a Codex workspace prints "Archived 1 Codex transcript(s)" and then "Up to
+    date" in the same run, and the transcript is never parsed. Signing the
+    outside source directories cannot see this, because Codex never passes
+    through them.
+    """
+    from synapt.recall import codex as codex_mod
+    from synapt.recall.cli import _archive_and_build
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+    sessions = tmp_path / "codex-sessions" / "2026" / "03" / "01"
+    _codex_rollout(sessions, project, "first", "about the first codex thing")
+
+    real_archive = codex_mod.archive_codex_transcripts
+    monkeypatch.setattr(
+        codex_mod, "archive_codex_transcripts",
+        lambda project_dir, sessions_dir=None: real_archive(
+            project_dir, sessions_dir=tmp_path / "codex-sessions"),
+    )
+
+    first = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    assert any("about the first codex thing" in _chunk_text(c) for c in first.chunks), (
+        "the Codex control never landed; this witness would prove nothing"
+    )
+    capsys.readouterr()
+
+    _codex_rollout(sessions, project, "second", "CODEXLATESENTINEL")
+
+    index = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    out = capsys.readouterr().out
+
+    assert "up to date" not in out.lower(), (
+        f"a new Codex transcript was archived and the build called itself up to date:\n{out}"
+    )
+    hits = [c for c in index.chunks if "CODEXLATESENTINEL" in _chunk_text(c)]
+    assert hits, f"a new Codex transcript reached the archive and was never parsed:\n{out}"
+
+
+def test_a_source_write_after_the_archive_copy_is_not_certified(tmp_path, capsys, monkeypatch):
+    """Step 1 copies, then the signature samples. The gap between is real.
+
+    A transcript landing after the copy but before the sample is absent from the
+    archive the build parses and present in a signature taken over the source
+    directories, so it is persisted as certified. The next run copies it into the
+    archive and then skips, because the source side has not moved since.
+    """
+    from synapt.recall import archive as archive_mod
+    from synapt.recall.cli import _archive_and_build
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    state = {"fired": False}
+    real_archive_transcripts = archive_mod.archive_transcripts
+
+    def archive_then_a_source_write(*args, **kwargs):
+        result = real_archive_transcripts(*args, **kwargs)
+        if not state["fired"]:
+            state["fired"] = True
+            _transcript(source / "postcopy.jsonl", turns=6, prefix="POSTCOPYSENTINEL")
+        return result
+
+    monkeypatch.setattr(archive_mod, "archive_transcripts", archive_then_a_source_write)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    monkeypatch.undo()
+    assert state["fired"], "the post-copy write never fired; this witness proved nothing"
+    capsys.readouterr()
+
+    index = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    out = capsys.readouterr().out
+
+    hits = [c for c in index.chunks if "POSTCOPYSENTINEL" in _chunk_text(c)]
+    assert hits, (
+        "a transcript written after the archive copy was signed as certified, so "
+        f"the next run copied it into the archive and then skipped parsing it:\n{out}"
+    )
+
+
+def test_a_channel_message_arriving_before_the_read_boundary_is_not_certified(
+    tmp_path, monkeypatch
+):
+    """The start-to-read-boundary comparison is load-bearing, and witnessed.
+
+    Found by mutation twice: it originally guarded mid-parse transcript
+    arrivals, and keying the signature on `build_sources` subsumed that case,
+    so the mutation stopped reddening anything. Its remaining responsibility is
+    channels and the archive, parsed BEFORE the journal read boundary. The
+    arrival fires from stub synthesis, which runs after channel parsing and
+    before that boundary -- squarely inside the window.
+
+    Store resolution is pinned through the explicit env seam rather than
+    inferred from cwd. An earlier attempt at this witness resolved the channels
+    directory by inference and was defeated by it; that is the store-resolution
+    class, not this guard, and the fix is to stop inferring. (Atlas, r2 on v7.)
+    """
+    from synapt.recall import journal as journal_mod
+    from synapt.recall.cli import _archive_and_build
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    ch = tmp_path / "channels"
+    ch.mkdir()
+    monkeypatch.setenv("SYNAPT_SHARED_CHANNELS_DIR", str(ch))
+    (ch / "dev.jsonl").write_text(json.dumps({
+        "id": "m1", "timestamp": "2026-03-01T09:00:00Z", "channel": "dev",
+        "type": "message", "body": "the first channel message", "from": "a",
+    }) + "\n")
+
+    state = {"fired": False}
+    real_synth = journal_mod.synthesize_journal_stubs
+
+    def synthesize_then_a_channel_arrives(*args, **kwargs):
+        result = real_synth(*args, **kwargs)
+        if not state["fired"]:
+            state["fired"] = True
+            (ch / "late.jsonl").write_text(json.dumps({
+                "id": "m2", "timestamp": "2026-03-01T09:30:00Z", "channel": "late",
+                "type": "message", "body": "CHANNELMIDPARSESENTINEL", "from": "b",
+            }) + "\n")
+        return result
+
+    monkeypatch.setattr(journal_mod, "synthesize_journal_stubs", synthesize_then_a_channel_arrives)
+    first = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+    monkeypatch.setattr(journal_mod, "synthesize_journal_stubs", real_synth)
+
+    assert state["fired"], "the channel arrival never fired; this witness proved nothing"
+    assert any(c.session_id.startswith("channel_") for c in first.chunks), (
+        "channels were never indexed at all; this witness would prove nothing"
+    )
+    assert not [c for c in first.chunks if "CHANNELMIDPARSESENTINEL" in _chunk_text(c)], (
+        "the late channel file was parsed by the run that created it; the arrival "
+        "did not land inside the intended window"
+    )
+
+    index = _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    hits = [c for c in index.chunks if "CHANNELMIDPARSESENTINEL" in _chunk_text(c)]
+    assert hits, (
+        "a channel message that arrived after channels were parsed was sampled "
+        "into the read-boundary signature it never reached the index through"
     )

@@ -204,6 +204,28 @@ def _release_build_lock(fd: int) -> None:
         os.close(fd)
 
 
+def _build_journal_files(project_dir: Path) -> list[Path]:
+    """Every journal file this build reads: local, plus each other worktree's.
+
+    Extracted so the no-op SIGNATURE and the build itself cannot read different
+    sets. Two independent derivations of "the inputs" are two chances to
+    disagree, and a signature covering fewer files than the build reads produces
+    a FALSE no-op -- the build reports "up to date" while a real change sits
+    unindexed, which is the one failure direction with no external symptom.
+    """
+    from synapt.recall.journal import _journal_path
+
+    local_journal = _journal_path(project_dir)
+    files = [local_journal]
+    for wt_archive in all_worktree_archive_dirs(project_dir):
+        # Archive dir is <main>/.synapt/recall/worktrees/<name>/transcripts/;
+        # the journal sits beside it at .../<name>/journal.jsonl
+        wt_journal = wt_archive.parent / "journal.jsonl"
+        if wt_journal.resolve() != local_journal.resolve() and wt_journal.exists():
+            files.append(wt_journal)
+    return files
+
+
 def _archive_and_build(
     project_dir: Path,
     source_dirs: list[Path] | None = None,
@@ -290,6 +312,73 @@ def _archive_and_build_locked(
         print(f"  Sharded layout: {db.shard_count} data shard(s)")
     else:
         db = RecallDB(index_dir / "recall.db")
+
+    # Fingerprint the inputs and short-circuit a no-op run.
+    #
+    # NOT before all work: archiving (Step 1) has already run and scanned the
+    # source dirs by this point. It copied nothing -- which is exactly why the
+    # signature matches, since the signature is path, size and mtime -- but the
+    # skip line must not claim a stage was skipped when it executed. An operator
+    # reads that line and stops looking, so it says what actually happened.
+    #
+    # A fast build and a broken build look identical from outside unless the
+    # build says which stages it skipped, so the no-op path REPORTS as well as
+    # returning early. Computed unconditionally, not only when incremental, so a
+    # full rebuild still leaves a baseline for the next incremental run --
+    # otherwise the first incremental build after any full one can never be a
+    # no-op and the signal looks broken.
+    #
+    # `is_noop` fails toward doing the work when the prior signature is absent,
+    # malformed, or version-mismatched. That asymmetry is deliberate: a wrong
+    # "changed" costs one unnecessary build, while a wrong "unchanged" leaves
+    # real content unindexed and prints a reassuring line about it.
+    from synapt.recall.build_delta import (
+        compute_input_signature,
+        is_noop,
+        signature_from_manifest,
+        signature_to_manifest,
+    )
+    from synapt.recall.channel import _channels_dir
+
+    # The ChatGPT export is parsed into the index on every build, so it is a
+    # build input and must be a signed one (Atlas, r2 on v3).
+    archive_paths = [Path(chatgpt_archive).expanduser()] if chatgpt_archive else []
+
+    def _readonly_signature():
+        """Signature over the inputs the build only READS.
+
+        Keyed on `build_sources` -- the ARCHIVE the build actually parses -- and
+        not on `source_dirs`, the outside directories Step 1 copies FROM. Signing
+        the copy source cannot see anything reaching the archive by another route
+        (Codex rollouts are copied straight from the Codex sessions directory and
+        never pass through source_dirs at all), and it mis-times everything else:
+        a transcript written after Step 1's copy is present in source_dirs and
+        absent from the archive, so it gets signed as parsed without having been.
+        Sign what is PARSED, not what it was copied from (Stromus, r1 on v6).
+
+        Journals are excluded deliberately: the build WRITES them (auto-journal
+        stubs), so they differ before and after by design and cannot be used to
+        detect an outside arrival. Everything here is content the build treats
+        as immutable for the duration of the run, which makes a difference
+        between two samples of it proof that something landed mid-build.
+        """
+        return compute_input_signature(
+            source_dirs=build_sources,
+            channels_dir=_channels_dir(project_dir),
+            archive_paths=archive_paths,
+        )
+
+    readonly_before = _readonly_signature()
+    build_signature = compute_input_signature(
+        source_dirs=build_sources,
+        channels_dir=_channels_dir(project_dir),
+        journal_paths=_build_journal_files(project_dir),
+        archive_paths=archive_paths,
+    )
+    if incremental and is_noop(signature_from_manifest(db.load_manifest()), build_signature):
+        print("  Up to date: no transcript, channel or journal input changed")
+        print("  Skipped: parse, enrich, index (archive scanned; nothing new)")
+        return TranscriptIndex.load(index_dir)
 
     # Step 4: Load existing data for incremental builds
     incremental_manifest = None
@@ -392,17 +481,11 @@ def _archive_and_build_locked(
     from synapt.recall.journal import _journal_path, synthesize_journal_stubs
     from synapt.recall.core import parse_journal_entries
 
-    # Collect journal files from all worktrees for the shared index
-    journal_files: list[Path] = []
+    journal_files = _build_journal_files(project_dir)
+    # Recomputed rather than taken as journal_files[0]: relying on the
+    # helper's ordering would make a harmless reordering there a silent
+    # bug here.
     local_journal = _journal_path(project_dir)
-    journal_files.append(local_journal)
-    # Also include journals from other worktrees
-    for wt_archive in all_worktree_archive_dirs(project_dir):
-        # Archive dir is <main>/.synapt/recall/worktrees/<name>/transcripts/
-        # Journal is at <main>/.synapt/recall/worktrees/<name>/journal.jsonl
-        wt_journal = wt_archive.parent / "journal.jsonl"
-        if wt_journal.resolve() != local_journal.resolve() and wt_journal.exists():
-            journal_files.append(wt_journal)
 
     transcript_chunks = [c for c in all_chunks if c.turn_index >= 0]
     if transcript_chunks:
@@ -413,6 +496,33 @@ def _archive_and_build_locked(
         synthesized = synthesize_journal_stubs(sessions, local_journal, project_root=str(project_dir))
         if synthesized:
             print(f"  Auto-journal: {synthesized} stub(s) synthesized")
+
+    # THE JOURNAL READ BOUNDARY. Stub synthesis is done; parsing has not begun.
+    # This is the journal state the index is about to reflect, and it is the
+    # only sample that can tell the build's OWN writes from an outside arrival:
+    # everything before this line is ours, everything after it is somebody
+    # else's. v4 excluded journals from the arrival guard entirely to avoid
+    # mistaking synthesis for an arrival -- correct about our writes, and it
+    # surrendered every genuine journal arrival along with them (Atlas, r2 on
+    # v4: an entry appended after the index save was certified as indexed and
+    # the next run returned zero of it). Excluding a class to suppress a false
+    # positive gives up the true positives in the same motion.
+    # ONE FULL SAMPLE, TAKEN HERE, AND IT IS THE ONE THAT GETS PERSISTED.
+    # v5 compared journals, then compared read-only inputs, then computed a
+    # THIRD signature to store -- so the value written to the manifest was never
+    # the value that was checked, and anything arriving in between was certified
+    # as indexed without being read (Atlas, r2 on v5: measured, three signature
+    # computations after the index write). Two samples of the same quantity are
+    # not the same sample. The stored signature is therefore taken HERE, before
+    # any guard runs, and the guards only decide whether to keep it: nothing that
+    # happens later can enter a value that was already computed.
+    signature_at_read = compute_input_signature(
+        source_dirs=build_sources,
+        channels_dir=_channels_dir(project_dir),
+        journal_paths=journal_files,
+        archive_paths=archive_paths,
+    )
+    readonly_at_read = _readonly_signature()
 
     # Journal entries → searchable chunks from ALL worktrees
     for journal_file in journal_files:
@@ -651,7 +761,69 @@ def _archive_and_build_locked(
                 "mtime": st.st_mtime,
                 "size": st.st_size,
             })
-    db.save_manifest({"source_files": source_files})
+    # Persist the signature alongside the file list so the NEXT run can tell
+    # "nothing changed" from "no idea". Written in the same call, because a
+    # manifest that has the file list but not the signature is a state where
+    # the no-op check silently never fires.
+    # RECOMPUTED, not the pre-build value. The build MUTATES ONE OF ITS OWN
+    # SIGNED INPUTS: it synthesizes auto-journal stubs, so the journal on disk
+    # after a build differs from the journal it read. Storing the pre-build
+    # signature means the next run computes a different digest from an unchanged
+    # workspace and the no-op can NEVER fire -- measured: pre 26636950,
+    # post f4d4491d, on a workspace nobody touched in between.
+    #
+    # What is stored is therefore "the input state as of the end of this build",
+    # which is exactly what the next run's pre-build signature is compared against.
+    #
+    # BUT A RECOMPUTE ALSO PICKS UP ARRIVALS. Anything that landed between the
+    # index write and this line gets stat'd into the stored signature while
+    # never having been read, so the next run compares equal, prints "Up to
+    # date", and the content is invisible until something else happens to
+    # change the digest. Measured on v3: a transcript dropped after the index
+    # save was certified as indexed and returned zero content (Atlas, r2).
+    #
+    # So the signature is stored ONLY when the read-only inputs are unchanged
+    # since the build read them. When they are not, the manifest keeps its file
+    # list and carries NO signature, which `signature_from_manifest` resolves to
+    # None and `is_noop` resolves to work. Failing toward one unnecessary build
+    # is the same asymmetry the no-op check already documents, applied to the
+    # one window where the build cannot vouch for its own inputs.
+    #
+    # TWO WINDOWS, TWO COMPARISONS, AND THE PERSISTED VALUE IS OLDER THAN BOTH.
+    #   1. start -> read boundary: read-only inputs must not have moved while
+    #      transcripts, channels and the archive were being parsed. Journals are
+    #      excluded from THIS one only, because the build writes them in this
+    #      window and would otherwise flag its own synthesis as an arrival.
+    #   2. read boundary -> now: the full input set, all four classes, must be
+    #      unchanged. Recomputed over the CURRENT sets rather than the ones read,
+    #      so a file that APPEARED mid-build also fails -- the safe direction.
+    # What is stored is `signature_at_read`, sampled before either comparison,
+    # so an arrival at any later point -- including after this very check --
+    # cannot be inside it. The next run then computes a different digest and
+    # does the work.
+    #
+    # The first comparison is witnessed by the channel-arrival test. It
+    # originally guarded mid-parse TRANSCRIPT arrivals; keying the signature on
+    # `build_sources` subsumed that case, leaving it responsible for channels
+    # and the archive, which are parsed before the journal read boundary.
+    # Its witness pins store resolution through the explicit env seam rather
+    # than inferring it from cwd -- an earlier attempt inferred, was defeated by
+    # its own inference, and was wrongly reported as blocked by test isolation.
+    manifest_payload = {"source_files": source_files}
+    inputs_stable = (
+        readonly_at_read.digest == readonly_before.digest
+        and compute_input_signature(
+            source_dirs=build_sources,
+            channels_dir=_channels_dir(project_dir),
+            journal_paths=_build_journal_files(project_dir),
+            archive_paths=archive_paths,
+        ).digest == signature_at_read.digest
+    )
+    if inputs_stable:
+        manifest_payload.update(signature_to_manifest(signature_at_read))
+    else:
+        print("  Note: input changed during the build; next run will not skip")
+    db.save_manifest(manifest_payload)
 
     logger.info("build: complete in %.1fs (%d chunks)", _time.monotonic() - build_t0, len(deduped))
     return final_index
@@ -2793,17 +2965,84 @@ def cmd_migrate_channels(args: "argparse.Namespace") -> None:
 # Argparse
 # ---------------------------------------------------------------------------
 
-def main():
-    # Configure logging so build progress is visible on stderr.
-    # Only set up if no handlers exist yet (avoid duplicate output when
-    # called from the MCP server, which configures its own logging).
-    if not logging.getLogger("synapt").handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(message)s",
-            stream=sys.stderr,
-        )
+def cmd_maintain(args: argparse.Namespace) -> None:
+    """Grind LLM cluster summaries on request, bounded, and report the backlog.
 
+    This is the grinder's explicit home. `build` no longer calls it, because an
+    unbounded grind inside a build made a routine rebuild unpredictably slow and
+    gave the operator no way to decline it.
+
+    The backlog is REPORTED, never silently drained: a queue that is being
+    worked and a queue that is stuck look identical from outside unless the
+    number left is printed, so it is printed even when it is zero.
+    """
+    # Import the MODULE, not the name. The grinder is swapped at runtime -- by
+    # tests, and by anyone pointing it at a different backend -- and a
+    # `from ... import upgrade_large_cluster_summaries` binds at import time, so
+    # the swap would be silently ignored while everything still looked correct.
+    from synapt.recall import clustering
+    from synapt.recall.core import project_data_dir
+    from synapt.recall.storage import RecallDB
+
+    min_chunks = 5
+    index_dir = project_data_dir(None) / "index"
+    if not index_dir.exists():
+        print(f"No recall index at {index_dir}; run `synapt build` first.")
+        return
+
+    from synapt.recall.sharding import is_sharded
+    if is_sharded(index_dir):
+        from synapt.recall.sharded_db import ShardedRecallDB
+        db = ShardedRecallDB.open(index_dir)
+    else:
+        db = RecallDB(index_dir / "recall.db")
+
+    try:
+        upgraded = clustering.upgrade_large_cluster_summaries(
+            db, min_chunks=min_chunks, max_upgrades=args.limit
+        )
+        # Count what is LEFT with the grinder's own eligibility criteria rather
+        # than a paraphrase of them: a backlog measured by a slightly different
+        # query is a number about a different question.
+        remaining = db._conn.execute(
+            "SELECT COUNT(*) "
+            "FROM clusters c "
+            "LEFT JOIN cluster_summaries cs "
+            "  ON c.cluster_id = cs.cluster_id AND cs.method = 'llm' "
+            "WHERE c.status = 'active' "
+            "  AND c.chunk_count >= ? "
+            "  AND cs.cluster_id IS NULL",
+            (min_chunks,),
+        ).fetchone()[0]
+    finally:
+        db.close()
+
+    print(f"maintain: upgraded {upgraded} cluster summar{'y' if upgraded == 1 else 'ies'}")
+    print(f"  {remaining} remaining above the {min_chunks}-chunk threshold")
+
+
+class _FullRebuild(argparse.Action):
+    """``--full`` sets BOTH ``full`` and ``incremental`` rather than leaving one
+    to be derived from the other.
+
+    A reader of the parsed namespace should not have to compute
+    ``incremental = not full``: two fields that must agree are two chances to
+    disagree, and this pair has already diverged once across two surfaces.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        namespace.full = True
+        namespace.incremental = False
+
+
+def make_parser() -> argparse.ArgumentParser:
+    """Build the full `synapt` argument parser.
+
+    Extracted from ``main()`` so DEFAULTS ARE TESTABLE. While the parser was
+    built inline, no test could ask what a bare ``synapt build`` actually
+    does, which is how the CLI and the MCP surface drifted to opposite
+    defaults for the same operation without anything going red.
+    """
     parser = argparse.ArgumentParser(
         prog="synapt",
         description="Persistent conversational memory for Claude Code sessions (per-project)",
@@ -2824,7 +3063,25 @@ def main():
     build_parser.add_argument("--chatgpt-archive", help="Path to ChatGPT export .zip (or conversations.json)")
     build_parser.add_argument("--out", default=None, help="Output directory for index (default: per-project)")
     build_parser.add_argument("--no-embeddings", action="store_true", help="Skip embeddings (BM25-only, faster build)")
-    build_parser.add_argument("--incremental", action="store_true", help="Skip already-indexed files")
+    # DEFAULT: incremental. `--full` is the explicit opt-out.
+    #
+    # The CLI defaulted to a FULL rebuild while MCP `recall_build` defaulted to
+    # incremental: the same operation with opposite defaults depending on which
+    # surface you reached through. Nothing went red because the parser was built
+    # inline inside main(), so no test could ask what a bare `synapt build` does.
+    # test_cli_and_mcp_defaults_agree now pins the two together; changing either
+    # default alone fails it.
+    build_parser.set_defaults(incremental=True, full=False)
+    _build_mode = build_parser.add_mutually_exclusive_group()
+    _build_mode.add_argument(
+        "--full", action=_FullRebuild, nargs=0,
+        help="Rebuild everything from scratch (opt out of the incremental default)",
+    )
+    _build_mode.add_argument(
+        "--incremental", action="store_true",
+        help="Skip already-indexed files. Now the default; still accepted so "
+             "scripts and hooks that pass it explicitly keep working.",
+    )
     build_parser.add_argument("--rescrub", action="store_true", help="Re-scrub archived transcripts with latest patterns before building")
 
     # Split
@@ -3017,6 +3274,17 @@ def main():
     channel_parser.add_argument("--name", default=None,
                                 help="Display name for join action")
 
+    maintain_parser = subparsers.add_parser(
+        "maintain",
+        help="Upgrade cluster summaries with an LLM, bounded, and report the backlog",
+    )
+    maintain_parser.add_argument(
+        "--limit", type=int, default=5,
+        help="Maximum summaries to generate this run (default: 5). Bounded by "
+             "default on purpose: an unbounded grind is what this command exists "
+             "to replace.",
+    )
+
     migrate_parser = subparsers.add_parser(
         "migrate",
         help="Migrate local .synapt/recall/channels/ to global ~/.synapt/channels/ store",
@@ -3033,10 +3301,27 @@ def main():
         "--project", default=None,
         help="Project ID (auto-detected from gripspace manifest if not set)",
     )
+    return parser
+
+
+def main():
+    # Configure logging so build progress is visible on stderr.
+    # Only set up if no handlers exist yet (avoid duplicate output when
+    # called from the MCP server, which configures its own logging).
+    if not logging.getLogger("synapt").handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            stream=sys.stderr,
+        )
+
+    parser = make_parser()
 
     args = parser.parse_args()
 
-    if args.command == "setup":
+    if args.command == "maintain":
+        cmd_maintain(args)
+    elif args.command == "setup":
         cmd_setup(args)
     elif args.command == "build":
         cmd_build(args)

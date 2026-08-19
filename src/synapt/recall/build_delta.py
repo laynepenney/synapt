@@ -98,8 +98,15 @@ def _iter_input_files(
     source_dirs: Sequence[Path] | None,
     channels_dir: Path | None,
     journal_paths: Iterable[Path] | None,
+    archive_paths: Iterable[Path] | None = None,
 ) -> list[Path]:
-    """Every file the build would read, from all three input classes.
+    """Every file the build would read, from all FOUR input classes.
+
+    `archive_paths` covers the ChatGPT export, which the build parses into the
+    index on every run and which this function did not see: replacing the
+    archive wholesale left the digest unchanged and the next run skipped it.
+    An input the build READS and the signature does not COVER makes the no-op
+    a decision over a strict subset of the truth (Atlas, r2 on v3).
 
     Directories are GLOBBED rather than read from a remembered list, so a newly
     arrived file changes the signature.  A signature built only from files it
@@ -123,6 +130,11 @@ def _iter_input_files(
         if journal.is_file():
             files.append(journal)
 
+    for archive in archive_paths or ():
+        archive = Path(archive)
+        if archive.is_file():
+            files.append(archive)
+
     return files
 
 
@@ -130,8 +142,9 @@ def compute_input_signature(
     source_dirs: Sequence[Path] | None = None,
     channels_dir: Path | None = None,
     journal_paths: Iterable[Path] | None = None,
+    archive_paths: Iterable[Path] | None = None,
 ) -> InputSignature:
-    """Fingerprint the build's inputs across transcripts, channels and journals.
+    """Fingerprint the build's inputs: transcripts, channels, journals, archives.
 
     Sorted before hashing so the digest depends on the input set and not on
     filesystem iteration order, which varies between runs and would otherwise
@@ -140,7 +153,7 @@ def compute_input_signature(
     does so *intermittently* is worse, because it trains people to distrust it.
     """
     entries: list[str] = []
-    for path in _iter_input_files(source_dirs, channels_dir, journal_paths):
+    for path in _iter_input_files(source_dirs, channels_dir, journal_paths, archive_paths):
         try:
             stat = path.stat()
         except OSError:
