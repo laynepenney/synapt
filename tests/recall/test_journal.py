@@ -336,6 +336,88 @@ class TestDedupAndCompact(unittest.TestCase):
         self.assertEqual(latest.next_steps, ["current next step"])
         self.assertNotIn("completed item", latest.done)
 
+    def test_dedup_orders_mixed_timestamp_formats_chronologically(self):
+        """A naive legacy timestamp is UTC, not a lexicographic timestamp."""
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T12:00:00", session_id="resumed-session",
+            focus="older naive entry", auto=False,
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T11:30:00-02:00", session_id="resumed-session",
+            focus="newer aware entry", auto=False,
+        ), self.path)
+
+        latest = read_latest(self.path)
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest.focus, "newer aware entry")
+
+    def test_read_and_compact_order_mixed_timestamp_formats_chronologically(self):
+        """All journal ordering uses the same timestamp interpretation."""
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T12:00:00", session_id="naive",
+            focus="older naive entry", auto=False,
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T11:30:00-02:00", session_id="aware",
+            focus="newer aware entry", auto=False,
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T10:00:00+00:00", session_id="dedup",
+            focus="discarded auto entry", auto=True,
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T10:30:00+00:00", session_id="dedup",
+            focus="dedup winner", auto=False,
+        ), self.path)
+
+        self.assertEqual(
+            [entry.focus for entry in read_entries(self.path, n=2)],
+            ["newer aware entry", "older naive entry"],
+        )
+
+        self.assertEqual(compact_journal(self.path), 1)
+        with open(self.path) as f:
+            stored = [json.loads(line)["focus"] for line in f if line.strip()]
+        self.assertEqual(
+            stored,
+            ["dedup winner", "older naive entry", "newer aware entry"],
+        )
+
+    def test_unparseable_timestamp_sorts_before_known_timestamps(self):
+        """A malformed legacy timestamp cannot displace a dated entry."""
+        append_entry(JournalEntry(
+            timestamp="not-a-timestamp", session_id="unknown", focus="unknown time",
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T10:00:00+00:00", session_id="known", focus="known time",
+        ), self.path)
+
+        self.assertEqual(
+            [entry.focus for entry in read_entries(self.path, n=2)],
+            ["known time", "unknown time"],
+        )
+
+    def test_extreme_offset_timestamp_sorts_before_known_timestamps(self):
+        """A parseable legacy value that overflows UTC conversion stays readable."""
+        append_entry(JournalEntry(
+            timestamp="0001-01-01T00:00:00+05:00", session_id="underflow",
+            focus="underflow time",
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="9999-12-31T23:59:59-05:00", session_id="overflow",
+            focus="overflow time",
+        ), self.path)
+        append_entry(JournalEntry(
+            timestamp="2026-08-13T10:00:00+00:00", session_id="known",
+            focus="known time",
+        ), self.path)
+
+        entries = read_entries(self.path, n=3)
+
+        self.assertEqual(entries[0].focus, "known time")
+        self.assertEqual({entry.focus for entry in entries[1:]}, {"underflow time", "overflow time"})
+
     def test_compact_journal_removes_duplicates(self):
         """compact_journal deduplicates and sorts the file."""
         append_entry(JournalEntry(
