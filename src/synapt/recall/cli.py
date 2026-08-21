@@ -2385,15 +2385,23 @@ def _dev_loop_activation_prompt(project: Path) -> str | None:
             f"Use the startup context to choose the next concrete task."
         )
 
-    interval = (
-        os.environ.get("SYNAPT_LOOP_INTERVAL")
-        or str(agent_cfg.get("loop_interval") or "2m")
-    )
+    # No resume is performed here, so the label does not claim one. The prior
+    # text read "SessionStart:resume hook success", which announced a handoff
+    # the hook never carried out -- a label is not a mechanism, and this one
+    # survived truncation more reliably than the context it mislabelled.
+    #
+    # The monitoring loop is likewise removed rather than reworded: a
+    # cadence-poll spends context re-reading unchanged state, and an agent
+    # that waits to be prompted does not need one.
+    # Claude CAN self-wake where Codex cannot, which is why this instruction
+    # had to be retired deliberately instead of falling away on its own.
     return (
-        f"SessionStart:resume hook success: Agent {agent_name} — join #{channel} "
-        f"and start monitoring loop at {interval} interval. Use recall_channel to "
-        f"join, CronCreate for the loop. Use show_pins=false and detail=medium for "
-        f"polling. Prefer doing needed work over reporting that work exists."
+        f"SessionStart:startup context loaded: Agent {agent_name} — join "
+        f"#{channel} once with recall_channel if channel context is needed. "
+        f"Do NOT create a cron loop or poll on a cadence: the monitoring "
+        f"loop is deprecated. Wait to be prompted, and notify your "
+        f"coordinator when a task completes. Prefer doing needed work over "
+        f"reporting that work exists."
     )
 
 
@@ -2511,7 +2519,8 @@ def cmd_hook(args: argparse.Namespace) -> None:
 
         # 10. Dev-loop activation prompt — deterministic hook replaces
         #     unreliable skill auto-activation (~20%). The agent reads this
-        #     system reminder and follows the instructions to start monitoring.
+        #     system reminder as its startup instruction; it does not start
+        #     a monitoring loop.
         try:
             prompt = _dev_loop_activation_prompt(project)
             if prompt:
