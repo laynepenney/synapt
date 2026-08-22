@@ -85,6 +85,7 @@ from synapt.recall.journal import (
     _read_all_session_ids,
     auto_extract_entry,
     append_entry,
+    split_journal_field,
 )
 
 
@@ -1722,12 +1723,12 @@ def cmd_journal(args: argparse.Namespace) -> None:
     if args.focus:
         entry.focus = args.focus
     if args.done:
-        entry.done = [d.strip() for d in args.done.split(";")]
+        entry.done = split_journal_field(args.done)
     if args.decisions:
-        entry.decisions = [d.strip() for d in args.decisions.split(";")]
+        entry.decisions = split_journal_field(args.decisions)
     explicit_next_steps = list(entry.next_steps)
     if args.next:
-        entry.next_steps = [n.strip() for n in args.next.split(";")]
+        entry.next_steps = split_journal_field(args.next)
         explicit_next_steps = list(entry.next_steps)
     entry.next_steps = merge_carried_forward_next_steps(
         entry.next_steps,
@@ -3181,9 +3182,9 @@ def make_parser() -> argparse.ArgumentParser:
     journal_parser.add_argument("--list", action="store_true", help="List recent journal entries")
     journal_parser.add_argument("--show", type=int, default=None, help="Show Nth most recent entry")
     journal_parser.add_argument("--focus", default=None, help="What this session was about")
-    journal_parser.add_argument("--done", default=None, help="What got done (semicolon-separated)")
-    journal_parser.add_argument("--decisions", default=None, help="Key decisions (semicolon-separated)")
-    journal_parser.add_argument("--next", default=None, help="Next steps (semicolon-separated)")
+    journal_parser.add_argument("--done", default=None, help="What got done (one per line; a single-line value falls back to semicolon-separated)")
+    journal_parser.add_argument("--decisions", default=None, help="Key decisions (one per line; a single-line value falls back to semicolon-separated)")
+    journal_parser.add_argument("--next", default=None, help="Next steps (one per line; a single-line value falls back to semicolon-separated)")
     journal_parser.add_argument("--repair", action="store_true",
                                 help="Recover fields swallowed by an unclosed tool-call parameter (append-only)")
     journal_parser.add_argument("--dry-run", action="store_true",

@@ -146,7 +146,7 @@ def _get_index(use_embeddings: bool = True) -> TranscriptIndex | None:
             try:
                 from synapt.recall.journal import (
                     extract_session_id, latest_transcript_path,
-                )
+        )
                 live_path = latest_transcript_path()
                 if live_path:
                     _cached_index._current_session_id = extract_session_id(live_path)
@@ -1638,9 +1638,20 @@ def recall_journal(
         action: "read" (latest entry), "write" (create entry), "list" (recent entries),
             or "pending" (unresolved carry-forward next steps only).
         focus: What this session was about (write only).
-        done: Semicolon-separated list of accomplishments (write only).
-        decisions: Semicolon-separated list of key decisions (write only).
-        next_steps: Semicolon-separated list of next steps (write only).
+        done: Accomplishments, ONE PER LINE (write only).
+        decisions: Key decisions, ONE PER LINE (write only).
+        next_steps: Next steps, ONE PER LINE (write only).
+
+    Item separation: these three fields split on NEWLINES, so a semicolon inside
+    a multi-line field is ordinary punctuation and the sentence stays whole. If a
+    field contains NO newline it falls back to splitting on semicolons, which
+    keeps older single-line callers working -- so a semicolon inside a
+    single-line item WILL still split it. Write one item per line and this never
+    bites you.
+
+    Ordering: the session-start read is TRUNCATED, and it leads with next_steps.
+    Put what is unresolved there; completed work is recoverable from version
+    control and the tracker, an unrecorded open question is not.
     """
     try:
         from synapt.recall.journal import (
@@ -1655,6 +1666,7 @@ def recall_journal(
             read_entries,
             read_latest,
             read_previous_meaningful,
+            split_journal_field,
         )
 
         if action == "read":
@@ -1687,12 +1699,12 @@ def recall_journal(
             if focus:
                 entry.focus = focus
             if done:
-                entry.done = [d.strip() for d in done.split(";")]
+                entry.done = split_journal_field(done)
             if decisions:
-                entry.decisions = [d.strip() for d in decisions.split(";")]
+                entry.decisions = split_journal_field(decisions)
             explicit_next_steps = list(entry.next_steps)
             if next_steps:
-                entry.next_steps = [n.strip() for n in next_steps.split(";")]
+                entry.next_steps = split_journal_field(next_steps)
                 explicit_next_steps = list(entry.next_steps)
             entry.next_steps = merge_carried_forward_next_steps(
                 entry.next_steps,
