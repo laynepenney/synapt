@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from synapt.recall.journal import (
     JournalEntry,
+    split_journal_field,
     _dedup_entries,
     append_entry,
     auto_extract_entry,
@@ -727,3 +728,73 @@ class TestPendingNextSteps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestJournalFieldSurvivesTheReader(unittest.TestCase):
+    """The claim is not "what I wrote" -- it is "what the reader receives"."""
+
+    def test_prose_with_a_semicolon_reaches_the_reader_whole(self):
+        # Written the way agents actually write these fields: one item per line,
+        # with semicolons as ordinary punctuation inside a sentence.
+        written = (
+            "LIVE HAZARD: do not run the cleanup; the installed binary predates the fix\n"
+            "second item"
+        )
+        entry = JournalEntry(timestamp="2026-01-01T00:00", next_steps=split_journal_field(written))
+
+        # Read back what a FRESH SESSION RECEIVES, not what was written.
+        served = format_for_session_start(entry)
+
+        self.assertIn(
+            "do not run the cleanup; the installed binary predates the fix",
+            served,
+            "the sentence must reach the reader whole -- a fragment reads as a terse "
+            "note rather than as damage, so nothing looks broken",
+        )
+        self.assertEqual(len(entry.next_steps), 2, "one item per line, not per clause")
+
+    def test_single_line_semicolons_still_split_for_existing_callers(self):
+        # Control, and a documented limit: with no newline the semicolon behaviour
+        # is exactly what it was, so `--done "a; b; c"` keeps working.
+        self.assertEqual(split_journal_field("a; b; c"), ["a", "b", "c"])
+
+
+class TestBoundedReadLeadsWithOpenThreads(unittest.TestCase):
+    """This read is BOUNDED, so whatever leads consumes the window."""
+
+    def test_open_threads_precede_completed_work(self):
+        entry = JournalEntry(
+            timestamp="2026-01-01T00:00",
+            done=["shipped the thing"],
+            decisions=["chose the approach"],
+            next_steps=["LIVE HAZARD: unresolved"],
+        )
+        served = format_for_session_start(entry)
+
+        hazard = served.index("LIVE HAZARD: unresolved")
+        completed = served.index("shipped the thing")
+        self.assertLess(
+            hazard,
+            completed,
+            "completed work is recoverable from git and the board; an unrecorded "
+            "open question is recoverable from nowhere, so it must not be the part "
+            "that gets truncated away",
+        )
+
+        # Positive control: both are actually present, so the ordering assertion
+        # is about ORDER and cannot pass by one of them simply being absent.
+        self.assertIn("shipped the thing", served)
+        self.assertIn("chose the approach", served)
+
+    def test_full_display_teaches_the_same_priority(self):
+        entry = JournalEntry(
+            timestamp="2026-01-01T00:00",
+            done=["shipped the thing"],
+            next_steps=["still open"],
+        )
+        text = format_entry_full(entry)
+        self.assertLess(
+            text.index("### Next"),
+            text.index("### Done"),
+            "two surfaces that teach different priorities are their own defect",
+        )
