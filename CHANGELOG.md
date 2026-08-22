@@ -2,6 +2,91 @@
 
 All notable changes to synapt are documented here.
 
+## [0.19.0] — 2026-08-21
+
+**Counting rule, stated so it can be checked.** Range `ca62880..bc594f3` — from the 0.18.0
+promotion merge to the `dev` tip at this release. Over that range: **35 commits total, 17 of
+them merge commits and 18 direct. 17 first-parent commits.**
+
+Composition of those 17, by path: **12 touch `src/` when each unit is diffed against its first
+parent**; 5 touch only tests, docs, or fixtures; and one of those 5 (`116ffcc`) is a
+post-promotion topology-repair merge carrying no content by its own message. "Reviewed units
+landed" is therefore 16 if you mean units that changed something, and 17 if you mean merges in
+the range.
+
+**The diff method is part of the claim, not pedantry.** A merge commit has no canonical diff.
+Against first parent — or `git log --first-parent --diff-merges=first-parent` — the answer is
+12. But `git show <merge> --name-only`, which is the command most readers will reach for first,
+returns **0**: a combined diff omits everything that was not a conflict resolution, and it does
+so silently rather than as an error. A count offered for checking is worth only as much as the
+method that reproduces it.
+
+**Why 0.19.0 and not 0.18.1.** 0.18.0 was published to PyPI at `2026-08-07T18:01:21Z`. **Every
+one of the 17 units above landed after that instant** — measured against each commit's date,
+not inferred. The published 0.18.0 artifact contains none of this work. PyPI forbids
+re-uploading a version, so this is a new minor rather than a patch to the existing one.
+
+An earlier draft of this section said "11 of the units above landed after that date." **The
+number 11 was real but attached to the wrong category** — it counts units carrying product
+changes, which the prose never named, while the sentence was making a claim about *timing*,
+where the true answer is all 17. Caught in review before this shipped. Worth recording rather than silently
+correcting, because this section's heading invites a reader to check the numbers, and a reader
+who finds one that fails has no way to know the other four are exact.
+
+### Fixed
+- **Windows test collection, broken on every pull request since 2026-08-07.**
+  `tests/recall_store_isolation.py` imported the POSIX-only `pwd` module at module scope, and
+  `conftest.py` imports that module at *root* scope. The `ModuleNotFoundError` therefore fired
+  before any collection at all — earlier than skip markers exist, so no marker could have
+  applied — taking down the entire Windows run rather than one module. The import is now made
+  at call time. POSIX behaviour is byte-identical.
+
+  **What is recorded here is the fact, without a theory attached.** Across all 19 pull-request
+  runs since 0.18.0 published, three Windows jobs failed in **every single one**, without
+  exception. That is measured, not sampled.
+
+  Why it went unaddressed for two weeks is **not something this entry can answer honestly.** An
+  earlier draft offered an explanation — that the rest of the matrix stayed green, so a
+  partially-red result read as a flaky lane rather than a broken one. Measurement does not
+  support it: that pattern holds in 8 of the 19 runs and is false in the other 11, where the
+  entire matrix was red for reasons this fix does not address and this entry does not diagnose.
+  The explanation was removed rather than softened.
+
+  Deliberately **not** replaced with `Path.home()`: that function reads `$HOME`, which is
+  precisely the value a test fixture can move, and the protected boundary must not be
+  derivable from the value under test or the guarantee becomes circular. On Windows the
+  function still raises, loudly and at the point of use, which is the honest outcome for a
+  POSIX-only guarantee.
+
+### Added
+- **Incremental builds by default**, with a new `maintain` command and change-detection
+  idempotence.
+
+### Changed
+- **Summary work moved out of `build` and into `maintain`.** This is a user-visible behaviour
+  change, not only an internal one: a `build` that previously produced summaries no longer
+  does, and `maintain` is where that work now happens.
+
+### Improved
+- **Store and data-root isolation**, including a resolution fix so that membership takes
+  precedence over locality.
+- **Journal correctness**, and a root-resolution fix across the archive verbs — export and
+  import, and also the archive, CLI, and server paths.
+- **`code_git` hardening** and a session-start prompt fix.
+
+### Documentation
+- Fixture provenance is now declared for the identify test fixtures.
+
+### Note on the changelog gap
+**0.15.2, 0.15.3, 0.16.0, 0.17.0, and 0.18.0 shipped without changelog entries** — the gap is
+wider than the three versions an earlier draft named. Rather than reconstruct them after the
+fact from commit archaeology, it is recorded here honestly.
+
+Their content **is** recoverable from the git history between the corresponding tags. **All five
+were checked on the public remote** with `ls-remote` — `v0.15.2`, `v0.15.3`, `v0.16.0`,
+`v0.17.0`, and `v0.18.0` — not merely the three an earlier draft vouched for while naming five.
+A recovery instruction is worth only as much as the refs it names.
+
 ## [0.15.1] — 2026-05-12
 
 ### Fixed
