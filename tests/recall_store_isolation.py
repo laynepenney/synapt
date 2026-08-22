@@ -15,7 +15,6 @@ installed they do nothing at all.
 from __future__ import annotations
 
 import os
-import pwd
 from pathlib import Path
 
 
@@ -35,7 +34,20 @@ def account_home() -> Path:
     precisely because a fixture can move both of those. The protected boundary
     must not be derivable from the value a test is currently asking the code to
     use, or every guarantee here becomes circular.
+
+    ``pwd`` is imported here rather than at module scope because it is POSIX-only.
+    At module scope it raises ``ModuleNotFoundError`` on Windows during pytest
+    *collection* — before any skip marker could apply — which took down the whole
+    Windows run rather than this one module. Importing at call time keeps
+    collection working everywhere and leaves POSIX behaviour byte-identical.
+
+    Deliberately NOT replaced with ``Path.home()``: that reads ``$HOME``, which is
+    exactly the value a fixture can move, and would make the boundary circular in
+    the way the paragraph above forbids. On Windows this still raises, loudly and
+    at the point of use, which is the honest outcome for a POSIX-only guarantee.
     """
+    import pwd
+
     return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
 
 
