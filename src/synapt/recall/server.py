@@ -658,10 +658,11 @@ def recall_export(
     """
     from synapt.recall.archive import export_recall_archive
 
-    project = Path.cwd().resolve()
+    # None => resolve via SYNAPT_RECALL_ROOT + inference. Forwarding Path.cwd()
+    # would suppress the override.
     try:
         archive_path, manifest = export_recall_archive(
-            project,
+            None,
             Path(output_path).expanduser() if output_path else None,
             exclude_transcripts=exclude_transcripts,
             exclude_channels=exclude_channels,
@@ -671,6 +672,7 @@ def recall_export(
 
     return (
         f"Recall archive exported to {archive_path}\n"
+        f"  - store: {manifest.get('data_dir', '?')}\n"
         f"  - chunks: {manifest.get('chunk_count', 0)}\n"
         f"  - knowledge: {manifest.get('knowledge_count', 0)}\n"
         f"  - worktrees: {manifest.get('worktree_count', 0)}"
@@ -686,9 +688,8 @@ def recall_import(archive_path: str, mode: str = "replace") -> str:
     """
     from synapt.recall.archive import import_recall_archive
 
-    project = Path.cwd().resolve()
     try:
-        summary = import_recall_archive(project, Path(archive_path), mode=mode)
+        summary = import_recall_archive(None, Path(archive_path), mode=mode)
     except Exception as e:
         return f"Import failed: {e}"
 
@@ -696,7 +697,8 @@ def recall_import(archive_path: str, mode: str = "replace") -> str:
         f"Recall archive imported from {Path(archive_path).expanduser().resolve()}\n"
         f"  - mode: {summary.get('mode', mode)}\n"
         f"  - chunks: {summary.get('chunk_count', 0)}\n"
-        f"  - knowledge: {summary.get('knowledge_count', 0)}"
+        f"  - knowledge: {summary.get('knowledge_count', 0)}\n"
+        f"  - store: {summary.get('data_dir', '?')}"
     )
 
 

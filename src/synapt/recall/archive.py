@@ -44,6 +44,27 @@ def _data_dir(project_dir: Path) -> Path:
     return project_data_dir(project_dir)
 
 
+def _resolve_project_dir(project_dir: Path | None) -> Path:
+    """Resolve the workspace root, honoring ``SYNAPT_RECALL_ROOT`` when unset.
+
+    ``project_data_dir`` returns ``<root>/.synapt/recall``; the archive code
+    wants ``<root>``. Derive it from the resolved data dir so the env override,
+    git-worktree, and gripspace inference all apply identically to the archive
+    verbs and to every other recall surface -- and verify the expected suffix
+    before stripping it (the same defense ``channel.py`` uses) rather than
+    trusting a blind ``parents[1]``.
+    """
+    if project_dir is not None:
+        return Path(project_dir).resolve()
+    data_dir = project_data_dir(None)
+    if data_dir.parent.name == ".synapt" and data_dir.name == "recall":
+        return data_dir.parent.parent
+    raise RuntimeError(
+        f"resolved recall data dir has an unexpected shape: {data_dir} "
+        f"(expected <root>/.synapt/recall); refusing to guess the root"
+    )
+
+
 def _index_dir(project_dir: Path) -> Path:
     """Return the recall index directory for *project_dir*."""
     return _data_dir(project_dir) / "index"
@@ -163,6 +184,13 @@ def _archive_manifest(
         "version": ARCHIVE_FORMAT_VERSION,
         "synapt_version": synapt_version,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        # The RESOLVED data directory the bytes actually came from, recorded
+        # after git-worktree and gripspace inference -- not the caller's
+        # argument. Reported by the CLI and MCP surfaces so a wrong-store
+        # export cannot hide behind plausible-looking counts, and so an
+        # explicit --path that inference redirects cannot hide behind a
+        # plausible-looking path either (recall#963 naming contract).
+        "data_dir": str(data_dir),
         "source_project": project_dir.name,
         "chunk_count": chunk_count,
         "knowledge_count": knowledge_count,
@@ -199,14 +227,23 @@ def _tar_add_file(tf: tarfile.TarFile, path: Path, arcname: str) -> None:
 
 
 def export_recall_archive(
-    project_dir: Path,
+    project_dir: Path | None = None,
     output_path: Path | None = None,
     *,
     exclude_transcripts: bool = False,
     exclude_channels: bool = False,
 ) -> tuple[Path, dict]:
-    """Export portable recall state to a ``.synapt-archive`` tar.gz file."""
-    project_dir = project_dir.resolve()
+    """Export portable recall state to a ``.synapt-archive`` tar.gz file.
+
+    *project_dir* is the workspace root to export. Pass ``None`` to resolve it
+    the same way every other recall surface does -- ``SYNAPT_RECALL_ROOT``
+    first, then git/gripspace inference, then cwd. Callers should only pass an
+    explicit root when they genuinely know it: ``project_data_dir`` consults
+    the env override ONLY when no root is passed, so a caller that forwards
+    ``Path.cwd()`` does not merely skip the override, it suppresses it. That
+    is how ``recall export`` silently exported the wrong store.
+    """
+    project_dir = _resolve_project_dir(project_dir)
     data_dir = _data_dir(project_dir)
     if not data_dir.exists():
         raise FileNotFoundError(f"No recall data found at {data_dir}")
@@ -534,7 +571,7 @@ def _rebuild_merged_index(
 
 
 def import_recall_archive(
-    project_dir: Path,
+    project_dir: Path | None,
     archive_path: Path,
     *,
     mode: str = "replace",
@@ -544,7 +581,20 @@ def import_recall_archive(
     ``mode="replace"`` fully restores the archived data directory.
     ``mode="merge"`` merges transcripts, journals, channels, reminders,
     and reconstructs a merged monolithic recall index from both sources.
+
+    *project_dir* follows the same rule as :func:`export_recall_archive`:
+    ``None`` resolves via ``SYNAPT_RECALL_ROOT`` and inference; an explicit
+    root suppresses the override, so pass one only when you truly know it.
+
+    The returned summary's ``data_dir`` is the RESOLVED destination store
+    this import wrote into, recorded after inference. The archive's own
+    origin store (its manifest ``data_dir``) is carried as
+    ``source_data_dir`` so the two are never confused: one names where the
+    bytes came from, the other where they landed. Archives written before
+    the manifest carried ``data_dir`` have no provenance to report, and the
+    key is omitted rather than set to ``None``, so absent reads as absent.
     """
+    project_dir = _resolve_project_dir(project_dir)
     if mode not in {"replace", "merge"}:
         raise ValueError("mode must be 'replace' or 'merge'")
 
@@ -573,6 +623,10 @@ def import_recall_archive(
             data_dir.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(extracted_dir, data_dir)
             summary = dict(manifest)
+            source_store = summary.pop("data_dir", None)
+            if source_store is not None:
+                summary["source_data_dir"] = source_store
+            summary["data_dir"] = str(data_dir)
             summary["mode"] = "replace"
             return summary
 
@@ -632,6 +686,10 @@ def import_recall_archive(
 
         summary = dict(manifest)
         summary.update(merged_index_stats)
+        source_store = summary.pop("data_dir", None)
+        if source_store is not None:
+            summary["source_data_dir"] = source_store
+        summary["data_dir"] = str(data_dir)
         summary["mode"] = "merge"
         summary["session_count"] = len({c.session_id for c in merged_chunks})
         return summary
@@ -681,9 +739,10 @@ def save_sync_config(project_dir: Path, config: dict) -> Path:
 def archive_transcripts(project_dir: Path, source_dir: Path) -> list[Path]:
     """Copy new transcript files from Claude Code's source dir to the project archive.
 
-    Skips files that already exist with the same size. Overwrites if the
-    source grew since last archive. Preserves larger archives when the
-    source shrinks (e.g., /clear truncated the transcript).
+    Skips files that already exist with the same size AND no newer mtime.
+    Overwrites if the source grew since last archive, or if it was modified
+    without changing length. Preserves larger archives when the source
+    shrinks (e.g., /clear truncated the transcript).
 
     Args:
         project_dir: Root of the project (where .synapt/recall/ lives).
@@ -698,12 +757,34 @@ def archive_transcripts(project_dir: Path, source_dir: Path) -> list[Path]:
     copied = []
     for src_file in sorted(source_dir.glob("*.jsonl")):
         dst_file = archive_dir / src_file.name
-        src_size = src_file.stat().st_size
+        src_stat = src_file.stat()
+        src_size = src_stat.st_size
         if dst_file.exists():
-            dst_size = dst_file.stat().st_size
+            dst_stat = dst_file.stat()
+            dst_size = dst_stat.st_size
             if src_size == dst_size:
-                continue  # No change
-            if src_size < dst_size:
+                # Equal size is NOT equal content. An edit that preserves the
+                # byte count leaves the size identical, so size alone can never
+                # observe it and the file is skipped on every subsequent build,
+                # permanently. mtime is the second, independent signal; compare
+                # it in ns so float rounding cannot make an unchanged file look
+                # newer than itself. copy2 replicates the source mtime as
+                # faithfully as the DESTINATION filesystem allows, which is
+                # exactly where this can degrade: the archive may sit on a
+                # different filesystem than the source, and one storing a
+                # coarser mtime truncates the copied stamp, so the destination
+                # reads as older than its own source and the file re-copies on
+                # every build.
+                #
+                # That degeneration is accepted deliberately, because the two
+                # ways of being wrong are not symmetric. A strict comparison
+                # errs toward WORK: the cost is a bounded, repeated copy. A
+                # tolerance would err toward SKIP, silently treating an edit
+                # inside the tolerance window as unchanged -- which is the
+                # exact defect class this check exists to kill.
+                if src_stat.st_mtime_ns <= dst_stat.st_mtime_ns:
+                    continue
+            elif src_size < dst_size:
                 continue  # Source shrunk (e.g., /clear truncated) — keep larger archive
         shutil.copy2(src_file, dst_file)
         copied.append(dst_file)

@@ -150,6 +150,133 @@ class TestFindGripspaceRoot:
         result = project_data_dir(griptree)
         assert result == grip / ".synapt" / "recall"
 
+    def _make_member_carrying_both_markers(self, tmp_path: Path) -> tuple[Path, Path]:
+        """A directory that is BOTH a gr2 workspace and a declared member.
+
+        This combination is not hypothetical: a workspace acquires the gr2
+        marker when it is managed by gr2, and keeps its membership marker
+        because it is still a griptree of a larger gripspace. Every existing
+        test in this class builds one marker or the other, which is why the
+        suite could not see the ordering between them.
+        """
+        grip = _make_gripspace(tmp_path)
+        main_repo = grip / "my-repo"
+        main_repo.mkdir()
+        git_dir = main_repo / ".git"
+        git_dir.mkdir()
+        worktrees_dir = git_dir / "worktrees" / "dev"
+        worktrees_dir.mkdir(parents=True)
+
+        member = tmp_path / "dev-tree"
+        member.mkdir()
+        (member / ".gitgrip").mkdir()
+        (member / ".gitgrip" / "griptree.json").write_text(
+            '{"branch": "dev", "path": "' + str(member) + '"}'
+        )
+        linked_repo = member / "my-repo"
+        linked_repo.mkdir()
+        (linked_repo / ".git").write_text(f"gitdir: {worktrees_dir}\n")
+        # ...and it is also a gr2-managed workspace.
+        (member / ".grip").mkdir()
+        return grip, member
+
+    def test_membership_beats_locality(self, tmp_path):
+        """Both markers present: resolve to the whole, not to the part.
+
+        The two markers answer different questions. ".grip" asks "am I a
+        workspace containing units?"; the griptree marker asks "whose larger
+        whole am I part of?". Store resolution needs the second, because a
+        member's data belongs to the workspace it is a member of — resolving
+        to itself strands that data where no other surface in the workspace
+        looks, and reports nothing.
+        """
+        grip, member = self._make_member_carrying_both_markers(tmp_path)
+
+        assert _find_gripspace_root(member) == grip
+
+    def test_membership_beats_locality_at_the_data_dir(self, tmp_path):
+        """The same claim at the level the caller actually consumes.
+
+        Asserting the resolver alone would leave the reader-visible effect
+        unproven, and the reader-visible effect is the whole point: this is
+        the path a store lands on.
+        """
+        grip, member = self._make_member_carrying_both_markers(tmp_path)
+
+        assert project_data_dir(member) == grip / ".synapt" / "recall"
+
+    def test_gr2_locality_still_applies_without_a_membership_claim(self, tmp_path):
+        """The control for the two above: locality is narrowed, not removed.
+
+        A gr2 workspace with no membership marker must still resolve to
+        itself. Without this, the two tests above would also pass if the
+        ".grip" branch had simply been deleted.
+        """
+        workspace = _make_gr2_workspace(tmp_path)
+        unit_home = workspace / "units" / "u_one" / "home"
+        unit_home.mkdir(parents=True)
+
+        assert _find_gripspace_root(workspace) == workspace
+        assert _find_gripspace_root(unit_home) == workspace
+
+    def _make_unresolvable_member(
+        self, parent: Path, with_grip: bool, name: str = "member"
+    ) -> Path:
+        """A directory declaring membership whose parent cannot be resolved.
+
+        It has sub-directories but none carries a `.git` *file*, so the
+        worktree-pointer walk that resolves a griptree back to its parent
+        finds nothing to follow and reports no parent.
+        """
+        member = parent / name
+        member.mkdir()
+        (member / ".gitgrip").mkdir()
+        (member / ".gitgrip" / "griptree.json").write_text('{"branch": "dev"}')
+        (member / "docs").mkdir()
+        if with_grip:
+            (member / ".grip").mkdir()
+        return member
+
+    def test_unresolvable_membership_falls_back_to_locality(self, tmp_path):
+        """THE REGRESSION WITNESS — consulting membership first must not strand.
+
+        Membership is asserted here and cannot be verified. Before the marker
+        order changed, such a directory short-circuited on `.grip` and
+        resolved to itself; consulting membership first would instead resolve
+        it to nothing, and its sub-directories would each land on a store of
+        their own. That fragments a store that previously cohered, which is
+        the exact failure this function is being changed to prevent.
+
+        So the fall-through is not a nicety: without it this change is a
+        regression for this population. Pinned so no later edit can quietly
+        re-break it.
+        """
+        member = self._make_unresolvable_member(tmp_path, with_grip=True)
+        deep = member / "docs" / "deep"
+        deep.mkdir(parents=True)
+
+        assert _find_gripspace_root(member) == member
+        assert _find_gripspace_root(deep) == member
+        assert project_data_dir(deep) == member / ".synapt" / "recall"
+
+    def test_unresolvable_membership_without_locality_does_not_walk_upward(
+        self, tmp_path
+    ):
+        """The third case, pinned deliberately UNCHANGED rather than improved.
+
+        Membership asserted, unverifiable, and no locality evidence either.
+        There IS a gripspace root above it, so continuing the walk would find
+        a better answer than `None` — and that is precisely why this asserts
+        `None`. A real improvement here belongs to the change that can bring
+        its own evidence for it. Cause 1's claim is that every directory
+        either improves or is unchanged and nothing else moves; the moment it
+        also improves an unrelated case, that claim stops being checkable.
+        """
+        grip = _make_gripspace(tmp_path)
+        member = self._make_unresolvable_member(grip, with_grip=False)
+
+        assert _find_gripspace_root(member) is None
+
     def test_linked_griptree_no_subrepos_returns_none(self, tmp_path):
         """A linked griptree with no sub-repos can't resolve — returns None."""
         griptree = tmp_path / "orphan-tree"
@@ -279,6 +406,97 @@ class TestProjectDataDirGripspace:
         result_b = project_data_dir(repo_b)
 
         assert result_root == result_a == result_b
+
+
+def test_worktree_bucket_is_stable_below_a_gr2_workspace(tmp_path):
+    """A subdirectory must read the workspace's journal, not mint a slice.
+
+    The ``.grip`` marker deliberately holds the data root constant.  Before
+    recall#974's fix, only the bucket changed from ``workspace`` to ``server``.
+    """
+    workspace = _make_gr2_workspace(tmp_path)
+    nested = workspace / "server"
+    nested.mkdir()
+
+    root_bucket = project_worktree_dir(workspace)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert root_bucket == nested_bucket
+    assert root_bucket == workspace / ".synapt" / "recall" / "worktrees" / "gr2-workspace"
+
+
+def test_gr2_workspace_boundary_beats_an_enclosing_git_root(tmp_path):
+    """A workspace marker owns its namespace even inside another checkout."""
+    (tmp_path / ".git").mkdir()
+    workspace = _make_gr2_workspace(tmp_path)
+    nested = workspace / "server"
+    nested.mkdir()
+
+    assert project_worktree_dir(nested) == (
+        workspace / ".synapt" / "recall" / "worktrees" / "gr2-workspace"
+    )
+
+
+def test_worktree_bucket_uses_the_repo_root_beneath_a_gripspace(tmp_path):
+    """Constituent repos share the store but retain distinct stable buckets."""
+    grip = _make_gripspace(tmp_path)
+    repo = _make_git_repo(grip, "repo-a")
+    nested = repo / "src" / "synapt"
+    nested.mkdir(parents=True)
+
+    repo_bucket = project_worktree_dir(repo)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert repo_bucket == nested_bucket
+    assert repo_bucket == grip / ".synapt" / "recall" / "worktrees" / "repo-a"
+
+
+def test_worktree_bucket_is_stable_below_a_linked_griptree(tmp_path):
+    """A linked griptree root is its own bucket even without a root .git."""
+    grip = _make_gripspace(tmp_path)
+    main_repo = _make_git_repo(grip, "repo-a")
+    worktree_dir = main_repo / ".git" / "worktrees" / "dev"
+    worktree_dir.mkdir(parents=True)
+
+    griptree = tmp_path / "dev-tree"
+    griptree.mkdir()
+    (griptree / ".gitgrip").mkdir()
+    (griptree / ".gitgrip" / "griptree.json").write_text("{}")
+    linked_repo = griptree / "repo-a"
+    linked_repo.mkdir()
+    (linked_repo / ".git").write_text(f"gitdir: {worktree_dir}\n")
+    nested = griptree / "docs"
+    nested.mkdir()
+
+    root_bucket = project_worktree_dir(griptree)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert root_bucket == nested_bucket
+    assert root_bucket == grip / ".synapt" / "recall" / "worktrees" / "dev-tree"
+
+
+def test_worktree_bucket_uses_a_linked_repo_file_as_its_root(tmp_path):
+    """A linked repository's .git file is a root marker, not a directory."""
+    grip = _make_gripspace(tmp_path)
+    main_repo = _make_git_repo(grip, "repo-a")
+    worktree_dir = main_repo / ".git" / "worktrees" / "dev"
+    worktree_dir.mkdir(parents=True)
+
+    griptree = tmp_path / "dev-tree"
+    griptree.mkdir()
+    (griptree / ".gitgrip").mkdir()
+    (griptree / ".gitgrip" / "griptree.json").write_text("{}")
+    linked_repo = griptree / "repo-a"
+    linked_repo.mkdir()
+    (linked_repo / ".git").write_text(f"gitdir: {worktree_dir}\n")
+    nested = linked_repo / "src" / "synapt"
+    nested.mkdir(parents=True)
+
+    root_bucket = project_worktree_dir(linked_repo)
+    nested_bucket = project_worktree_dir(nested)
+
+    assert root_bucket == nested_bucket
+    assert root_bucket == grip / ".synapt" / "recall" / "worktrees" / "repo-a"
 
 
 class TestProjectTranscriptDirsGripspace:

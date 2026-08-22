@@ -396,7 +396,7 @@ def _set_manifest(project: Path, source_files: list[dict]) -> None:
     con.close()
 
 
-def test_cmd_resume_prints_the_stale_banner(store):
+def test_cmd_resume_prints_the_stale_banner(owned_recall_root, store):
     """The wiring, end to end: a stale store must say so in stdout."""
     _real_index(store)
     _archive_file(_archive_dir(store), "rollout-unindexed.jsonl", "turns nobody indexed")
@@ -408,7 +408,7 @@ def test_cmd_resume_prints_the_stale_banner(store):
     assert "recall build" in out, "the banner must carry its remedy"
 
 
-def test_cmd_resume_stays_quiet_when_the_index_is_current(store):
+def test_cmd_resume_stays_quiet_when_the_index_is_current(owned_recall_root, store):
     """Control: the banner is conditional, not unconditional decoration."""
     _real_index(store)
     f = _archive_file(_archive_dir(store), "rollout-indexed.jsonl", "turns")
@@ -420,7 +420,7 @@ def test_cmd_resume_stays_quiet_when_the_index_is_current(store):
     assert "a real question" in out, "the turns must still render"
 
 
-def test_cmd_resume_runs_the_deep_leg_only_when_cheap_is_fresh_and_view_empty(store, monkeypatch):
+def test_cmd_resume_runs_the_deep_leg_only_when_cheap_is_fresh_and_view_empty(owned_recall_root, store, monkeypatch):
     """The deep-trigger path, pinned at the call site rather than described."""
     import synapt.recall.freshness as fresh_mod
 

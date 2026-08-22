@@ -72,12 +72,13 @@ class TestGenerateStartupContext:
 
     def test_reminders_surfaced(self, tmp_path):
         """Pending reminders appear in startup context."""
-        from synapt.recall.reminders import add_reminder, _reminders_path
+        from synapt.recall.reminders import add_reminder
 
-        # Point reminders to tmp dir
-        rpath = _reminders_path()
-        rpath.parent.mkdir(parents=True, exist_ok=True)
-
+        # The two lines that used to stand here called the REAL _reminders_path()
+        # and mkdir'd its parent — creating a directory inside the operator's
+        # live store — and then threw the value away, because the patch below
+        # supplies the path that is actually used. Dead code that wrote to a
+        # real location while looking like setup for a temp one (Ref #967).
         with patch("synapt.recall.reminders._reminders_path") as mock_path:
             rfile = tmp_path / ".synapt" / "reminders.json"
             rfile.parent.mkdir(parents=True, exist_ok=True)
@@ -238,8 +239,20 @@ loop_interval = "1m"
         assert "deprecated for Codex" in prompt
         assert "CronCreate for the loop" not in prompt
 
-    def test_claude_prompt_keeps_croncreate_instruction(self, tmp_path):
-        """Claude agents keep the existing cron-backed monitoring instruction."""
+    def test_claude_prompt_claims_no_resume_and_no_loop(self, tmp_path):
+        """Claude agents are told what the hook DID, and not to poll.
+
+        This test previously asserted the opposite -- it pinned
+        "CronCreate for the loop" as required output, so the deprecated
+        monitoring loop was defended by a passing test after the
+        instruction had already been withdrawn. A green suite asserting
+        behaviour that was retired is worse than an untested one:
+        it reports agreement.
+
+        The label is checked too. The prompt used to open
+        "SessionStart:resume hook success" while performing no resume,
+        which is a claim about a mechanism that does not run.
+        """
         project = tmp_path / "worktree"
         project.mkdir()
         gitgrip = tmp_path / ".gitgrip"
@@ -260,8 +273,14 @@ loop_interval = "5m"
             prompt = _dev_loop_activation_prompt(project)
 
         assert prompt is not None
-        assert "CronCreate for the loop" in prompt
-        assert "5m interval" in prompt
+        # The label must not announce a resume the hook never performs.
+        assert "SessionStart:resume hook success" not in prompt
+        assert "startup context loaded" in prompt
+        # The deprecated loop must not be instructed, in any of its forms.
+        assert "CronCreate" not in prompt
+        assert "5m interval" not in prompt
+        assert "monitoring loop is deprecated" in prompt
+        assert "notify your coordinator" in prompt
 
 
 class TestStartupSubcommand:

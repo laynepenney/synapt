@@ -3,6 +3,8 @@
 import json
 import tempfile
 import unittest
+
+from _isolation_helpers import owned_store
 from pathlib import Path
 
 from synapt.recall.codex import (
@@ -571,6 +573,18 @@ class TestTheBuildPreCheckReadsTheCodexArm(unittest.TestCase):
     A guard whose result nothing consumes does not exist, so this drives the real
     pre-check branch rather than poking the helper.
     """
+
+    def setUp(self):
+        # cmd_build resolves the recall data root implicitly, so without an
+        # owned root this drives the pre-check against a live store (Ref #967).
+        # unittest.TestCase cannot take the shared fixture, so it uses the
+        # shared helper — this was a hand-rolled two-variable save/restore
+        # until now, which is exactly the duplication owned_store exists to
+        # remove. Consolidated: one restore path, not a per-class copy.
+        self._store = owned_store()
+
+    def tearDown(self):
+        self._store.restore()
 
     def _run_precheck(self, has_codex: bool):
         """Drive cmd_build's pre-check with everything downstream stubbed."""

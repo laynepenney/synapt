@@ -4359,13 +4359,6 @@ def _find_gripspace_root(path: Path) -> Path | None:
 
     home = Path.home().resolve()
     while current != current.parent:
-        # gr2 owns one .grip/ namespace at the workspace root. Spawned units
-        # live beneath it, so recognizing that marker makes their shared index
-        # and knowledge land at the containing workspace instead of at each
-        # unit cwd. This composes with the existing gr1 detector below.
-        if (current / ".grip").is_dir():
-            _gripspace_cache[cache_key] = (current, time.monotonic())
-            return current
         gitgrip = current / ".gitgrip"
         if gitgrip.is_dir():
             # Linked griptree has griptree.json (singular) — always resolve
@@ -4373,12 +4366,55 @@ def _find_gripspace_root(path: Path) -> Path | None:
             # happens when `gr` clones the full directory structure).
             if (gitgrip / "griptree.json").exists():
                 root = _resolve_griptree_parent(current)
-                _gripspace_cache[cache_key] = (root, time.monotonic())
-                return root
+                if root is not None:
+                    _gripspace_cache[cache_key] = (root, time.monotonic())
+                    return root
+                # Membership is ASSERTED here but could not be VERIFIED. Use
+                # the strongest signal that actually was verified: ".grip" is
+                # positive evidence this directory is a workspace, so fall
+                # through to it rather than reporting nothing.
+                #
+                # Without this, reordering the two markers would make things
+                # WORSE for exactly this population: such a directory used to
+                # short-circuit on ".grip" and resolve to itself, and would
+                # instead resolve to nothing — fragmenting a store that
+                # previously cohered, which is the failure this function is
+                # being changed to prevent.
+                if (current / ".grip").is_dir():
+                    _gripspace_cache[cache_key] = (current, time.monotonic())
+                    return current
+                # No membership we can verify and no locality evidence either.
+                # Return None EXACTLY as before, and deliberately do NOT keep
+                # walking upward. Continuing the walk might well find a better
+                # answer, but it would be a NEW behaviour for a case this
+                # change is not about, and it would break the property that
+                # makes this change checkable: every directory either improves
+                # or is unchanged, and nothing else moves.
+                _gripspace_cache[cache_key] = (None, time.monotonic())
+                return None
             # Gripspace root has only griptrees.json (plural), no singular
             if (gitgrip / "griptrees.json").exists():
                 _gripspace_cache[cache_key] = (current, time.monotonic())
                 return current
+
+        # MEMBERSHIP BEATS LOCALITY. gr2 owns one .grip/ namespace at the
+        # workspace root, and spawned units live beneath it, so recognizing
+        # that marker makes their shared index and knowledge land at the
+        # containing workspace instead of at each unit cwd. That is still
+        # true, and it is why this check exists.
+        #
+        # It is consulted AFTER the gr1 membership markers above, because the
+        # two answer different questions: ".grip" asks "am I a workspace
+        # containing units?", while .gitgrip/griptree.json asks "whose larger
+        # whole am I a part of?". A directory can hold both, and store
+        # resolution needs the second — a member's data belongs to the
+        # workspace it is a member of. Checked first, ".grip" would shadow the
+        # membership claim entirely: the directory resolves to itself, its
+        # data lands where no other surface in that workspace looks, and
+        # nothing anywhere reports a problem.
+        if (current / ".grip").is_dir():
+            _gripspace_cache[cache_key] = (current, time.monotonic())
+            return current
         # Don't walk above $HOME
         if current == home:
             break
@@ -4443,7 +4479,7 @@ def project_slug(project_dir: Path | None = None) -> str:
 
 
 def _worktree_name(project_dir: Path | None = None) -> str:
-    """Return the current worktree's name (its directory basename).
+    """Return the stable worktree or workspace name for per-worktree data.
 
     For the main worktree at ``/Users/me/Development/rd``, returns ``rd``.
     For a linked worktree at ``/Users/me/Development/poe``, returns ``poe``.
@@ -4465,7 +4501,56 @@ def _worktree_name(project_dir: Path | None = None) -> str:
                     f"per-worktree files outside worktrees/."
                 )
             return env_name
-    return (project_dir or Path.cwd()).resolve().name
+
+    current = (project_dir or Path.cwd()).resolve()
+    grip_root = _find_gripspace_root(current)
+    candidate = current
+    while candidate != candidate.parent:
+        # A .git marker identifies the root of either a main checkout or a
+        # linked worktree. It is a directory in the former and a file in the
+        # latter. Keep walking only until the nearest such root so a
+        # constituent repository retains its own bucket inside a shared
+        # gripspace store.
+        if (candidate / ".git").exists():
+            return candidate.name
+        if (candidate / ".gitgrip" / "griptree.json").exists():
+            return candidate.name
+        if candidate == grip_root:
+            break
+        candidate = candidate.parent
+
+    # A non-git directory inside a gripspace still belongs to the workspace.
+    # This mirrors data-root resolution and prevents a cwd subdirectory from
+    # becoming a second, silently partial journal bucket.
+    if grip_root is not None:
+        return grip_root.name
+    return current.name
+
+
+# ---------------------------------------------------------------------------
+# Data-root policy seam
+# ---------------------------------------------------------------------------
+# A consumer may install a callable consulted with (operation, path) when a
+# recall data root is resolved, before any directory is created or migrated.
+# With no policy installed this is a no-op and behaviour is unchanged.
+
+_data_root_policy = None
+
+
+def set_data_root_policy(policy):
+    """Install a recall data-root policy; returns the previous one."""
+    global _data_root_policy
+    previous = _data_root_policy
+    _data_root_policy = policy
+    return previous
+
+
+def _guard_data_root(operation: str, path: Path) -> Path:
+    """Consult the installed policy, then return *path* unchanged."""
+    policy = _data_root_policy
+    if policy is not None:
+        policy(operation, path)
+    return path
 
 
 def project_data_dir(project_dir: Path | None = None) -> Path:
@@ -4529,6 +4614,11 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
             root = grip_root
 
     new_dir = root / ".synapt" / "recall"
+
+    # Guarded before the legacy-migration tail below, which renames real
+    # directories on disk. A consumer may install a policy that refuses a
+    # resolved data root; with none installed this is a no-op.
+    _guard_data_root("project_data_dir", new_dir)
 
     if not new_dir.exists():
         # Tier 1: .synapse/recall/ (intermediate rename era)
@@ -4844,10 +4934,31 @@ def build_index(
             pass
 
     # Filter for incremental builds — skip files whose mtime AND size match
-    already_indexed: dict[str, tuple[float, int]] = {}
+    # Keyed on (source dir, name), never the basename alone: `source_files` is
+    # ONE flat list spanning every build source, so two worktrees archiving the
+    # same session name yield two entries. Under a basename key the second
+    # overwrites the first, and the loser's stamp can never match its own file —
+    # so it re-parses on every incremental build, forever, with no error.
+    #
+    # The key uses the source dir's BASENAME, which is unique only because the
+    # build sources are siblings under one root. A future multi-root source
+    # list can collide here the same way basenames collide today, and would
+    # need the fuller path. Impossible by topology now; stated so that whoever
+    # adds the second root meets this instead of rediscovering it.
+    already_indexed: dict[tuple[str, str], tuple[float, int]] = {}
+    # Manifests written before entries carried "dir" keep the old flat key.
+    # They cannot distinguish colliding basenames — that is the defect — but a
+    # legacy manifest is better than forcing one full rebuild on upgrade, and
+    # the next build rewrites the manifest in the scoped form.
+    legacy_indexed: dict[str, tuple[float, int]] = {}
     if incremental_manifest:
         for src in incremental_manifest.get("source_files", []):
-            already_indexed[src["name"]] = (src.get("mtime", 0), src.get("size", 0))
+            stamp = (src.get("mtime", 0), src.get("size", 0))
+            src_dir = src.get("dir")
+            if src_dir is None:
+                legacy_indexed[src["name"]] = stamp
+            else:
+                already_indexed[(src_dir, src["name"])] = stamp
 
     from synapt.recall.codex import is_codex_transcript, parse_codex_transcript
 
@@ -4857,8 +4968,11 @@ def build_index(
     parsed_files: list[Path] = []  # Track which files were actually parsed
 
     for filepath in jsonl_files:
-        if filepath.name in already_indexed:
-            stored_mtime, stored_size = already_indexed[filepath.name]
+        stamp = already_indexed.get((filepath.parent.name, filepath.name))
+        if stamp is None:
+            stamp = legacy_indexed.get(filepath.name)
+        if stamp is not None:
+            stored_mtime, stored_size = stamp
             stat = filepath.stat()
             if stat.st_mtime == stored_mtime and stat.st_size == stored_size:
                 skipped += 1
