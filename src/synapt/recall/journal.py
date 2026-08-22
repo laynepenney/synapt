@@ -119,6 +119,24 @@ def _entry_collapses(entry: JournalEntry) -> list[tuple[str, str]]:
     return found
 
 
+def split_journal_field(text: str) -> list[str]:
+    """Split a journal field into items, preferring newlines over semicolons.
+
+    Semicolons are ordinary punctuation in the prose these fields carry, so
+    splitting on them silently fragments sentences and strips their subject --
+    an entry that reads as terse notes rather than as damage. Newlines are how
+    the fields are actually written, one item per line.
+
+    Newline-first keeps every existing single-line caller working unchanged:
+    with no newline present the semicolon behaviour is exactly what it was.
+    """
+    if "\n" in text:
+        parts = text.split("\n")
+    else:
+        parts = text.split(";")
+    return [item.strip() for item in parts if item.strip()]
+
+
 def _served(values: list[str]) -> list[str]:
     """Drop collapsed values from anything about to be displayed.
 
@@ -446,10 +464,13 @@ def format_for_session_start(entry: JournalEntry) -> str:
     if entry.focus and not is_collapsed(entry.focus):
         lines.append(f"Last session ({ts}): {entry.focus}")
 
+    # Open threads FIRST. This read is BOUNDED, so ordering is not taste here --
+    # whatever leads consumes the window. Completed work is recoverable from git
+    # and the board; an unrecorded open question is recoverable from nowhere.
     for label, items in (
-        ("Done:", _served(entry.done)),
-        ("Decisions:", _served(entry.decisions)),
         ("Next steps:", _served(entry.next_steps)),
+        ("Decisions:", _served(entry.decisions)),
+        ("Done:", _served(entry.done)),
     ):
         if items:
             lines.append(label)
@@ -465,10 +486,13 @@ def format_entry_full(entry: JournalEntry) -> str:
         lines.append(f"**Branch:** {entry.branch}")
     if entry.focus and not is_collapsed(entry.focus):
         lines.append(f"**Focus:** {entry.focus}")
+    # Same order as the session-start read. This surface is unbounded, so the
+    # ordering is not forced here -- but two surfaces that teach different
+    # priorities are their own defect, and a human reading top-down also stops.
     for heading, items in (
-        ("\n### Done", _served(entry.done)),
-        ("\n### Decisions", _served(entry.decisions)),
         ("\n### Next", _served(entry.next_steps)),
+        ("\n### Decisions", _served(entry.decisions)),
+        ("\n### Done", _served(entry.done)),
     ):
         if items:
             lines.append(heading)
