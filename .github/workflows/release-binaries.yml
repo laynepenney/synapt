@@ -1,0 +1,97 @@
+name: release binaries
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build and attach binaries to"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos-aarch64
+            expected-arch: arm64
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            expected-arch: x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Verify runner architecture
+        shell: bash
+        run: test "$(uname -m)" = "${{ matrix.expected-arch }}"
+      - name: Build wheel and self-contained CLI
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check build pex
+          python -m build --wheel
+          pex dist/synapt-*.whl \
+            --exclude sentence-transformers \
+            --exclude mlx-lm \
+            --exclude anthropic \
+            --exclude openai-agents \
+            --console-script synapt \
+            --pip-version latest-compatible \
+            --scie eager \
+            --scie-only \
+            --scie-python-version 3.13 \
+            -o synapt
+      - name: Smoke test CLI and MCP server
+        shell: bash
+        run: |
+          set -o pipefail
+          clean_home="$(mktemp -d)"
+          env -i HOME="$clean_home" PATH=/usr/bin:/bin ./synapt --version | grep -F "${RELEASE_TAG#v}"
+          ./synapt --help | grep -F "persistent conversational memory"
+          response="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"release-smoke","version":"1"}}}' | ./synapt server)"
+          grep -F '"id":1' <<<"$response"
+          grep -F '"name":"synapt"' <<<"$response"
+      - name: Package artifact
+        shell: bash
+        run: |
+          tar -czf "synapt-${{ matrix.platform }}.tar.gz" synapt
+          shasum -a 256 "synapt-${{ matrix.platform }}.tar.gz" > "synapt-${{ matrix.platform }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: synapt-${{ matrix.platform }}
+          path: |
+            synapt-${{ matrix.platform }}.tar.gz
+            synapt-${{ matrix.platform }}.tar.gz.sha256
+
+  release:
+    name: Attach release binaries
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.sha256
