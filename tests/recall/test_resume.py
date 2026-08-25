@@ -39,6 +39,7 @@ from synapt.recall.resume import (
     build_resume_view,
     format_resume,
     is_harness_authored,
+    load_resume_index,
     resolve_session,
 )
 
@@ -513,6 +514,107 @@ class TestLazyHydration(unittest.TestCase):
         """Unhydrated chunks look content-free, so a broken read reports an empty session."""
         view = build_resume_view(self.loaded, limit=10, journal_path=None)
         self.assertEqual(len(view.turns), 2)
+
+
+class TestBoundedResumeLoad(unittest.TestCase):
+    """The CLI read should scale with sessions plus the selected tail, not all chunks."""
+
+    def test_sqlite_loader_does_not_construct_the_full_transcript_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _save_sqlite_index([
+                _chunk(SESSION_A, 0, "older question", "older answer",
+                       timestamp="2026-08-01T10:00:00Z"),
+                _chunk(SESSION_B, 0, "newer question", "newer answer",
+                       timestamp="2026-08-05T10:00:00Z"),
+            ], directory)
+
+            with mock.patch.object(
+                TranscriptIndex,
+                "load",
+                side_effect=AssertionError("full index load should not run"),
+            ):
+                index = load_resume_index(directory)
+                try:
+                    view = build_resume_view(index, limit=10, journal_path=None)
+                finally:
+                    index.close()
+
+            self.assertEqual(view.session_id, SESSION_B)
+            self.assertEqual(view.turns[0].user_text, "newer question")
+
+    def test_session_order_ignores_newer_journal_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _save_sqlite_index([
+                _chunk(SESSION_A, 0, "live", "work",
+                       timestamp="2026-08-05T10:00:00Z"),
+                _chunk(SESSION_B, 0, "old", "work",
+                       timestamp="2026-08-01T10:00:00Z"),
+                _chunk(SESSION_B, -1, "journal", "",
+                       timestamp="2026-08-25T10:00:00Z"),
+            ], directory)
+
+            index = load_resume_index(directory)
+            try:
+                self.assertEqual(resolve_session(index, None), SESSION_A)
+            finally:
+                index.close()
+
+    def test_only_selected_session_is_hydrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _save_sqlite_index([
+                _chunk(SESSION_A, 0, "secret older question", "older answer",
+                       timestamp="2026-08-01T10:00:00Z"),
+                _chunk(SESSION_B, 0, "selected question", "selected answer",
+                       timestamp="2026-08-05T10:00:00Z"),
+            ], directory)
+
+            index = load_resume_index(directory)
+            try:
+                with mock.patch.object(
+                    index._db,
+                    "load_session_chunks",
+                    wraps=index._db.load_session_chunks,
+                ) as load:
+                    view = build_resume_view(index, limit=10, journal_path=None)
+                load.assert_called_once_with(SESSION_B)
+            finally:
+                index.close()
+
+            rendered = format_resume(view)
+            self.assertIn("selected question", rendered)
+            self.assertNotIn("secret older question", rendered)
+
+    def test_session_without_a_timestamp_does_not_disappear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _save_sqlite_index([
+                _chunk(SESSION_A, 0, "question", "answer", timestamp=""),
+            ], directory)
+
+            index = load_resume_index(directory)
+            try:
+                self.assertEqual(resolve_session(index, None), SESSION_A)
+            finally:
+                index.close()
+
+    def test_timestamp_spelling_does_not_decide_bounded_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            _save_sqlite_index([
+                _chunk(SESSION_A, 0, "later", "answer",
+                       timestamp="2026-08-06T03:00:00.500000+00:00"),
+                _chunk(SESSION_B, 0, "earlier", "answer",
+                       timestamp="2026-08-06T03:00:00Z"),
+            ], directory)
+
+            index = load_resume_index(directory)
+            try:
+                self.assertEqual(resolve_session(index, None), SESSION_A)
+            finally:
+                index.close()
 
 
 # ---------------------------------------------------------------------------

@@ -1086,6 +1086,37 @@ def test_list_sessions_empty_index():
     assert index.list_sessions() == []
 
 
+def test_list_sessions_batch_hydrates_candidate_sessions(tmp_path, monkeypatch):
+    """Lazy session listing must not issue one hydration query per header."""
+    from unittest.mock import Mock
+
+    from synapt.recall.storage import RecallDB
+
+    directory = tmp_path / "index"
+    db = RecallDB(directory / "recall.db")
+    try:
+        db.save_chunks(make_test_chunks())
+    finally:
+        db.close()
+
+    index = TranscriptIndex.load(directory, use_embeddings=False)
+    batch = Mock(wraps=index._db.load_chunks_by_rowids)
+    monkeypatch.setattr(index._db, "load_chunks_by_rowids", batch)
+    monkeypatch.setattr(
+        index,
+        "_get_chunk",
+        lambda _idx: (_ for _ in ()).throw(
+            AssertionError("session listing hydrated one chunk at a time")
+        ),
+    )
+
+    sessions = index.list_sessions()
+
+    assert len(sessions) == 2
+    batch.assert_called_once()
+    index._db.close()
+
+
 # ---------------------------------------------------------------------------
 # Tests: build_index incremental change detection
 # ---------------------------------------------------------------------------

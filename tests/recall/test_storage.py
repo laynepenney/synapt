@@ -184,6 +184,20 @@ class TestChunksCRUD:
         assert set(batch) == {1, 2}
         assert batch[2].id == sample_chunks[1].id
 
+    def test_batch_load_does_not_fall_back_to_one_query_per_row(
+        self, db, sample_chunks, monkeypatch
+    ):
+        db.save_chunks(sample_chunks)
+
+        def individual_load_is_a_failure(_rowid):
+            raise AssertionError("batch loading issued an individual row query")
+
+        monkeypatch.setattr(db, "load_chunk_by_rowid", individual_load_is_a_failure)
+        batch = db.load_chunks_by_rowids([1, 2, 999])
+
+        assert set(batch) == {1, 2}
+        assert batch[1].id == sample_chunks[0].id
+
     def test_save_replaces_existing(self, db, sample_chunks):
         db.save_chunks(sample_chunks)
         assert db.chunk_count() == 3

@@ -1255,18 +1255,31 @@ def cmd_stats(args: argparse.Namespace) -> None:
 
 def cmd_sessions(args: argparse.Namespace) -> None:
     """List recent sessions with date, turn count, and first message."""
+    from synapt.recall.sharding import is_sharded
+
     index_dir = _resolve_index_dir(args)
-    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         print("Run 'synapt build' or 'synapt setup' first.", file=sys.stderr)
         sys.exit(1)
 
-    index = TranscriptIndex.load(index_dir, use_embeddings=False)
-    sessions = index.list_sessions(
-        max_sessions=args.max_sessions,
-        after=args.after,
-        before=args.before,
-    )
+    from synapt.recall.resume import load_resume_index
+
+    index = load_resume_index(index_dir)
+    try:
+        sessions = index.list_sessions(
+            max_sessions=args.max_sessions,
+            after=args.after,
+            before=args.before,
+        )
+    finally:
+        db = getattr(index, "_db", None)
+        if db is not None:
+            db.close()
 
     if not sessions:
         print("No sessions found.")
@@ -1290,30 +1303,45 @@ def cmd_resume(args: argparse.Namespace) -> None:
     request was wrong). Collapsing them would send the reader down the wrong path.
     """
     from synapt.recall.journal import _journal_path
-    from synapt.recall.resume import ResumeError, build_resume_view, format_resume
+    from synapt.recall.resume import (
+        ResumeError,
+        build_resume_view,
+        format_resume,
+        load_resume_index,
+    )
+    from synapt.recall.sharding import is_sharded
 
     index_dir = _resolve_index_dir(args)
-    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         print("Run 'synapt recall build' or 'synapt init' first.", file=sys.stderr)
         sys.exit(1)
 
-    index = TranscriptIndex.load(index_dir, use_embeddings=False)
+    index = load_resume_index(index_dir)
 
     try:
-        view = build_resume_view(
-            index,
-            session_id=getattr(args, "session", None),
-            limit=getattr(args, "turns", None) or 10,
-            journal_path=_journal_path(),
-        )
-    except ResumeError as exc:
-        # An empty index is an honest empty state, not a failure to act on.
-        if not index._session_order:
-            print("No sessions indexed yet. Nothing to resume.")
-            return
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        try:
+            view = build_resume_view(
+                index,
+                session_id=getattr(args, "session", None),
+                limit=getattr(args, "turns", None) or 10,
+                journal_path=_journal_path(),
+            )
+        except ResumeError as exc:
+            # An empty index is an honest empty state, not a failure to act on.
+            if not index._session_order:
+                print("No sessions indexed yet. Nothing to resume.")
+                return
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        db = getattr(index, "_db", None)
+        if db is not None:
+            db.close()
 
     # Freshness is attached AFTER the view is built, so build_resume_view keeps
     # its no-implicit-I/O contract and the check can never change what is shown
