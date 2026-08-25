@@ -50,13 +50,10 @@ Agent skill files for repository-native use live in:
 For the default Claude Code path:
 
 ```bash
-brew install synapt-dev/tap/synapt
+pip install synapt
 claude mcp add synapt -- synapt server
 synapt init
 ```
-
-The Homebrew formula installs a self-contained CLI on macOS Apple Silicon and
-Linux x86_64. Python users can install the same release with `pip install synapt`.
 
 That gives you:
 - a project-local `.synapt/` memory store
@@ -71,7 +68,7 @@ That gives you:
 Recommended:
 
 ```bash
-brew install synapt-dev/tap/synapt
+pip install synapt
 claude mcp add synapt -- synapt server
 synapt init
 ```
@@ -81,7 +78,7 @@ synapt init
 Install:
 
 ```bash
-brew install synapt-dev/tap/synapt
+pip install synapt
 ```
 
 Add to `~/.codex/config.toml`:

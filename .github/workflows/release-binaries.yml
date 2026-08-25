@@ -17,8 +17,37 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  validate:
+    name: Validate existing release tag
+    runs-on: ubuntu-latest
+    outputs:
+      commit-sha: ${{ steps.tag.outputs.commit-sha }}
+      ref-sha: ${{ steps.tag.outputs.ref-sha }}
+    steps:
+      - name: Bind tag to its current Git object
+        id: tag
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "release tag must be SemVer-shaped: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          remote="https://github.com/${REPOSITORY}.git"
+          refs="$(git ls-remote --exit-code --tags "$remote" "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+          ref_sha="$(awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref { print $1 }' <<<"$refs")"
+          commit_sha="$(awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref { print $1 }' <<<"$refs")"
+          test -n "$ref_sha"
+          if [[ -z "$commit_sha" ]]; then
+            commit_sha="$ref_sha"
+          fi
+          echo "ref-sha=$ref_sha" >> "$GITHUB_OUTPUT"
+          echo "commit-sha=$commit_sha" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.platform }})
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -27,69 +56,128 @@ jobs:
           - os: macos-latest
             platform: macos-aarch64
             expected-arch: arm64
+            science-asset: science-macos-aarch64
+            science-sha256: 74f4f80d997f851feaeeb447bcf3b33d7fa75221e8c8d5ebd5015504cbeb53db
+            python-sha256: d681f7cebf4885637242cba807d22f476b9ea8555ac2dc7307172426dbf161e1
+            jump-sha256: a17ccad392ca4437f0c9040da9c8fc98552de4c452fc4f64b21f7d1f8099829b
           - os: ubuntu-latest
             platform: linux-x86_64
             expected-arch: x86_64
+            science-asset: science-linux-x86_64
+            science-sha256: 028146ffa5d206e374a26f71f58b04539fc2a82e60eb43054634baae16c8e688
+            python-sha256: 8a70011ae25276a9925f89304cdc086466cd269ee6cfe68a9506694ca5ff4f9c
+            jump-sha256: a5afd5cd99ac201865d329980e9856521d394e2780441c4abc2f73add5b7e2d0
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/setup-python@v5
+          ref: ${{ github.sha }}
+          path: release-infra
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          path: source
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.13"
-      - name: Verify runner architecture
-        shell: bash
-        run: test "$(uname -m)" = "${{ matrix.expected-arch }}"
-      - name: Build wheel and self-contained CLI
+      - name: Verify source and runner identity
         shell: bash
         run: |
-          python -m pip install --disable-pip-version-check build pex
-          python -m build --wheel
-          pex dist/synapt-*.whl \
+          test "$(git -C release-infra rev-parse HEAD)" = "${{ github.sha }}"
+          test "$(git -C source rev-parse HEAD)" = "${{ needs.validate.outputs.commit-sha }}"
+          test "$(uname -m)" = "${{ matrix.expected-arch }}"
+      - name: Install hash-locked release toolchain
+        run: python -m pip install --disable-pip-version-check --require-hashes -r release-infra/requirements-release.lock
+      - name: Build wheel and self-contained CLI
+        shell: bash
+        working-directory: source
+        run: |
+          python -m build --wheel --no-isolation
+          wheel="$(printf '%s\n' dist/synapt-*.whl)"
+          wheel_sha="$(shasum -a 256 "$wheel" | awk '{ print $1 }')"
+          wheel_uri="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$wheel")"
+          printf 'synapt @ %s --hash=sha256:%s\n' "$wheel_uri" "$wheel_sha" > synapt-wheel.lock
+          mkdir release-wheelhouse
+          python -m pip download \
+            --disable-pip-version-check \
+            --only-binary=:all: \
+            --require-hashes \
+            --destination-directory release-wheelhouse \
+            -r ../release-infra/requirements-release.lock \
+            -r requirements-mcp.lock
+          python -m pip download \
+            --disable-pip-version-check \
+            --no-deps \
+            --require-hashes \
+            --destination-directory release-wheelhouse \
+            -r synapt-wheel.lock
+          curl --fail --location --silent --show-error \
+            --output science \
+            "https://github.com/a-scie/lift/releases/download/v0.21.0/${{ matrix.science-asset }}"
+          printf '%s  science\n' "${{ matrix.science-sha256 }}" | shasum -a 256 --check
+          chmod +x science
+          pex -r synapt-wheel.lock -r requirements-mcp.lock \
+            --no-pypi \
+            --find-links release-wheelhouse \
             --exclude sentence-transformers \
             --exclude mlx-lm \
             --exclude anthropic \
             --exclude openai-agents \
             --console-script synapt \
-            --pip-version latest-compatible \
+            --pip-version 26.2.1 \
+            --no-allow-pip-version-fallback \
             --scie eager \
             --scie-only \
-            --scie-python-version 3.13 \
+            --scie-python-version 3.13.15 \
+            --scie-pbs-release 20260825 \
+            --scie-science-binary ./science \
             -o synapt
+          SCIE=inspect ./synapt > synapt-scie.json
+          test "$(jq -r '.scie.lift.files[] | select(.key == "python-distribution") | .hash' synapt-scie.json)" = "${{ matrix.python-sha256 }}"
+          test "$(jq -r '.scie.jump.hash' synapt-scie.json)" = "${{ matrix.jump-sha256 }}"
       - name: Smoke test CLI and MCP server
         shell: bash
+        working-directory: source
         run: |
           set -o pipefail
           clean_home="$(mktemp -d)"
-          env -i HOME="$clean_home" PATH=/usr/bin:/bin ./synapt --version | grep -F "${RELEASE_TAG#v}"
+          actual_version="$(env -i HOME="$clean_home" PATH=/usr/bin:/bin ./synapt --version)"
+          test "$actual_version" = "synapt ${RELEASE_TAG#v}"
           ./synapt --help | grep -F "persistent conversational memory"
           response="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"release-smoke","version":"1"}}}' | ./synapt server)"
           grep -F '"id":1' <<<"$response"
           grep -F '"name":"synapt"' <<<"$response"
       - name: Package artifact
         shell: bash
+        working-directory: source
         run: |
           tar -czf "synapt-${{ matrix.platform }}.tar.gz" synapt
           shasum -a 256 "synapt-${{ matrix.platform }}.tar.gz" > "synapt-${{ matrix.platform }}.tar.gz.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: synapt-${{ matrix.platform }}
           path: |
-            synapt-${{ matrix.platform }}.tar.gz
-            synapt-${{ matrix.platform }}.tar.gz.sha256
+            source/synapt-${{ matrix.platform }}.tar.gz
+            source/synapt-${{ matrix.platform }}.tar.gz.sha256
 
   release:
     name: Attach release binaries
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Verify tag has not moved
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          actual="$(git ls-remote --exit-code --tags "https://github.com/${REPOSITORY}.git" "refs/tags/$RELEASE_TAG" | awk '{ print $1 }')"
+          test "$actual" = "${{ needs.validate.outputs.ref-sha }}"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: |
