@@ -79,33 +79,47 @@ jobs:
           path: source
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.13"
+          python-version: "3.13.15"
       - name: Verify source and runner identity
         shell: bash
         run: |
           test "$(git -C release-infra rev-parse HEAD)" = "${{ github.sha }}"
           test "$(git -C source rev-parse HEAD)" = "${{ needs.validate.outputs.commit-sha }}"
           test "$(uname -m)" = "${{ matrix.expected-arch }}"
+          test "$(python --version)" = "Python 3.13.15"
       - name: Install hash-locked release toolchain
-        run: python -m pip install --disable-pip-version-check --require-hashes -r release-infra/requirements-release.lock
+        shell: bash
+        run: |
+          python -m venv --without-pip release-venv
+          curl --fail --location --silent --show-error \
+            --output pip-26.2.1-py3-none-any.whl \
+            https://files.pythonhosted.org/packages/f3/6e/1736e5b4ae2b778ef2f81c47d797de9f891d4d8acb047a24ca37a60294dd/pip-26.2.1-py3-none-any.whl
+          printf '%s  pip-26.2.1-py3-none-any.whl\n' \
+            71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e | shasum -a 256 --check
+          PYTHONPATH="$PWD/pip-26.2.1-py3-none-any.whl" \
+            release-venv/bin/python -m pip install \
+              --disable-pip-version-check \
+              --require-hashes \
+              -r release-infra/requirements-release.lock
+          release-venv/bin/python -c 'import importlib.metadata as m; expected={"build":"1.5.0","pex":"2.100.7","pip":"26.2.1","setuptools":"83.0.0","wheel":"0.47.0"}; actual={name:m.version(name) for name in expected}; assert actual == expected, actual'
       - name: Build wheel and self-contained CLI
         shell: bash
         working-directory: source
         run: |
-          python -m build --wheel --no-isolation
+          ../release-venv/bin/python -m build --wheel --no-isolation
           wheel="$(printf '%s\n' dist/synapt-*.whl)"
           wheel_sha="$(shasum -a 256 "$wheel" | awk '{ print $1 }')"
-          wheel_uri="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$wheel")"
+          wheel_uri="$(../release-venv/bin/python -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$wheel")"
           printf 'synapt @ %s --hash=sha256:%s\n' "$wheel_uri" "$wheel_sha" > synapt-wheel.lock
           mkdir release-wheelhouse
-          python -m pip download \
+          ../release-venv/bin/python -m pip download \
             --disable-pip-version-check \
             --only-binary=:all: \
             --require-hashes \
             --destination-directory release-wheelhouse \
             -r ../release-infra/requirements-release.lock \
             -r requirements-mcp.lock
-          python -m pip download \
+          ../release-venv/bin/python -m pip download \
             --disable-pip-version-check \
             --no-deps \
             --require-hashes \
@@ -116,7 +130,7 @@ jobs:
             "https://github.com/a-scie/lift/releases/download/v0.21.0/${{ matrix.science-asset }}"
           printf '%s  science\n' "${{ matrix.science-sha256 }}" | shasum -a 256 --check
           chmod +x science
-          pex -r synapt-wheel.lock -r requirements-mcp.lock \
+          ../release-venv/bin/pex -r synapt-wheel.lock -r requirements-mcp.lock \
             --no-pypi \
             --find-links release-wheelhouse \
             --exclude sentence-transformers \
