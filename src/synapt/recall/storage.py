@@ -421,6 +421,36 @@ class RecallDB:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @classmethod
+    def open_readonly(cls, db_path: Path | str, busy_timeout_ms: int = 2000) -> "RecallDB":
+        """Open an EXISTING index for reads only.
+
+        No schema DDL, no migrations, a short busy timeout, and SQLite's
+        ``mode=ro`` so any write is an error rather than a contention.
+
+        Why this exists: the session-start hook read pending contradictions
+        through ``__init__``, whose ``_ensure_schema`` runs DDL and migrations
+        under a 30s busy timeout. Behind a concurrent build that connect
+        blocked for 13.9s while the query itself took 0.00s. A process that
+        prints from existing state must never queue behind the writer.
+
+        Raises ``sqlite3.OperationalError`` if the file does not exist: a
+        read-only open never mints a store, and a missing index must read as
+        "missing", not as "empty".
+        """
+        path = Path(db_path)
+        if not path.exists():
+            raise sqlite3.OperationalError(f"no index at {path}")
+        uri = path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=busy_timeout_ms / 1000)
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        conn.execute("PRAGMA query_only=1")
+        conn.row_factory = sqlite3.Row
+        obj = cls.__new__(cls)
+        obj._path = path
+        obj._conn = conn
+        return obj
+
     def _ensure_schema(self) -> None:
         self._conn.executescript(_SCHEMA_SQL)
         # Migrate existing tables: add columns that may be missing
@@ -1017,14 +1047,173 @@ class RecallDB:
         )
 
     def load_chunks_by_rowids(self, rowids: list[int]) -> dict[int, TranscriptChunk]:
-        """Load multiple chunks by rowid."""
+        """Load multiple chunks by rowid with bounded SQL query count."""
         if not rowids:
             return {}
+
+        from synapt.recall.core import TranscriptChunk
+
+        loaded: dict[int, TranscriptChunk] = {}
+        # Stay below SQLite's commonly configured 999-variable limit.
+        for offset in range(0, len(rowids), 900):
+            batch = rowids[offset:offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                "SELECT rowid, id, session_id, timestamp, turn_index, "
+                "user_text, assistant_text, tools_used, files_touched, "
+                "tool_content, date_text, transcript_path, byte_offset, byte_length, "
+                "agent_id FROM chunks WHERE rowid IN (" + placeholders + ")",
+                batch,
+            ).fetchall()
+            for r in rows:
+                loaded[r["rowid"]] = TranscriptChunk(
+                    id=r["id"],
+                    session_id=r["session_id"],
+                    timestamp=r["timestamp"],
+                    turn_index=r["turn_index"],
+                    user_text=r["user_text"],
+                    assistant_text=r["assistant_text"],
+                    tools_used=json.loads(r["tools_used"]) if r["tools_used"] else [],
+                    files_touched=(
+                        json.loads(r["files_touched"]) if r["files_touched"] else []
+                    ),
+                    tool_content=r["tool_content"] or "",
+                    date_text=r["date_text"] or "",
+                    transcript_path=r["transcript_path"] or "",
+                    byte_offset=r["byte_offset"] if r["byte_offset"] is not None else -1,
+                    byte_length=r["byte_length"] if r["byte_length"] is not None else 0,
+                    agent_id=r["agent_id"],
+                )
+        return loaded
+
+    def session_overview(self) -> dict[str, dict]:
+        """Return routing and listing metadata without materializing chunks."""
+        rows = self._conn.execute(
+            "SELECT session_id, "
+            "MIN(NULLIF(timestamp, '')) AS earliest_ts, "
+            "MAX(NULLIF(timestamp, '')) AS latest_ts, "
+            "SUM(CASE WHEN turn_index >= 0 THEN 1 ELSE 0 END) AS turn_count, "
+            "SUM(CASE WHEN turn_index != -1 AND timestamp IS NOT NULL "
+            "          AND timestamp != '' THEN 1 ELSE 0 END) AS activity_count, "
+            "MAX(CASE WHEN turn_index != -1 THEN julianday(timestamp) END) AS activity_jd, "
+            "MAX(CASE WHEN turn_index != -1 AND julianday(timestamp) IS NULL "
+            "         THEN timestamp END) AS activity_raw, "
+            "MAX(julianday(timestamp)) AS fallback_jd, "
+            "MAX(CASE WHEN julianday(timestamp) IS NULL THEN timestamp END) AS fallback_raw "
+            "FROM chunks GROUP BY session_id"
+        ).fetchall()
+
+        result: dict[str, dict] = {}
+        for row in rows:
+            parsed = row["activity_jd"]
+            raw = row["activity_raw"]
+            if parsed is None and raw is None:
+                parsed = row["fallback_jd"]
+                raw = row["fallback_raw"]
+            if parsed is not None:
+                unix_seconds = (float(parsed) - 2440587.5) * 86400
+                activity = (1, f"{unix_seconds:020.6f}")
+            else:
+                activity = (0, raw or "")
+            result[row["session_id"]] = {
+                "activity": activity,
+                "earliest_ts": row["earliest_ts"] or "",
+                "latest_ts": row["latest_ts"] or "",
+                "turn_count": int(row["turn_count"] or 0),
+                "has_real_activity": bool(row["activity_count"]),
+            }
+        return result
+
+    def session_activity(self) -> dict[str, tuple[int, str]]:
+        """Return each session's newest activity without materializing chunks."""
         return {
-            rowid: chunk
-            for rowid in rowids
-            if (chunk := self.load_chunk_by_rowid(rowid)) is not None
+            session_id: overview["activity"]
+            for session_id, overview in self.session_overview().items()
         }
+
+    def load_session_chunks(self, session_id: str) -> list[TranscriptChunk]:
+        """Load conversation chunks for one session, oldest turn first."""
+        return self.load_session_chunks_many([session_id], include_journal=False).get(
+            session_id, []
+        )
+
+    def load_session_chunks_many(
+        self,
+        session_ids: list[str],
+        include_journal: bool = True,
+    ) -> dict[str, list[TranscriptChunk]]:
+        """Load full chunks for a bounded set of sessions."""
+        from synapt.recall.core import TranscriptChunk
+
+        grouped: dict[str, list[TranscriptChunk]] = {sid: [] for sid in session_ids}
+        if not session_ids:
+            return grouped
+        for offset in range(0, len(session_ids), 900):
+            batch = session_ids[offset:offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            journal_clause = "" if include_journal else " AND turn_index >= 0"
+            rows = self._conn.execute(
+                "SELECT id, session_id, timestamp, turn_index, "
+                "user_text, assistant_text, tools_used, files_touched, "
+                "tool_content, date_text, transcript_path, byte_offset, byte_length, "
+                "agent_id FROM chunks WHERE session_id IN (" + placeholders + ")"
+                + journal_clause + " ORDER BY session_id, turn_index",
+                batch,
+            ).fetchall()
+            for r in rows:
+                grouped.setdefault(r["session_id"], []).append(
+                    TranscriptChunk(
+                        id=r["id"],
+                        session_id=r["session_id"],
+                        timestamp=r["timestamp"],
+                        turn_index=r["turn_index"],
+                        user_text=r["user_text"],
+                        assistant_text=r["assistant_text"],
+                        tools_used=(
+                            json.loads(r["tools_used"]) if r["tools_used"] else []
+                        ),
+                        files_touched=(
+                            json.loads(r["files_touched"])
+                            if r["files_touched"] else []
+                        ),
+                        tool_content=r["tool_content"] or "",
+                        date_text=r["date_text"] or "",
+                        transcript_path=r["transcript_path"] or "",
+                        byte_offset=(
+                            r["byte_offset"] if r["byte_offset"] is not None else -1
+                        ),
+                        byte_length=(
+                            r["byte_length"] if r["byte_length"] is not None else 0
+                        ),
+                        agent_id=r["agent_id"],
+                    )
+                )
+        return grouped
+
+    def load_session_listing(self, session_ids: list[str]) -> dict[str, list[dict]]:
+        """Load only the fields needed to render session summaries."""
+        grouped: dict[str, list[dict]] = {sid: [] for sid in session_ids}
+        for offset in range(0, len(session_ids), 900):
+            batch = session_ids[offset:offset + 900]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                "SELECT session_id, turn_index, user_text, files_touched "
+                "FROM chunks WHERE session_id IN (" + placeholders + ") "
+                "ORDER BY session_id, turn_index",
+                batch,
+            ).fetchall()
+            for row in rows:
+                grouped.setdefault(row["session_id"], []).append({
+                    "turn_index": row["turn_index"],
+                    "user_text": row["user_text"] or "",
+                    "files_touched": (
+                        json.loads(row["files_touched"])
+                        if row["files_touched"] else []
+                    ),
+                })
+        return grouped
 
     def chunk_count(self) -> int:
         """Number of chunks in the database."""

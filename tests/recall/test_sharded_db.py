@@ -3,6 +3,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.sharded_db import ShardedRecallDB
@@ -28,6 +29,28 @@ class TestShardedRecallDBMonolithic(unittest.TestCase):
         db = ShardedRecallDB.open(self.index_dir)
         self.assertTrue(db.is_monolithic)
         db.close()
+
+    def test_open_readonly_uses_query_only_connection(self):
+        writer = RecallDB(self.index_dir / "recall.db")
+        writer.close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        self.assertTrue(db.is_monolithic)
+        with self.assertRaises(Exception):
+            db._index._conn.execute("DELETE FROM chunks")
+        db.close()
+
+    def test_open_readonly_skips_schema_work(self):
+        RecallDB(self.index_dir / "recall.db").close()
+
+        with mock.patch.object(
+            RecallDB,
+            "_ensure_schema",
+            side_effect=AssertionError("read-only open ran schema work"),
+        ):
+            db = ShardedRecallDB.open_readonly(self.index_dir)
+            self.assertEqual(db.chunk_count(), 0)
+            db.close()
 
     def test_knowledge_roundtrip(self):
         db = ShardedRecallDB.open(self.index_dir)
@@ -120,6 +143,73 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         self.assertFalse(db.is_monolithic)
         self.assertEqual(db.shard_count, 1)
         db.close()
+
+    def test_open_readonly_detects_sharded_layout(self):
+        self._create_two_shard_layout().close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        self.assertFalse(db.is_monolithic)
+        self.assertEqual(db.shard_count, 2)
+        self.assertEqual(db.chunk_count(), 2)
+        db.close()
+
+    def test_bounded_session_reads_merge_across_shards(self):
+        RecallDB(self.index_dir / "index.db").close()
+        first = RecallDB(self.index_dir / "data_001.db")
+        second = RecallDB(self.index_dir / "data_002.db")
+        first.save_chunks([
+            self._make_chunk("shared:t0", "shared", "2026-01-01T00:00:00Z", "first"),
+        ])
+        second.save_chunks([
+            TranscriptChunk(
+                id="shared:t1",
+                session_id="shared",
+                timestamp="2026-01-02T00:00:00Z",
+                turn_index=1,
+                user_text="second",
+                assistant_text="assistant",
+            ),
+        ])
+        first.close()
+        second.close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        try:
+            self.assertIn("shared", db.session_activity())
+            self.assertEqual(
+                [chunk.id for chunk in db.load_session_chunks("shared")],
+                ["shared:t0", "shared:t1"],
+            )
+        finally:
+            db.close()
+
+    def test_journal_in_a_later_shard_does_not_replace_real_activity(self):
+        RecallDB(self.index_dir / "index.db").close()
+        first = RecallDB(self.index_dir / "data_001.db")
+        second = RecallDB(self.index_dir / "data_002.db")
+        first.save_chunks([
+            self._make_chunk("dead:t0", "dead", "2026-01-01T00:00:00Z", "old"),
+            self._make_chunk("live:t0", "live", "2026-01-02T00:00:00Z", "new"),
+        ])
+        second.save_chunks([
+            TranscriptChunk(
+                id="dead:journal",
+                session_id="dead",
+                timestamp="2026-08-25T00:00:00Z",
+                turn_index=-1,
+                user_text="journal",
+                assistant_text="",
+            ),
+        ])
+        first.close()
+        second.close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        try:
+            activity = db.session_activity()
+            self.assertGreater(activity["live"], activity["dead"])
+        finally:
+            db.close()
 
     def test_multiple_shards(self):
         RecallDB(self.index_dir / "index.db").close()

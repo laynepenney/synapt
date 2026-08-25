@@ -779,27 +779,68 @@ def sweep_stores(root: Path | str, dry_run: bool = False) -> list[dict]:
     return reports
 
 
-def extract_session_id(path: Path | str) -> str:
-    """Read the sessionId from the first progress entry in a transcript file.
+# How far extract_session_id will look before giving up. Modern transcripts
+# carry the id on line 1; legacy ones within the first few dozen lines. The
+# bound is generous for that and still O(1) in transcript size.
+SESSION_ID_SCAN_MAX_LINES = 2000
+SESSION_ID_SCAN_MAX_BYTES = 8_000_000
 
-    Scans only as far as the first progress entry — much cheaper than a full
-    parse for callers that just need to identify the session.  Returns an
-    empty string when no progress entry is found or the file cannot be read.
+
+def _session_id_from_record(d: object) -> str:
+    """The session id one transcript line carries, in every format met so far.
+
+    * Claude Code, current: any record with a ``sessionId`` string — the
+      first is a ``custom-title`` on line 1.
+    * Claude Code, legacy: ``progress`` records (also ``sessionId``).
+    * Codex archives: ``session_meta.payload.id``.
     """
+    if not isinstance(d, dict):
+        return ""
+    if d.get("type") == "session_meta":
+        payload = d.get("payload")
+        sid = payload.get("id", "") if isinstance(payload, dict) else ""
+        return sid if isinstance(sid, str) else ""
+    sid = d.get("sessionId")
+    return sid if isinstance(sid, str) else ""
+
+
+def extract_session_id(
+    path: Path | str,
+    max_lines: int = SESSION_ID_SCAN_MAX_LINES,
+    max_bytes: int = SESSION_ID_SCAN_MAX_BYTES,
+) -> str:
+    """Read the session id from a transcript, scanning a BOUNDED prefix.
+
+    Returns "" when no line in the first *max_lines* lines / *max_bytes*
+    bytes carries an id, or the file cannot be read.
+
+    Why bounded, and why any-line: this used to accept only ``progress`` and
+    ``session_meta`` records. Modern transcripts have neither — the id sits on
+    line 1 in a ``custom-title`` record — so on 111 of 160 archived files the
+    scan read the ENTIRE file (1.4 GB in one case) at every session start,
+    returned "", never journaled the session, and did it all again next
+    start. That is where the session-start hook's 60s timeout went. A miss
+    that stops at the bound is the only kind that cannot become that.
+    """
+    seen_bytes = 0
     try:
         with open(path, encoding="utf-8") as f:
-            for line in f:
+            for n, line in enumerate(f, start=1):
+                if n > max_lines:
+                    break
+                seen_bytes += len(line)
+                if seen_bytes > max_bytes:
+                    break
                 line = line.strip()
                 if not line:
                     continue
                 try:
                     d = json.loads(line)
-                    if d.get("type") == "session_meta":
-                        return d.get("payload", {}).get("id", "")
-                    if d.get("type") == "progress" and d.get("sessionId"):
-                        return d["sessionId"]
                 except (json.JSONDecodeError, ValueError):
                     continue
+                sid = _session_id_from_record(d)
+                if sid:
+                    return sid
     except OSError:
         pass
     return ""
@@ -906,8 +947,8 @@ def auto_extract_entry(
                         d = json.loads(line)
                     except (json.JSONDecodeError, ValueError):
                         continue
-                    if d.get("type") == "progress" and not session_id:
-                        session_id = d.get("sessionId", "")
+                    if not session_id:
+                        session_id = _session_id_from_record(d)
                     if d.get("type") == "assistant":
                         for block in d.get("message", {}).get("content", []) or []:
                             if not isinstance(block, dict):

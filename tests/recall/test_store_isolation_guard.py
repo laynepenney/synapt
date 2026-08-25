@@ -36,6 +36,15 @@ from synapt.recall import core as core_mod
 from synapt.recall import direct as direct_mod
 from synapt.recall import journal as journal_mod
 
+# NOTE on off-POSIX: only the witnesses that derive the boundary from the passwd
+# home are POSIX-only, and they are exactly the ones that request the
+# ``protected_channel_root`` / ``rederive_protected_root`` fixtures — those
+# fixtures skip off-POSIX (see conftest). The portable witnesses here — the
+# data-root guarantees and the decoy-root refusal mechanics, which use
+# ``register_protected_root`` and never touch ``pwd``/``os.getuid`` — run on
+# every platform. A module-level skip would collapse those two scopes and turn
+# one honest POSIX-only absence into thirty absent witnesses (Atlas, r2).
+
 
 # ---------------------------------------------------------------------------
 # helpers

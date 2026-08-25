@@ -285,6 +285,14 @@ def _unwind_extra_protected_roots():
 
 @pytest.fixture(name="protected_channel_root")
 def _protected_channel_root() -> Path:
+    # The passwd-derived real root is POSIX-only. Skipping HERE — in the
+    # fixture — rather than at module scope is deliberate: it skips exactly the
+    # witnesses that speak about the real account home (the few that request
+    # this fixture) and leaves the portable ones — the data-root guarantees and
+    # the decoy-root refusal mechanics, which never touch pwd/os.getuid —
+    # running on every platform. A module-level skip would drop those too.
+    if not hasattr(os, "getuid"):
+        pytest.skip("the passwd-derived protected root is POSIX-only")
     return protected_channel_root()
 
 
@@ -392,7 +400,13 @@ def rederive_protected_root():
     Returned as a callable rather than a value so the derivation runs after the
     test's monkeypatching, which is the only way to witness that the boundary
     does not move when HOME and ``Path.home()`` do.
+
+    POSIX-only, for the same reason as ``protected_channel_root``: it derives the
+    boundary from the passwd home. Skips off-POSIX so only the derivation
+    witnesses skip, not the portable ones.
     """
+    if not hasattr(os, "getuid"):
+        pytest.skip("the passwd-derived protected root is POSIX-only")
     return protected_channel_root
 
 

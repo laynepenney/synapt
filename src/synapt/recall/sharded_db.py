@@ -89,6 +89,20 @@ class ShardedRecallDB:
         db = RecallDB(index_dir / "recall.db")
         return cls(db, [])
 
+    @classmethod
+    def open_readonly(cls, index_dir: Path) -> ShardedRecallDB:
+        """Open an existing layout without DDL, migrations, or write access."""
+        if is_sharded(index_dir):
+            index_db = RecallDB.open_readonly(index_dir / "index.db")
+            try:
+                data_dbs = [RecallDB.open_readonly(p) for p in list_shards(index_dir)]
+            except Exception:
+                index_db.close()
+                raise
+            return cls(index_db, data_dbs)
+
+        return cls(RecallDB.open_readonly(index_dir / "recall.db"), [])
+
     # -- Delegated methods (index DB) --------------------------------------
 
     def load_manifest(self) -> dict:
@@ -180,6 +194,75 @@ class ShardedRecallDB:
                 })
             return loaded
         return self._index.load_chunks_by_rowids(rowids)
+
+    def session_overview(self) -> dict[str, dict]:
+        """Return merged session metadata across all chunk shards."""
+        result: dict[str, dict] = {}
+        for _, db in self._iter_data_shards():
+            for session_id, overview in db.session_overview().items():
+                current = result.get(session_id)
+                if current is None:
+                    result[session_id] = dict(overview)
+                    continue
+                if overview["has_real_activity"] and not current["has_real_activity"]:
+                    current["activity"] = overview["activity"]
+                elif overview["has_real_activity"] == current["has_real_activity"]:
+                    current["activity"] = max(
+                        current["activity"], overview["activity"]
+                    )
+                current["has_real_activity"] = (
+                    current["has_real_activity"] or overview["has_real_activity"]
+                )
+                if overview["earliest_ts"]:
+                    current["earliest_ts"] = min(
+                        filter(None, (current["earliest_ts"], overview["earliest_ts"]))
+                    )
+                if overview["latest_ts"]:
+                    current["latest_ts"] = max(
+                        current["latest_ts"], overview["latest_ts"]
+                    )
+                current["turn_count"] += overview["turn_count"]
+        return result
+
+    def session_activity(self) -> dict[str, tuple[int, str]]:
+        """Return newest activity per session across all chunk shards."""
+        return {
+            session_id: overview["activity"]
+            for session_id, overview in self.session_overview().items()
+        }
+
+    def load_session_chunks(self, session_id: str):  # noqa: ANN201
+        """Load one session across all shards, oldest turn first."""
+        return self.load_session_chunks_many(
+            [session_id], include_journal=False
+        ).get(session_id, [])
+
+    def load_session_chunks_many(
+        self,
+        session_ids: list[str],
+        include_journal: bool = True,
+    ):  # noqa: ANN201
+        """Load a bounded set of sessions across all shards."""
+        grouped = {session_id: [] for session_id in session_ids}
+        for _, db in self._iter_data_shards():
+            partial = db.load_session_chunks_many(session_ids, include_journal)
+            for session_id, chunks in partial.items():
+                grouped.setdefault(session_id, []).extend(chunks)
+        for chunks in grouped.values():
+            chunks.sort(key=lambda chunk: chunk.turn_index)
+        return grouped
+
+    def load_session_listing(self, session_ids: list[str]) -> dict[str, list[dict]]:
+        """Load summary fields for a bounded set of sessions across shards."""
+        grouped: dict[str, list[dict]] = {session_id: [] for session_id in session_ids}
+        for _, db in self._iter_data_shards():
+            partial = db.load_session_listing(session_ids)
+            for session_id, rows in partial.items():
+                grouped.setdefault(session_id, []).extend(rows)
+        for rows in grouped.values():
+            rows.sort(key=lambda row: row["turn_index"])
+        return grouped
+
     def sample_chunk_texts(self, limit: int = 100) -> list[str]:
         """Return representative chunk text samples across all shards."""
         if self._data_dbs:

@@ -167,23 +167,41 @@ def _install_codex_skill(skill_name: str = "dev-loop") -> Path | None:
     return dest
 
 
-def _acquire_build_lock(data_dir: Path, timeout: float = 60.0) -> "int | None":
-    """Acquire an exclusive file lock for index builds.
+def _build_lock_busy_message(data_dir: Path, name: str = "build.lock") -> str:
+    """Who holds the lock, from the stamp the holder wrote on acquire."""
+    try:
+        stamp = (data_dir / name).read_text(encoding="utf-8").strip()
+    except OSError:
+        stamp = ""
+    return f"held by {stamp}" if stamp else "holder unknown"
+
+
+def _acquire_build_lock(data_dir: Path, timeout: float = 60.0, name: str = "build.lock") -> "int | None":
+    """Acquire an exclusive file lock for index builds (or, by *name*, for any
+    other single-flight job such as ``catchup``).
 
     Returns the lock file descriptor on success, None if the lock could not
-    be acquired within *timeout* seconds (another build is running).
+    be acquired within *timeout* seconds (another holder is running). On
+    success the holder stamps ``pid … since …`` into the file, so a waiter
+    that gives up can say WHO it waited on rather than only that it waited.
     """
     import errno
     import time
     from synapt.recall._filelock import lock_exclusive_nb
 
-    lock_path = data_dir / "build.lock"
+    lock_path = data_dir / name
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
     deadline = time.monotonic() + timeout
     while True:
         try:
             lock_exclusive_nb(fd)
+            try:
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, f"pid {os.getpid()} since {datetime.now().astimezone().isoformat(timespec='seconds')}\n".encode())
+            except OSError:
+                pass  # the stamp is a courtesy; the lock is the guarantee
             return fd
         except OSError as exc:
             # Only retry on lock contention; other errors are fatal
@@ -247,7 +265,7 @@ def _archive_and_build(
     data_dir = project_data_dir(project_dir)
     lock_fd = _acquire_build_lock(data_dir)
     if lock_fd is None:
-        print("  Warning: another build is in progress (timed out waiting for lock)")
+        print(f"  Warning: another build is in progress (timed out waiting for lock; {_build_lock_busy_message(data_dir)})")
         return None
 
     try:
@@ -1237,18 +1255,31 @@ def cmd_stats(args: argparse.Namespace) -> None:
 
 def cmd_sessions(args: argparse.Namespace) -> None:
     """List recent sessions with date, turn count, and first message."""
+    from synapt.recall.sharding import is_sharded
+
     index_dir = _resolve_index_dir(args)
-    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         print("Run 'synapt build' or 'synapt setup' first.", file=sys.stderr)
         sys.exit(1)
 
-    index = TranscriptIndex.load(index_dir, use_embeddings=False)
-    sessions = index.list_sessions(
-        max_sessions=args.max_sessions,
-        after=args.after,
-        before=args.before,
-    )
+    from synapt.recall.resume import load_resume_index
+
+    index = load_resume_index(index_dir)
+    try:
+        sessions = index.list_sessions(
+            max_sessions=args.max_sessions,
+            after=args.after,
+            before=args.before,
+        )
+    finally:
+        db = getattr(index, "_db", None)
+        if db is not None:
+            db.close()
 
     if not sessions:
         print("No sessions found.")
@@ -1272,30 +1303,45 @@ def cmd_resume(args: argparse.Namespace) -> None:
     request was wrong). Collapsing them would send the reader down the wrong path.
     """
     from synapt.recall.journal import _journal_path
-    from synapt.recall.resume import ResumeError, build_resume_view, format_resume
+    from synapt.recall.resume import (
+        ResumeError,
+        build_resume_view,
+        format_resume,
+        load_resume_index,
+    )
+    from synapt.recall.sharding import is_sharded
 
     index_dir = _resolve_index_dir(args)
-    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         print("Run 'synapt recall build' or 'synapt init' first.", file=sys.stderr)
         sys.exit(1)
 
-    index = TranscriptIndex.load(index_dir, use_embeddings=False)
+    index = load_resume_index(index_dir)
 
     try:
-        view = build_resume_view(
-            index,
-            session_id=getattr(args, "session", None),
-            limit=getattr(args, "turns", None) or 10,
-            journal_path=_journal_path(),
-        )
-    except ResumeError as exc:
-        # An empty index is an honest empty state, not a failure to act on.
-        if not index._session_order:
-            print("No sessions indexed yet. Nothing to resume.")
-            return
-        print(f"Error: {exc}", file=sys.stderr)
-        sys.exit(1)
+        try:
+            view = build_resume_view(
+                index,
+                session_id=getattr(args, "session", None),
+                limit=getattr(args, "turns", None) or 10,
+                journal_path=_journal_path(),
+            )
+        except ResumeError as exc:
+            # An empty index is an honest empty state, not a failure to act on.
+            if not index._session_order:
+                print("No sessions indexed yet. Nothing to resume.")
+                return
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    finally:
+        db = getattr(index, "_db", None)
+        if db is not None:
+            db.close()
 
     # Freshness is attached AFTER the view is built, so build_resume_view keeps
     # its no-implicit-I/O contract and the check can never change what is shown
@@ -2457,11 +2503,16 @@ def cmd_hook(args: argparse.Namespace) -> None:
     """
     import subprocess
 
-    # Drain stdin (hook protocol sends JSON on stdin)
+    # Read the hook payload (JSON on stdin). SessionStart carries ``source``:
+    # "startup" | "resume" | "clear" | "compact" | "fork". It used to be
+    # drained and discarded; it is the one field that says WHY we are waking.
+    payload: dict = {}
     try:
-        sys.stdin.read()
+        raw = sys.stdin.read()
+        parsed = json.loads(raw) if raw and raw.strip() else {}
+        payload = parsed if isinstance(parsed, dict) else {}
     except Exception:
-        pass
+        payload = {}
 
     # Opt-out check
     if (project_data_dir() / "no-auto-capture").exists():
@@ -2470,64 +2521,90 @@ def cmd_hook(args: argparse.Namespace) -> None:
     event = args.event
 
     if event == "session-start":
+        # INVARIANT: this branch does O(1) work in transcript and index size,
+        # prints inside a fixed byte budget, and records its own run.
+        #
+        # Why (2026-08-25, Ref #856, #119): the archive + journal catch-up
+        # that used to run here first was O(archive) — 5.5 minutes on one
+        # machine — so the hook was killed at the 60s timeout and emitted
+        # NOTHING. A timed-out hook's output is discarded, not truncated, and
+        # no signal anywhere said so. Every O(n) job now lives in `catchup`,
+        # spawned detached; this branch prints from existing state only.
+        from synapt.recall.session_start import HookRun, render_wake
+
+        source = str(payload.get("source") or "startup")
+        run = HookRun("session-start", source)
+        warning = run.begin()
         project = Path.cwd().resolve()
-        transcript_all = project_transcript_dirs(project)
+        banners: list[str] = []
 
-        # 0a. Stale MCP server warning — surface prominently so agent acts (#428)
-        try:
-            from synapt.recall.server import _check_version_stale
-            stale_warning = _check_version_stale()
-            if stale_warning:
-                print(f"WARNING: {stale_warning}")
-                print("Call recall_reload to restart the MCP server with the latest code.")
-        except Exception:
-            pass
+        # 0. Stale MCP server warning — surface prominently so agent acts (#428)
+        with run.phase("version_check"):
+            try:
+                from synapt.recall.server import _check_version_stale
+                stale_warning = _check_version_stale()
+                if stale_warning:
+                    banners.append(
+                        f"WARNING: {stale_warning}\n"
+                        "Call recall_reload to restart the MCP server with the latest code."
+                    )
+            except Exception:
+                pass
 
-        # 0. Catch up: archive + journal for any un-processed transcripts.
-        #    Handles /clear (where session-end may not have fired) and
-        #    crash recovery. Only writes a journal entry if the latest
-        #    transcript's session isn't already journaled.
-        for transcript_dir in transcript_all:
-            _catchup_archive_and_journal(project, transcript_dir)
+        # 1. ONE detached process for everything unbounded: archive, journal
+        #    catch-up, journal compaction, incremental build, one enrich.
+        #    Sequenced inside `catchup` under its own lock so they cannot
+        #    fight each other (or a manual build) for the build lock.
+        with run.phase("spawn_catchup"):
+            transcript_all = project_transcript_dirs(project)
+            if transcript_all:
+                try:
+                    subprocess.Popen(
+                        [sys.executable, "-m", "synapt.recall.cli", "catchup"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except Exception:
+                    banners.append("WARNING: could not spawn `synapt recall catchup`; index and journal will not update this session.")
 
-        # 1. Defer the expensive incremental rebuild to a background process.
-        #    Parsing 28K+ chunks, re-clustering, and FTS rebuild can take >60s
-        #    which exceeds the hook timeout. Surface context from the existing
-        #    index instead — it's at most one session behind.  Fixes #119.
-        if transcript_all:
-            subprocess.Popen(
-                [sys.executable, "-m", "synapt.recall.cli", "build", "--incremental"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        # 2. Compact journal (dedup + sort) before surfacing context. Cheap
+        #    (tens of ms on a 5 MB journal) and it keeps the read consistent.
+        with run.phase("compact_journal"):
+            try:
+                from synapt.recall.journal import compact_journal
+                removed = compact_journal()
+                if removed:
+                    print(f"  Journal: compacted ({removed} duplicate(s) removed)", file=sys.stderr)
+            except Exception:
+                pass
 
-        # 2. Compact journal (dedup + sort) before surfacing context
-        from synapt.recall.journal import compact_journal
-        removed = compact_journal()
-        if removed:
-            print(f"  Journal: compacted ({removed} duplicate(s) removed)", file=sys.stderr)
+        # 3. Surface startup context from EXISTING state (shared with
+        #    cmd_startup for Codex parity) ...
+        with run.phase("context"):
+            lines = generate_startup_context(project)
 
-        # 3. Enrich one auto-stub in the background (non-blocking)
-        subprocess.Popen(
-            [sys.executable, "-m", "synapt.recall.cli", "enrich", "--max-entries", "1"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        # 4. ... rendered inside the byte budget, head line first, full text
+        #    on disk with a pointer. The harness previews ~2 KB of this.
+        with run.phase("render"):
+            text = render_wake(lines, project=project, source=source, run=run,
+                               warning=warning, banners=banners)
+        sys.stdout.write(text)
 
-        # 4-9. Surface startup context (shared with cmd_startup for Codex parity)
-        for line in generate_startup_context(project):
-            print(line)
-
-        # 10. Dev-loop activation prompt — deterministic hook replaces
-        #     unreliable skill auto-activation (~20%). The agent reads this
-        #     system reminder as its startup instruction; it does not start
-        #     a monitoring loop.
+        # 5. Dev-loop activation prompt — deterministic hook replaces
+        #    unreliable skill auto-activation (~20%). The agent reads this
+        #    system reminder as its startup instruction; it does not start
+        #    a monitoring loop.
+        extra = 0
         try:
             prompt = _dev_loop_activation_prompt(project)
             if prompt:
                 print(f"\n{prompt}")
+                extra = len(prompt.encode("utf-8")) + 1
         except Exception:
             pass  # Loop activation is non-critical
+
+        run.finish(output_bytes=len(text.encode("utf-8")) + extra)
 
     elif event == "session-end":
         # 1. Archive transcripts locally
@@ -3031,6 +3108,52 @@ def cmd_maintain(args: argparse.Namespace) -> None:
     print(f"  {remaining} remaining above the {min_chunks}-chunk threshold")
 
 
+def cmd_catchup(args: argparse.Namespace) -> None:
+    """Everything the session-start hook defers, in one detached process.
+
+    1. Archive + journal catch-up for every transcript dir (O(archive))
+    2. Journal compaction
+    3. ``build --incremental`` (O(index))
+    4. ``enrich --max-entries 1``
+
+    Sequenced, not parallel: the old hook spawned build and enrich as two
+    separate processes and ran the catch-up inline, so three things could
+    contend for the build lock and the hook itself could be killed mid-way.
+    Single-flight under ``catchup.lock``: a second catchup while one is
+    running (two sessions starting together) steps aside and says so on
+    stderr, because two of these at once would double-journal and then
+    queue on the build lock for a minute each.
+    """
+    from synapt.recall.journal import compact_journal
+
+    project = Path.cwd().resolve()
+    data_dir = project_data_dir(project)
+    fd = _acquire_build_lock(data_dir, timeout=0, name="catchup.lock")
+    if fd is None:
+        print(f"[catchup] already running ({_build_lock_busy_message(data_dir, name='catchup.lock')}); yielding",
+              file=sys.stderr)
+        return
+    try:
+        dirs = project_transcript_dirs(project)
+        for transcript_dir in dirs:
+            _catchup_archive_and_journal(project, transcript_dir)
+        removed = compact_journal()
+        if removed:
+            print(f"[catchup] journal: compacted ({removed} duplicate(s) removed)", file=sys.stderr)
+        if getattr(args, "no_build", False) or not dirs:
+            return
+        subprocess.run(
+            [sys.executable, "-m", "synapt.recall.cli", "build", "--incremental"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "synapt.recall.cli", "enrich", "--max-entries", "1"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    finally:
+        _release_build_lock(fd)
+
+
 class _FullRebuild(argparse.Action):
     """``--full`` sets BOTH ``full`` and ``incremental`` rather than leaving one
     to be derived from the other.
@@ -3284,6 +3407,17 @@ def make_parser() -> argparse.ArgumentParser:
     channel_parser.add_argument("--name", default=None,
                                 help="Display name for join action")
 
+    catchup_parser = subparsers.add_parser(
+        "catchup",
+        help="Run the session-start hook's deferred maintenance: archive, journal "
+             "catch-up, compaction, incremental build, one enrich. The hook spawns "
+             "this detached; run it by hand to catch up now.",
+    )
+    catchup_parser.add_argument(
+        "--no-build", action="store_true",
+        help="Archive and journal only; skip the incremental build and enrich",
+    )
+
     maintain_parser = subparsers.add_parser(
         "maintain",
         help="Upgrade cluster summaries with an LLM, bounded, and report the backlog",
@@ -3331,6 +3465,8 @@ def main():
 
     if args.command == "maintain":
         cmd_maintain(args)
+    elif args.command == "catchup":
+        cmd_catchup(args)
     elif args.command == "setup":
         cmd_setup(args)
     elif args.command == "build":

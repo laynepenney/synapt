@@ -1,7 +1,7 @@
 {
   "name": "synapt-recall",
-  "version": "0.1.0",
-  "description": "Persistent memory for Claude Code sessions via synapt recall",
+  "version": "0.2.0",
+  "description": "Persistent memory and automatic session context for Claude Code via synapt recall",
   "author": {
     "name": "synapt",
     "url": "https://github.com/synapt-dev"

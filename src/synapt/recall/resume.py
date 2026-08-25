@@ -29,6 +29,7 @@ from pathlib import Path
 from synapt.recall.freshness import IndexFreshness
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.journal import JournalEntry, read_entries
+from synapt.recall.sharded_db import ShardedRecallDB
 
 DEFAULT_TURNS = 10
 
@@ -104,6 +105,91 @@ class ResumeView:
     # surface that was decided. ``None`` means NOT CHECKED -- which is not the
     # same as fresh, and the renderer must not treat it as such.
     freshness: "IndexFreshness | None" = None
+
+
+class BoundedResumeIndex:
+    """The small TranscriptIndex surface resume needs over a read-only store."""
+
+    def __init__(self, db: ShardedRecallDB):
+        self._db = db
+        self._overview = db.session_overview()
+        self.sessions = {session_id: [] for session_id in self._overview}
+        self._session_order = sorted(
+            self._overview,
+            key=lambda session_id: self._overview[session_id]["activity"],
+            reverse=True,
+        )
+
+    def session_tail(self, session_id: str) -> list[TranscriptChunk]:
+        return self._db.load_session_chunks(session_id)
+
+    def list_sessions(
+        self,
+        max_sessions: int = 20,
+        after: str | None = None,
+        before: str | None = None,
+    ) -> list[dict]:
+        """Return recent session summaries while hydrating only candidates."""
+        session_ids = []
+        for session_id in self._session_order:
+            overview = self._overview[session_id]
+            earliest_ts = overview["earliest_ts"]
+            latest_ts = overview["latest_ts"]
+            if not earliest_ts or not latest_ts:
+                continue
+            if after and latest_ts < after:
+                continue
+            if before and earliest_ts >= before:
+                continue
+            session_ids.append(session_id)
+            if len(session_ids) >= max_sessions:
+                break
+
+        hydrated = self._db.load_session_listing(session_ids)
+        results = []
+        for session_id in session_ids:
+            overview = self._overview[session_id]
+            chunks = hydrated.get(session_id, [])
+            transcript_chunks = [
+                chunk for chunk in chunks if chunk["turn_index"] >= 0
+            ]
+            first_message = ""
+            for chunk in sorted(
+                transcript_chunks or chunks,
+                key=lambda item: item["turn_index"],
+            ):
+                if chunk["user_text"]:
+                    first_message = chunk["user_text"][:120]
+                    if len(chunk["user_text"]) > 120:
+                        first_message += "..."
+                    break
+            files = {
+                file_path
+                for chunk in chunks
+                for file_path in chunk["files_touched"]
+            }
+            results.append(
+                {
+                    "session_id": session_id,
+                    "date": overview["earliest_ts"][:10],
+                    "turn_count": overview["turn_count"],
+                    "first_message": first_message,
+                    "files_count": len(files),
+                }
+            )
+        return results
+
+    def close(self) -> None:
+        self._db.close()
+
+
+def load_resume_index(directory: Path) -> TranscriptIndex | BoundedResumeIndex:
+    """Load only session routing metadata until one session is selected."""
+    from synapt.recall.sharding import is_sharded
+
+    if (directory / "recall.db").exists() or is_sharded(directory):
+        return BoundedResumeIndex(ShardedRecallDB.open_readonly(directory))
+    return TranscriptIndex.load(directory, use_embeddings=False)
 
 
 # ---------------------------------------------------------------------------
