@@ -669,3 +669,33 @@ class TestBuildLockHolder:
             assert not (data_dir / "build.lock").exists()
         finally:
             cli._release_build_lock(fd)
+
+    def test_a_real_second_holder_is_excluded_then_reacquirable(self, tmp_path):
+        """Single-flight holds against a REAL second acquire, no patching.
+
+        This is the contention half of the lock's contract, exercised through
+        the real lock rather than a mocked ``lock_exclusive_nb``: while one
+        holder has it, a second non-blocking acquire returns None; after
+        release it is acquirable again. On POSIX ``flock`` excludes across two
+        open descriptions of the same file even in one process; on Windows the
+        same exclusion must hold through ``msvcrt.locking``. It is therefore the
+        cross-platform witness that the Windows sentinel-byte lock (which moved
+        off byte 0 so the stamp stays readable) still SERIALIZES rather than
+        merely relocating the lock somewhere uncontended — the guarantee a
+        readability fix must not quietly break.
+        """
+        data_dir = tmp_path / "data"
+        first = cli._acquire_build_lock(data_dir, timeout=0)
+        assert first is not None
+        try:
+            # The stamp remains readable WHILE the lock is held (the exact case
+            # that failed on Windows: msvcrt locks are mandatory, so locking the
+            # stamp bytes made this read raise PermissionError).
+            assert str(os.getpid()) in (data_dir / "build.lock").read_text()
+            second = cli._acquire_build_lock(data_dir, timeout=0)
+            assert second is None, "a second holder must be excluded while the lock is held"
+        finally:
+            cli._release_build_lock(first)
+        reacquired = cli._acquire_build_lock(data_dir, timeout=0)
+        assert reacquired is not None, "the lock must be acquirable again after release"
+        cli._release_build_lock(reacquired)
