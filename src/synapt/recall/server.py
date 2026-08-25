@@ -1394,15 +1394,21 @@ def _apply_contest_resolution(
     return True
 
 
-def format_contradictions_for_session_start() -> str:
+def format_contradictions_for_session_start(limit: int = 5) -> str:
     """Format pending contradictions for the SessionStart hook.
 
     Returns a string to print to stdout (which becomes the system-reminder
     the model sees). The model should then ask the user about each one.
     Returns empty string if no pending contradictions.
 
-    Uses a lightweight DB connection instead of loading the full index,
-    since only SQL queries are needed (no chunk/embedding data).  Fixes #119.
+    Reads through ``RecallDB.open_readonly``: no schema DDL, short busy
+    timeout, cannot queue behind a concurrent build (the writer-path connect
+    measured 13.9s under a live build; the query 0.00s). Fixes #119's
+    remaining half.
+
+    Shows at most *limit* rows and always states the TOTAL, so a backlog
+    reads as a number rather than as a wall of text that the ~2KB startup
+    preview truncates anyway (Ref #856).
     """
     from synapt.recall.storage import RecallDB
 
@@ -1411,11 +1417,12 @@ def format_contradictions_for_session_start() -> str:
         return ""
 
     try:
-        db = RecallDB(db_path)
-        pending = db.list_pending_contradictions()
-        if not pending:
+        db = RecallDB.open_readonly(db_path)
+        total = db.pending_contradiction_count()
+        if not total:
             db.close()
             return ""
+        pending = db.list_pending_contradictions()[:max(0, limit)]
         # Build node lookup for old content
         old_ids = {c["old_node_id"] for c in pending}
         node_lookup = {
@@ -1423,7 +1430,8 @@ def format_contradictions_for_session_start() -> str:
             for nid in old_ids
         }
         db.close()
-        lines = [f"Pending contradictions ({len(pending)}) — ask the user to resolve:"]
+        shown = f"; showing {len(pending)}" if total > len(pending) else ""
+        lines = [f"Pending contradictions ({total}{shown}) — ask the user to resolve:"]
         for c in pending:
             old_node = node_lookup.get(c["old_node_id"])
             old_content = old_node["content"][:120] if old_node else "(deleted node)"
