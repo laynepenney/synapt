@@ -17,6 +17,20 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+# The protected boundary is derived from the passwd database (``pwd`` +
+# ``os.getuid``), which is POSIX-only. ``hasattr(os, "getuid")`` is the
+# capability probe: it is False on Windows. Only the PASSWD-DERIVED half of the
+# guarantee is POSIX-only; on other platforms the permanent protected root (the
+# real home channel store) is absent, so that protection is inert, and only the
+# witnesses that derive the boundary from the passwd home skip off-POSIX. The
+# portable witnesses — the data-root guarantees and the decoy-root refusal
+# mechanics — continue to run on every platform. This flag exists so
+# the boundary is never *computed* off-POSIX — a computation that used to run at
+# pytest collection time (``conftest`` constructs the policy at import) and took
+# down the whole Windows run with ``ModuleNotFoundError: No module named 'pwd'``
+# before any skip marker could apply.
+POSIX_ACCOUNT_HOME = hasattr(os, "getuid")
+
 
 class RecallStoreIsolationError(AssertionError):
     """Raised when a test would resolve a write target into a protected store.
@@ -43,9 +57,20 @@ def account_home() -> Path:
 
     Deliberately NOT replaced with ``Path.home()``: that reads ``$HOME``, which is
     exactly the value a fixture can move, and would make the boundary circular in
-    the way the paragraph above forbids. On Windows this still raises, loudly and
-    at the point of use, which is the honest outcome for a POSIX-only guarantee.
+    the way the paragraph above forbids. On a non-POSIX platform this raises
+    ``RecallStoreIsolationError`` at the point of use — loud and honest for a
+    POSIX-only guarantee — rather than a bare ``ModuleNotFoundError``/
+    ``AttributeError``. Callers that run off-POSIX (the policy constructor,
+    ``protected_channel_root``) must gate on ``POSIX_ACCOUNT_HOME`` so this is
+    never reached during collection; see ``StoreIsolationPolicy.__init__``.
     """
+    if not POSIX_ACCOUNT_HOME:
+        raise RecallStoreIsolationError(
+            "account_home() is POSIX-only: it derives the account home from the "
+            "passwd database (pwd + os.getuid), which does not exist on this "
+            "platform. The store-isolation guarantee is POSIX-only; guard callers "
+            "on POSIX_ACCOUNT_HOME rather than reaching this."
+        )
     import pwd
 
     return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
@@ -95,7 +120,17 @@ class StoreIsolationPolicy:
     """
 
     def __init__(self) -> None:
-        self._permanent: list[Path] = [protected_channel_root()]
+        # POSIX-only, computed eagerly on POSIX (unchanged) and SKIPPED
+        # elsewhere. ``conftest`` constructs this policy at import, so the eager
+        # ``protected_channel_root()`` call ran during collection — where, on
+        # Windows, it raised ``ModuleNotFoundError: No module named 'pwd'`` and
+        # took the whole run down before any skip marker applied. With no passwd
+        # database there is no immovable account home to protect, so the
+        # permanent set is empty and the channel guard has no permanent
+        # (real-home) root to refuse against — the passwd-derived guarantee is
+        # honestly absent rather than faked or crashing. Per-test decoy roots and
+        # the data-root guard are unaffected; they do not depend on the passwd home.
+        self._permanent: list[Path] = [protected_channel_root()] if POSIX_ACCOUNT_HOME else []
         self._extra: list[Path] = []
         self.session_root: Path | None = None
         self.session_channel_root: Path | None = None
