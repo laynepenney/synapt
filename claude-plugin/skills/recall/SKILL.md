@@ -5,14 +5,16 @@ description: Persistent memory across Claude Code sessions. Search before you ac
 
 # synapt recall
 
-Persistent memory for Claude Code. Search past sessions, save durable knowledge, and maintain context across conversations.
+Persistent memory for Claude Code. The plugin loads bounded current context at
+session start. Search past sessions for deeper context, save durable knowledge,
+and maintain context across conversations.
 
 ## When to use (do this automatically, without being asked)
 
 - **Before making a design decision**: `recall_search` for prior discussion
 - **When debugging an error**: `recall_search` for past fixes
 - **When user references past work**: `recall_search` immediately
-- **Starting a session**: `recall_journal` to read recent entries
+- **Starting a session**: use the injected current context first, then `recall_journal` when more detail is needed
 - **When unsure if something was discussed**: `recall_quick` (fast, cheap)
 - **When you need file history**: `recall_files` for who changed what and why
 

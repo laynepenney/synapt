@@ -4185,7 +4185,7 @@ class TranscriptIndex:
         before: str | None = None,
     ) -> list[dict]:
         """Return recent sessions with summary info, newest-first."""
-        results = []
+        candidates = []
         for session_id in self._session_order:
             chunks = self.sessions[session_id]
 
@@ -4201,15 +4201,43 @@ class TranscriptIndex:
             if before and earliest_ts >= before:
                 continue
 
-            # First user message as summary (skip journal chunks)
             transcript_chunks = [c for c in chunks if c.turn_index >= 0]
-            sorted_chunks = sorted(
-                transcript_chunks or chunks,
-                key=lambda c: c.turn_index,
-            )
+            candidates.append((
+                session_id,
+                chunks,
+                transcript_chunks,
+                earliest_ts,
+            ))
+            if len(candidates) >= max_sessions:
+                break
+
+        hydrated_by_id: dict[str, TranscriptChunk] = {}
+        if self._lazy_chunks and self._db is not None:
+            rowids = []
+            for _, chunks, _, _ in candidates:
+                for chunk in chunks:
+                    idx = self._id_to_idx.get(chunk.id)
+                    rowid = self._idx_to_rowid.get(idx) if idx is not None else None
+                    if rowid is not None:
+                        rowids.append(rowid)
+            hydrated_by_id = {
+                chunk.id: chunk
+                for chunk in self._db.load_chunks_by_rowids(rowids).values()
+            }
+        else:
+            hydrated_by_id = {
+                chunk.id: chunk
+                for _, chunks, _, _ in candidates
+                for chunk in chunks
+            }
+
+        results = []
+        for session_id, chunks, transcript_chunks, earliest_ts in candidates:
+            # First user message as summary (skip journal chunks)
+            sorted_chunks = sorted(transcript_chunks or chunks, key=lambda c: c.turn_index)
             first_msg = ""
             for c in sorted_chunks:
-                full = self._get_chunk(self._id_to_idx[c.id])
+                full = hydrated_by_id.get(c.id, c)
                 if full.user_text:
                     first_msg = full.user_text[:120]
                     if len(full.user_text) > 120:
@@ -4218,7 +4246,7 @@ class TranscriptIndex:
 
             all_files = set()
             for c in chunks:
-                full = self._get_chunk(self._id_to_idx[c.id])
+                full = hydrated_by_id.get(c.id, c)
                 all_files.update(full.files_touched)
 
             results.append({
@@ -4228,9 +4256,6 @@ class TranscriptIndex:
                 "first_message": first_msg,
                 "files_count": len(all_files),
             })
-
-            if len(results) >= max_sessions:
-                break
 
         return results
 

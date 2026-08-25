@@ -1,7 +1,15 @@
 {
   "name": "synapt-recall",
-  "version": "0.1.0",
-  "description": "Codex plugin scaffold for synapt recall MCP access.",
+  "version": "0.2.0",
+  "description": "Persistent memory and automatic session context for Codex via synapt recall.",
+  "author": {
+    "name": "synapt",
+    "url": "https://github.com/synapt-dev"
+  },
+  "homepage": "https://synapt.dev",
+  "repository": "https://github.com/synapt-dev/recall",
+  "license": "MIT",
+  "keywords": ["memory", "recall", "persistent", "context", "sessions"],
   "interface": {
     "displayName": "synapt Recall",
     "shortDescription": "Local-first memory and recall for Codex.",
@@ -11,7 +19,12 @@
     "capabilities": [
       "MCP",
       "Recall",
-      "Local Memory"
+      "Local Memory",
+      "Automatic Session Context"
+    ],
+    "defaultPrompt": [
+      "Find the most relevant context from our past work.",
+      "Save this decision so a future session inherits it."
     ]
   }
 }

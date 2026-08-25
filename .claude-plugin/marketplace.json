@@ -1,0 +1,15 @@
+{
+  "name": "synapt-plugins",
+  "owner": {
+    "name": "synapt"
+  },
+  "description": "Local-first memory and continuity plugins from synapt.",
+  "plugins": [
+    {
+      "name": "synapt-recall",
+      "source": "./claude-plugin",
+      "description": "Persistent recall and automatic bounded session context for Claude Code",
+      "category": "Productivity"
+    }
+  ]
+}

@@ -380,6 +380,22 @@ synapt init
 
 `synapt init` installs session hooks for automatic transcript archiving.
 
+The repository's `claude-plugin/` package also owns a bounded `SessionStart`
+hook. Install it from this repository's marketplace:
+
+```text
+/plugin marketplace add synapt-dev/recall
+/plugin install synapt-recall@synapt-plugins
+```
+
+Current recall context is then injected automatically without resuming an old
+conversation. Do not also install the legacy global `SessionStart` hook because
+Claude Code runs both registrations.
+
+For shared workspaces, link `claude-plugin/project-settings.json` to
+`.claude/settings.json`. After the folder is trusted, Claude Code prompts once
+for the marketplace and plugin consent, then keeps the plugin updated.
+
 ### Codex CLI
 
 Install synapt and register the MCP server:
@@ -403,6 +419,11 @@ synapt init
 ```
 
 `synapt init` installs the `dev-loop` skill automatically, giving Codex recall search, channel coordination, and journal access.
+
+The repository's `codex-plugin/` package owns the equivalent bounded
+`SessionStart` hook. A gripspace can link that package's `hooks/hooks.json` to
+workspace `.codex/hooks.json`, keeping the capability in recall while making
+continuity automatic for every Codex session in the workspace.
 
 ## What `synapt init` does
 

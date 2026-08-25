@@ -527,11 +527,18 @@ def recall_sessions(
         after: Only sessions with activity after this date (ISO 8601).
         before: Only sessions with activity before this date (ISO 8601).
     """
-    index = _get_index()
-    if index is None:
-        index_dir = project_index_dir()
+    from synapt.recall.resume import load_resume_index
+    from synapt.recall.sharding import is_sharded
+
+    index_dir = project_index_dir()
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
         return f"No index found at {index_dir}. Run `synapt recall setup` first."
 
+    index = load_resume_index(index_dir)
     try:
         sessions = index.list_sessions(
             max_sessions=max_sessions,
@@ -540,6 +547,10 @@ def recall_sessions(
         )
     except Exception as exc:
         return f"Session listing failed: {exc}"
+    finally:
+        db = getattr(index, "_db", None)
+        if db is not None:
+            db.close()
 
     if not sessions:
         return "No sessions found."

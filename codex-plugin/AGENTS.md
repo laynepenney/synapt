@@ -5,6 +5,7 @@ Use this plugin when Codex should have direct access to synapt recall over MCP.
 ## What it provides
 
 - local `synapt server` MCP access
+- bounded recall context on every session start
 - recall search, save, context, journal, and channel tools
 - no identity or org behavior; this is OSS-only packaging of existing recall primitives
 
