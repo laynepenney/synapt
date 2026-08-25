@@ -1,0 +1,17 @@
+{
+  "description": "Load bounded synapt recall context when a Claude Code session starts.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "synapt recall hook session-start",
+            "statusMessage": "Loading current synapt context",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

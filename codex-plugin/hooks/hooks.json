@@ -1,0 +1,18 @@
+{
+  "description": "Load bounded synapt recall context when a Codex session starts.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "synapt recall hook session-start",
+            "statusMessage": "Loading current synapt context",
+            "timeout": 30,
+            "additionalContextLimit": 3000
+          }
+        ]
+      }
+    ]
+  }
+}
