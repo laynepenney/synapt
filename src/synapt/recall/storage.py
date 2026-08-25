@@ -421,6 +421,36 @@ class RecallDB:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @classmethod
+    def open_readonly(cls, db_path: Path | str, busy_timeout_ms: int = 2000) -> "RecallDB":
+        """Open an EXISTING index for reads only.
+
+        No schema DDL, no migrations, a short busy timeout, and SQLite's
+        ``mode=ro`` so any write is an error rather than a contention.
+
+        Why this exists: the session-start hook read pending contradictions
+        through ``__init__``, whose ``_ensure_schema`` runs DDL and migrations
+        under a 30s busy timeout. Behind a concurrent build that connect
+        blocked for 13.9s while the query itself took 0.00s. A process that
+        prints from existing state must never queue behind the writer.
+
+        Raises ``sqlite3.OperationalError`` if the file does not exist: a
+        read-only open never mints a store, and a missing index must read as
+        "missing", not as "empty".
+        """
+        path = Path(db_path)
+        if not path.exists():
+            raise sqlite3.OperationalError(f"no index at {path}")
+        uri = path.resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=busy_timeout_ms / 1000)
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        conn.execute("PRAGMA query_only=1")
+        conn.row_factory = sqlite3.Row
+        obj = cls.__new__(cls)
+        obj._path = path
+        obj._conn = conn
+        return obj
+
     def _ensure_schema(self) -> None:
         self._conn.executescript(_SCHEMA_SQL)
         # Migrate existing tables: add columns that may be missing
