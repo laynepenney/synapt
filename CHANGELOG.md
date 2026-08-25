@@ -2,6 +2,31 @@
 
 All notable changes to synapt are documented here.
 
+## [0.20.0] — 2026-08-25
+
+**Scope.** This release promotes `v0.19.1..5b891d0`: 7 commits and 2 first-parent
+units, measured with `git rev-list --count` and `git rev-list --first-parent --count`
+over that exact range.
+
+### Added
+- **Automatic bounded session continuity for Codex and Claude Code.** The repository
+  plugin bundles now own SessionStart hooks that inject a time-budgeted wake
+  without making transcript resume the normal launch path. The bundles are distributed
+  from the repository rather than inside the Python sdist or wheel, and their versions
+  advance from 0.1.0 to 0.2.0.
+- **`synapt recall catchup` runs deferred session maintenance explicitly.** The command
+  archives newly available transcripts and rebuilds stale recall state outside the
+  synchronous SessionStart hook.
+
+### Changed
+- **Session listing and resume hydrate only selected sessions.** Routing metadata is
+  read first, then full event payloads are loaded only for the bounded result set.
+- **SessionStart defers transcript catchup.** The hook budgets its wake and records the
+  outcome. Journal compaction and startup-context generation remain synchronous.
+
+### Fixed
+- **Windows build locking.** Windows can read the build-lock stamp while the lock is held.
+
 ## [0.19.0] — 2026-08-21
 
 **Counting rule, stated so it can be checked.** Range `ca62880..bc594f3` — from the 0.18.0
