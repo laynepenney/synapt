@@ -2,6 +2,32 @@
 
 All notable changes to synapt are documented here.
 
+## [0.21.0] — 2026-08-26
+
+**Scope.** This release promotes `v0.20.0..b8f22c4`: 7 commits and 2 first-parent
+units, measured with `git rev-list --count` and `git rev-list --first-parent --count`
+over that exact range.
+
+### Added
+- **Bounded SessionEnd recovery checkpoints.** Claude Code and Codex hooks capture a
+  scrubbed continuity checkpoint inside the three-second SessionEnd ceiling without
+  importing SQLite, subprocess, or the recall indexing stack.
+- **Runtime compaction handoff indexing.** Recall locates trustworthy compaction
+  summaries while indexing sessions and can surface the newest handoff on a later
+  fresh start.
+- **Standalone release binaries.** Release automation now builds hermetic macOS arm64
+  and Linux x86_64 executables with checksums for package-manager distribution.
+
+### Changed
+- **SessionStart continuity is configurable.** `off`, `explicit`, `automatic`, and
+  `always` modes let users choose how much startup recovery they want. Automatic is
+  the default.
+- **Compaction-triggered starts do no resume work.** Plugin and global SessionStart
+  matchers exclude `compact`, with an early CLI guard as a backstop. The active
+  conversation already carries its context across compaction.
+- **Agent plugin versions advance to 0.3.0.** Both the Claude Code and Codex bundles
+  include the SessionEnd checkpoint and compact-start exclusion.
+
 ## [0.20.0] — 2026-08-25
 
 **Scope.** This release promotes `v0.19.1..5b891d0`: 7 commits and 2 first-parent
