@@ -565,6 +565,79 @@ def recall_sessions(
     return "\n".join(lines)
 
 
+def recall_resume(
+    session_id: str | None = None,
+    turns: int = 10,
+) -> str:
+    """Show the tail of the most recent session so a fresh session can pick up where it stopped.
+
+    Answers by POSITION (the last N turns), not by relevance -- which is what a
+    cold "where did we leave off" needs and what search cannot give. Pairs the
+    tail with the journal entry that session wrote, if any, and labels the
+    index-freshness verdict so a stale view is never mistaken for a complete one.
+
+    Use at session start, alongside recall_journal: the journal is what the
+    previous session chose to write, this is what actually happened last. They
+    diverge whenever work continued after the journal was written.
+
+    Same surface as the `synapt resume` CLI.
+
+    Args:
+        session_id: Session to resume (prefix accepted). Default: the newest session.
+        turns: Number of tail turns to show (default 10).
+    """
+    from synapt.recall.journal import _journal_path
+    from synapt.recall.resume import (
+        ResumeError,
+        build_resume_view,
+        format_resume,
+        load_resume_index,
+    )
+    from synapt.recall.sharding import is_sharded
+
+    index_dir = project_index_dir()
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
+        return f"No index found at {index_dir}. Run `synapt recall setup` first."
+
+    index = load_resume_index(index_dir)
+    try:
+        try:
+            view = build_resume_view(
+                index,
+                session_id=session_id,
+                limit=turns,
+                journal_path=_journal_path(),
+            )
+        except ResumeError as exc:
+            if not index._session_order:
+                return "No sessions indexed yet. Nothing to resume."
+            return f"Resume failed: {exc}"
+    finally:
+        db = getattr(index, "_db", None)
+        if db is not None:
+            db.close()
+
+    # Freshness is attached after the view is built (same contract as the CLI):
+    # it can only change what the reader is told, never what is shown. A failure
+    # to compute it leaves the verdict None, rendered as NOT CHECKED, not fresh.
+    try:
+        import dataclasses
+
+        from synapt.recall.freshness import check_index_freshness
+
+        result = check_index_freshness(None, index_dir=index_dir)
+        if not result.stale and not view.turns:
+            result = check_index_freshness(None, index_dir=index_dir, deep=True)
+        view = dataclasses.replace(view, freshness=result)
+    except Exception:
+        pass
+
+    return format_resume(view)
+
 def recall_build(incremental: bool = True) -> str:
     """Build or rebuild the transcript index from auto-discovered sources.
 
@@ -2419,6 +2492,7 @@ def register_tools(mcp) -> None:
     mcp.tool()(_with_directive_check(recall_quick))
     mcp.tool()(_with_directive_check(recall_files))
     mcp.tool()(_with_directive_check(recall_sessions))
+    mcp.tool()(_with_directive_check(recall_resume))
     mcp.tool()(recall_build)
     mcp.tool()(recall_setup)
     mcp.tool()(recall_export)
