@@ -1,8 +1,9 @@
 {
-  "description": "Load bounded synapt recall context when a Codex session starts.",
+  "description": "Load bounded synapt recall context and capture a bounded recovery checkpoint for Codex sessions.",
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "startup|resume|clear|fork",
         "hooks": [
           {
             "type": "command",
@@ -10,6 +11,18 @@
             "statusMessage": "Loading current synapt context",
             "timeout": 30,
             "additionalContextLimit": 3000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "synapt recall checkpoint --event-json -",
+            "statusMessage": "Capturing bounded synapt checkpoint",
+            "timeout": 3
           }
         ]
       }

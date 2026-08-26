@@ -421,9 +421,33 @@ synapt init
 `synapt init` installs the `dev-loop` skill automatically, giving Codex recall search, channel coordination, and journal access.
 
 The repository's `codex-plugin/` package owns the equivalent bounded
-`SessionStart` hook. A gripspace can link that package's `hooks/hooks.json` to
-workspace `.codex/hooks.json`, keeping the capability in recall while making
-continuity automatic for every Codex session in the workspace.
+`SessionStart` hook and the bounded `SessionEnd` recovery checkpoint. A
+gripspace can link that package's `hooks/hooks.json` to workspace
+`.codex/hooks.json`, keeping the capability in recall while making continuity
+automatic for every Codex session in the workspace.
+
+### Session continuity policy
+
+SessionStart recovery is intent-aware. A compaction-triggered start is always a
+no-op because the runtime already carried the live conversation forward. The
+default `automatic` policy also treats `/clear` as an intentional clean slate.
+
+Set the policy globally in `~/.synapt/config.json` or per project in
+`.synapt/recall/config.json`:
+
+```json
+{
+  "session_start": {
+    "continuity": "automatic"
+  }
+}
+```
+
+Available modes are `off`, `explicit`, `automatic`, and `always`. `explicit`
+only injects recovery context for a runtime `resume`. `automatic` covers normal
+startup, resume, and fork. `always` also crosses a clear boundary when that is
+explicitly desired. `SYNAPT_SESSION_START_CONTINUITY` provides the equivalent
+environment override.
 
 ## What `synapt init` does
 
@@ -437,7 +461,8 @@ It will:
 1. archive project-relevant Claude Code and Codex transcripts
 2. build the `.synapt/recall/index/recall.db` search index
 3. register the Synapt MCP server in Claude Code when the `claude` CLI is available
-4. install Claude hooks for `SessionStart`, `SessionEnd`, and `PreCompact`
+4. install Claude hooks for bounded `SessionStart`, bounded `SessionEnd`
+   checkpoint capture, and `PreCompact`
 5. deploy the packaged Codex `dev-loop` skill
 6. add `.synapt/` to `.gitignore`
 

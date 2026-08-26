@@ -394,7 +394,12 @@ def _archive_and_build_locked(
         journal_paths=_build_journal_files(project_dir),
         archive_paths=archive_paths,
     )
-    if incremental and is_noop(signature_from_manifest(db.load_manifest()), build_signature):
+    from synapt.recall.compaction import compaction_index_ready
+    if (
+        incremental
+        and compaction_index_ready(project_dir)
+        and is_noop(signature_from_manifest(db.load_manifest()), build_signature)
+    ):
         print("  Up to date: no transcript, channel or journal input changed")
         print("  Skipped: parse, enrich, index (archive scanned; nothing new)")
         return TranscriptIndex.load(index_dir)
@@ -772,6 +777,10 @@ def _archive_and_build_locked(
             st = fp.stat()
             source_files.append({
                 "name": fp.name,
+                # Exact identity for sidecar projections such as compaction
+                # summaries. ``dir`` remains for the transcript parser's
+                # backwards-compatible incremental key.
+                "source_path": str(fp),
                 # The source dir scopes the name. This list is FLAT across every
                 # build source, so two worktrees archiving the same session name
                 # produce two entries that are indistinguishable without it, and
@@ -828,6 +837,21 @@ def _archive_and_build_locked(
     # Its witness pins store resolution through the explicit env seam rather
     # than inferring it from cwd -- an earlier attempt inferred, was defeated by
     # its own inference, and was wrongly reported as blocked by test isolation.
+    # Compaction handoffs get an explicit continuity-metadata projection, so
+    # SessionStart need not rely on their incidental ordinary-turn shape or
+    # reopen and scan a transcript.
+    compaction_indexed = True
+    try:
+        from synapt.recall.compaction import update_compaction_summary_index
+        update_compaction_summary_index(
+            build_sources,
+            project=project_dir,
+            previous_manifest=incremental_manifest,
+        )
+    except Exception as exc:
+        compaction_indexed = False
+        logger.warning("Compaction summary indexing failed: %s", exc)
+
     manifest_payload = {"source_files": source_files}
     inputs_stable = (
         readonly_at_read.digest == readonly_before.digest
@@ -838,8 +862,10 @@ def _archive_and_build_locked(
             archive_paths=archive_paths,
         ).digest == signature_at_read.digest
     )
-    if inputs_stable:
+    if inputs_stable and compaction_indexed:
         manifest_payload.update(signature_to_manifest(signature_at_read))
+    elif not compaction_indexed:
+        print("  Note: compaction summary indexing failed; next run will not skip")
     else:
         print("  Note: input changed during the build; next run will not skip")
     db.save_manifest(manifest_payload)
@@ -2081,8 +2107,12 @@ def cmd_channel(args: argparse.Namespace) -> None:
 
 
 _GLOBAL_HOOKS: dict[str, dict[str, str | int]] = {
-    "SessionStart": {"command": "synapt recall hook session-start", "timeout": 60},
-    "SessionEnd": {"command": "synapt recall hook session-end", "timeout": 60},
+    "SessionStart": {
+        "command": "synapt recall hook session-start",
+        "timeout": 60,
+        "matcher": "startup|resume|clear|fork",
+    },
+    "SessionEnd": {"command": "synapt recall checkpoint --event-json -", "timeout": 3},
     "PreCompact": {"command": "synapt recall hook precompact", "timeout": 300},
 }
 
@@ -2104,8 +2134,11 @@ def _install_global_hooks() -> int:
     installed = 0
     migrated = 0
 
-    # Migrate: remove old "synapse recall hook ..." entries
+    # Migrate renamed commands and the former unbounded default SessionEnd.
+    # The heavy handler remains available explicitly, but must not coexist
+    # with the bounded checkpoint in automatic hook configuration.
     _OLD_HOOK_PREFIX = "synapse recall hook "
+    _OBSOLETE_COMMANDS = {"synapt recall hook session-end"}
     for event in list(hooks.keys()):
         matchers = hooks.get(event, [])
         for m in matchers:
@@ -2114,8 +2147,13 @@ def _install_global_hooks() -> int:
             inner = m.get("hooks", [])
             filtered = [
                 h for h in inner
-                if not (isinstance(h, dict) and
-                        h.get("command", "").startswith(_OLD_HOOK_PREFIX))
+                if not (
+                    isinstance(h, dict)
+                    and (
+                        h.get("command", "").startswith(_OLD_HOOK_PREFIX)
+                        or h.get("command") in _OBSOLETE_COMMANDS
+                    )
+                )
             ]
             if len(filtered) < len(inner):
                 migrated += len(inner) - len(filtered)
@@ -2124,10 +2162,31 @@ def _install_global_hooks() -> int:
     for event, hook_cfg in _GLOBAL_HOOKS.items():
         command = hook_cfg["command"]
         timeout = hook_cfg.get("timeout", 60)
+        desired_matcher = str(hook_cfg.get("matcher", ""))
         matchers = hooks.setdefault(event, [])
-        # Check if our command is already registered
+
+        # Move an existing command when its source matcher changed. In
+        # particular, the old catch-all SessionStart must stop launching on a
+        # compaction-triggered start.
+        for matcher in matchers:
+            if not isinstance(matcher, dict):
+                continue
+            matcher_value = str(matcher.get("matcher") or "")
+            if matcher_value == desired_matcher:
+                continue
+            inner = matcher.get("hooks", [])
+            filtered = [
+                hook for hook in inner
+                if not (isinstance(hook, dict) and hook.get("command") == command)
+            ]
+            if len(filtered) < len(inner):
+                migrated += len(inner) - len(filtered)
+            matcher["hooks"] = filtered
+
+        # Check if our command is already registered under the right matcher.
         already = any(
             isinstance(m, dict)
+            and str(m.get("matcher") or "") == desired_matcher
             and any(
                 isinstance(h, dict) and h.get("command") == command
                 for h in m.get("hooks", [])
@@ -2137,15 +2196,18 @@ def _install_global_hooks() -> int:
         if already:
             continue
 
-        # Find or create a catch-all matcher
+        # Find or create the event's required matcher.
         target = None
         for m in matchers:
-            if isinstance(m, dict) and not m.get("matcher"):
+            if (
+                isinstance(m, dict)
+                and str(m.get("matcher") or "") == desired_matcher
+            ):
                 target = m
                 break
         entry = {"type": "command", "command": str(command), "timeout": int(timeout)}
         if target is None:
-            matchers.append({"matcher": "", "hooks": [entry]})
+            matchers.append({"matcher": desired_matcher, "hooks": [entry]})
         else:
             target.setdefault("hooks", []).append(entry)
         installed += 1
@@ -2214,7 +2276,11 @@ def _catchup_archive_and_journal(project: Path, transcript_dir: Path) -> None:
         print(f"  Catch-up: wrote {journaled} journal entry(ies)", file=sys.stderr)
 
 
-def generate_startup_context(project: Path) -> list[str]:
+def generate_startup_context(
+    project: Path,
+    *,
+    include_continuity: bool = True,
+) -> list[str]:
     """Generate startup context lines for any tool (Claude, Codex, etc.).
 
     Returns a list of context strings covering:
@@ -2232,7 +2298,11 @@ def generate_startup_context(project: Path) -> list[str]:
     background indexing, archiving, and enrichment are NOT included here;
     those belong in cmd_hook which runs inside Claude's hook lifecycle.
     """
+    continuity_lines: list[str] = []
     lines: list[str] = []
+    journal_lines: list[str] = []
+    compaction_line: str | None = None
+    latest_authored_journal_timestamp: str | None = None
 
     # 1. Branch-aware context
     try:
@@ -2248,11 +2318,11 @@ def generate_startup_context(project: Path) -> list[str]:
             if branch_entries:
                 latest = sorted(branch_entries, key=lambda e: e.timestamp)[-1]
                 if latest.focus:
-                    lines.append(f"Branch context ({branch}): {latest.focus}")
+                    continuity_lines.append(f"Branch context ({branch}): {latest.focus}")
                     if latest.decisions:
-                        lines.append(f"  Decisions: {'; '.join(latest.decisions[:3])}")
+                        continuity_lines.append(f"  Decisions: {'; '.join(latest.decisions[:3])}")
                     if latest.next_steps:
-                        lines.append(f"  Next steps: {'; '.join(latest.next_steps[:3])}")
+                        continuity_lines.append(f"  Next steps: {'; '.join(latest.next_steps[:3])}")
     except Exception:
         pass
 
@@ -2272,7 +2342,7 @@ def generate_startup_context(project: Path) -> list[str]:
                 prs = _json.loads(pr_result.stdout)
                 for pr in prs:
                     n_reviews = len(pr.get("reviews", []))
-                    lines.append(f"Open PR: #{pr['number']} -- {pr['title']} ({n_reviews} review(s))")
+                    continuity_lines.append(f"Open PR: #{pr['number']} -- {pr['title']} ({n_reviews} review(s))")
     except Exception:
         pass
 
@@ -2285,12 +2355,55 @@ def generate_startup_context(project: Path) -> list[str]:
             all_entries = _dedup_entries(_read_all_entries(jf))
             rich = [e for e in all_entries if e.has_rich_content()]
             rich.sort(key=lambda e: e.timestamp, reverse=True)
+            # A files-only authored checkpoint still supersedes an older raw
+            # transcript tail even though it is not rich enough to render.
+            authored = [
+                entry for entry in all_entries
+                if not entry.auto and entry.has_content()
+            ]
+            authored.sort(key=lambda entry: entry.timestamp, reverse=True)
+            if authored:
+                latest_authored_journal_timestamp = authored[0].timestamp
             for entry in rich[:3]:
-                lines.append(format_for_session_start(entry))
+                journal_lines.append(format_for_session_start(entry))
     except Exception:
         pass
 
-    # 4. Knowledge nodes
+    # 4. Latest runtime-authored compaction handoff. This sidecar is refreshed
+    # by transcript indexing, so startup remains O(1) in transcript size.
+    try:
+        from synapt.recall.compaction import (
+            format_compaction_summary,
+            latest_compaction_summary,
+        )
+        summary = latest_compaction_summary(project)
+        if summary:
+            compaction_line = format_compaction_summary(summary)
+    except Exception:
+        pass
+
+    # 5. Raw SessionEnd recovery checkpoint, but only while it is newer than
+    # the latest authored journal. Once an authored handoff catches up, it is
+    # authoritative and the raw tail disappears from startup.
+    try:
+        from synapt.checkpoint import (
+            format_checkpoint,
+            is_newer_than,
+            read_checkpoint,
+        )
+        checkpoint = read_checkpoint(project)
+        if checkpoint and is_newer_than(checkpoint, latest_authored_journal_timestamp):
+            continuity_lines.append(format_checkpoint(checkpoint))
+    except Exception:
+        pass
+
+    # Raw current-facing evidence must survive the startup byte budget before
+    # older authored history. The compaction handoff follows it, then journals.
+    if compaction_line:
+        continuity_lines.append(compaction_line)
+    continuity_lines.extend(journal_lines)
+
+    # 6. Knowledge nodes
     try:
         from synapt.recall.knowledge import read_nodes, format_knowledge_for_session_start
         kn_text = format_knowledge_for_session_start(read_nodes())
@@ -2299,7 +2412,7 @@ def generate_startup_context(project: Path) -> list[str]:
     except Exception:
         pass
 
-    # 5. Pending reminders
+    # 7. Pending reminders
     try:
         from synapt.recall.reminders import pop_pending, format_for_session_start as fmt_reminders
         pending = pop_pending()
@@ -2308,7 +2421,7 @@ def generate_startup_context(project: Path) -> list[str]:
     except Exception:
         pass
 
-    # 6. Pending contradictions
+    # 8. Pending contradictions
     try:
         from synapt.recall.server import format_contradictions_for_session_start
         contradictions_text = format_contradictions_for_session_start()
@@ -2317,7 +2430,7 @@ def generate_startup_context(project: Path) -> list[str]:
     except Exception:
         pass
 
-    # 7. Channel unread summary
+    # 9. Channel unread summary
     try:
         from synapt.recall.channel import channel_join, channel_unread, channel_read
         role = "agent" if os.environ.get("SYNAPT_AGENT_ID") else "human"
@@ -2335,7 +2448,7 @@ def generate_startup_context(project: Path) -> list[str]:
     except Exception:
         pass
 
-    # 8. Pending directives
+    # 10. Pending directives
     try:
         from synapt.recall.channel import check_directives
         directives = check_directives()
@@ -2344,7 +2457,7 @@ def generate_startup_context(project: Path) -> list[str]:
     except Exception:
         pass
 
-    return lines
+    return (continuity_lines if include_continuity else []) + lines
 
 
 def _gripspace_root(project: Path) -> Path:
@@ -2495,14 +2608,51 @@ def cmd_startup(args: argparse.Namespace) -> None:
             print(line)
 
 
+def _session_start_continuity_allowed(source: str) -> bool:
+    """Return whether SessionStart should inject recovery context.
+
+    A compaction start is always a no-op because the runtime has already
+    carried the live context forward.  The remaining sources are governed by
+    the user's continuity policy.  ``automatic`` deliberately respects
+    ``/clear`` as an intent boundary.
+    """
+    source = (source or "startup").strip().lower()
+    if source == "compact":
+        return False
+
+    from synapt.recall.config import load_config
+
+    mode = load_config().get_session_start_continuity()
+    if mode == "off":
+        return False
+    if mode == "explicit":
+        return source == "resume"
+    if mode == "automatic":
+        return source in {"startup", "resume", "fork"}
+    return True
+
+
+def _spawn_session_start_catchup(project: Path) -> bool:
+    """Start the one detached maintenance worker, if transcripts exist."""
+    import subprocess
+
+    if not project_transcript_dirs(project):
+        return False
+    subprocess.Popen(
+        [sys.executable, "-m", "synapt.recall.cli", "catchup"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return True
+
+
 def cmd_hook(args: argparse.Namespace) -> None:
     """Versioned hook handler — replaces shell scripts.
 
     Called directly from Claude Code hooks config:
         "command": "synapt recall hook session-start"
     """
-    import subprocess
-
     # Read the hook payload (JSON on stdin). SessionStart carries ``source``:
     # "startup" | "resume" | "clear" | "compact" | "fork". It used to be
     # drained and discarded; it is the one field that says WHY we are waking.
@@ -2514,11 +2664,23 @@ def cmd_hook(args: argparse.Namespace) -> None:
     except Exception:
         payload = {}
 
+    event = args.event
+
+    if event == "session-start":
+        source = str(payload.get("source") or "startup").strip().lower()
+        if source == "compact":
+            # The runtime already carried the live context across compaction.
+            # Do not resolve recall state, render a wake, log a run, or start
+            # deferred resume maintenance for this SessionStart.
+            return
+
+    include_continuity = True
+    if event == "session-start":
+        include_continuity = _session_start_continuity_allowed(source)
+
     # Opt-out check
     if (project_data_dir() / "no-auto-capture").exists():
         return
-
-    event = args.event
 
     if event == "session-start":
         # INVARIANT: this branch does O(1) work in transcript and index size,
@@ -2532,7 +2694,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # spawned detached; this branch prints from existing state only.
         from synapt.recall.session_start import HookRun, render_wake
 
-        source = str(payload.get("source") or "startup")
+        source = str(payload.get("source") or "startup").strip().lower()
         run = HookRun("session-start", source)
         warning = run.begin()
         project = Path.cwd().resolve()
@@ -2556,17 +2718,10 @@ def cmd_hook(args: argparse.Namespace) -> None:
         #    Sequenced inside `catchup` under its own lock so they cannot
         #    fight each other (or a manual build) for the build lock.
         with run.phase("spawn_catchup"):
-            transcript_all = project_transcript_dirs(project)
-            if transcript_all:
-                try:
-                    subprocess.Popen(
-                        [sys.executable, "-m", "synapt.recall.cli", "catchup"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                    )
-                except Exception:
-                    banners.append("WARNING: could not spawn `synapt recall catchup`; index and journal will not update this session.")
+            try:
+                _spawn_session_start_catchup(project)
+            except Exception:
+                banners.append("WARNING: could not spawn `synapt recall catchup`; index and journal will not update this session.")
 
         # 2. Compact journal (dedup + sort) before surfacing context. Cheap
         #    (tens of ms on a 5 MB journal) and it keeps the read consistent.
@@ -2582,7 +2737,10 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # 3. Surface startup context from EXISTING state (shared with
         #    cmd_startup for Codex parity) ...
         with run.phase("context"):
-            lines = generate_startup_context(project)
+            lines = generate_startup_context(
+                project,
+                include_continuity=include_continuity,
+            )
 
         # 4. ... rendered inside the byte budget, head line first, full text
         #    on disk with a pointer. The harness previews ~2 KB of this.
@@ -3367,6 +3525,15 @@ def make_parser() -> argparse.ArgumentParser:
     startup_parser.add_argument("--compact", action="store_true",
                                 help="Single-line summary for prompt injection")
 
+    checkpoint_parser = subparsers.add_parser(
+        "checkpoint",
+        help="Capture a bounded SessionEnd recovery checkpoint",
+    )
+    checkpoint_parser.add_argument(
+        "--event-json", default="-",
+        help="Hook event JSON path, or - for stdin",
+    )
+
     # Hook (versioned hook commands — called directly from Claude Code hooks config)
     hook_parser = subparsers.add_parser("hook", help="Run a Claude Code hook (session-start, session-end, precompact, check-directives)")
     hook_parser.add_argument("event", choices=["session-start", "session-end", "precompact", "check-directives"],
@@ -3505,6 +3672,9 @@ def main():
         cmd_remind(args)
     elif args.command == "startup":
         cmd_startup(args)
+    elif args.command == "checkpoint":
+        from synapt.checkpoint import main as checkpoint_main
+        raise SystemExit(checkpoint_main(["--event-json", args.event_json]))
     elif args.command == "hook":
         cmd_hook(args)
     elif args.command == "install-hook":

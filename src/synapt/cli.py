@@ -38,6 +38,12 @@ def _dispatch_recall(*args: str) -> None:
 
 
 def main():
+    # SessionEnd has a hard three-second ceiling in Codex. Route the bounded
+    # checkpoint before plugin discovery or the full recall CLI import.
+    if len(sys.argv) >= 3 and sys.argv[1:3] == ["recall", "checkpoint"]:
+        from synapt.checkpoint import main as checkpoint_main
+        raise SystemExit(checkpoint_main(sys.argv[3:]))
+
     extra_commands = _discover_commands()
 
     if len(sys.argv) < 2:

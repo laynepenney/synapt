@@ -8,6 +8,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 HOOK_COMMAND = "synapt recall hook session-start"
+CHECKPOINT_COMMAND = "synapt recall checkpoint --event-json -"
 
 
 def _hooks(runtime: str) -> dict:
@@ -21,8 +22,17 @@ def _json(path: Path) -> dict:
 
 def _session_start_command(runtime: str) -> dict:
     hooks = _hooks(runtime)["hooks"]
-    assert set(hooks) == {"SessionStart"}
+    assert set(hooks) == {"SessionStart", "SessionEnd"}
     groups = hooks["SessionStart"]
+    assert len(groups) == 1
+    assert groups[0]["matcher"] == "startup|resume|clear|fork"
+    commands = groups[0]["hooks"]
+    assert len(commands) == 1
+    return commands[0]
+
+
+def _session_end_command(runtime: str) -> dict:
+    groups = _hooks(runtime)["hooks"]["SessionEnd"]
     assert len(groups) == 1
     commands = groups[0]["hooks"]
     assert len(commands) == 1
@@ -45,6 +55,14 @@ def test_claude_plugin_loads_bounded_session_context() -> None:
     assert command["command"] == HOOK_COMMAND
     assert command["timeout"] == 30
     assert "additionalContextLimit" not in command
+
+
+def test_plugins_capture_bounded_session_end_checkpoint() -> None:
+    for runtime in ("codex", "claude"):
+        command = _session_end_command(runtime)
+        assert command["type"] == "command"
+        assert command["command"] == CHECKPOINT_COMMAND
+        assert command["timeout"] == 3
 
 
 def test_claude_marketplace_distributes_repo_plugin() -> None:

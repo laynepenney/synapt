@@ -46,6 +46,25 @@ class TestGenerateStartupContext:
             result = generate_startup_context(tmp_path)
         assert result == []
 
+    def test_continuity_can_be_suppressed_without_suppressing_ambient_context(self, tmp_path):
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.journal._journal_path", return_value=tmp_path / "none"), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value={
+                 "runtime": "claude", "timestamp": "2026-01-01", "summary": "resume me",
+             }), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=None), \
+             patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[object()]), \
+             patch("synapt.recall.reminders.format_for_session_start", return_value="ambient reminder"), \
+             patch("synapt.recall.server.format_contradictions_for_session_start", return_value=""), \
+             patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            text = "\n".join(generate_startup_context(tmp_path, include_continuity=False))
+
+        assert "resume me" not in text
+        assert "ambient reminder" in text
+
     def test_journal_entries_surfaced(self, tmp_path):
         """Journal entries appear in startup context when present."""
         from synapt.recall.journal import JournalEntry, append_entry, _journal_path
@@ -69,6 +88,135 @@ class TestGenerateStartupContext:
         # Should have at least one line from the journal entry
         text = "\n".join(result)
         assert "Codex startup parity" in text or "test-session" in text
+
+    def test_newer_raw_checkpoint_is_surfaced_after_authored_journal(self, tmp_path):
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-04-10T12:00:00Z",
+            session_id="authored-session",
+            focus="Authored handoff",
+        ), jf)
+        checkpoint = {
+            "schema_version": 1,
+            "captured_at": "2026-04-11T12:00:00Z",
+            "parse_status": "ok",
+            "last_user_text": "latest request",
+            "last_assistant_text": "latest response",
+            "files_touched": ["src/new.py"],
+        }
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value=None), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=checkpoint):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        assert "LAST CHECKPOINT" in text
+        assert "Not an authored journal" in text
+        assert "latest request" in text
+
+    def test_checkpoint_and_compaction_precede_older_journal_context(self, tmp_path):
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-04-10T12:00:00Z",
+            session_id="journal",
+            focus="older journal context",
+        ), jf)
+        checkpoint = {
+            "schema_version": 1,
+            "captured_at": "2026-04-11T12:00:00Z",
+            "parse_status": "ok",
+            "last_user_text": "newest raw turn",
+        }
+        summary = {
+            "runtime": "claude",
+            "timestamp": "2026-04-10T18:00:00Z",
+            "summary": "compacted handoff",
+        }
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value=summary), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=checkpoint):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        assert text.index("LAST CHECKPOINT") < text.index("LAST COMPACTION SUMMARY")
+        assert text.index("LAST COMPACTION SUMMARY") < text.index("older journal context")
+
+    def test_checkpoint_older_than_authored_journal_is_suppressed(self, tmp_path):
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-04-12T12:00:00Z",
+            session_id="authored-session",
+            focus="New authored handoff",
+        ), jf)
+        checkpoint = {
+            "schema_version": 1,
+            "captured_at": "2026-04-11T12:00:00Z",
+            "parse_status": "ok",
+            "last_user_text": "stale raw request",
+        }
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value=None), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=checkpoint):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        assert "LAST CHECKPOINT" not in text
+        assert "stale raw request" not in text
+
+    def test_files_only_authored_journal_suppresses_older_checkpoint(self, tmp_path):
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-04-12T12:00:00Z",
+            session_id="files-only-session",
+            files_modified=["src/final.py"],
+        ), jf)
+        checkpoint = {
+            "schema_version": 1,
+            "captured_at": "2026-04-11T12:00:00Z",
+            "parse_status": "ok",
+            "last_user_text": "stale raw request",
+        }
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value=None), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=checkpoint):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        assert "LAST CHECKPOINT" not in text
+        assert "stale raw request" not in text
+
+    def test_newer_auto_journal_does_not_hide_raw_checkpoint(self, tmp_path):
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-04-12T12:00:00Z",
+            session_id="auto-session",
+            focus="Automatically extracted focus",
+            auto=True,
+        ), jf)
+        checkpoint = {
+            "schema_version": 1,
+            "captured_at": "2026-04-11T12:00:00Z",
+            "parse_status": "partial",
+            "last_user_text": "raw request survives",
+        }
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value=None), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=checkpoint):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        assert "LAST CHECKPOINT" in text
+        assert "raw request survives" in text
 
     def test_reminders_surfaced(self, tmp_path):
         """Pending reminders appear in startup context."""
