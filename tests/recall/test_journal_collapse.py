@@ -218,7 +218,7 @@ class TestServingFilter(unittest.TestCase):
                                 next_steps=[COLLAPSED_A, "carry me forward"])
         merged = merge_carried_forward_next_steps(["today's step"], [], previous)
         self.assertNotIn(COLLAPSED_A, merged)
-        self.assertIn("carry me forward", merged)   # control
+        self.assertTrue(any(s.startswith("carry me forward") for s in merged))   # control (stamped, recall#984)
         self.assertIn("today's step", merged)
 
     def test_thirteen_entry_propagation_serves_zero(self):

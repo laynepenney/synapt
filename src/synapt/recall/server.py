@@ -1753,7 +1753,7 @@ def recall_journal(
             format_for_session_start,
             format_write_confirmation,
             latest_transcript_path,
-            merge_carried_forward_next_steps,
+            merge_carried_forward_with_report,
             pending_next_steps,
             read_entries,
             read_latest,
@@ -1798,7 +1798,7 @@ def recall_journal(
             if next_steps:
                 entry.next_steps = split_journal_field(next_steps)
                 explicit_next_steps = list(entry.next_steps)
-            entry.next_steps = merge_carried_forward_next_steps(
+            entry.next_steps, carry_report = merge_carried_forward_with_report(
                 entry.next_steps,
                 entry.done,
                 previous_entry,
@@ -1817,7 +1817,7 @@ def recall_journal(
             append_entry(entry)
             return (
                 "Journal entry written.\n\n"
-                f"{format_write_confirmation(entry, explicit_next_steps)}"
+                f"{format_write_confirmation(entry, explicit_next_steps, report=carry_report)}"
             )
 
         return f"Unknown action: {action}. Use 'read', 'write', 'list', or 'pending'."
