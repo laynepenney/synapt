@@ -49,6 +49,8 @@ _ENV_MAP = {
 
 # Default query parameters
 DEFAULT_MAX_TOKENS = 1500
+DEFAULT_SESSION_START_CONTINUITY = "automatic"
+SESSION_START_CONTINUITY_MODES = {"off", "explicit", "automatic", "always"}
 
 # Reverse lookup: config key → env var name
 _KEY_TO_ENV = {v: k for k, v in _ENV_MAP.items()}
@@ -61,6 +63,7 @@ class RecallConfig:
     models: dict[str, str] = field(default_factory=lambda: dict(DEFAULTS))
     backend: str = "auto"
     max_tokens: int = DEFAULT_MAX_TOKENS
+    session_start_continuity: str = DEFAULT_SESSION_START_CONTINUITY
 
     def get_model(self, key: str) -> str:
         """Get a model name by key, with env var override."""
@@ -82,6 +85,20 @@ class RecallConfig:
             except ValueError:
                 logger.warning("Invalid SYNAPT_MAX_TOKENS=%r, using %d", env_val, self.max_tokens)
         return self.max_tokens
+
+    def get_session_start_continuity(self) -> str:
+        """Return the SessionStart recovery policy, with env override."""
+        value = os.environ.get(
+            "SYNAPT_SESSION_START_CONTINUITY", self.session_start_continuity,
+        ).strip().lower()
+        if value not in SESSION_START_CONTINUITY_MODES:
+            logger.warning(
+                "Invalid SessionStart continuity mode %r, using %s",
+                value,
+                DEFAULT_SESSION_START_CONTINUITY,
+            )
+            return DEFAULT_SESSION_START_CONTINUITY
+        return value
 
     def active_models(self) -> dict[str, str]:
         """Get all active model names (with env overrides applied)."""
@@ -189,7 +206,18 @@ def load_config() -> RecallConfig:
         except (ValueError, TypeError):
             logger.warning("Invalid max_tokens in project config, using default")
 
-    config = RecallConfig(models=models, backend=backend, max_tokens=max_tokens)
+    continuity = DEFAULT_SESSION_START_CONTINUITY
+    for data in (global_data, project_data):
+        session_start = data.get("session_start", {})
+        if isinstance(session_start, dict) and "continuity" in session_start:
+            continuity = str(session_start["continuity"]).strip().lower()
+
+    config = RecallConfig(
+        models=models,
+        backend=backend,
+        max_tokens=max_tokens,
+        session_start_continuity=continuity,
+    )
     _cached_config = config
     _cached_mtime = current_mtime
 

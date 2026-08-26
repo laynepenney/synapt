@@ -97,11 +97,18 @@ def test_install_global_hooks_creates_entries(tmp_path):
     assert "SessionEnd" in settings["hooks"]
     assert "PreCompact" in settings["hooks"]
 
+    session_start = settings["hooks"]["SessionStart"][0]
+    assert session_start["matcher"] == "startup|resume|clear|fork"
+    assert session_start["hooks"][0]["command"] == "synapt recall hook session-start"
+
     # Verify PreCompact uses the synapt recall hook command (not a shell script)
     matchers = settings["hooks"]["PreCompact"]
     inner_hooks = matchers[0]["hooks"]
     assert inner_hooks[0]["command"] == "synapt recall hook precompact"
     assert inner_hooks[0]["timeout"] == 300
+    session_end = settings["hooks"]["SessionEnd"][0]["hooks"][0]
+    assert session_end["command"] == "synapt recall checkpoint --event-json -"
+    assert session_end["timeout"] == 3
 
 
 def test_install_global_hooks_idempotent(tmp_path):
@@ -135,6 +142,114 @@ def test_install_global_hooks_preserves_existing_settings(tmp_path):
     assert settings["permissions"]["allow"] == ["Bash(git:*)"]
     assert "PostSave" in settings["hooks"]
     assert "PreCompact" in settings["hooks"]
+
+
+def test_install_global_hooks_replaces_unbounded_session_end(tmp_path):
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir(parents=True)
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionEnd": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": "synapt recall hook session-end",
+                    "timeout": 60,
+                }],
+            }],
+        },
+    }))
+
+    with patch("synapt.recall.cli.Path.home", return_value=tmp_path):
+        _install_global_hooks()
+
+    hooks = json.loads((settings_dir / "settings.json").read_text())["hooks"]["SessionEnd"]
+    commands = [hook["command"] for matcher in hooks for hook in matcher["hooks"]]
+    assert commands == ["synapt recall checkpoint --event-json -"]
+
+
+def test_install_global_hooks_moves_session_start_off_catch_all(tmp_path):
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir(parents=True)
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": "synapt recall hook session-start",
+                    "timeout": 60,
+                }],
+            }],
+        },
+    }))
+
+    with patch("synapt.recall.cli.Path.home", return_value=tmp_path):
+        _install_global_hooks()
+
+    matchers = json.loads(
+        (settings_dir / "settings.json").read_text(),
+    )["hooks"]["SessionStart"]
+    commands = [
+        (matcher["matcher"], hook["command"])
+        for matcher in matchers
+        for hook in matcher["hooks"]
+    ]
+    assert commands == [
+        ("startup|resume|clear|fork", "synapt recall hook session-start"),
+    ]
+
+
+def test_install_global_hooks_persists_duplicate_catch_all_cleanup(tmp_path):
+    settings_dir = tmp_path / ".claude"
+    settings_dir.mkdir(parents=True)
+    command = {
+        "type": "command",
+        "command": "synapt recall hook session-start",
+        "timeout": 60,
+    }
+    (settings_dir / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [
+                {"matcher": "", "hooks": [command]},
+                {
+                    "matcher": "startup|resume|clear|fork",
+                    "hooks": [command],
+                },
+            ],
+            "SessionEnd": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": "synapt recall checkpoint --event-json -",
+                    "timeout": 3,
+                }],
+            }],
+            "PreCompact": [{
+                "matcher": "",
+                "hooks": [{
+                    "type": "command",
+                    "command": "synapt recall hook precompact",
+                    "timeout": 300,
+                }],
+            }],
+        },
+    }))
+
+    with patch("synapt.recall.cli.Path.home", return_value=tmp_path):
+        assert _install_global_hooks() == 0
+
+    matchers = json.loads(
+        (settings_dir / "settings.json").read_text(),
+    )["hooks"]["SessionStart"]
+    commands = [
+        (matcher["matcher"], hook["command"])
+        for matcher in matchers
+        for hook in matcher["hooks"]
+    ]
+    assert commands == [
+        ("startup|resume|clear|fork", "synapt recall hook session-start"),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +381,7 @@ def test_cmd_setup_orchestrates_all_steps(tmp_path):
             for h in matcher.get("hooks", []):
                 hook_cmds.append(h.get("command", ""))
     assert "synapt recall hook session-start" in hook_cmds
-    assert "synapt recall hook session-end" in hook_cmds
+    assert "synapt recall checkpoint --event-json -" in hook_cmds
     assert "synapt recall hook precompact" in hook_cmds
 
     # Verify .gitignore was updated

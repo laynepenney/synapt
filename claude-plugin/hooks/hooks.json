@@ -1,14 +1,27 @@
 {
-  "description": "Load bounded synapt recall context when a Claude Code session starts.",
+  "description": "Load bounded synapt recall context and capture a bounded recovery checkpoint for Claude Code sessions.",
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "startup|resume|clear|fork",
         "hooks": [
           {
             "type": "command",
             "command": "synapt recall hook session-start",
             "statusMessage": "Loading current synapt context",
             "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "synapt recall checkpoint --event-json -",
+            "statusMessage": "Capturing bounded synapt checkpoint",
+            "timeout": 3
           }
         ]
       }

@@ -31,6 +31,15 @@ class TestRecallConfig:
         assert cfg.get_model("summarization") == DEFAULTS["summarization"]
         assert cfg.get_model("enrichment") == DEFAULTS["enrichment"]
         assert cfg.backend == "auto"
+        assert cfg.get_session_start_continuity() == "automatic"
+
+    def test_session_start_continuity_env_override(self, monkeypatch):
+        monkeypatch.setenv("SYNAPT_SESSION_START_CONTINUITY", "explicit")
+        assert RecallConfig().get_session_start_continuity() == "explicit"
+
+    def test_invalid_session_start_continuity_falls_back(self):
+        cfg = RecallConfig(session_start_continuity="surprise-me")
+        assert cfg.get_session_start_continuity() == "automatic"
 
     def test_custom_model(self):
         cfg = RecallConfig(models={**DEFAULTS, "embedding": "custom-model"})
@@ -115,6 +124,17 @@ class TestLoadConfig:
         cfg = load_config()
         assert cfg.get_model("embedding") == "project-model"
         assert cfg.get_model("summarization") == "global-summary"
+
+    def test_project_config_controls_session_start_continuity(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        project_dir = tmp_path / ".synapt" / "recall"
+        project_dir.mkdir(parents=True)
+        (project_dir / "config.json").write_text(json.dumps({
+            "session_start": {"continuity": "explicit"}
+        }))
+
+        assert load_config().get_session_start_continuity() == "explicit"
 
     def test_env_var_overrides_config(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))

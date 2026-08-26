@@ -693,6 +693,48 @@ def test_second_build_after_a_change_does_not_claim_to_be_up_to_date(tmp_path, c
     assert "up to date" not in out, f"build claimed 'up to date' after real work:\n{out}"
 
 
+def test_compaction_sidecar_failure_prevents_next_build_from_skipping(
+    tmp_path, capsys, monkeypatch,
+):
+    """A stale but valid sidecar must not be certified by the main manifest."""
+    import synapt.recall.compaction as compaction
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.core import project_index_dir
+    from synapt.recall.storage import RecallDB
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+    sidecar = compaction.compaction_index_path(project)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        json.dumps({"schema_version": 1, "summaries": []}),
+        encoding="utf-8",
+    )
+
+    def fail(*args, **kwargs):
+        raise OSError("sidecar unavailable")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(compaction, "update_compaction_summary_index", fail)
+        _archive_and_build(
+            project, source_dirs=[source], use_embeddings=False, incremental=True,
+        )
+
+    manifest = RecallDB(project_index_dir(project) / "recall.db").load_manifest()
+    assert "input_signature" not in manifest
+    capsys.readouterr()
+
+    _archive_and_build(
+        project, source_dirs=[source], use_embeddings=False, incremental=True,
+    )
+    out = capsys.readouterr().out.lower()
+    assert "up to date" not in out
+    assert "compaction summary indexing failed" not in out
+
+
 def test_noop_build_still_returns_a_usable_index(tmp_path):
     """Skipping stages must not degrade the return contract.
 

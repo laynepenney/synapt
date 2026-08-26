@@ -195,6 +195,55 @@ def _run_hook(monkeypatch, tmp_path, *, source="startup", context_lines=None, tr
     return out.getvalue(), popen_calls
 
 
+class TestSessionStartContinuityPolicy:
+    @pytest.mark.parametrize(
+        ("mode", "source", "allowed"),
+        [
+            ("off", "startup", False),
+            ("explicit", "startup", False),
+            ("explicit", "resume", True),
+            ("automatic", "startup", True),
+            ("automatic", "resume", True),
+            ("automatic", "fork", True),
+            ("automatic", "clear", False),
+            ("always", "clear", True),
+            ("always", "compact", False),
+        ],
+    )
+    def test_policy(self, mode, source, allowed):
+        config = type("Config", (), {
+            "get_session_start_continuity": lambda self: mode,
+        })()
+        with patch("synapt.recall.config.load_config", return_value=config):
+            assert cli._session_start_continuity_allowed(source) is allowed
+
+    def test_compact_hook_is_absolute_noop(
+        self, owned_recall_root, monkeypatch, tmp_path, capsys,
+    ):
+        payload = json.dumps({"hook_event_name": "SessionStart", "source": "compact"})
+        monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+        monkeypatch.chdir(tmp_path)
+        with patch.object(cli, "_session_start_continuity_allowed") as policy, \
+             patch.object(cli, "project_data_dir") as data_dir, \
+             patch.object(cli, "_spawn_session_start_catchup") as catchup, \
+             patch.object(cli, "generate_startup_context") as context:
+            cli.cmd_hook(argparse.Namespace(event="session-start"))
+        policy.assert_not_called()
+        data_dir.assert_not_called()
+        catchup.assert_not_called()
+        context.assert_not_called()
+        assert capsys.readouterr().out == ""
+
+    def test_clear_keeps_ambient_startup_but_disables_continuity(
+        self, owned_recall_root, monkeypatch, tmp_path,
+    ):
+        with patch.object(cli, "generate_startup_context", return_value=["ambient"]) as context:
+            out, _ = _run_hook(monkeypatch, tmp_path, source="clear")
+
+        context.assert_called_once_with(tmp_path.resolve(), include_continuity=False)
+        assert "ambient" in out
+
+
 class TestHookDoesNoUnboundedWorkInline:
     def test_catchup_is_not_called_inline(self, owned_recall_root, monkeypatch, tmp_path):
         with patch.object(cli, "_catchup_archive_and_journal") as catchup:
@@ -484,8 +533,8 @@ class TestWakeOutputBudget:
 
     def test_source_is_carried_from_the_payload(self, owned_recall_root, monkeypatch, tmp_path):
         self._seed_big_journal(tmp_path)
-        out, _ = _run_hook(monkeypatch, tmp_path, source="clear")
-        assert "source=clear" in out.splitlines()[0]
+        out, _ = _run_hook(monkeypatch, tmp_path, source="resume")
+        assert "source=resume" in out.splitlines()[0]
 
     def test_small_context_is_not_clipped(self, owned_recall_root, monkeypatch, tmp_path):
         """Control: a context under budget passes through whole, no 'withheld'."""
