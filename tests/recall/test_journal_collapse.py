@@ -291,6 +291,32 @@ class TestRepair(unittest.TestCase):
         # something to be true about.
         self.assertIn("Await the post-compact spark", served)
 
+    def test_repair_serves_a_swallowed_done_and_focus(self):
+        # Atlas, r2 on shape-C v1: recover_collapsed parsed the swallowed done
+        # correctly, then repair_journal built the corrective entry with only
+        # the contaminated marker in done and dropped the recovered value, so
+        # the report counted a field that was never served. Parsing a field is
+        # not recovering it; this asserts the SERVED fruit, end to end.
+        from synapt.recall.journal import format_for_session_start, read_latest
+        tmp = Path(tempfile.mkdtemp()) / "journal.jsonl"
+        value = COLLAPSED_C + "\n<focus>the swallowed focus line"
+        _write(tmp, [JournalEntry(timestamp="2026-08-26T20:10:00+00:00", session_id="s",
+                                  next_steps=[value])])
+        report = repair_journal(tmp)
+        self.assertEqual(report["recovered_fields"].get("done"), 1)
+        self.assertEqual(report["recovered_fields"].get("focus"), 1)
+        latest = read_latest(tmp)
+        self.assertTrue(latest.repair)
+        self.assertIn(value, latest.done)   # the loop-breaking marker survives, verbatim
+        self.assertIn("Fixed: gr pr merge bound to the exact head. Journaled.", latest.done)
+        self.assertIn("the swallowed focus line", latest.focus)
+        served = format_for_session_start(latest)
+        self.assertIn("bound to the exact head", served)
+        self.assertIn("the swallowed focus line", served)
+        # Control: the served text carries the content and not the opener.
+        self.assertNotIn("<done>", served)
+        self.assertNotIn("<focus>", served)
+
     def test_repair_is_idempotent(self):
         repair_journal(self.path)
         after_first = self.path.read_text(encoding="utf-8")
@@ -357,3 +383,59 @@ class TestRepair(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# Shape C -- found in a real store 2026-08-26: the emitter dropped EVERY closing tag, so the
+# sibling fields arrive as bare opening tags inside the unclosed value. Two consecutive writes,
+# one of them a clean three-parameter call; done and decisions both empty, next_steps carrying
+# "<decisions>..." and "<done>..." items. Shapes A and B never fire on it: there is no closing
+# tag and no "<parameter name=" anywhere.
+COLLAPSED_C = (
+    "Blocked: gate unserviced, artifacts durable."
+    "\n<decisions>Fixed rather than filed. Kept the frozen scope."
+    "\n<done>Fixed: gr pr merge bound to the exact head. Journaled."
+)
+
+
+class TestShapeC(unittest.TestCase):
+    def test_bare_opening_tags_are_detected(self):
+        self.assertTrue(is_collapsed(COLLAPSED_C))
+        self.assertTrue(is_collapsed("<done>x"))
+        self.assertTrue(is_collapsed("prose then <decisions>more"))
+
+    def test_clean_prose_with_angle_brackets_still_not_flagged(self):
+        # The control, widened for the new signatures: ordinary comparisons and
+        # generic angle-bracket prose must not trip a field-name opener.
+        self.assertFalse(is_collapsed("a < b and c > d, 3<4"))
+        self.assertFalse(is_collapsed("use <angle brackets> in prose freely"))
+        self.assertFalse(is_collapsed("the <donee> of the trust"))     # not a field name
+        self.assertFalse(is_collapsed("<Done> as a heading"))            # case is exact
+
+    def test_recovery_splits_on_bare_openers(self):
+        head, recovered = recover_collapsed(COLLAPSED_C)
+        self.assertEqual(head, "Blocked: gate unserviced, artifacts durable.")
+        self.assertEqual(recovered["decisions"], ["Fixed rather than filed. Kept the frozen scope."])
+        self.assertEqual(recovered["done"], ["Fixed: gr pr merge bound to the exact head. Journaled."])
+
+    def test_recovery_never_loses_content_shape_c(self):
+        head, recovered = recover_collapsed(COLLAPSED_C)
+        rebuilt = head + " " + " ".join(v for vs in recovered.values() for v in vs)
+        for phrase in ("gate unserviced", "Fixed rather than filed", "bound to the exact head"):
+            self.assertIn(phrase, rebuilt)
+
+    def test_guard_refuses_shape_c_and_names_the_field(self):
+        tmp = Path(tempfile.mkdtemp()) / "journal.jsonl"
+        entry = JournalEntry(timestamp="2026-08-26T20:10:00+00:00", session_id="s",
+                             next_steps=["ordinary step", COLLAPSED_C])
+        with self.assertRaises(JournalFieldCollapse) as ctx:
+            append_entry(entry, tmp)
+        self.assertIn("next_steps", str(ctx.exception))
+        # the guard names the first matching signature in tuple order; either opener proves shape C
+        self.assertTrue("<done>" in str(ctx.exception) or "<decisions>" in str(ctx.exception), str(ctx.exception))
+
+    def test_serving_never_shows_a_shape_c_step(self):
+        previous = JournalEntry(timestamp="2026-08-26T20:10:00+00:00", session_id="s",
+                                next_steps=[COLLAPSED_C, "carry me forward"])
+        merged = merge_carried_forward_next_steps(["today"], [], previous)
+        self.assertFalse(any("<decisions>" in s for s in merged))
+        self.assertTrue(any(s.startswith("carry me forward") for s in merged))   # control

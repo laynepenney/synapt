@@ -45,6 +45,13 @@ COLLAPSE_SIGNATURES: tuple[str, ...] = (
     "</next_steps>",
     "</invoke>",
     "<parameter name=",
+    # Shape C (real store, 2026-08-26): every closing tag dropped, so sibling
+    # fields arrive as BARE OPENING tags inside the unclosed value.  Exact,
+    # case-sensitive field names only; "<donee>" or "<Done>" do not match.
+    "<focus>",
+    "<done>",
+    "<decisions>",
+    "<next_steps>",
 )
 
 # The journal fields a collapse can carry, in schema order.
@@ -58,6 +65,13 @@ _HEAD_BOUNDARY = re.compile(r"</(?:focus|done|decisions|next_steps)>")
 _SEGMENT = re.compile(
     r'<parameter\s+name="(?P<pname>[a-z_]+)"\s*>(?P<pval>.*?)</(?P=pname)>'
     r"|<(?P<tag>[a-z_]+)>(?P<tval>.*?)</(?P=tag)>",
+    re.DOTALL,
+)
+
+# Shape C: an opening field tag with no closer; the value runs to the next
+# opening field tag or the end of the text.
+_BARE_OPENER = re.compile(
+    r"<(?P<name>focus|done|decisions|next_steps)>(?P<val>.*?)(?=<(?:focus|done|decisions|next_steps)>|\Z)",
     re.DOTALL,
 )
 
@@ -104,6 +118,13 @@ def recover_collapsed(text: str) -> tuple[str, dict[str, list[str]]]:
         value = (value or "").strip()
         if value:
             swallowed.setdefault(name, []).append(value)
+    if not swallowed:
+        # Shape C: bare openers, no closers.  Each field runs from its opening
+        # tag to the next opening tag (or the end).
+        for match in _BARE_OPENER.finditer(remainder):
+            value = match.group("val").strip()
+            if value:
+                swallowed.setdefault(match.group("name"), []).append(value)
     return head.strip(), swallowed
 
 
@@ -788,12 +809,26 @@ def repair_journal(path: Path | None = None, dry_run: bool = False) -> dict:
 
     # The recovered text must itself be clean — a repair pass that injected
     # what the guard refuses would be laundering the contamination.
+    def clean(name: str) -> list[str]:
+        return [v for v in recovered.get(name, []) if not is_collapsed(v)]
+
+    # Parsing a field is not recovering it (Atlas, r2 on v1 of shape C): the
+    # report counted a swallowed <done> that this entry then never carried.
+    # Every recovered field lands on the corrective entry's OWN surface for
+    # that field. ``done`` keeps the contaminated values FIRST and verbatim --
+    # they are the loop-breaking marker -- and the clean recovered done values
+    # follow them. ``focus`` is a scalar, so recovered focus text is appended
+    # to the repair's own focus rather than replacing it.
+    focus = "Journal field-collapse repair"
+    recovered_focus = clean("focus")
+    if recovered_focus:
+        focus += " (recovered focus: " + " | ".join(recovered_focus) + ")"
     corrective = JournalEntry(
         timestamp=datetime.now(timezone.utc).isoformat(),
-        focus="Journal field-collapse repair",
-        done=collapsed_values,
-        decisions=[v for v in recovered.get("decisions", []) if not is_collapsed(v)],
-        next_steps=[v for v in recovered.get("next_steps", []) if not is_collapsed(v)],
+        focus=focus,
+        done=collapsed_values + clean("done"),
+        decisions=clean("decisions"),
+        next_steps=clean("next_steps"),
         repair=True,
     )
     append_entry(corrective, path, allow_collapsed=True)
