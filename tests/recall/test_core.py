@@ -496,10 +496,10 @@ def test_lookup_max_tokens_ladder_is_monotone_and_bounded(monkeypatch):
     monkeypatch.setenv("SYNAPT_DISABLE_CLUSTERS", "1")
     monkeypatch.setenv("SYNAPT_DISABLE_DEDUP", "1")
     monkeypatch.setenv("SYNAPT_DISABLE_BOOSTS", "1")
-    index = TranscriptIndex(_make_token_budget_ladder_chunks())
+    chunks = _make_token_budget_ladder_chunks()
     budgets = (10, 500, 2400, 100000)
     results = [
-        index.lookup(
+        TranscriptIndex(chunks).lookup(
             "deployment", max_chunks=5, max_tokens=budget,
             threshold_ratio=0, half_life=0,
         )
@@ -513,6 +513,7 @@ def test_lookup_max_tokens_ladder_is_monotone_and_bounded(monkeypatch):
     # The formatter intentionally returns one useful block even when that
     # block alone exceeds the approximate budget. That makes the explicit
     # tolerance the largest first block plus the fixed header, and no more.
+    index = TranscriptIndex(chunks)
     first_block_tokens = max(
         len(index._format_chunk_block(i, query="deployment")) // 4
         for i in range(len(index.chunks))
