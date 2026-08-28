@@ -24,7 +24,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -1063,7 +1063,9 @@ class TranscriptIndex:
 
         # Query result cache — avoids re-computing BM25/embedding/RRF for
         # identical queries within the same index lifetime. LRU with max 32 entries.
-        self._query_cache: dict[tuple, str] = {}
+        self._query_cache: dict[
+            tuple, tuple[str, SearchResultSummary | None]
+        ] = {}
         self._query_cache_max = 32
 
         # Working memory — seeded from recent access_log for cross-session persistence
@@ -1874,7 +1876,11 @@ class TranscriptIndex:
         )
         cached = self._query_cache.get(cache_key)
         if cached is not None:
-            return cached
+            cached_result, cached_summary = cached
+            self._last_search_summary = (
+                replace(cached_summary) if cached_summary is not None else None
+            )
+            return cached_result
 
         # Query intent classification — adjusts search parameters based on
         # the type of information being sought (recency, embedding weight,
@@ -1975,7 +1981,12 @@ class TranscriptIndex:
             # Evict oldest entry
             oldest = next(iter(self._query_cache))
             del self._query_cache[oldest]
-        self._query_cache[cache_key] = result
+        cached_summary = (
+            replace(self._last_search_summary)
+            if self._last_search_summary is not None
+            else None
+        )
+        self._query_cache[cache_key] = (result, cached_summary)
         return result
 
     def _global_lookup(
