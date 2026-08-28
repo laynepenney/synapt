@@ -314,6 +314,24 @@ END;
 """
 
 
+def _normalize_ddl(sql: str) -> str:
+    """Put a CREATE statement into the form ``sqlite_master`` stores it in.
+
+    ``sqlite_master.sql`` holds the statement as executed and **without** the
+    trailing statement terminator, so a module constant written as a runnable
+    script — ending in ``);`` — can never compare equal to it no matter how the
+    whitespace is handled.  Collapsing whitespace is not enough: ``strip()``
+    removes the newline after the semicolon and leaves the semicolon itself.
+
+    Both sides of a schema comparison go through this function so the two are
+    in the same form.  Comparing a stored statement against a raw constant is
+    the defect this exists to prevent.  All three detectors route through it;
+    nothing in the code compels a fourth one to, so adding an FTS table means
+    routing its detector here deliberately.
+    """
+    return " ".join(sql.strip().lower().split()).rstrip(";").rstrip()
+
+
 _FTS5_KEYWORDS = frozenset({"and", "or", "not", "near"})
 
 
@@ -819,9 +837,7 @@ class RecallDB:
         ).fetchone()
         if row is None:
             return False
-        current = " ".join((row[0] or "").lower().split())
-        expected = " ".join(_CLUSTERS_FTS_TABLE_SQL.strip().lower().split())
-        return current != expected
+        return _normalize_ddl(row[0] or "") != _normalize_ddl(_CLUSTERS_FTS_TABLE_SQL)
 
     def _needs_fts_migration(self) -> bool:
         """Check if the FTS table's definition differs from the current schema.
@@ -835,9 +851,7 @@ class RecallDB:
         ).fetchone()
         if row is None:
             return False
-        current = " ".join((row[0] or "").lower().split())
-        expected = " ".join(_FTS_TABLE_SQL.strip().lower().split())
-        return current != expected
+        return _normalize_ddl(row[0] or "") != _normalize_ddl(_FTS_TABLE_SQL)
 
     def _needs_knowledge_fts_migration(self) -> bool:
         """Check if the knowledge FTS definition differs from the current schema."""
@@ -846,9 +860,7 @@ class RecallDB:
         ).fetchone()
         if row is None:
             return False
-        current = " ".join((row[0] or "").lower().split())
-        expected = " ".join(_KNOWLEDGE_FTS_TABLE_SQL.strip().lower().split())
-        return current != expected
+        return _normalize_ddl(row[0] or "") != _normalize_ddl(_KNOWLEDGE_FTS_TABLE_SQL)
 
     def close(self) -> None:
         """Close the database connection."""
