@@ -449,6 +449,23 @@ startup, resume, and fork. `always` also crosses a clear boundary when that is
 explicitly desired. `SYNAPT_SESSION_START_CONTINUITY` provides the equivalent
 environment override.
 
+### Recall data root
+
+Every `recall_channel` response reports the absolute channel state store it
+used. This makes identical calls from different worktrees distinguishable,
+including empty results and failures after the store has been resolved.
+
+Recall resolves its data root in this order:
+
+1. an explicit project directory, or `SYNAPT_RECALL_ROOT` when no project
+   directory was supplied
+2. the repository's main worktree
+3. the GitGrip workspace root
+4. the current working directory
+
+The reported path is operational provenance only. Public recall does not infer
+or report the caller's identity from it.
+
 ## What `synapt init` does
 
 Run from a project root:

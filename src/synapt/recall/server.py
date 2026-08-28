@@ -2296,11 +2296,14 @@ def recall_channel(
         unclaim: Release a previously claimed message_id.
         intent: Declare intent to create something (message = description of planned work).
     """
+    state_store = None
     try:
         from synapt.recall.actions import get_action_registry
+        from synapt.recall.channel import _db_path
 
         registry = get_action_registry()
-        return registry.dispatch(
+        state_store = _db_path().resolve()
+        result = registry.dispatch(
             action,
             channel=channel,
             message=message,
@@ -2314,8 +2317,10 @@ def recall_channel(
             detail=detail,
             msg_type=msg_type,
         )
+        return f"Channel state store: {state_store}\n{result}"
     except Exception as exc:
-        return f"Channel failed: {exc}"
+        prefix = f"Channel state store: {state_store}\n" if state_store else ""
+        return f"{prefix}Channel failed: {exc}"
 
 
 # ---------------------------------------------------------------------------

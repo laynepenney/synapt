@@ -290,7 +290,8 @@ class TestRecallChannelIntegration(unittest.TestCase):
         reg.register("join", handler, tier="oss")
 
         result = recall_channel(action="join", channel="dev", name="Atlas")
-        self.assertEqual(result, "joined via registry")
+        self.assertIn("Channel state store:", result)
+        self.assertTrue(result.endswith("\njoined via registry"))
         _, kwargs = handler.call_args
         self.assertEqual(kwargs["channel"], "dev")
         self.assertEqual(kwargs["name"], "Atlas")
@@ -321,7 +322,8 @@ class TestRecallChannelIntegration(unittest.TestCase):
         reg.register("who", lambda **_kwargs: "premium who", tier="premium")
 
         result = recall_channel(action="who")
-        self.assertEqual(result, "premium who")
+        self.assertIn("Channel state store:", result)
+        self.assertTrue(result.endswith("\npremium who"))
 
 
 if __name__ == "__main__":
