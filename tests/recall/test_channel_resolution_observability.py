@@ -71,6 +71,7 @@ class TestChannelResolutionObservability(unittest.TestCase):
         from synapt.recall.server import recall_channel
 
         state_db = Path("/distinct/witness/channels.db")
+        resolved_state_db = state_db.resolve()
         actions = sorted(get_action_registry().known_actions)
         with (
             patch("synapt.recall.channel._db_path", return_value=state_db),
@@ -81,7 +82,7 @@ class TestChannelResolutionObservability(unittest.TestCase):
                     result = recall_channel(action=action)
                     self.assertEqual(
                         result,
-                        f"Channel state store: {state_db}\npayload",
+                        f"Channel state store: {resolved_state_db}\npayload",
                     )
 
         self.assertEqual(dispatch.call_count, len(actions))
@@ -91,6 +92,7 @@ class TestChannelResolutionObservability(unittest.TestCase):
         from synapt.recall.server import recall_channel
 
         state_db = Path("/distinct/failure/channels.db")
+        resolved_state_db = state_db.resolve()
         with (
             patch("synapt.recall.channel._db_path", return_value=state_db),
             patch.object(ActionRegistry, "dispatch", side_effect=RuntimeError("boom")),
@@ -99,7 +101,7 @@ class TestChannelResolutionObservability(unittest.TestCase):
 
         self.assertEqual(
             result,
-            f"Channel state store: {state_db}\nChannel failed: boom",
+            f"Channel state store: {resolved_state_db}\nChannel failed: boom",
         )
 
     def test_store_resolution_failure_reports_the_original_error(self) -> None:
