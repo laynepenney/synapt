@@ -452,6 +452,92 @@ def test_lookup_token_budget():
     assert len(result) < 400
 
 
+def test_format_results_token_budget_stops_after_first_oversized_block(monkeypatch):
+    """The first useful block may exceed the approximation; later blocks may not."""
+    monkeypatch.setenv("SYNAPT_DISABLE_DEDUP", "1")
+    chunks = [
+        TranscriptChunk(
+            id="alpha:t0", session_id="alpha-session",
+            timestamp="2026-08-27T10:00:00Z", turn_index=0,
+            user_text="deployment alpha witness",
+            assistant_text="alpha evidence " * 60,
+        ),
+        TranscriptChunk(
+            id="beta:t0", session_id="beta-session",
+            timestamp="2026-08-27T11:00:00Z", turn_index=0,
+            user_text="deployment beta witness",
+            assistant_text="beta evidence " * 60,
+        ),
+    ]
+    index = TranscriptIndex(chunks)
+
+    small = index._format_results([(0, 2.0), (1, 1.0)], max_tokens=10)
+    large = index._format_results([(0, 2.0), (1, 1.0)], max_tokens=10_000)
+
+    assert ("alpha evidence" in small) != ("beta evidence" in small)
+    assert "alpha evidence" in large
+    assert "beta evidence" in large
+
+
+def _make_token_budget_ladder_chunks():
+    return [
+        TranscriptChunk(
+            id=f"s{i}:t0", session_id=f"session-{i}",
+            timestamp=f"2026-08-{10 + i:02d}T12:00:00Z", turn_index=0,
+            user_text=f"deployment witness {i}",
+            assistant_text="deployment evidence " + f"unique{i} " * 45,
+        )
+        for i in range(10)
+    ]
+
+
+def test_lookup_max_tokens_ladder_is_monotone_and_bounded(monkeypatch):
+    """Budget changes move payload size without exceeding one-block tolerance."""
+    monkeypatch.setenv("SYNAPT_DISABLE_CLUSTERS", "1")
+    monkeypatch.setenv("SYNAPT_DISABLE_DEDUP", "1")
+    monkeypatch.setenv("SYNAPT_DISABLE_BOOSTS", "1")
+    index = TranscriptIndex(_make_token_budget_ladder_chunks())
+    budgets = (10, 500, 2400, 100000)
+    results = [
+        index.lookup(
+            "deployment", max_chunks=5, max_tokens=budget,
+            threshold_ratio=0, half_life=0,
+        )
+        for budget in budgets
+    ]
+    sizes = [len(result) for result in results]
+
+    assert sizes == sorted(sizes)
+    assert sizes[0] < sizes[2]
+
+    # The formatter intentionally returns one useful block even when that
+    # block alone exceeds the approximate budget. That makes the explicit
+    # tolerance the largest first block plus the fixed header, and no more.
+    first_block_tokens = max(
+        len(index._format_chunk_block(i, query="deployment")) // 4
+        for i in range(len(index.chunks))
+    )
+    header_tokens = len("Past session context:") // 4 + 1
+    for budget, result in zip(budgets, results):
+        assert len(result) // 4 <= budget + first_block_tokens + header_tokens
+
+
+def test_lookup_max_chunks_ladder_control_is_unchanged(monkeypatch):
+    """The parameter control from #993 continues to move independently."""
+    monkeypatch.setenv("SYNAPT_DISABLE_CLUSTERS", "1")
+    monkeypatch.setenv("SYNAPT_DISABLE_DEDUP", "1")
+    monkeypatch.setenv("SYNAPT_DISABLE_BOOSTS", "1")
+    index = TranscriptIndex(_make_token_budget_ladder_chunks())
+    sizes = [
+        len(index.lookup(
+            "deployment", max_chunks=max_chunks, max_tokens=100000,
+            threshold_ratio=0, half_life=0,
+        ))
+        for max_chunks in (1, 3, 5, 10)
+    ]
+    assert sizes == [979, 2895, 4811, 4811]
+
+
 def test_lookup_empty_index():
     index = TranscriptIndex([])
     assert index.lookup("anything") == ""
