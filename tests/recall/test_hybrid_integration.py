@@ -354,6 +354,20 @@ class TestQueryCache:
         assert result1 == result2
         assert result1  # Non-empty
 
+    def test_cache_hit_restores_search_summary(self, tmp_path):
+        """A cached result must carry the summary that describes its payload."""
+        index = _build_index(tmp_path)
+
+        result1 = index.lookup("database schema", max_chunks=5)
+        summary1 = index._last_search_summary
+        result2 = index.lookup("database schema", max_chunks=5)
+        summary2 = index._last_search_summary
+
+        assert result2 == result1
+        assert summary1 is not None
+        assert summary2 == summary1
+        assert summary2 is not summary1
+
     def test_different_params_different_cache(self, tmp_path):
         """Different max_chunks should not hit cache."""
         index = _build_index(tmp_path)
