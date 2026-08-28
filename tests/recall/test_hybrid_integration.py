@@ -376,6 +376,16 @@ class TestQueryCache:
         # Different params → different results (or at least different cache entries)
         assert len(index._query_cache) == 2
 
+    def test_different_max_tokens_different_cache(self, tmp_path):
+        """Changing the budget misses; repeating that budget hits."""
+        index = _build_index(tmp_path)
+        index.lookup("database schema", max_chunks=5, max_tokens=10)
+        assert len(index._query_cache) == 1
+        index.lookup("database schema", max_chunks=5, max_tokens=10_000)
+        assert len(index._query_cache) == 2
+        index.lookup("database schema", max_chunks=5, max_tokens=10_000)
+        assert len(index._query_cache) == 2
+
     def test_cache_eviction(self, tmp_path):
         """Cache should evict oldest when full."""
         index = _build_index(tmp_path)

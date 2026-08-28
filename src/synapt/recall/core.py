@@ -1869,7 +1869,7 @@ class TranscriptIndex:
 
         # Check query cache — skip if max_tokens=0 (diagnostics-only mode)
         cache_key = (
-            query, max_chunks, max_sessions, after, before,
+            query, max_chunks, max_tokens, max_sessions, after, before,
             half_life, threshold_ratio, depth, include_archived,
             include_historical, now, knowledge_boost, max_knowledge,
             agent_id,
@@ -3510,7 +3510,7 @@ class TranscriptIndex:
                            for prev in emitted_token_sets):
                         continue  # Skip near-duplicate
             block_tokens = len(block) // 4
-            if token_count + block_tokens > max_tokens and len(lines) > 1:
+            if token_count + block_tokens > max_tokens and selected_blocks:
                 break
             selected_blocks.append((sort_ts, len(selected_blocks), block))
             token_count += block_tokens
