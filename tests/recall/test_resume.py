@@ -223,6 +223,34 @@ class TestSessionSelection(unittest.TestCase):
 
         self.assertNotIn("CALLER SOURCE PARTIAL", first)
 
+    def test_partial_warning_preserves_mixed_offset_spellings(self):
+        indexed = "2026-08-01T12:00:00+01:00"
+        live = "2026-08-01T12:30:00+01:00"
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "indexed question",
+                "indexed answer",
+                timestamp=indexed,
+            )
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp=live,
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn(f"indexed through {indexed}", first)
+        self.assertIn(f"live through {live}", first)
+
     def test_sidecar_only_session_names_missing_searchable_endpoint(self):
         index = _index([
             _chunk(
