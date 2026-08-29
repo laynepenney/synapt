@@ -130,25 +130,37 @@ def test_same_process_status_does_not_reprobe_its_own_marker(monkeypatch, tmp_pa
     assert _wait_status(server, build_id, "completed")["result"] == "index built"
 
 
-def test_receipt_pid_probe_reuses_query_only_windows_primitive(monkeypatch):
+def test_receipt_status_uses_query_only_windows_pid_primitive(monkeypatch, tmp_path):
     from synapt.recall import server, session_start
 
-    calls = []
+    pid_calls = []
+    marker_calls = []
 
     def forbidden_kill(*args):
         pytest.fail(f"os.kill{args} would terminate the process on Windows")
 
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(session_start.sys, "platform", "win32")
     monkeypatch.setattr(session_start.os, "kill", forbidden_kill)
     monkeypatch.setattr(
         session_start,
         "_pid_alive_win32",
-        lambda pid: calls.append(pid) or True,
+        lambda pid: pid_calls.append(pid) or True,
+    )
+    monkeypatch.setattr(
+        server,
+        "_build_server_marker_alive",
+        lambda project, marker: marker_calls.append((project, marker)) or True,
     )
 
+    receipt = _running_receipt("build_abcdef012345", 424242)
+    server._write_build_receipt(tmp_path.resolve(), receipt)
+
     assert server._pid_alive is session_start._pid_alive
-    assert server._pid_alive(424242) is True
-    assert calls == [424242]
+    observed = json.loads(server.recall_build_status(receipt["build_id"]))
+    assert observed["state"] == "running"
+    assert pid_calls == [424242]
+    assert marker_calls == [(tmp_path.resolve(), receipt["server_marker"])]
 
 
 def test_status_cannot_overwrite_a_terminal_receipt_with_interrupted(monkeypatch, tmp_path):
