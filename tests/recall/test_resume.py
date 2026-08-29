@@ -43,6 +43,7 @@ from synapt.recall.resume import (
     is_harness_authored,
     load_resume_index,
     resolve_session,
+    _latest_event_timestamp,
     _source_label,
 )
 
@@ -150,6 +151,118 @@ class TestSessionSelection(unittest.TestCase):
         self.assertIn("CALLER SOURCE STALE", first)
         self.assertIn("cccccccc", first)
         self.assertIn("14000000 bytes", first)
+
+    def test_caller_present_but_live_extent_newer_is_named_on_first_line(self):
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-05T12:00:00Z",
+        )
+        view = build_resume_view(
+            self.index,
+            caller_sources=[source],
+            journal_path=None,
+        )
+
+        first = format_resume(view).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn(SESSION_A[:8], first)
+        self.assertIn("2026-08-01T10:00:00Z", first)
+        self.assertIn("2026-08-05T12:00:00Z", first)
+        self.assertIn("synapt recall build --no-embeddings", first)
+
+    def test_caller_matching_live_and_indexed_extents_has_no_partial_warning(self):
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T10:00:00Z",
+        )
+        first = format_resume(
+            build_resume_view(
+                self.index,
+                caller_sources=[source],
+                journal_path=None,
+            )
+        ).splitlines()[0]
+
+        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+
+    def test_sidecar_projection_timestamp_cannot_hide_partial_transcript(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "indexed question",
+                "indexed answer",
+                timestamp="2026-08-01T10:00:00Z",
+            ),
+            _chunk(
+                SESSION_A,
+                -2,
+                "sidecar",
+                "projection",
+                timestamp="2026-08-01T12:00:00Z",
+            ),
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T11:00:00Z",
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("indexed through 2026-08-01T10:00:00Z", first)
+
+    def test_foreign_live_extent_is_not_a_caller_partial_warning(self):
+        source = CallerTranscript(
+            session_id=SESSION_B,
+            path=Path("/foreign/b.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-06T12:00:00Z",
+        )
+        first = format_resume(
+            build_resume_view(
+                self.index,
+                session_id=SESSION_A,
+                caller_sources=[source],
+                journal_path=None,
+            )
+        ).splitlines()[0]
+
+        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+
+    def test_latest_event_timestamp_reads_backward_over_large_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"timestamp": "2026-08-01T10:00:00Z"})
+                + "\n"
+                + json.dumps(
+                    {
+                        "timestamp": "2026-08-05T12:00:00Z",
+                        "payload": "x" * 70_000,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _latest_event_timestamp(transcript),
+                "2026-08-05T12:00:00Z",
+            )
 
     def test_store_fallback_names_selected_worktree_on_first_line(self):
         index = _index([
