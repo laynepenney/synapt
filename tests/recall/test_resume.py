@@ -192,6 +192,63 @@ class TestSessionSelection(unittest.TestCase):
 
         self.assertNotIn("CALLER SOURCE PARTIAL", first)
 
+    def test_mixed_iso_offsets_compare_by_instant_not_spelling(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "earlier instant",
+                "answer",
+                timestamp="2026-08-01T12:00:00+02:00",
+            ),
+            _chunk(
+                SESSION_A,
+                1,
+                "later instant",
+                "answer",
+                timestamp="2026-08-01T11:00:00Z",
+            ),
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T10:30:00Z",
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+
+    def test_sidecar_only_session_names_missing_searchable_endpoint(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                -2,
+                "sidecar",
+                "projection",
+                timestamp="2026-08-01T12:00:00Z",
+            )
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T11:00:00Z",
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("indexed through no searchable transcript endpoint", first)
+        self.assertIn("live through 2026-08-01T11:00:00Z", first)
+
     def test_sidecar_projection_timestamp_cannot_hide_partial_transcript(self):
         index = _index([
             _chunk(
@@ -306,6 +363,38 @@ class TestSessionSelection(unittest.TestCase):
                 found = caller_transcripts(caller)
 
             self.assertEqual([item.session_id for item in found], ["own-session"])
+
+    def test_caller_discovery_skips_source_removed_after_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            caller = root / "caller"
+            caller.mkdir()
+            transcript_root = root / "transcripts"
+            transcript_root.mkdir()
+            transcript = transcript_root / "session.jsonl"
+            transcript.write_text("{}\n")
+
+            with (
+                mock.patch(
+                    "synapt.recall.core.project_transcript_dir",
+                    return_value=transcript_root,
+                ),
+                mock.patch(
+                    "synapt.recall.codex.discover_codex_sessions",
+                    return_value=None,
+                ),
+                mock.patch(
+                    "synapt.recall.journal.extract_session_id",
+                    return_value=SESSION_A,
+                ),
+                mock.patch(
+                    "synapt.recall.resume._latest_event_timestamp",
+                    side_effect=FileNotFoundError("removed after stat"),
+                ),
+            ):
+                found = caller_transcripts(caller)
+
+            self.assertEqual(found, [])
 
     def test_source_labels_do_not_print_absolute_non_worktree_paths(self):
         self.assertEqual(

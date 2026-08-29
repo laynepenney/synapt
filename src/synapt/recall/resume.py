@@ -194,6 +194,7 @@ def caller_transcripts(project_dir: Path | None = None) -> list[CallerTranscript
         try:
             stat = path.stat()
             session_id = extract_session_id(str(path))
+            latest_timestamp = _latest_event_timestamp(path)
         except OSError:
             continue
         if session_id:
@@ -203,7 +204,7 @@ def caller_transcripts(project_dir: Path | None = None) -> list[CallerTranscript
                     path,
                     stat.st_mtime,
                     stat.st_size,
-                    _latest_event_timestamp(path),
+                    latest_timestamp,
                 )
             )
     return sorted(found, key=lambda item: item.mtime, reverse=True)
@@ -583,7 +584,11 @@ def build_resume_view(
 
     source_path = next((c.transcript_path for c in chunks if c.transcript_path), "")
     source_label = _source_label(source_path)
-    selected_latest = max((chunk.timestamp for chunk in chunks if chunk.timestamp), default="")
+    selected_latest = max(
+        (chunk.timestamp for chunk in chunks if chunk.timestamp),
+        key=_timestamp_epoch,
+        default="",
+    )
     selected_epoch = _timestamp_epoch(selected_latest)
     unindexed = [
         item for item in (caller_sources or [])
@@ -597,12 +602,11 @@ def build_resume_view(
     if (
         selected_source is not None
         and selected_source.latest_timestamp
-        and selected_latest
         and _timestamp_epoch(selected_source.latest_timestamp) > selected_epoch
     ):
         caller_partial = CallerExtentGap(
             selected_source,
-            selected_latest,
+            selected_latest or "no searchable transcript endpoint",
             selected_source.latest_timestamp,
         )
 
