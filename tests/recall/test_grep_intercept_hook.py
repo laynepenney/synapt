@@ -37,7 +37,7 @@ def test_extracts_patterns_from_grep_and_rg_shapes() -> None:
     cases = [
         (_bash('rg -n "memory leak" src tests'), "memory leak"),
         (_bash("rg --fixed-strings 'SYNAPT_SHARED_CHANNELS_DIR' src"), "SYNAPT_SHARED_CHANNELS_DIR"),
-        (_bash("grep -R --line-number 'modal_execution_requested' active-compression"), "modal_execution_requested"),
+        (_bash("grep -R --line-number 'worker_ready' runtime-logs"), "worker_ready"),
         (_bash("grep -- 'literal-leading-dash' README.md"), "literal-leading-dash"),
         (_grep_tool("recall_quick verified absence", path="src"), "recall_quick verified absence"),
     ]
