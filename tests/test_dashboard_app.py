@@ -43,6 +43,75 @@ def test_stop_dashboard_cleans_stale_pidfile(tmp_path):
         assert not pid_path.exists()
 
 
+def test_agent_overlay_reuses_query_only_windows_pid_probe(tmp_path):
+    """The dashboard status overlay reaches the shared Windows-safe probe."""
+    from synapt.dashboard import app
+    from synapt.recall import session_start
+
+    assert app._pid_alive is session_start._pid_alive
+    team_db = tmp_path / ".synapt" / "orgs" / "synapt-dev" / "team.db"
+    team_db.parent.mkdir(parents=True)
+    team_db.touch()
+    pid_calls = []
+
+    def query_only_probe(pid):
+        pid_calls.append(pid)
+        return True
+
+    registered = [{
+        "agent_id": "agent-001",
+        "display_name": "Agent",
+        "role": "agent",
+        "status": "running",
+        "pid": 424243,
+        "tmux_target": "workspace:agent",
+    }]
+    with patch.object(session_start.sys, "platform", "win32"), \
+         patch.object(
+             session_start.os,
+             "kill",
+             side_effect=AssertionError("os.kill must not run on Windows"),
+         ), \
+         patch.object(session_start, "_pid_alive_win32", query_only_probe), \
+         patch("synapt.dashboard.app.Path.home", return_value=tmp_path), \
+         patch("synapt.dashboard.app._resolve_org_id", return_value="synapt-dev"), \
+         patch("synapt.dashboard.app._registry_list_agents", return_value=registered), \
+         patch("synapt.dashboard.app.channel_agents_json", return_value=[]), \
+         patch("synapt.dashboard.app._tmux_window_agents", return_value={}):
+        agents = app._combined_agents_json_sync()
+
+    assert [agent["display_name"] for agent in agents] == ["Agent"]
+    assert agents[0]["status"] == "running"
+    assert pid_calls == [424243]
+
+
+def test_stale_pid_cleanup_reuses_query_only_windows_pid_probe(tmp_path):
+    """PID-file cleanup reaches the shared Windows-safe liveness probe."""
+    from synapt.dashboard import app
+    from synapt.recall import session_start
+
+    assert app._pid_alive is session_start._pid_alive
+    pid_path = tmp_path / "dashboard.pid"
+    pid_path.write_text("424244\n")
+    pid_calls = []
+
+    def query_only_probe(pid):
+        pid_calls.append(pid)
+        return True
+
+    with patch.object(session_start.sys, "platform", "win32"), \
+         patch.object(
+             session_start.os,
+             "kill",
+             side_effect=AssertionError("os.kill must not run on Windows"),
+         ), \
+         patch.object(session_start, "_pid_alive_win32", query_only_probe):
+        app._cleanup_stale_pidfile(pid_path)
+
+    assert pid_path.read_text() == "424244\n"
+    assert pid_calls == [424244]
+
+
 def test_synapt_help_lists_dashboard(capsys):
     from synapt.cli import main
 
