@@ -50,6 +50,7 @@ from synapt.recall.core import (
 from synapt.recall._llm_util import truncate_at_word as _tw
 from synapt.recall.embeddings import get_embedding_provider
 from synapt.recall.hybrid import classify_query_intent, intent_search_params
+from synapt.recall.session_start import _pid_alive
 
 
 def _cap_tokens(requested: int) -> int:
@@ -757,20 +758,6 @@ def _receipt_paths_newest(directory: Path) -> list[Path]:
         key=lambda path: path.stat().st_mtime_ns,
         reverse=True,
     )
-
-
-def _pid_alive(pid: object) -> bool:
-    if not isinstance(pid, int) or pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 def _ensure_build_server_marker(project: Path) -> str:

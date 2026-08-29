@@ -130,6 +130,27 @@ def test_same_process_status_does_not_reprobe_its_own_marker(monkeypatch, tmp_pa
     assert _wait_status(server, build_id, "completed")["result"] == "index built"
 
 
+def test_receipt_pid_probe_reuses_query_only_windows_primitive(monkeypatch):
+    from synapt.recall import server, session_start
+
+    calls = []
+
+    def forbidden_kill(*args):
+        pytest.fail(f"os.kill{args} would terminate the process on Windows")
+
+    monkeypatch.setattr(session_start.sys, "platform", "win32")
+    monkeypatch.setattr(session_start.os, "kill", forbidden_kill)
+    monkeypatch.setattr(
+        session_start,
+        "_pid_alive_win32",
+        lambda pid: calls.append(pid) or True,
+    )
+
+    assert server._pid_alive is session_start._pid_alive
+    assert server._pid_alive(424242) is True
+    assert calls == [424242]
+
+
 def test_status_cannot_overwrite_a_terminal_receipt_with_interrupted(monkeypatch, tmp_path):
     from synapt.recall import cli, server
 
