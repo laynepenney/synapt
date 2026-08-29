@@ -7,6 +7,84 @@ never construct the full index, and always close the DB it opened.
 from unittest.mock import Mock, patch
 
 
+def test_recall_resume_default_selects_the_callers_session_not_store_newest(
+    monkeypatch, tmp_path
+):
+    from synapt.recall import server
+    from synapt.recall.core import TranscriptChunk, TranscriptIndex
+    from synapt.recall.resume import CallerTranscript
+
+    caller_id = "aaaaaaaa-1111-2222-3333-444444444444"
+    foreign_id = "bbbbbbbb-1111-2222-3333-444444444444"
+
+    def chunk(session_id, timestamp, text):
+        return TranscriptChunk(
+            id=f"{session_id[:8]}:t0",
+            session_id=session_id,
+            timestamp=timestamp,
+            turn_index=0,
+            user_text=text,
+            assistant_text="answer",
+        )
+
+    index = TranscriptIndex([
+        chunk(caller_id, "2026-08-28T10:00:00Z", "CALLER"),
+        chunk(foreign_id, "2026-08-29T10:00:00Z", "FOREIGN"),
+    ], use_embeddings=False)
+    (tmp_path / "recall.db").touch()
+    monkeypatch.setattr(server, "project_index_dir", lambda: tmp_path)
+    source = CallerTranscript(caller_id, tmp_path / "caller.jsonl", 1.0, 1)
+    with (
+        patch("synapt.recall.journal._journal_path", return_value=None),
+        patch("synapt.recall.resume.load_resume_index", return_value=index),
+        patch("synapt.recall.resume.caller_transcripts", return_value=[source]),
+        patch("synapt.recall.freshness.check_index_freshness", side_effect=RuntimeError),
+    ):
+        out = server.recall_resume()
+
+    assert "CALLER" in out
+    assert "FOREIGN" not in out
+
+
+def test_recall_resume_uses_server_cwd_as_the_mcp_caller_root(monkeypatch, tmp_path):
+    from synapt.recall import server
+    from synapt.recall.core import TranscriptChunk, TranscriptIndex
+    from synapt.recall.resume import CallerTranscript
+
+    caller_root = tmp_path / "caller"
+    caller_root.mkdir()
+    caller_id = "aaaaaaaa-1111-2222-3333-444444444444"
+    index = TranscriptIndex([
+        TranscriptChunk(
+            id="aaaaaaaa:t0",
+            session_id=caller_id,
+            timestamp="2026-08-29T10:00:00Z",
+            turn_index=0,
+            user_text="CALLER",
+            assistant_text="answer",
+        )
+    ], use_embeddings=False)
+    (tmp_path / "recall.db").touch()
+    monkeypatch.setattr(server, "project_index_dir", lambda: tmp_path)
+    source = CallerTranscript(caller_id, tmp_path / "caller.jsonl", 1.0, 1)
+    with (
+        patch.object(server.Path, "cwd", return_value=caller_root),
+        patch("synapt.recall.journal._journal_path", return_value=None),
+        patch("synapt.recall.resume.load_resume_index", return_value=index),
+        patch(
+            "synapt.recall.resume.caller_transcripts", return_value=[source]
+        ) as discover,
+        patch(
+            "synapt.recall.freshness.check_index_freshness",
+            side_effect=RuntimeError,
+        ),
+    ):
+        out = server.recall_resume()
+
+    assert "CALLER" in out
+    discover.assert_called_once_with(caller_root)
+
+
 def test_recall_resume_reports_missing_index(monkeypatch, tmp_path):
     from synapt.recall import server
 
