@@ -100,6 +100,37 @@ class TestProcessTracking(unittest.TestCase):
         crashed = detect_crashed(db_path=self._db_path)
         self.assertIn("apollo-001", [c["agent_id"] for c in crashed])
 
+    def test_crash_sweep_reuses_query_only_windows_pid_probe(self):
+        """Crash detection reaches the shared Windows-safe liveness probe."""
+        from synapt.recall import registry, session_start
+
+        self.assertIs(registry._pid_alive, session_start._pid_alive)
+        update_status, _, detect_crashed, _ = self._import_functions()
+        self._register_agent("agent-001", "Agent")
+        update_status(
+            db_path=self._db_path,
+            agent_id="agent-001",
+            status="running",
+            pid=424242,
+        )
+        pid_calls = []
+
+        def query_only_probe(pid):
+            pid_calls.append(pid)
+            return True
+
+        with patch.object(session_start.sys, "platform", "win32"), \
+             patch.object(
+                 session_start.os,
+                 "kill",
+                 side_effect=AssertionError("os.kill must not run on Windows"),
+             ), \
+             patch.object(session_start, "_pid_alive_win32", query_only_probe):
+            crashed = detect_crashed(db_path=self._db_path)
+
+        self.assertEqual(crashed, [])
+        self.assertEqual(pid_calls, [424242])
+
     def test_clear_session_preserves_agent_id(self):
         """Clearing a session resets process columns but keeps agent identity."""
         update_status, get_status, _, clear_session = self._import_functions()
