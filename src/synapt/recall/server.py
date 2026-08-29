@@ -1,6 +1,6 @@
 """synapt.recall MCP server — expose transcript search as tools for Claude Code.
 
-Provides fifteen tools via the Model Context Protocol:
+Provides recall tools via the Model Context Protocol, including:
   - recall_search: Search past session transcripts by keyword/topic
   - recall_quick: Fast, low-cost knowledge-only search for speculative checks
   - recall_context: Drill down into a search result for full raw content
@@ -8,6 +8,7 @@ Provides fifteen tools via the Model Context Protocol:
   - recall_sessions: List recent sessions with summaries
   - recall_timeline: View chronological timeline of work arcs
   - recall_build: Build or rebuild the transcript index
+  - recall_build_status: Read a durable background-build receipt
   - recall_setup: Initialize synapt recall for the current project
   - recall_stats: Get index statistics
   - recall_journal: Read or write session journal entries
@@ -27,6 +28,9 @@ import atexit
 import contextlib
 import json
 import logging
+import os
+import re
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,6 +42,7 @@ from synapt.recall.config import load_config
 _STARTUP_VERSION = getattr(_synapt_pkg, "__version__", "unknown")
 from synapt.recall.core import (
     TranscriptIndex,
+    atomic_json_write,
     format_size,
     project_data_dir,
     project_index_dir,
@@ -45,6 +50,7 @@ from synapt.recall.core import (
 from synapt.recall._llm_util import truncate_at_word as _tw
 from synapt.recall.embeddings import get_embedding_provider
 from synapt.recall.hybrid import classify_query_intent, intent_search_params
+from synapt.recall.session_start import _pid_alive
 
 
 def _cap_tokens(requested: int) -> int:
@@ -638,38 +644,375 @@ def recall_resume(
 
     return format_resume(view)
 
-def recall_build(incremental: bool = True) -> str:
-    """Build or rebuild the transcript index from auto-discovered sources.
+_BUILD_RECEIPT_LOCK = threading.Lock()
+_BUILD_ID_RE = re.compile(r"^build_[0-9a-f]{12}$")
+_BUILD_SERVER_MARKER_RE = re.compile(r"^build-server-[0-9a-f]{32}\.lock$")
+_BUILD_SERVER_INSTANCE_RE = re.compile(r"^[0-9a-f]{32}$")
+_BUILD_RECEIPT_STATES = {"queued", "running", "completed", "failed", "interrupted"}
+_BUILD_RUNNING_PHASES = {
+    "starting",
+    "waiting_for_lock",
+    "lock_timeout",
+    "archiving",
+    "parsing",
+    "indexing",
+    "clustering",
+    "finalizing",
+}
+_BUILD_SERVER_INSTANCE = uuid.uuid4().hex
+_BUILD_THREADS: dict[str, threading.Thread] = {}
+_BUILD_SERVER_MARKERS: dict[str, tuple[str, int]] = {}
 
-    Archives transcripts from Claude Code's source directory into the project,
-    then builds a searchable index at <project>/.synapt/recall/index/.
 
-    Args:
-        incremental: If True, skip already-indexed files for faster rebuilds.
-    """
+def _build_receipts_dir(project: Path) -> Path:
+    return project_data_dir(project) / "builds"
+
+
+def _build_receipt_path(project: Path, build_id: str) -> Path:
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        raise ValueError("invalid build id in receipt")
+    return _build_receipts_dir(project) / f"{build_id}.json"
+
+
+def _write_build_receipt(project: Path, receipt: dict) -> None:
+    directory = _build_receipts_dir(project)
+    directory.mkdir(parents=True, exist_ok=True)
+    receipt["updated_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_json_write(receipt, _build_receipt_path(project, receipt["build_id"]))
+
+
+def _read_build_receipt(path: Path) -> dict:
+    def require_timestamp(field: str) -> None:
+        raw = value.get(field)
+        if not isinstance(raw, str) or not raw:
+            raise ValueError(f"receipt {field} is invalid")
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"receipt {field} is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"receipt {field} is missing a timezone")
+
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("receipt is not a JSON object")
+    build_id = value.get("build_id")
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        raise ValueError("receipt build_id is invalid")
+    if build_id != path.stem:
+        raise ValueError("receipt build_id does not match its filename")
+    state = value.get("state")
+    if not isinstance(state, str) or state not in _BUILD_RECEIPT_STATES:
+        raise ValueError("receipt state is invalid")
+    phase = value.get("phase")
+    if not isinstance(phase, str) or not phase:
+        raise ValueError("receipt phase is invalid")
+    pid = value.get("pid")
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("receipt pid is invalid")
+    instance = value.get("server_instance")
+    if not isinstance(instance, str) or not _BUILD_SERVER_INSTANCE_RE.fullmatch(instance):
+        raise ValueError("receipt server_instance is invalid")
+    marker = value.get("server_marker")
+    if not isinstance(marker, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(marker):
+        raise ValueError("receipt server_marker is invalid")
+    if marker != f"build-server-{instance}.lock":
+        raise ValueError("receipt server_marker does not match server_instance")
+    if type(value.get("incremental")) is not bool:
+        raise ValueError("receipt incremental flag is invalid")
+    for field in ("created_at", "updated_at"):
+        require_timestamp(field)
+    expected_phase = {
+        "queued": "queued",
+        "completed": "completed",
+        "failed": "failed",
+        "interrupted": "interrupted",
+    }.get(state)
+    if expected_phase is not None and phase != expected_phase:
+        raise ValueError(f"receipt phase does not match state {state}")
+    if state == "running":
+        if phase not in _BUILD_RUNNING_PHASES:
+            raise ValueError("running receipt phase is invalid")
+        require_timestamp("started_at")
+    if state in {"completed", "failed", "interrupted"}:
+        require_timestamp("finished_at")
+    if state == "completed":
+        shards = value.get("updated_shards")
+        if not isinstance(shards, list) or not all(isinstance(item, str) for item in shards):
+            raise ValueError("completed receipt updated_shards is invalid")
+        if not isinstance(value.get("stats"), dict):
+            raise ValueError("completed receipt stats is invalid")
+        if not isinstance(value.get("result"), str) or not value["result"]:
+            raise ValueError("completed receipt result is invalid")
+    if state in {"failed", "interrupted"}:
+        if not isinstance(value.get("error"), str) or not value["error"]:
+            raise ValueError(f"{state} receipt error is invalid")
+    if "cache_warning" in value and not isinstance(value["cache_warning"], str):
+        raise ValueError("receipt cache_warning is invalid")
+    return value
+
+
+def _receipt_paths_newest(directory: Path) -> list[Path]:
+    return sorted(
+        directory.glob("build_*.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+
+
+def _ensure_build_server_marker(project: Path) -> str:
+    from synapt.recall.cli import _acquire_build_lock
+
+    data_dir = project_data_dir(project)
+    key = str(data_dir.resolve())
+    existing = _BUILD_SERVER_MARKERS.get(key)
+    if existing is not None:
+        return existing[0]
+    name = f"build-server-{_BUILD_SERVER_INSTANCE}.lock"
+    fd = _acquire_build_lock(data_dir, timeout=0, name=name)
+    if fd is None:
+        raise RuntimeError("could not establish the build-server liveness marker")
+    _BUILD_SERVER_MARKERS[key] = (name, fd)
+    return name
+
+
+def _build_server_marker_alive(project: Path, name: str) -> bool:
+    from synapt.recall.cli import _acquire_build_lock, _release_build_lock
+
+    if not isinstance(name, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(name):
+        raise ValueError("invalid build-server marker name")
+    fd = _acquire_build_lock(project_data_dir(project), timeout=0, name=name)
+    if fd is None:
+        return True
+    _release_build_lock(fd)
+    return False
+
+
+def _release_build_server_markers() -> None:
+    from synapt.recall.cli import _release_build_lock
+
+    while _BUILD_SERVER_MARKERS:
+        _, (_, fd) = _BUILD_SERVER_MARKERS.popitem()
+        _release_build_lock(fd)
+
+
+atexit.register(_release_build_server_markers)
+
+
+def _receipt_owner_alive(project: Path, receipt: dict) -> bool:
+    pid = receipt.get("pid")
+    if not _pid_alive(pid):
+        return False
+    if pid == os.getpid():
+        if receipt.get("server_instance") != _BUILD_SERVER_INSTANCE:
+            return False
+        if receipt.get("state") == "queued":
+            return True
+        thread = _BUILD_THREADS.get(str(receipt.get("build_id") or ""))
+        return thread is not None and thread.is_alive()
+    marker = receipt.get("server_marker")
+    if isinstance(marker, str) and marker:
+        return _build_server_marker_alive(project, marker)
+    return False
+
+
+def _active_build_receipt(project: Path) -> dict | None:
+    directory = _build_receipts_dir(project)
+    if not directory.exists():
+        return None
+    for path in _receipt_paths_newest(directory):
+        try:
+            receipt = _read_build_receipt(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"existing build receipt is unreadable: {path.name}: "
+                f"{type(exc).__name__}: {exc}. Remove that file to allow new "
+                "builds. It is a stale or corrupt receipt, never the build lock."
+            ) from exc
+        if receipt.get("state") not in {"queued", "running"}:
+            continue
+        if _receipt_owner_alive(project, receipt):
+            return receipt
+        receipt["state"] = "interrupted"
+        receipt["phase"] = "interrupted"
+        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+        receipt["error"] = "build process exited before writing a terminal receipt"
+        _write_build_receipt(project, receipt)
+    return None
+
+
+def _index_file_snapshot(project: Path) -> dict[str, tuple[int, ...]]:
+    index_dir = project_index_dir(project)
+    paths = list(index_dir.glob("data_*.db"))
+    paths.extend(index_dir / name for name in ("index.db", "recall.db"))
+    snapshot = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        wal = Path(f"{path}-wal")
+        base_stat = path.stat()
+        wal_stat = wal.stat() if wal.exists() else None
+        snapshot[path.name] = (
+            base_stat.st_size,
+            base_stat.st_mtime_ns,
+            wal_stat.st_size if wal_stat else -1,
+            wal_stat.st_mtime_ns if wal_stat else -1,
+        )
+    return snapshot
+
+
+def _run_build_job(project: Path, receipt: dict, incremental: bool) -> None:
     from synapt.recall.cli import _archive_and_build
 
-    project = Path.cwd().resolve()
+    before = _index_file_snapshot(project)
+
+    def report(phase: str) -> None:
+        receipt["state"] = "running"
+        receipt["phase"] = phase
+        if "started_at" not in receipt:
+            receipt["started_at"] = datetime.now(timezone.utc).isoformat()
+        _write_build_receipt(project, receipt)
+
     try:
+        report("starting")
         final_index = _archive_and_build(
-            project,
-            use_embeddings=True,
-            incremental=incremental,
+            project, use_embeddings=True, incremental=incremental, progress=report,
         )
-    except Exception as e:
-        return f"Build failed: {e}"
+        if receipt.get("phase") == "lock_timeout":
+            raise RuntimeError("timed out waiting for the build lock")
+        after = _index_file_snapshot(project)
+        receipt["state"] = "completed"
+        receipt["phase"] = "completed"
+        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+        receipt["updated_shards"] = sorted(
+            name for name, fingerprint in after.items()
+            if before.get(name) != fingerprint
+        )
+        if final_index and final_index.chunks:
+            receipt["stats"] = final_index.stats()
+            receipt["result"] = "index built"
+        else:
+            receipt["stats"] = {"chunk_count": 0, "session_count": 0}
+            receipt["result"] = "no transcripts found"
+    except BaseException as exc:
+        receipt["state"] = "failed"
+        receipt["phase"] = "failed"
+        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+        receipt["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        _invalidate_cache()
+        try:
+            try:
+                _invalidate_cache()
+            except Exception as exc:
+                receipt["cache_warning"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                with _BUILD_RECEIPT_LOCK:
+                    _write_build_receipt(project, receipt)
+                    _BUILD_THREADS.pop(receipt["build_id"], None)
+        finally:
+            # The guarded terminal write normally removes the thread. Keep the
+            # cleanup idempotent if writing the receipt itself raises.
+            _BUILD_THREADS.pop(receipt["build_id"], None)
 
-    if not final_index or not final_index.chunks:
-        return "No Claude Code or Codex transcripts found for this project."
 
-    stats = final_index.stats()
-    index_dir = project_index_dir(project)
+def recall_build(incremental: bool = True) -> str:
+    """Start an index build and immediately return its durable build id.
+
+    Use recall_build_status with that id for progress and outcome.
+    """
+    from synapt.recall.cli import _acquire_build_lock, _release_build_lock
+
+    project = Path.cwd().resolve()
+    with _BUILD_RECEIPT_LOCK:
+        receipt_lock = _acquire_build_lock(
+            project_data_dir(project), timeout=5, name="build-receipt.lock",
+        )
+        if receipt_lock is None:
+            return "Build not started: timed out creating a durable build receipt."
+        try:
+            try:
+                active = _active_build_receipt(project)
+            except RuntimeError as exc:
+                return f"Build not started: {exc}"
+            if active is not None:
+                build_id = active["build_id"]
+                return (
+                    f"Build already running: {build_id}. "
+                    f"Check recall_build_status(build_id={build_id!r})."
+                )
+            build_id = f"build_{uuid.uuid4().hex[:12]}"
+            now = datetime.now(timezone.utc).isoformat()
+            try:
+                server_marker = _ensure_build_server_marker(project)
+            except RuntimeError as exc:
+                return f"Build not started: {exc}"
+            receipt = {
+                "build_id": build_id,
+                "state": "queued",
+                "phase": "queued",
+                "pid": os.getpid(),
+                "server_instance": _BUILD_SERVER_INSTANCE,
+                "server_marker": server_marker,
+                "incremental": incremental,
+                "created_at": now,
+                "updated_at": now,
+            }
+            _write_build_receipt(project, receipt)
+            thread = threading.Thread(
+                target=_run_build_job,
+                args=(project, receipt, incremental),
+                name=f"recall-{build_id}",
+                daemon=True,
+            )
+            _BUILD_THREADS[build_id] = thread
+            try:
+                thread.start()
+            except BaseException as exc:
+                _BUILD_THREADS.pop(build_id, None)
+                receipt["state"] = "failed"
+                receipt["phase"] = "failed"
+                receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+                receipt["error"] = f"worker did not start: {type(exc).__name__}: {exc}"
+                _write_build_receipt(project, receipt)
+                return f"Build not started: {build_id}: {receipt['error']}"
+        finally:
+            _release_build_lock(receipt_lock)
     return (
-        f"Index built: {stats['chunk_count']} chunks from "
-        f"{stats['session_count']} sessions. Saved to {index_dir}"
+        f"Build started: {build_id}. "
+        f"Check recall_build_status(build_id={build_id!r})."
     )
+
+
+def recall_build_status(build_id: str = "") -> str:
+    """Return the durable status receipt for one background recall build.
+
+    Omit build_id to read the newest receipt for the current project.
+    """
+    project = Path.cwd().resolve()
+    if build_id:
+        if not _BUILD_ID_RE.fullmatch(build_id):
+            return "Invalid build id. Expected build_<12 lowercase hex characters>."
+        path = _build_receipt_path(project, build_id)
+    else:
+        directory = _build_receipts_dir(project)
+        paths = _receipt_paths_newest(directory) if directory.exists() else []
+        if not paths:
+            return "No build receipts found for this project."
+        path = paths[0]
+    with _BUILD_RECEIPT_LOCK:
+        if not path.exists():
+            return f"Build receipt not found: {build_id}"
+        try:
+            receipt = _read_build_receipt(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return f"Build receipt unreadable: {type(exc).__name__}: {exc}"
+        if receipt.get("state") in {"queued", "running"} and not _receipt_owner_alive(project, receipt):
+            receipt["state"] = "interrupted"
+            receipt["phase"] = "interrupted"
+            receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+            receipt["error"] = "build process exited before writing a terminal receipt"
+            _write_build_receipt(project, receipt)
+    return json.dumps(receipt, indent=2, sort_keys=True)
 
 
 def recall_setup(no_hook: bool = False) -> str:
@@ -2499,6 +2842,7 @@ def register_tools(mcp) -> None:
     mcp.tool()(_with_directive_check(recall_sessions))
     mcp.tool()(_with_directive_check(recall_resume))
     mcp.tool()(recall_build)
+    mcp.tool()(recall_build_status)
     mcp.tool()(recall_setup)
     mcp.tool()(recall_export)
     mcp.tool()(recall_import)

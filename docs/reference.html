@@ -366,10 +366,19 @@
 
     <div class="tool-sig">
       <h4>recall_build</h4>
-      <p>Build or rebuild the transcript index.</p>
+      <p>Start a background index build and return a durable build id immediately.</p>
       <table>
         <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
         <tr><td><code>incremental</code></td><td>bool</td><td>true</td><td>Skip already-indexed transcripts</td></tr>
+      </table>
+    </div>
+
+    <div class="tool-sig">
+      <h4>recall_build_status</h4>
+      <p>Read a durable build receipt with phase, terminal state, statistics, and changed shards.</p>
+      <table>
+        <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
+        <tr><td><code>build_id</code></td><td>string</td><td>latest</td><td>Build id returned by <code>recall_build</code></td></tr>
       </table>
     </div>
 

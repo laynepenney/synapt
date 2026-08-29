@@ -334,7 +334,11 @@ synapt init</code></pre>
       </tr>
       <tr>
         <td><code>recall_build</code></td>
-        <td>Build or rebuild the transcript index (supports incremental mode)</td>
+        <td>Start a background index build and return a durable build id</td>
+      </tr>
+      <tr>
+        <td><code>recall_build_status</code></td>
+        <td>Read build progress, terminal outcome, statistics, and changed shards</td>
       </tr>
       <tr>
         <td><code>recall_setup</code></td>
@@ -353,6 +357,7 @@ synapt init</code></pre>
         <td>Index statistics: chunks, sessions, date range, embeddings status, storage size</td>
       </tr>
     </table>
+    <p>If <code>recall_build</code> names an unreadable receipt, remove that named receipt to allow new builds. It is stale or corrupt state, never the build lock.</p>
 
     <h3>Coordination</h3>
     <table>
