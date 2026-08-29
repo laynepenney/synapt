@@ -816,18 +816,17 @@ def _receipt_owner_alive(project: Path, receipt: dict) -> bool:
     pid = receipt.get("pid")
     if not _pid_alive(pid):
         return False
+    if pid == os.getpid():
+        if receipt.get("server_instance") != _BUILD_SERVER_INSTANCE:
+            return False
+        if receipt.get("state") == "queued":
+            return True
+        thread = _BUILD_THREADS.get(str(receipt.get("build_id") or ""))
+        return thread is not None and thread.is_alive()
     marker = receipt.get("server_marker")
     if isinstance(marker, str) and marker:
-        if not _build_server_marker_alive(project, marker):
-            return False
-    if pid != os.getpid():
-        return True
-    if receipt.get("server_instance") != _BUILD_SERVER_INSTANCE:
-        return False
-    if receipt.get("state") == "queued":
-        return True
-    thread = _BUILD_THREADS.get(str(receipt.get("build_id") or ""))
-    return thread is not None and thread.is_alive()
+        return _build_server_marker_alive(project, marker)
+    return False
 
 
 def _active_build_receipt(project: Path) -> dict | None:
@@ -920,8 +919,12 @@ def _run_build_job(project: Path, receipt: dict, incremental: bool) -> None:
             except Exception as exc:
                 receipt["cache_warning"] = f"{type(exc).__name__}: {exc}"
             finally:
-                _write_build_receipt(project, receipt)
+                with _BUILD_RECEIPT_LOCK:
+                    _write_build_receipt(project, receipt)
+                    _BUILD_THREADS.pop(receipt["build_id"], None)
         finally:
+            # The guarded terminal write normally removes the thread. Keep the
+            # cleanup idempotent if writing the receipt itself raises.
             _BUILD_THREADS.pop(receipt["build_id"], None)
 
 
@@ -1009,18 +1012,19 @@ def recall_build_status(build_id: str = "") -> str:
         if not paths:
             return "No build receipts found for this project."
         path = paths[0]
-    if not path.exists():
-        return f"Build receipt not found: {build_id}"
-    try:
-        receipt = _read_build_receipt(path)
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return f"Build receipt unreadable: {type(exc).__name__}: {exc}"
-    if receipt.get("state") in {"queued", "running"} and not _receipt_owner_alive(project, receipt):
-        receipt["state"] = "interrupted"
-        receipt["phase"] = "interrupted"
-        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
-        receipt["error"] = "build process exited before writing a terminal receipt"
-        _write_build_receipt(project, receipt)
+    with _BUILD_RECEIPT_LOCK:
+        if not path.exists():
+            return f"Build receipt not found: {build_id}"
+        try:
+            receipt = _read_build_receipt(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return f"Build receipt unreadable: {type(exc).__name__}: {exc}"
+        if receipt.get("state") in {"queued", "running"} and not _receipt_owner_alive(project, receipt):
+            receipt["state"] = "interrupted"
+            receipt["phase"] = "interrupted"
+            receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+            receipt["error"] = "build process exited before writing a terminal receipt"
+            _write_build_receipt(project, receipt)
     return json.dumps(receipt, indent=2, sort_keys=True)
 
 

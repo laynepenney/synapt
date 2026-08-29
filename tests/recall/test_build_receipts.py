@@ -99,6 +99,69 @@ def test_returns_receipt_before_completion_and_reuses_active_job(monkeypatch, tm
     assert completed["updated_shards"] == ["data_002.db"]
 
 
+def test_same_process_status_does_not_reprobe_its_own_marker(monkeypatch, tmp_path):
+    from synapt.recall import cli, server
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_build(project, *, use_embeddings, incremental, progress):
+        progress("parsing")
+        entered.set()
+        assert release.wait(2)
+        return _FakeIndex()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_archive_and_build", blocked_build)
+    monkeypatch.setattr(server, "_invalidate_cache", lambda: None)
+
+    build_id = _build_id(server.recall_build())
+    assert entered.wait(1), "worker did not start"
+    monkeypatch.setattr(
+        server,
+        "_build_server_marker_alive",
+        lambda *_args: pytest.fail("same-process marker was re-probed"),
+    )
+
+    running = json.loads(server.recall_build_status(build_id))
+    assert running["state"] == "running"
+
+    release.set()
+    assert _wait_status(server, build_id, "completed")["result"] == "index built"
+
+
+def test_status_cannot_overwrite_a_terminal_receipt_with_interrupted(monkeypatch, tmp_path):
+    from synapt.recall import cli, server
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_owner_alive = server._receipt_owner_alive
+
+    def blocked_build(project, *, use_embeddings, incremental, progress):
+        progress("parsing")
+        entered.set()
+        assert release.wait(2)
+        return None
+
+    def delayed_owner_check(project, receipt):
+        release.set()
+        time.sleep(0.1)
+        return original_owner_alive(project, receipt)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_archive_and_build", blocked_build)
+    monkeypatch.setattr(server, "_invalidate_cache", lambda: None)
+
+    build_id = _build_id(server.recall_build())
+    assert entered.wait(1), "worker did not start"
+    monkeypatch.setattr(server, "_receipt_owner_alive", delayed_owner_check)
+
+    observed = json.loads(server.recall_build_status(build_id))
+    assert observed["state"] == "running"
+    completed = _wait_status(server, build_id, "completed")
+    assert completed["result"] == "no transcripts found"
+
+
 def test_failure_is_a_terminal_durable_receipt(monkeypatch, tmp_path):
     from synapt.recall import cli, server
 
