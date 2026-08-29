@@ -46,6 +46,22 @@ def _wait_status(server, build_id: str, state: str) -> dict:
     raise AssertionError(server.recall_build_status(build_id))
 
 
+def _running_receipt(build_id: str, pid: int) -> dict:
+    timestamp = "2026-08-29T00:00:00+00:00"
+    return {
+        "build_id": build_id,
+        "state": "running",
+        "phase": "indexing",
+        "pid": pid,
+        "server_instance": "f" * 32,
+        "server_marker": "build-server-0123456789abcdef0123456789abcdef.lock",
+        "incremental": True,
+        "created_at": timestamp,
+        "started_at": timestamp,
+        "updated_at": timestamp,
+    }
+
+
 def test_returns_receipt_before_completion_and_reuses_active_job(monkeypatch, tmp_path):
     from synapt.recall import cli, server
 
@@ -172,14 +188,8 @@ def test_dead_process_receipt_becomes_interrupted(monkeypatch, tmp_path):
     from synapt.recall import server
 
     monkeypatch.chdir(tmp_path)
-    receipt = {
-        "build_id": "build_0123456789ab",
-        "state": "running",
-        "phase": "clustering",
-        "pid": 999_999_999,
-        "server_marker": "build-server-0123456789abcdef0123456789abcdef.lock",
-        "created_at": "2026-08-29T00:00:00+00:00",
-    }
+    receipt = _running_receipt("build_0123456789ab", 999_999_999)
+    receipt["phase"] = "clustering"
     server._write_build_receipt(tmp_path.resolve(), receipt)
 
     result = json.loads(server.recall_build_status(receipt["build_id"]))
@@ -192,15 +202,10 @@ def test_same_pid_from_previous_server_instance_is_interrupted(monkeypatch, tmp_
     from synapt.recall import server
 
     monkeypatch.chdir(tmp_path)
-    receipt = {
-        "build_id": "build_123456789abc",
-        "state": "running",
-        "phase": "clustering",
-        "pid": os.getpid(),
-        "server_instance": "instance-before-exec-reload",
-        "server_marker": "build-server-123456789abcdef0123456789abcdef0.lock",
-        "created_at": "2026-08-29T00:00:00+00:00",
-    }
+    receipt = _running_receipt("build_123456789abc", os.getpid())
+    receipt["phase"] = "clustering"
+    receipt["server_instance"] = "e" * 32
+    receipt["server_marker"] = "build-server-123456789abcdef0123456789abcdef0.lock"
     server._write_build_receipt(tmp_path.resolve(), receipt)
 
     result = json.loads(server.recall_build_status(receipt["build_id"]))
@@ -250,15 +255,10 @@ def test_invalid_active_receipt_envelope_refuses_without_side_effects(
     monkeypatch.chdir(tmp_path)
     directory = server._build_receipts_dir(tmp_path.resolve())
     directory.mkdir(parents=True)
-    receipt = {
-        "build_id": build_id,
-        "state": "running",
-        "phase": "indexing",
-        "pid": os.getpid(),
-        "server_instance": "untrusted-instance",
-        "created_at": "2026-08-29T00:00:00+00:00",
-    }
-    if server_marker is not None:
+    receipt = _running_receipt(build_id, os.getpid())
+    if server_marker is None:
+        receipt.pop("server_marker")
+    else:
         receipt["server_marker"] = server_marker
     original = json.dumps(receipt)
     (directory / filename).write_text(original, encoding="utf-8")
@@ -270,6 +270,65 @@ def test_invalid_active_receipt_envelope_refuses_without_side_effects(
     assert (directory / filename).read_text(encoding="utf-8") == original
     assert not (tmp_path / "escaped.json").exists()
     assert not (tmp_path / "marker-target.lock").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("state", "runnning"),
+        ("state", ["running"]),
+        ("pid", "12345"),
+        ("server_instance", None),
+        ("server_instance", "not-a-server-instance"),
+    ],
+)
+def test_invalid_receipt_core_refuses_without_rewrite_or_duplicate(
+    monkeypatch, tmp_path, field, value,
+):
+    from synapt.recall import server
+
+    monkeypatch.chdir(tmp_path)
+    directory = server._build_receipts_dir(tmp_path.resolve())
+    directory.mkdir(parents=True)
+    path = directory / "build_deadbeefcafe.json"
+    receipt = _running_receipt("build_deadbeefcafe", os.getpid())
+    if value is None:
+        receipt.pop(field)
+    else:
+        receipt[field] = value
+    original = json.dumps(receipt)
+    path.write_text(original, encoding="utf-8")
+
+    response = server.recall_build()
+
+    assert response.startswith("Build not started:")
+    assert "receipt is unreadable" in response
+    assert path.read_text(encoding="utf-8") == original
+    assert list(directory.glob("build_*.json")) == [path]
+
+
+def test_status_refuses_incomplete_terminal_receipt(monkeypatch, tmp_path):
+    from synapt.recall import server
+
+    monkeypatch.chdir(tmp_path)
+    directory = server._build_receipts_dir(tmp_path.resolve())
+    directory.mkdir(parents=True)
+    path = directory / "build_deadbeefcafe.json"
+    receipt = _running_receipt("build_deadbeefcafe", os.getpid())
+    receipt.update({
+        "state": "completed",
+        "phase": "completed",
+        "finished_at": "2026-08-29T00:01:00+00:00",
+    })
+    receipt.pop("started_at")
+    original = json.dumps(receipt)
+    path.write_text(original, encoding="utf-8")
+
+    response = server.recall_build_status("build_deadbeefcafe")
+
+    assert response.startswith("Build receipt unreadable:")
+    assert "updated_shards" in response
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_live_sibling_process_receipt_is_reused(monkeypatch, tmp_path):
@@ -293,15 +352,9 @@ def test_live_sibling_process_receipt_is_reused(monkeypatch, tmp_path):
     try:
         assert child.stdout is not None
         assert child.stdout.readline().strip() == "ready"
-        receipt = {
-            "build_id": "build_abcdef012345",
-            "state": "running",
-            "phase": "indexing",
-            "pid": child.pid,
-            "server_instance": "sibling-instance",
-            "server_marker": marker,
-            "created_at": "2026-08-29T00:00:00+00:00",
-        }
+        receipt = _running_receipt("build_abcdef012345", child.pid)
+        receipt["server_instance"] = "d" * 32
+        receipt["server_marker"] = marker
         server._write_build_receipt(tmp_path.resolve(), receipt)
         response = server.recall_build()
         assert "already running" in response.lower()

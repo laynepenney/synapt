@@ -646,6 +646,8 @@ def recall_resume(
 _BUILD_RECEIPT_LOCK = threading.Lock()
 _BUILD_ID_RE = re.compile(r"^build_[0-9a-f]{12}$")
 _BUILD_SERVER_MARKER_RE = re.compile(r"^build-server-[0-9a-f]{32}\.lock$")
+_BUILD_SERVER_INSTANCE_RE = re.compile(r"^[0-9a-f]{32}$")
+_BUILD_RECEIPT_STATES = {"queued", "running", "completed", "failed", "interrupted"}
 _BUILD_SERVER_INSTANCE = uuid.uuid4().hex
 _BUILD_THREADS: dict[str, threading.Thread] = {}
 _BUILD_SERVER_MARKERS: dict[str, tuple[str, int]] = {}
@@ -677,10 +679,53 @@ def _read_build_receipt(path: Path) -> dict:
         raise ValueError("receipt build_id is invalid")
     if build_id != path.stem:
         raise ValueError("receipt build_id does not match its filename")
-    if value.get("state") in {"queued", "running"}:
-        marker = value.get("server_marker")
-        if not isinstance(marker, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(marker):
-            raise ValueError("active receipt server_marker is invalid")
+    state = value.get("state")
+    if not isinstance(state, str) or state not in _BUILD_RECEIPT_STATES:
+        raise ValueError("receipt state is invalid")
+    phase = value.get("phase")
+    if not isinstance(phase, str) or not phase:
+        raise ValueError("receipt phase is invalid")
+    pid = value.get("pid")
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("receipt pid is invalid")
+    instance = value.get("server_instance")
+    if not isinstance(instance, str) or not _BUILD_SERVER_INSTANCE_RE.fullmatch(instance):
+        raise ValueError("receipt server_instance is invalid")
+    marker = value.get("server_marker")
+    if not isinstance(marker, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(marker):
+        raise ValueError("receipt server_marker is invalid")
+    if type(value.get("incremental")) is not bool:
+        raise ValueError("receipt incremental flag is invalid")
+    for field in ("created_at", "updated_at"):
+        if not isinstance(value.get(field), str) or not value[field]:
+            raise ValueError(f"receipt {field} is invalid")
+    expected_phase = {
+        "queued": "queued",
+        "completed": "completed",
+        "failed": "failed",
+        "interrupted": "interrupted",
+    }.get(state)
+    if expected_phase is not None and phase != expected_phase:
+        raise ValueError(f"receipt phase does not match state {state}")
+    if state == "running":
+        if not isinstance(value.get("started_at"), str) or not value["started_at"]:
+            raise ValueError("running receipt started_at is invalid")
+    if state in {"completed", "failed", "interrupted"}:
+        if not isinstance(value.get("finished_at"), str) or not value["finished_at"]:
+            raise ValueError(f"{state} receipt finished_at is invalid")
+    if state == "completed":
+        shards = value.get("updated_shards")
+        if not isinstance(shards, list) or not all(isinstance(item, str) for item in shards):
+            raise ValueError("completed receipt updated_shards is invalid")
+        if not isinstance(value.get("stats"), dict):
+            raise ValueError("completed receipt stats is invalid")
+        if not isinstance(value.get("result"), str) or not value["result"]:
+            raise ValueError("completed receipt result is invalid")
+    if state in {"failed", "interrupted"}:
+        if not isinstance(value.get("error"), str) or not value["error"]:
+            raise ValueError(f"{state} receipt error is invalid")
+    if "cache_warning" in value and not isinstance(value["cache_warning"], str):
+        raise ValueError("receipt cache_warning is invalid")
     return value
 
 
