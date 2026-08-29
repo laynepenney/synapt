@@ -55,6 +55,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger("synapt.recall.cli")
@@ -251,6 +252,7 @@ def _archive_and_build(
     use_embeddings: bool = True,
     incremental: bool = False,
     chatgpt_archive: str | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> TranscriptIndex | None:
     """Archive transcripts and build the index. Shared by build/rebuild/setup.
 
@@ -263,14 +265,19 @@ def _archive_and_build(
     Returns the final TranscriptIndex, or None if no chunks found.
     """
     data_dir = project_data_dir(project_dir)
+    if progress:
+        progress("waiting_for_lock")
     lock_fd = _acquire_build_lock(data_dir)
     if lock_fd is None:
+        if progress:
+            progress("lock_timeout")
         print(f"  Warning: another build is in progress (timed out waiting for lock; {_build_lock_busy_message(data_dir)})")
         return None
 
     try:
         return _archive_and_build_locked(
             project_dir, source_dirs, use_embeddings, incremental, chatgpt_archive,
+            progress,
         )
     finally:
         _release_build_lock(lock_fd)
@@ -282,6 +289,7 @@ def _archive_and_build_locked(
     use_embeddings: bool,
     incremental: bool,
     chatgpt_archive: str | None,
+    progress: Callable[[str], None] | None = None,
 ) -> TranscriptIndex | None:
     """Inner build logic — caller must hold the build lock."""
     import time as _time
@@ -295,6 +303,8 @@ def _archive_and_build_locked(
     archive_dir = project_archive_dir(project_dir)
 
     # Step 1: Archive transcripts from Claude Code's source dir
+    if progress:
+        progress("archiving")
     if not source_dirs:
         source_dirs = project_transcript_dirs(project_dir)
 
@@ -442,6 +452,8 @@ def _archive_and_build_locked(
                          _profile.content_type, _subchunk_min)
 
     # Build from archived transcripts (BM25-only, no DB needed for parsing)
+    if progress:
+        progress("parsing")
     logger.info("build: parsing transcripts from %d source(s)...", len(build_sources))
     for build_source in build_sources:
         index = build_index(
@@ -568,6 +580,8 @@ def _archive_and_build_locked(
             deduped.append(chunk)
 
     # Build final index with SQLite backend
+    if progress:
+        progress("indexing")
     logger.info("build: saving %d chunks to FTS5 index...", len(deduped))
     save_t0 = _time.monotonic()
     final_index = TranscriptIndex(
@@ -580,6 +594,8 @@ def _archive_and_build_locked(
     logger.info("build: FTS5 save complete in %.1fs", _time.monotonic() - save_t0)
 
     # Cluster chunks by topic similarity
+    if progress:
+        progress("clustering")
     logger.info("build: clustering %d transcript chunks...", sum(1 for c in deduped if c.turn_index >= 0))
     from synapt.recall.clustering import cluster_chunks as _cluster_chunks, generate_concat_summary
     transcript_only = [c for c in deduped if c.turn_index >= 0]
@@ -870,6 +886,8 @@ def _archive_and_build_locked(
         print("  Note: input changed during the build; next run will not skip")
     db.save_manifest(manifest_payload)
 
+    if progress:
+        progress("finalizing")
     logger.info("build: complete in %.1fs (%d chunks)", _time.monotonic() - build_t0, len(deduped))
     return final_index
 
