@@ -648,6 +648,16 @@ _BUILD_ID_RE = re.compile(r"^build_[0-9a-f]{12}$")
 _BUILD_SERVER_MARKER_RE = re.compile(r"^build-server-[0-9a-f]{32}\.lock$")
 _BUILD_SERVER_INSTANCE_RE = re.compile(r"^[0-9a-f]{32}$")
 _BUILD_RECEIPT_STATES = {"queued", "running", "completed", "failed", "interrupted"}
+_BUILD_RUNNING_PHASES = {
+    "starting",
+    "waiting_for_lock",
+    "lock_timeout",
+    "archiving",
+    "parsing",
+    "indexing",
+    "clustering",
+    "finalizing",
+}
 _BUILD_SERVER_INSTANCE = uuid.uuid4().hex
 _BUILD_THREADS: dict[str, threading.Thread] = {}
 _BUILD_SERVER_MARKERS: dict[str, tuple[str, int]] = {}
@@ -671,6 +681,17 @@ def _write_build_receipt(project: Path, receipt: dict) -> None:
 
 
 def _read_build_receipt(path: Path) -> dict:
+    def require_timestamp(field: str) -> None:
+        raw = value.get(field)
+        if not isinstance(raw, str) or not raw:
+            raise ValueError(f"receipt {field} is invalid")
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"receipt {field} is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"receipt {field} is missing a timezone")
+
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError("receipt is not a JSON object")
@@ -694,11 +715,12 @@ def _read_build_receipt(path: Path) -> dict:
     marker = value.get("server_marker")
     if not isinstance(marker, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(marker):
         raise ValueError("receipt server_marker is invalid")
+    if marker != f"build-server-{instance}.lock":
+        raise ValueError("receipt server_marker does not match server_instance")
     if type(value.get("incremental")) is not bool:
         raise ValueError("receipt incremental flag is invalid")
     for field in ("created_at", "updated_at"):
-        if not isinstance(value.get(field), str) or not value[field]:
-            raise ValueError(f"receipt {field} is invalid")
+        require_timestamp(field)
     expected_phase = {
         "queued": "queued",
         "completed": "completed",
@@ -708,11 +730,11 @@ def _read_build_receipt(path: Path) -> dict:
     if expected_phase is not None and phase != expected_phase:
         raise ValueError(f"receipt phase does not match state {state}")
     if state == "running":
-        if not isinstance(value.get("started_at"), str) or not value["started_at"]:
-            raise ValueError("running receipt started_at is invalid")
+        if phase not in _BUILD_RUNNING_PHASES:
+            raise ValueError("running receipt phase is invalid")
+        require_timestamp("started_at")
     if state in {"completed", "failed", "interrupted"}:
-        if not isinstance(value.get("finished_at"), str) or not value["finished_at"]:
-            raise ValueError(f"{state} receipt finished_at is invalid")
+        require_timestamp("finished_at")
     if state == "completed":
         shards = value.get("updated_shards")
         if not isinstance(shards, list) or not all(isinstance(item, str) for item in shards):
