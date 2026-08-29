@@ -14,14 +14,15 @@ one. So the rules below are deliberately asymmetric — they prefer showing
 something slightly noisy over hiding something real, and they label an inferred
 pairing rather than presenting it as a proven one.
 
-Runtime independence is structural, not special-cased: this module reads chunks
-and never a transcript, so anything the parsers produce — Claude Code sessions
-via ``parse_transcript``, Codex CLI rollouts via ``parse_codex_transcript`` —
-resumes identically.
+Runtime independence is structural at the rendered-tail boundary: anything the
+parsers produce resumes identically. Caller freshness additionally reads the
+last top-level timestamp from the caller-scoped live JSONL source. It does not
+interpret runtime-specific event payloads.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -109,6 +110,7 @@ class ResumeView:
     selection_scope: str = "explicit"
     source_label: str = "unknown"
     caller_unindexed: list["CallerTranscript"] = field(default_factory=list)
+    caller_partial: "CallerExtentGap | None" = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,57 @@ class CallerTranscript:
     path: Path
     mtime: float
     size: int
+    latest_timestamp: str = ""
+
+
+@dataclass(frozen=True)
+class CallerExtentGap:
+    source: CallerTranscript
+    indexed_latest: str
+    live_latest: str
+
+
+def _latest_event_timestamp(path: Path, *, block_size: int = 64 * 1024) -> str:
+    """Read backward until a JSONL event with a top-level timestamp appears."""
+    with path.open("rb") as stream:
+        position = stream.seek(0, 2)
+        suffix = b""
+        while position:
+            start = max(0, position - block_size)
+            stream.seek(start)
+            data = stream.read(position - start) + suffix
+            lines = data.splitlines()
+            suffix = lines.pop(0) if start and lines else b""
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                timestamp = event.get("timestamp") if isinstance(event, dict) else None
+                if isinstance(timestamp, str) and timestamp:
+                    return timestamp
+            position = start
+        if suffix:
+            try:
+                event = json.loads(suffix)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                event = None
+            timestamp = event.get("timestamp") if isinstance(event, dict) else None
+            if isinstance(timestamp, str) and timestamp:
+                return timestamp
+    return ""
+
+
+def _timestamp_epoch(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def caller_transcripts(project_dir: Path | None = None) -> list[CallerTranscript]:
@@ -141,10 +194,19 @@ def caller_transcripts(project_dir: Path | None = None) -> list[CallerTranscript
         try:
             stat = path.stat()
             session_id = extract_session_id(str(path))
+            latest_timestamp = _latest_event_timestamp(path)
         except OSError:
             continue
         if session_id:
-            found.append(CallerTranscript(session_id, path, stat.st_mtime, stat.st_size))
+            found.append(
+                CallerTranscript(
+                    session_id,
+                    path,
+                    stat.st_mtime,
+                    stat.st_size,
+                    latest_timestamp,
+                )
+            )
     return sorted(found, key=lambda item: item.mtime, reverse=True)
 
 
@@ -522,20 +584,31 @@ def build_resume_view(
 
     source_path = next((c.transcript_path for c in chunks if c.transcript_path), "")
     source_label = _source_label(source_path)
-    selected_latest = index._overview.get(resolved, {}).get("latest_ts", "") if hasattr(index, "_overview") else ""
-    selected_epoch = 0.0
-    if selected_latest:
-        try:
-            parsed = datetime.fromisoformat(selected_latest.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            selected_epoch = parsed.timestamp()
-        except ValueError:
-            pass
+    selected_latest = max(
+        (chunk.timestamp for chunk in chunks if chunk.timestamp),
+        key=_timestamp_epoch,
+        default="",
+    )
+    selected_epoch = _timestamp_epoch(selected_latest)
     unindexed = [
         item for item in (caller_sources or [])
         if item.session_id not in index.sessions and item.mtime > selected_epoch
     ]
+    selected_source = next(
+        (item for item in (caller_sources or []) if item.session_id == resolved),
+        None,
+    )
+    caller_partial = None
+    if (
+        selected_source is not None
+        and selected_source.latest_timestamp
+        and _timestamp_epoch(selected_source.latest_timestamp) > selected_epoch
+    ):
+        caller_partial = CallerExtentGap(
+            selected_source,
+            selected_latest or "no searchable transcript endpoint",
+            selected_source.latest_timestamp,
+        )
 
     return ResumeView(
         session_id=resolved,
@@ -548,6 +621,7 @@ def build_resume_view(
         selection_scope=selection_scope,
         source_label=source_label,
         caller_unindexed=unindexed,
+        caller_partial=caller_partial,
     )
 
 
@@ -697,6 +771,13 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
         header = (
             f"⚠ CALLER SOURCE STALE: {newest.session_id[:8]} "
             f"({stamp}, {newest.size} bytes) is newer and unindexed | " + header
+        )
+    if view.caller_partial:
+        gap = view.caller_partial
+        header = (
+            f"⚠ CALLER SOURCE PARTIAL: {gap.source.session_id[:8]} "
+            f"indexed through {gap.indexed_latest}, live through {gap.live_latest} | "
+            "run `synapt recall build --no-embeddings` to refresh | " + header
         )
 
     lines = [header]
