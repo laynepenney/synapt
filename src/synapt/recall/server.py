@@ -566,7 +566,7 @@ def recall_sessions(
         lines.append(
             f"  {s['date']}  {s['session_id'][:8]}  "
             f"{s['turn_count']} turns  {s['files_count']} files  "
-            f"\"{s['first_message']}\""
+            f"[{s['source_root']}]  \"{s['first_message']}\""
         )
     return "\n".join(lines)
 
@@ -581,6 +581,9 @@ def recall_resume(
     cold "where did we leave off" needs and what search cannot give. Pairs the
     tail with the journal entry that session wrote, if any, and labels the
     index-freshness verdict so a stale view is never mistaken for a complete one.
+    With no explicit session ID, the MCP caller is the server process's current
+    working directory. Its newest indexed transcript wins before the shared
+    store-wide fallback is considered.
 
     Use at session start, alongside recall_journal: the journal is what the
     previous session chose to write, this is what actually happened last. They
@@ -589,13 +592,15 @@ def recall_resume(
     Same surface as the `synapt resume` CLI.
 
     Args:
-        session_id: Session to resume (prefix accepted). Default: the newest session.
+        session_id: Session to resume (prefix accepted). Default: the newest
+            session rooted at the MCP server's current working directory.
         turns: Number of tail turns to show (default 10).
     """
     from synapt.recall.journal import _journal_path
     from synapt.recall.resume import (
         ResumeError,
         build_resume_view,
+        caller_transcripts,
         format_resume,
         load_resume_index,
     )
@@ -617,6 +622,7 @@ def recall_resume(
                 session_id=session_id,
                 limit=turns,
                 journal_path=_journal_path(),
+                caller_sources=caller_transcripts(Path.cwd()),
             )
         except ResumeError as exc:
             if not index._session_order:

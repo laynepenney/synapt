@@ -1334,7 +1334,7 @@ def cmd_sessions(args: argparse.Namespace) -> None:
         print(
             f"  {s['date']}  {s['session_id'][:8]}  "
             f"{s['turn_count']} turns  {s['files_count']} files  "
-            f"\"{s['first_message']}\""
+            f"[{s['source_root']}]  \"{s['first_message']}\""
         )
 
 
@@ -1350,6 +1350,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
     from synapt.recall.resume import (
         ResumeError,
         build_resume_view,
+        caller_transcripts,
         format_resume,
         load_resume_index,
     )
@@ -1374,6 +1375,9 @@ def cmd_resume(args: argparse.Namespace) -> None:
                 session_id=getattr(args, "session", None),
                 limit=getattr(args, "turns", None) or 10,
                 journal_path=_journal_path(),
+                caller_sources=caller_transcripts(
+                    getattr(args, "project", None) or Path.cwd()
+                ),
             )
         except ResumeError as exc:
             # An empty index is an honest empty state, not a failure to act on.

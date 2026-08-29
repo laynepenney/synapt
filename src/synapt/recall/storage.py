@@ -1112,6 +1112,7 @@ class RecallDB:
             "         THEN timestamp END) AS activity_raw, "
             "MAX(julianday(timestamp)) AS fallback_jd, "
             "MAX(CASE WHEN julianday(timestamp) IS NULL THEN timestamp END) AS fallback_raw "
+            ", MIN(NULLIF(transcript_path, '')) AS transcript_path "
             "FROM chunks GROUP BY session_id"
         ).fetchall()
 
@@ -1133,6 +1134,7 @@ class RecallDB:
                 "latest_ts": row["latest_ts"] or "",
                 "turn_count": int(row["turn_count"] or 0),
                 "has_real_activity": bool(row["activity_count"]),
+                "transcript_path": row["transcript_path"] or "",
             }
         return result
 
@@ -1211,7 +1213,7 @@ class RecallDB:
                 continue
             placeholders = ",".join("?" for _ in batch)
             rows = self._conn.execute(
-                "SELECT session_id, turn_index, user_text, files_touched "
+                "SELECT session_id, turn_index, user_text, files_touched, transcript_path "
                 "FROM chunks WHERE session_id IN (" + placeholders + ") "
                 "ORDER BY session_id, turn_index",
                 batch,
@@ -1224,6 +1226,7 @@ class RecallDB:
                         json.loads(row["files_touched"])
                         if row["files_touched"] else []
                     ),
+                    "transcript_path": row["transcript_path"] or "",
                 })
         return grouped
 

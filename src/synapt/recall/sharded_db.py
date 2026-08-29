@@ -222,6 +222,8 @@ class ShardedRecallDB:
                         current["latest_ts"], overview["latest_ts"]
                     )
                 current["turn_count"] += overview["turn_count"]
+                if not current.get("transcript_path") and overview.get("transcript_path"):
+                    current["transcript_path"] = overview["transcript_path"]
         return result
 
     def session_activity(self) -> dict[str, tuple[int, str]]:
