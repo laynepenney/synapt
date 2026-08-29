@@ -645,6 +645,7 @@ def recall_resume(
 
 _BUILD_RECEIPT_LOCK = threading.Lock()
 _BUILD_ID_RE = re.compile(r"^build_[0-9a-f]{12}$")
+_BUILD_SERVER_MARKER_RE = re.compile(r"^build-server-[0-9a-f]{32}\.lock$")
 _BUILD_SERVER_INSTANCE = uuid.uuid4().hex
 _BUILD_THREADS: dict[str, threading.Thread] = {}
 _BUILD_SERVER_MARKERS: dict[str, tuple[str, int]] = {}
@@ -655,6 +656,8 @@ def _build_receipts_dir(project: Path) -> Path:
 
 
 def _build_receipt_path(project: Path, build_id: str) -> Path:
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        raise ValueError("invalid build id in receipt")
     return _build_receipts_dir(project) / f"{build_id}.json"
 
 
@@ -669,6 +672,15 @@ def _read_build_receipt(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError("receipt is not a JSON object")
+    build_id = value.get("build_id")
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        raise ValueError("receipt build_id is invalid")
+    if build_id != path.stem:
+        raise ValueError("receipt build_id does not match its filename")
+    if value.get("state") in {"queued", "running"}:
+        marker = value.get("server_marker")
+        if not isinstance(marker, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(marker):
+            raise ValueError("active receipt server_marker is invalid")
     return value
 
 
@@ -713,6 +725,8 @@ def _ensure_build_server_marker(project: Path) -> str:
 def _build_server_marker_alive(project: Path, name: str) -> bool:
     from synapt.recall.cli import _acquire_build_lock, _release_build_lock
 
+    if not isinstance(name, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(name):
+        raise ValueError("invalid build-server marker name")
     fd = _acquire_build_lock(project_data_dir(project), timeout=0, name=name)
     if fd is None:
         return True
@@ -759,7 +773,8 @@ def _active_build_receipt(project: Path) -> dict | None:
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise RuntimeError(
                 f"existing build receipt is unreadable: {path.name}: "
-                f"{type(exc).__name__}: {exc}"
+                f"{type(exc).__name__}: {exc}. Remove that file to allow new "
+                "builds. It is a stale or corrupt receipt, never the build lock."
             ) from exc
         if receipt.get("state") not in {"queued", "running"}:
             continue

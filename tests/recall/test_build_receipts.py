@@ -99,6 +99,23 @@ def test_failure_is_a_terminal_durable_receipt(monkeypatch, tmp_path):
     assert failed["error"] == "RuntimeError: fixture boom"
 
 
+def test_worker_start_failure_rewrites_prewritten_receipt_as_failed(monkeypatch, tmp_path):
+    from synapt.recall import server
+
+    def fail_to_start(self):
+        raise RuntimeError("thread fixture")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(threading.Thread, "start", fail_to_start)
+
+    response = server.recall_build()
+    build_id = _build_id(response)
+    receipt = json.loads(server.recall_build_status(build_id))
+    assert response.startswith("Build not started:")
+    assert receipt["state"] == "failed"
+    assert receipt["error"] == "worker did not start: RuntimeError: thread fixture"
+
+
 def test_lock_timeout_is_failed_not_reported_as_empty(monkeypatch, tmp_path):
     from synapt.recall import cli, server
 
@@ -160,6 +177,7 @@ def test_dead_process_receipt_becomes_interrupted(monkeypatch, tmp_path):
         "state": "running",
         "phase": "clustering",
         "pid": 999_999_999,
+        "server_marker": "build-server-0123456789abcdef0123456789abcdef.lock",
         "created_at": "2026-08-29T00:00:00+00:00",
     }
     server._write_build_receipt(tmp_path.resolve(), receipt)
@@ -180,6 +198,7 @@ def test_same_pid_from_previous_server_instance_is_interrupted(monkeypatch, tmp_
         "phase": "clustering",
         "pid": os.getpid(),
         "server_instance": "instance-before-exec-reload",
+        "server_marker": "build-server-123456789abcdef0123456789abcdef0.lock",
         "created_at": "2026-08-29T00:00:00+00:00",
     }
     server._write_build_receipt(tmp_path.resolve(), receipt)
@@ -199,13 +218,65 @@ def test_corrupt_existing_receipt_refuses_a_new_build(monkeypatch, tmp_path):
     response = server.recall_build()
     assert response.startswith("Build not started:")
     assert "receipt is unreadable" in response
+    assert "Remove that file to allow new builds" in response
+
+
+@pytest.mark.parametrize(
+    ("filename", "build_id", "server_marker"),
+    [
+        (
+            "build_deadbeefcafe.json",
+            "../../../escaped",
+            "build-server-0123456789abcdef0123456789abcdef.lock",
+        ),
+        (
+            "build_deadbeefcafe.json",
+            "build_0123456789ab",
+            "build-server-0123456789abcdef0123456789abcdef.lock",
+        ),
+        (
+            "build_deadbeefcafe.json",
+            "build_deadbeefcafe",
+            "../../marker-target.lock",
+        ),
+        ("build_deadbeefcafe.json", "build_deadbeefcafe", None),
+    ],
+)
+def test_invalid_active_receipt_envelope_refuses_without_side_effects(
+    monkeypatch, tmp_path, filename, build_id, server_marker,
+):
+    from synapt.recall import server
+
+    monkeypatch.chdir(tmp_path)
+    directory = server._build_receipts_dir(tmp_path.resolve())
+    directory.mkdir(parents=True)
+    receipt = {
+        "build_id": build_id,
+        "state": "running",
+        "phase": "indexing",
+        "pid": os.getpid(),
+        "server_instance": "untrusted-instance",
+        "created_at": "2026-08-29T00:00:00+00:00",
+    }
+    if server_marker is not None:
+        receipt["server_marker"] = server_marker
+    original = json.dumps(receipt)
+    (directory / filename).write_text(original, encoding="utf-8")
+
+    response = server.recall_build()
+
+    assert response.startswith("Build not started:")
+    assert "receipt is unreadable" in response
+    assert (directory / filename).read_text(encoding="utf-8") == original
+    assert not (tmp_path / "escaped.json").exists()
+    assert not (tmp_path / "marker-target.lock").exists()
 
 
 def test_live_sibling_process_receipt_is_reused(monkeypatch, tmp_path):
     from synapt.recall import server
 
     monkeypatch.chdir(tmp_path)
-    marker = "build-server-sibling-fixture.lock"
+    marker = "build-server-abcdef0123456789abcdef0123456789.lock"
     source_root = str(Path(server.__file__).resolve().parents[2])
     script = (
         "import time; from pathlib import Path; "
@@ -271,6 +342,34 @@ def test_changed_shards_excludes_unchanged_existing_store(monkeypatch, tmp_path)
     build_id = _build_id(server.recall_build())
     result = _wait_status(server, build_id, "completed")
     assert result["updated_shards"] == ["data_002.db"]
+
+
+def test_changed_shards_detects_wal_only_change(monkeypatch, tmp_path):
+    from synapt.recall import cli, server
+
+    index_dir = server.project_index_dir(tmp_path.resolve())
+    index_dir.mkdir(parents=True)
+    base = index_dir / "data_001.db"
+    changed_wal = index_dir / "data_001.db-wal"
+    unchanged = index_dir / "data_002.db"
+    unchanged_wal = index_dir / "data_002.db-wal"
+    base.write_bytes(b"unchanged base")
+    changed_wal.write_bytes(b"before")
+    unchanged.write_bytes(b"unchanged base")
+    unchanged_wal.write_bytes(b"unchanged wal")
+
+    def build(project, *, use_embeddings, incremental, progress):
+        progress("indexing")
+        changed_wal.write_bytes(b"after with a different size")
+        return _FakeIndex()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_archive_and_build", build)
+    monkeypatch.setattr(server, "_invalidate_cache", lambda: None)
+
+    build_id = _build_id(server.recall_build())
+    result = _wait_status(server, build_id, "completed")
+    assert result["updated_shards"] == ["data_001.db"]
 
 
 def test_cli_build_forwards_phase_callback_without_changing_sync_result(monkeypatch, tmp_path):
