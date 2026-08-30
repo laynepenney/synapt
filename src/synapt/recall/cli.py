@@ -2643,10 +2643,21 @@ def cmd_grep_intercept(args: argparse.Namespace) -> None:
         return
     if not isinstance(payload, dict):
         return
-    output = build_pretooluse_output(
-        payload,
-        config=GrepInterceptConfig(enabled=True, timeout_ms=150),
-    )
+    # This command is a JSON hook protocol. Index-load diagnostics belong to
+    # interactive commands, not to the hook's stderr channel. Logging handlers
+    # may retain the original stderr object, so redirecting stderr is not enough.
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        output = build_pretooluse_output(
+            payload,
+            config=GrepInterceptConfig(
+                enabled=True,
+                timeout_ms=max(1, args.timeout_ms),
+            ),
+        )
+    finally:
+        logging.disable(previous_logging_disable)
     if output is not None:
         print(json.dumps(output, separators=(",", ":")))
 
@@ -3568,9 +3579,15 @@ def make_parser() -> argparse.ArgumentParser:
     startup_parser.add_argument("--compact", action="store_true",
                                 help="Single-line summary for prompt injection")
 
-    subparsers.add_parser(
+    grep_intercept_parser = subparsers.add_parser(
         "grep-intercept",
         help="Add bounded recall context to grep-shaped PreToolUse events",
+    )
+    grep_intercept_parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=500,
+        help="Inner recall deadline in milliseconds (default: 500)",
     )
 
     checkpoint_parser = subparsers.add_parser(

@@ -19,9 +19,50 @@ from typing import Any
 RecallQuick = Callable[[str], str]
 
 _RECALL_BLOCK = re.compile(
-    r"^--- \[(?:cluster:|knowledge #|\d{4}-\d{2}-\d{2} session )",
+    r"^--- \[(?:cluster:|knowledge #|\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2})? session )",
     re.MULTILINE,
 )
+
+_FLAG_OPTIONS = {
+    "grep": {
+        "--basic-regexp", "--extended-regexp", "--fixed-strings", "--ignore-case",
+        "--invert-match", "--line-number", "--no-filename", "--only-matching",
+        "--quiet", "--recursive", "--with-filename", "--word-regexp",
+        "-E", "-F", "-H", "-I", "-L", "-R", "-c", "-h", "-i", "-l",
+        "-n", "-o", "-q", "-r", "-s", "-v", "-w", "-x",
+    },
+    "rg": {
+        "--case-sensitive", "--column", "--count", "--files-with-matches",
+        "--fixed-strings", "--hidden", "--ignore-case", "--invert-match",
+        "--line-number", "--no-heading", "--no-ignore", "--only-matching",
+        "--smart-case", "--stats", "--text", "--trim", "--type-list",
+        "--unrestricted", "--word-regexp", "-F", "-H", "-I", "-L", "-N",
+        "-S", "-U", "-c", "-h", "-i", "-l", "-n", "-o", "-p", "-s",
+        "-u", "-v", "-w", "-x",
+    },
+}
+
+_VALUE_OPTIONS = {
+    "grep": {
+        "--after-context", "--before-context", "--binary-files", "--context",
+        "--devices", "--directories", "--exclude", "--exclude-dir",
+        "--exclude-from", "--file", "--include", "--label", "--max-count",
+        "-A", "-B", "-C", "-f", "-m",
+    },
+    "rg": {
+        "--after-context", "--before-context", "--context", "--encoding",
+        "--engine", "--file", "--glob", "--iglob", "--max-columns",
+        "--max-count", "--max-depth", "--max-filesize", "--path-separator",
+        "--pre", "--pre-glob", "--regex-size-limit", "--replace", "--sort",
+        "--sortr", "--type", "--type-add", "--type-not", "-A", "-B", "-C",
+        "-E", "-M", "-T", "-f", "-g", "-j", "-m", "-r", "-t",
+    },
+}
+
+_PATTERN_OPTIONS = {
+    "grep": {"--regexp", "-e"},
+    "rg": {"--regexp", "-e"},
+}
 
 
 @dataclass(frozen=True)
@@ -29,7 +70,7 @@ class GrepInterceptConfig:
     """Runtime controls for the opt-in grep interception hook."""
 
     enabled: bool = False
-    timeout_ms: int = 150
+    timeout_ms: int = 500
 
 
 def extract_grep_pattern(tool_call: Mapping[str, Any]) -> str | None:
@@ -55,6 +96,12 @@ def extract_grep_pattern(tool_call: Mapping[str, Any]) -> str | None:
     if not words or words[0] not in {"grep", "rg"}:
         return None
 
+    command_name = words[0]
+    flag_options = _FLAG_OPTIONS[command_name]
+    value_options = _VALUE_OPTIONS[command_name]
+    pattern_options = _PATTERN_OPTIONS[command_name]
+    short_flags = {option[1:] for option in flag_options if re.fullmatch(r"-[A-Za-z]", option)}
+
     index = 1
     while index < len(words):
         word = words[index]
@@ -63,7 +110,34 @@ def extract_grep_pattern(tool_call: Mapping[str, Any]) -> str | None:
             break
         if not word.startswith("-") or word == "-":
             break
-        index += 1
+
+        option, separator, inline_value = word.partition("=")
+        if option in pattern_options:
+            if separator:
+                return inline_value or None
+            index += 1
+            return words[index] if index < len(words) and words[index] else None
+        if option in value_options:
+            index += 1 if separator else 2
+            continue
+        if option in flag_options:
+            index += 1
+            continue
+
+        if word.startswith("--"):
+            return None
+
+        short_option = word[:2]
+        attached_value = word[2:]
+        if short_option in pattern_options and attached_value:
+            return attached_value
+        if short_option in value_options and attached_value:
+            index += 1
+            continue
+        if len(word) > 2 and all(character in short_flags for character in word[1:]):
+            index += 1
+            continue
+        return None
     if index >= len(words):
         return None
     return words[index]
@@ -173,12 +247,16 @@ def annotate_tool_result(
 def claude_pretooluse_settings_snippet(
     *,
     enabled: bool,
-    timeout_ms: int = 150,
+    timeout_ms: int = 500,
 ) -> dict[str, Any]:
     """Return an opt-in Claude Code settings fragment for the hook."""
     if not enabled:
         return {"hooks": {"PreToolUse": []}}
-    timeout_seconds = min(1.0, max(0.001, timeout_ms / 1000))
+    inner_timeout_ms = min(500, max(1, timeout_ms))
+    # The command process must start, import the CLI, and decode stdin before the
+    # inner recall budget begins. Keep those two budgets distinct.
+    startup_headroom_seconds = 0.5
+    timeout_seconds = inner_timeout_ms / 1000 + startup_headroom_seconds
     return {
         "hooks": {
             "PreToolUse": [
@@ -187,7 +265,10 @@ def claude_pretooluse_settings_snippet(
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "synapt recall grep-intercept",
+                            "command": (
+                                "synapt recall grep-intercept "
+                                f"--timeout-ms {inner_timeout_ms}"
+                            ),
                             "timeout": timeout_seconds,
                         }
                     ],
