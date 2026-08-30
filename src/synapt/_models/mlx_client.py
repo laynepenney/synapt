@@ -106,12 +106,47 @@ class MLXClient(ModelClient):
         model: str,
         messages: List[Message],
         temperature: float = 0.2,
+        usage_out: Optional[dict] = None,
         adapter_path: Optional[str] = None,
         fuse_adapters: Optional[List[str]] = None,
         **kwargs,
     ) -> str:
-        from mlx_lm.generate import generate
+        """Run a completion, optionally reporting the runtime's token counts.
+
+        BEHAVIOUR CHANGE, stated rather than buried: this used to call
+        ``mlx_lm.generate.generate``.  It now drives ``stream_generate``
+        directly, because ``generate`` returns only the text and discards the
+        counts we need.  The returned TEXT is unchanged, and that is provable
+        rather than hopeful -- ``generate`` is, in full, for the
+        ``verbose=False`` path we use::
+
+            text = ""
+            for response in stream_generate(model, tokenizer, prompt, **kwargs):
+                text += response.text
+            return text
+
+        which is exactly the loop below.  Callers that omit ``usage_out`` see
+        identical output; what changed is that we call the streaming primitive
+        ``generate`` was already calling on our behalf.
+
+        ``response.text`` is the detokenizer's LAST SEGMENT -- a DELTA per
+        yield -- so the text must be ACCUMULATED.  ``generation_tokens`` is
+        cumulative (``n + 1``) and ``prompt_tokens`` is constant, so the counts
+        come from the FINAL response.  A single-yield fixture cannot tell
+        accumulate from take-first or take-last; the two-yield witness in
+        ``tests/test_model_client_usage_out.py`` is what pins it.
+        """
+        import importlib
+
         from mlx_lm.sample_utils import make_sampler
+
+        # mlx_lm/__init__.py does ``from .generate import generate``, which
+        # overwrites the ``generate`` ATTRIBUTE on the package object with the
+        # function -- so ``import mlx_lm.generate as x`` silently binds the
+        # FUNCTION, not the module, and ``x.stream_generate`` raises
+        # AttributeError.  importlib reads sys.modules directly and is the only
+        # form that reliably yields the module.
+        mlx_generate = importlib.import_module("mlx_lm.generate")
 
         if fuse_adapters:
             model_obj, tokenizer = self._load_fused(model, fuse_adapters)
@@ -124,10 +159,22 @@ class MLXClient(ModelClient):
             top_k=self.options.top_k,
             min_p=self.options.min_p,
         )
-        return generate(
+        text = ""
+        final = None
+        for response in mlx_generate.stream_generate(
             model_obj,
             tokenizer,
             prompt,
             max_tokens=kwargs.get("max_tokens", self.options.max_tokens),
             sampler=sampler,
-        )
+        ):
+            text += response.text
+            final = response
+
+        if usage_out is not None:
+            usage_out["tokens_in"] = getattr(final, "prompt_tokens", None)
+            usage_out["tokens_out"] = getattr(final, "generation_tokens", None)
+            # Structurally null: mlx_lm reports no cache tier on the response.
+            usage_out["cached_tokens"] = None
+
+        return text

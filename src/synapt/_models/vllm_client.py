@@ -9,7 +9,7 @@ Requires: pip install vllm
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from .base import Message, ModelClient
 
@@ -40,6 +40,7 @@ class VLLMClient(ModelClient):
         model: str,
         messages: List[Message],
         temperature: float = 0.2,
+        usage_out: Optional[dict] = None,
         **kwargs,
     ) -> str:
         from vllm import SamplingParams
@@ -57,5 +58,34 @@ class VLLMClient(ModelClient):
 
         outputs = engine.chat(chat_messages, params)
         if outputs and outputs[0].outputs:
+            if usage_out is not None:
+                usage_out.update(usage_from_request_output(outputs[0]))
             return outputs[0].outputs[0].text.strip()
         return ""
+
+
+def usage_from_request_output(request_output) -> dict:
+    """Token counts off a vLLM ``RequestOutput``, as a PURE function.
+
+    Split out deliberately.  Both end-to-end vLLM tests are ``importorskip``'d,
+    and vllm is a runtime we do not install locally, so on every machine we work
+    on those tests are SKIPS -- and a skip is not a green.  ``vllm_client``
+    itself imports fine without vllm (every vllm import is call-time), so this
+    helper can be executed directly against the same fake objects with no
+    runtime present.  That is the only way this arithmetic is ever RUN here
+    rather than merely typechecked.
+
+    ``cached_tokens`` is structurally ``None``: vLLM reports no cache tier on
+    the objects read here, and a guessed number in a metering field is worse
+    than a missing one.
+    """
+    prompt_token_ids = getattr(request_output, "prompt_token_ids", None)
+    completion = (getattr(request_output, "outputs", None) or [None])[0]
+    completion_token_ids = getattr(completion, "token_ids", None)
+    return {
+        "tokens_in": len(prompt_token_ids) if prompt_token_ids is not None else None,
+        "tokens_out": (
+            len(completion_token_ids) if completion_token_ids is not None else None
+        ),
+        "cached_tokens": None,
+    }
