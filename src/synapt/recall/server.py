@@ -528,6 +528,33 @@ def recall_quick(query: str) -> str:
             return result
         diag = index._last_diagnostics
         if diag:
+            sessions = f"{diag.total_sessions} session"
+            if diag.total_sessions != 1:
+                sessions += "s"
+            chunks = f"{diag.total_chunks} indexed chunk"
+            if diag.total_chunks != 1:
+                chunks += "s"
+            if diag.reason == "empty_index":
+                return (
+                    f"No indexed recall corpus available for '{query}'.\n"
+                    f"The keyword check had {sessions} across {chunks}.\n"
+                    "Verified absence unavailable because there was no indexed "
+                    "corpus to search."
+                )
+            if diag.reason == "no_matches":
+                coverage = f"searched {sessions} across {chunks}"
+                if diag.oldest_indexed_at:
+                    coverage += f", indexed back to {diag.oldest_indexed_at}"
+                semantic_note = (
+                    "semantic search was also used"
+                    if diag.semantic_search_used
+                    else "semantic search was not used"
+                )
+                return (
+                    f"No prior keyword match found for '{query}'.\n"
+                    f"The keyword check {coverage}; {semantic_note}.\n"
+                    "Proceeding fresh is reasonable after this keyword check."
+                )
             return diag.format_message()
         return "No results found."
     except Exception as exc:
