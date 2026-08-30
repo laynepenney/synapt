@@ -2630,6 +2630,38 @@ def cmd_startup(args: argparse.Namespace) -> None:
             print(line)
 
 
+def cmd_grep_intercept(args: argparse.Namespace) -> None:
+    """Emit advisory recall context for a Claude Code PreToolUse event."""
+    from synapt.integrations.grep_intercept import (
+        GrepInterceptConfig,
+        build_pretooluse_output,
+    )
+
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(payload, dict):
+        return
+    # This command is a JSON hook protocol. Index-load diagnostics belong to
+    # interactive commands, not to the hook's stderr channel. Logging handlers
+    # may retain the original stderr object, so redirecting stderr is not enough.
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        output = build_pretooluse_output(
+            payload,
+            config=GrepInterceptConfig(
+                enabled=True,
+                timeout_ms=max(1, args.timeout_ms),
+            ),
+        )
+    finally:
+        logging.disable(previous_logging_disable)
+    if output is not None:
+        print(json.dumps(output, separators=(",", ":")))
+
+
 def _session_start_continuity_allowed(source: str) -> bool:
     """Return whether SessionStart should inject recovery context.
 
@@ -3547,6 +3579,17 @@ def make_parser() -> argparse.ArgumentParser:
     startup_parser.add_argument("--compact", action="store_true",
                                 help="Single-line summary for prompt injection")
 
+    grep_intercept_parser = subparsers.add_parser(
+        "grep-intercept",
+        help="Add bounded recall context to grep-shaped PreToolUse events",
+    )
+    grep_intercept_parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=500,
+        help="Inner recall deadline in milliseconds (default: 500)",
+    )
+
     checkpoint_parser = subparsers.add_parser(
         "checkpoint",
         help="Capture a bounded SessionEnd recovery checkpoint",
@@ -3694,6 +3737,8 @@ def main():
         cmd_remind(args)
     elif args.command == "startup":
         cmd_startup(args)
+    elif args.command == "grep-intercept":
+        cmd_grep_intercept(args)
     elif args.command == "checkpoint":
         from synapt.checkpoint import main as checkpoint_main
         raise SystemExit(checkpoint_main(["--event-json", args.event_json]))
