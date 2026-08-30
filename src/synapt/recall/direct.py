@@ -125,6 +125,46 @@ def _inbox_path(agent_id: str, project_dir: Path | None = None) -> Path:
     return base / f"{agent_id}.jsonl"
 
 
+# recall#820 cross-org silo fix: the gripspace-local stores above (_direct_dir
+# routes through _channels_dir(project_dir)) silo direct messages per-gripspace.
+# A send from gripspace A lands in A's store; a read from gripspace B queries B's
+# store and finds nothing. The canonical cross-org root below is
+# project-INDEPENDENT (org-keyed, project component dropped) so every gripspace
+# in the org agrees on one inbox per recipient. send_message dual-writes here;
+# read_inbox union-reads from here. Design: Option A (project-independent
+# org-canonical cross-org root).
+_DEFAULT_ORG = "synapt-dev"
+
+
+def _cross_org_root(project_dir: Path | None = None) -> Path:
+    """Resolve the project-independent, org-canonical cross-org direct root.
+
+    Resolution:
+    1. SYNAPT_SHARED_CHANNELS_DIR override -> <shared>/_cross-org/direct/.
+       This branch keeps the existing test suite + explicit shared deployments
+       isolated: because send_message now ALWAYS dual-writes here, a raw
+       Path.home() root would write into the real ~/.synapt during tests that
+       only set the shared override. Honoring the override forecloses that.
+    2. Org-canonical under home -> ~/.synapt/channels/<org>/_cross-org/direct/.
+       The org is derived from the gripspace manifest; the <project> component
+       is intentionally dropped so the root is shared across all gripspaces in
+       the org (this is the silo fix).
+    """
+    from synapt.recall.channel import _resolve_org_id, _shared_channels_dir
+
+    shared = _shared_channels_dir()
+    if shared:
+        return shared / "_cross-org" / "direct"
+    org = _resolve_org_id(project_dir) or _DEFAULT_ORG
+    return Path.home() / ".synapt" / "channels" / org / "_cross-org" / "direct"
+
+
+def _cross_org_inbox_path(to_agent: str, project_dir: Path | None = None) -> Path:
+    base = _cross_org_root(project_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{to_agent}.jsonl"
+
+
 def _db_path(project_dir: Path | None = None) -> Path:
     base = _direct_dir(project_dir)
     base.mkdir(parents=True, exist_ok=True)
@@ -251,10 +291,17 @@ def send_message(
         if deny_reason is not None:
             raise PermissionError(f"send denied: {deny_reason}")
 
-    # Write to recipient's inbox JSONL
+    # Write to recipient's inbox JSONL (gripspace-local; intra-org fast path)
     inbox = _inbox_path(to_agent, project_dir)
+    line = json.dumps(msg.to_dict(), ensure_ascii=False) + "\n"
     with open(inbox, "a", encoding="utf-8") as f:
-        f.write(json.dumps(msg.to_dict(), ensure_ascii=False) + "\n")
+        f.write(line)
+
+    # recall#820: dual-write to the project-independent cross-org canonical
+    # inbox so a recipient in a different gripspace reads it (the silo fix).
+    cross_inbox = _cross_org_inbox_path(to_agent, project_dir)
+    with open(cross_inbox, "a", encoding="utf-8") as f:
+        f.write(line)
 
     # Track in SQLite
     conn = _get_db(project_dir)
@@ -291,30 +338,104 @@ def send_message(
     return msg
 
 
+def _read_cross_org_candidates(
+    agent_id: str,
+    conn: sqlite3.Connection,
+    local_ids: set[str],
+    project_dir: Path | None,
+) -> list[DirectMessage]:
+    """Return cross-org canonical messages for agent_id not already tracked locally.
+
+    recall#820: messages sent from another gripspace have no local SQLite row
+    (their delivery state lives in the SENDER's store). This scans the canonical
+    cross-org inbox and surfaces any message whose message_id is neither in the
+    local delivered set (`local_ids`) nor already present in the local SQLite
+    `messages` table (read/acked on a prior read). Caller marks the returned
+    ones READ; messages beyond the read limit are left untracked so a later
+    read re-surfaces them.
+    """
+    cross_inbox = _cross_org_inbox_path(agent_id, project_dir)
+    if not cross_inbox.exists():
+        return []
+
+    candidates: list[DirectMessage] = []
+    seen: set[str] = set(local_ids)
+    with open(cross_inbox, encoding="utf-8") as f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            msg = DirectMessage.from_dict(data)
+            if msg.to_agent != agent_id or msg.message_id in seen:
+                continue
+            seen.add(msg.message_id)
+            already = conn.execute(
+                "SELECT 1 FROM messages WHERE message_id = ?", (msg.message_id,)
+            ).fetchone()
+            if already is not None:
+                continue
+            candidates.append(msg)
+    return candidates
+
+
+def _track_cross_org_read(conn: sqlite3.Connection, msg: DirectMessage) -> None:
+    """Insert a local SQLite tracking row (status=READ) for a cross-org message.
+
+    Gives the cross-org message a local delivery-state row so re-reads dedup it
+    and ack_message can transition it. Idempotent via INSERT OR IGNORE.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    conn.execute(
+        """INSERT OR IGNORE INTO messages
+           (message_id, from_agent, to_agent, timestamp, body, reply_to,
+            priority, status, created_at, delivered_at, read_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            msg.message_id,
+            msg.from_agent,
+            msg.to_agent,
+            msg.timestamp,
+            msg.body,
+            msg.reply_to,
+            msg.priority,
+            STATUS_READ,
+            now,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+
+
 def read_inbox(
     *,
     agent_id: str,
     limit: int = 20,
     project_dir: Path | None = None,
 ) -> list[DirectMessage]:
-    """Read unread messages from an agent's inbox.  Marks them as READ."""
+    """Read unread messages from an agent's inbox.  Marks them as READ.
+
+    recall#820: union of the local SQLite delivery store (intra-org fast path)
+    and the project-independent cross-org canonical inbox (cross-gripspace
+    path), deduped by message_id. Urgent messages surface first, then oldest
+    first; only the returned (post-limit) messages are marked READ.
+    """
     conn = _get_db(project_dir)
     try:
-        rows = conn.execute(
+        local_rows = conn.execute(
             """SELECT message_id, from_agent, to_agent, timestamp, body,
                       reply_to, priority
                FROM messages
-               WHERE to_agent = ? AND status = ?
-               ORDER BY
-                   CASE WHEN priority = 'urgent' THEN 0 ELSE 1 END,
-                   created_at ASC
-               LIMIT ?""",
-            (agent_id, STATUS_DELIVERED, limit),
+               WHERE to_agent = ? AND status = ?""",
+            (agent_id, STATUS_DELIVERED),
         ).fetchall()
 
-        messages = []
-        for row in rows:
-            msg = DirectMessage(
+        local_msgs = [
+            DirectMessage(
                 message_id=row["message_id"],
                 from_agent=row["from_agent"],
                 to_agent=row["to_agent"],
@@ -323,10 +444,26 @@ def read_inbox(
                 reply_to=row["reply_to"],
                 priority=row["priority"],
             )
-            messages.append(msg)
-            _transition_status(conn, msg.message_id, STATUS_READ)
+            for row in local_rows
+        ]
+        local_ids = {m.message_id for m in local_msgs}
 
-        return messages
+        cross_msgs = _read_cross_org_candidates(agent_id, conn, local_ids, project_dir)
+        is_cross = {m.message_id for m in cross_msgs}
+
+        combined = local_msgs + cross_msgs
+        combined.sort(
+            key=lambda m: (0 if m.priority == PRIORITY_URGENT else 1, m.timestamp)
+        )
+        returned = combined[:limit]
+
+        for msg in returned:
+            if msg.message_id in is_cross:
+                _track_cross_org_read(conn, msg)
+            else:
+                _transition_status(conn, msg.message_id, STATUS_READ)
+
+        return returned
     finally:
         conn.close()
 
@@ -512,7 +649,9 @@ def resolve_pane(to_agent: str, pane_map: dict[str, Any]) -> PaneTarget | None:
     entry = pane_map.get(to_agent) or pane_map.get(_normalize_agent_key(to_agent))
     if not isinstance(entry, dict) or not entry.get("target"):
         return None
-    return PaneTarget(target=str(entry["target"]), runtime=str(entry.get("runtime", "claude")))
+    return PaneTarget(
+        target=str(entry["target"]), runtime=str(entry.get("runtime", "claude"))
+    )
 
 
 def build_tmux_commands(
@@ -565,7 +704,9 @@ def deliver_via_tmux(
     """
     run = run or _run_tmux
     sleep = sleep or time.sleep
-    cmds, enters = build_tmux_commands(target, runtime, body, buffer_name=buffer_name, large_threshold=large_threshold)
+    cmds, enters = build_tmux_commands(
+        target, runtime, body, buffer_name=buffer_name, large_threshold=large_threshold
+    )
     try:
         for cmd in cmds:
             is_load = cmd[:2] == ["tmux", "load-buffer"]
@@ -578,12 +719,29 @@ def deliver_via_tmux(
             returncode = getattr(result, "returncode", 0)
             if returncode != 0:
                 detail = getattr(result, "stderr", "") or f"tmux exited {returncode}"
-                return TmuxDelivery(delivered=False, target=target, enters=enters, detail=f"{cmd[1]} failed for {target}: {detail}".strip())
+                return TmuxDelivery(
+                    delivered=False,
+                    target=target,
+                    enters=enters,
+                    detail=f"{cmd[1]} failed for {target}: {detail}".strip(),
+                )
     except FileNotFoundError:
-        return TmuxDelivery(delivered=False, target=target, enters=enters, detail="tmux not available")
+        return TmuxDelivery(
+            delivered=False, target=target, enters=enters, detail="tmux not available"
+        )
     except Exception as exc:  # never let delivery break the send
-        return TmuxDelivery(delivered=False, target=target, enters=enters, detail=f"tmux delivery error: {exc}")
-    return TmuxDelivery(delivered=True, target=target, enters=enters, detail=f"pasted to {target} ({enters} Enter(s))")
+        return TmuxDelivery(
+            delivered=False,
+            target=target,
+            enters=enters,
+            detail=f"tmux delivery error: {exc}",
+        )
+    return TmuxDelivery(
+        delivered=True,
+        target=target,
+        enters=enters,
+        detail=f"pasted to {target} ({enters} Enter(s))",
+    )
 
 
 def _attempt_tmux_delivery(to_agent: str, body: str) -> TmuxDelivery | None:
