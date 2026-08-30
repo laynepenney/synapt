@@ -826,7 +826,8 @@ def test_same_path_same_length_replacement_invalidates_the_cursor(
     replaced_stat = transcript.stat()
     os.utime(
         transcript,
-        ns=(replaced_stat.st_atime_ns, old_mtime_ns + 1),
+        # Windows rounds file timestamps more coarsely than one nanosecond.
+        ns=(replaced_stat.st_atime_ns, old_mtime_ns + 1_000_000_000),
     )
     assert transcript.stat().st_size == old_size
     assert transcript.stat().st_mtime_ns != old_mtime_ns
