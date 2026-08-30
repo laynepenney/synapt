@@ -411,7 +411,14 @@ class TestRecallQuickIntentRouting:
         mock_index = MagicMock()
         mock_index.lookup.return_value = "some result"
 
-        with patch("synapt.recall.server._get_index", return_value=mock_index):
+        with (
+            patch("synapt.recall.server._get_index", return_value=mock_index),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             recall_quick("what is the database port")
 
         call_kwargs = mock_index.lookup.call_args.kwargs
@@ -425,7 +432,14 @@ class TestRecallQuickIntentRouting:
         mock_index = MagicMock()
         mock_index.lookup.return_value = "some result"
 
-        with patch("synapt.recall.server._get_index", return_value=mock_index):
+        with (
+            patch("synapt.recall.server._get_index", return_value=mock_index),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             recall_quick("what's pending")
 
         call_kwargs = mock_index.lookup.call_args.kwargs
@@ -440,7 +454,14 @@ class TestRecallQuickIntentRouting:
         mock_index = MagicMock()
         mock_index.lookup.return_value = "some result"
 
-        with patch("synapt.recall.server._get_index", return_value=mock_index):
+        with (
+            patch("synapt.recall.server._get_index", return_value=mock_index),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             recall_quick("why did the build fail")
 
         call_kwargs = mock_index.lookup.call_args.kwargs

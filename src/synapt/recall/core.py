@@ -763,6 +763,11 @@ def parse_transcript(
     path: Path,
     seen_uuids: set[str] | None = None,
     subchunk_min_text: int | None = None,
+    *,
+    start_offset: int = 0,
+    stop_offset: int | None = None,
+    turn_index_start: int = 0,
+    session_id_override: str | None = None,
 ) -> list[TranscriptChunk]:
     """Parse a Claude Code transcript JSONL file into semantic chunks.
 
@@ -786,7 +791,7 @@ def parse_transcript(
         seen_uuids = set()
 
     chunks: list[TranscriptChunk] = []
-    session_id = path.stem  # UUID from filename
+    session_id = session_id_override or path.stem  # UUID from filename
     transcript_path = str(path)
 
     # Accumulator for current turn — segments track tool-boundary splits
@@ -798,9 +803,9 @@ def parse_transcript(
     current_tool_summaries: list[str] = []
     # Maps tool_use_id → (tool_name, tool_input) for matching results
     current_tool_use_map: dict[str, tuple[str, dict]] = {}
-    turn_index = 0
-    turn_start_offset = 0
-    current_offset = 0
+    turn_index = turn_index_start
+    turn_start_offset = start_offset
+    current_offset = start_offset
 
     # --- Sub-chunk segment tracking ---
     # Each segment represents one coherent work unit within a turn.
@@ -927,9 +932,14 @@ def parse_transcript(
         saw_tool_result = False
 
     with open(path, encoding="utf-8", newline="") as f:
+        if start_offset:
+            f.seek(start_offset)
         for raw_line in f:
             line_start = current_offset
-            current_offset += len(raw_line.encode("utf-8"))
+            line_bytes = len(raw_line.encode("utf-8"))
+            if stop_offset is not None and current_offset + line_bytes > stop_offset:
+                break
+            current_offset += line_bytes
             line = raw_line.strip()
             if not line:
                 continue
@@ -4202,6 +4212,7 @@ class TranscriptIndex:
         if self._db is not None:
             # SQLite path
             self._db.save_chunks(self._materialize_all_chunks())
+            self._db.retire_absorbed_query_tails()
             self._db.save_manifest(manifest)
             self._refresh_rowid_map()
             return

@@ -1496,7 +1496,14 @@ class TestRecallSearchHistorical:
                 return "result"
 
         mock_index = MockIndex()
-        with patch("synapt.recall.server._get_index", return_value=mock_index):
+        with (
+            patch("synapt.recall.server._get_index", return_value=mock_index),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             with patch("synapt.recall.live.search_live_transcript", return_value=""):
                 recall_search("test query", include_historical=True)
 

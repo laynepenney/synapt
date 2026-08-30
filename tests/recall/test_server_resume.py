@@ -112,8 +112,11 @@ def test_recall_resume_empty_index_is_honest_empty_not_error(monkeypatch, tmp_pa
             "_get_index",
             side_effect=AssertionError("resume constructed the full index"),
         ),
+        patch.object(server, "_query_freshness_line", return_value="Freshness: NOT_BOUND"),
     ):
-        assert server.recall_resume() == "No sessions indexed yet. Nothing to resume."
+        result = server.recall_resume()
+        assert result.startswith("No sessions indexed yet. Nothing to resume.")
+        assert "Freshness: NOT_BOUND" in result
 
     load.assert_called_once_with(tmp_path)
     index._db.close.assert_called_once_with()
@@ -132,10 +135,12 @@ def test_recall_resume_unresolved_session_is_an_error_not_empty(monkeypatch, tmp
         patch("synapt.recall.journal._journal_path", return_value=tmp_path / "journal.jsonl"),
         patch("synapt.recall.resume.load_resume_index", return_value=index),
         patch("synapt.recall.resume.build_resume_view", side_effect=ResumeError("no such session zzz")),
+        patch.object(server, "_query_freshness_line", return_value="Freshness: NOT_BOUND"),
     ):
         out = server.recall_resume(session_id="zzz")
 
-    assert out == "Resume failed: no such session zzz"
+    assert out.startswith("Resume failed: no such session zzz")
+    assert "Freshness: NOT_BOUND" in out
     index._db.close.assert_called_once_with()
 
 
@@ -155,8 +160,11 @@ def test_recall_resume_passes_session_and_turns_and_renders(monkeypatch, tmp_pat
         patch("synapt.recall.resume.build_resume_view", return_value=view) as build,
         patch("synapt.recall.freshness.check_index_freshness", side_effect=RuntimeError("no fs")),
         patch("synapt.recall.resume.format_resume", return_value="RENDERED") as fmt,
+        patch.object(server, "_query_freshness_line", return_value="Freshness: NOT_BOUND"),
     ):
-        assert server.recall_resume(session_id="ab", turns=3) == "RENDERED"
+        result = server.recall_resume(session_id="ab", turns=3)
+        assert result.startswith("RENDERED")
+        assert "Freshness: NOT_BOUND" in result
 
     kwargs = build.call_args.kwargs
     assert kwargs["session_id"] == "ab"

@@ -111,9 +111,24 @@ MCP_INSTRUCTIONS = (
 # ---------------------------------------------------------------------------
 
 _cached_index: TranscriptIndex | None = None
-_cached_mtime: float = 0.0
+_cached_mtime: tuple[tuple[str, int, int], ...] = ()
 _cached_dir: Path | None = None
 _cached_has_embeddings: bool = False
+
+
+def _index_cache_stamp(index_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """Fingerprint base and WAL files that can change searchable results."""
+    paths = [index_dir / "chunks.jsonl", index_dir / "recall.db", index_dir / "index.db"]
+    paths.extend(sorted(index_dir.glob("data_*.db")))
+    stamp = []
+    for path in paths:
+        for candidate in (path, Path(f"{path}-wal")):
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            stamp.append((candidate.name, stat.st_size, stat.st_mtime_ns))
+    return tuple(stamp)
 
 
 def _get_index(use_embeddings: bool = True) -> TranscriptIndex | None:
@@ -126,17 +141,14 @@ def _get_index(use_embeddings: bool = True) -> TranscriptIndex | None:
     global _cached_index, _cached_mtime, _cached_dir, _cached_has_embeddings
     index_dir = project_index_dir()
 
-    # Prefer recall.db, fall back to legacy chunks.jsonl
-    db_path = index_dir / "recall.db"
-    check_path = db_path if db_path.exists() else index_dir / "chunks.jsonl"
-    if not check_path.exists():
+    stamp = _index_cache_stamp(index_dir)
+    if not stamp:
         return None
 
     try:
-        mtime = check_path.stat().st_mtime
         needs_reload = (
             _cached_index is None
-            or mtime != _cached_mtime
+            or stamp != _cached_mtime
             or index_dir != _cached_dir
             or (use_embeddings and not _cached_has_embeddings)
         )
@@ -154,7 +166,7 @@ def _get_index(use_embeddings: bool = True) -> TranscriptIndex | None:
                 len(_cached_index.chunks), _time.monotonic() - _load_t0,
             )
             _cached_has_embeddings = use_embeddings
-            _cached_mtime = mtime
+            _cached_mtime = stamp
             _cached_dir = index_dir
             # Set current session ID for access tracking (distinct_sessions)
             try:
@@ -180,9 +192,34 @@ def _invalidate_cache() -> None:
         with contextlib.suppress(Exception):
             _cached_index._db.close()
     _cached_index = None
-    _cached_mtime = 0.0
+    _cached_mtime = ()
     _cached_dir = None
     _cached_has_embeddings = False
+
+
+def _query_freshness_line(index_dir: Path) -> str:
+    """Run the bounded caller-tail preflight and return its stable label."""
+    from synapt.recall.query_freshness import (
+        QueryFreshnessResult,
+        QueryFreshnessState,
+        format_query_freshness,
+        refresh_current_session,
+    )
+
+    try:
+        result = refresh_current_session(index_dir, Path.cwd())
+    except Exception as exc:
+        result = QueryFreshnessResult(
+            state=QueryFreshnessState.ERROR,
+            reason=f"{type(exc).__name__}:{exc}",
+        )
+    if result.index_changed:
+        _invalidate_cache()
+    return format_query_freshness(result)
+
+
+def _with_query_freshness(result: str, freshness_line: str) -> str:
+    return f"{result}\n\n{freshness_line}"
 
 
 def _resolved_index_dir() -> Path:
@@ -364,6 +401,8 @@ def recall_search(
                             in results. When multiple versions exist in the same lineage,
                             the highest-confidence one is kept (confidence-based fallback).
     """
+    index_dir = project_index_dir()
+    freshness_line = _query_freshness_line(index_dir)
     # min_score takes precedence over threshold_ratio when explicitly set
     if min_score is not None:
         threshold_ratio = min_score
@@ -403,15 +442,18 @@ def recall_search(
     if index is None:
         if historical_filter:
             index_dir = project_index_dir()
-            return (
+            return _with_query_freshness((
                 f"Historical search unavailable: no index found at {index_dir}. "
                 f"Run `synapt recall setup` first. "
                 f"Cannot satisfy date-filtered query without an index."
-            )
+            ), freshness_line)
         if live_result:
-            return live_result
+            return _with_query_freshness(live_result, freshness_line)
         index_dir = project_index_dir()
-        return f"No index found at {index_dir}. Run `synapt recall setup` first."
+        return _with_query_freshness(
+            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            freshness_line,
+        )
 
     try:
         # Pass half_life=None when caller used the MCP default (60.0) so
@@ -463,7 +505,7 @@ def recall_search(
             )
 
         if parts:
-            return "\n\n".join(parts)
+            return _with_query_freshness("\n\n".join(parts), freshness_line)
         # Surface diagnostics explaining why search returned nothing
         diag = index._last_diagnostics
         if diag:
@@ -473,10 +515,16 @@ def recall_search(
                     f"\n[Note: Embeddings unavailable — semantic search disabled. "
                     f"{index._embedding_reason}]"
                 )
-            return _label_empty_result(msg, _resolved_index_dir())
-        return _label_empty_result("No results found.", _resolved_index_dir())
+            return _with_query_freshness(
+                _label_empty_result(msg, _resolved_index_dir()),
+                freshness_line,
+            )
+        return _with_query_freshness(
+            _label_empty_result("No results found.", _resolved_index_dir()),
+            freshness_line,
+        )
     except Exception as exc:
-        return f"Search failed: {exc}"
+        return _with_query_freshness(f"Search failed: {exc}", freshness_line)
 
 
 @_memory_op_tap("mem_read")
@@ -495,6 +543,8 @@ def recall_quick(query: str) -> str:
     Args:
         query: Natural language query or keywords to search for.
     """
+    index_dir = project_index_dir()
+    freshness_line = _query_freshness_line(index_dir)
     quick_budget = _cap_tokens(500)
     intent = classify_query_intent(query)
     # Route depth by intent:
@@ -511,7 +561,10 @@ def recall_quick(query: str) -> str:
     index = _get_index(use_embeddings=False)
     if index is None:
         index_dir = project_index_dir()
-        return f"No index found at {index_dir}. Run `synapt recall setup` first."
+        return _with_query_freshness(
+            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            freshness_line,
+        )
 
     try:
         result = index.lookup(
@@ -525,7 +578,7 @@ def recall_quick(query: str) -> str:
             max_knowledge=params.get("max_knowledge"),
         )
         if result:
-            return result
+            return _with_query_freshness(result, freshness_line)
         diag = index._last_diagnostics
         if diag:
             sessions = f"{diag.total_sessions} session"
@@ -535,12 +588,12 @@ def recall_quick(query: str) -> str:
             if diag.total_chunks != 1:
                 chunks += "s"
             if diag.reason == "empty_index":
-                return (
+                return _with_query_freshness((
                     f"No indexed recall corpus available for '{query}'.\n"
                     f"The keyword check had {sessions} across {chunks}.\n"
                     "Verified absence unavailable because there was no indexed "
                     "corpus to search."
-                )
+                ), freshness_line)
             if diag.reason == "no_matches":
                 coverage = f"searched {sessions} across {chunks}"
                 if diag.oldest_indexed_at:
@@ -550,15 +603,15 @@ def recall_quick(query: str) -> str:
                     if diag.semantic_search_used
                     else "semantic search was not used"
                 )
-                return (
+                return _with_query_freshness((
                     f"No prior keyword match found for '{query}'.\n"
                     f"The keyword check {coverage}; {semantic_note}.\n"
                     "Proceeding fresh is reasonable after this keyword check."
-                )
-            return diag.format_message()
-        return "No results found."
+                ), freshness_line)
+            return _with_query_freshness(diag.format_message(), freshness_line)
+        return _with_query_freshness("No results found.", freshness_line)
     except Exception as exc:
-        return f"Search failed: {exc}"
+        return _with_query_freshness(f"Search failed: {exc}", freshness_line)
 
 
 def recall_files(
@@ -690,12 +743,16 @@ def recall_resume(
     from synapt.recall.sharding import is_sharded
 
     index_dir = project_index_dir()
+    freshness_line = _query_freshness_line(index_dir)
     if (
         not (index_dir / "recall.db").exists()
         and not (index_dir / "chunks.jsonl").exists()
         and not is_sharded(index_dir)
     ):
-        return f"No index found at {index_dir}. Run `synapt recall setup` first."
+        return _with_query_freshness(
+            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            freshness_line,
+        )
 
     index = load_resume_index(index_dir)
     try:
@@ -709,8 +766,10 @@ def recall_resume(
             )
         except ResumeError as exc:
             if not index._session_order:
-                return "No sessions indexed yet. Nothing to resume."
-            return f"Resume failed: {exc}"
+                return _with_query_freshness(
+                    "No sessions indexed yet. Nothing to resume.", freshness_line
+                )
+            return _with_query_freshness(f"Resume failed: {exc}", freshness_line)
     finally:
         db = getattr(index, "_db", None)
         if db is not None:
@@ -731,7 +790,7 @@ def recall_resume(
     except Exception:
         pass
 
-    return format_resume(view)
+    return _with_query_freshness(format_resume(view), freshness_line)
 
 _BUILD_RECEIPT_LOCK = threading.Lock()
 _BUILD_ID_RE = re.compile(r"^build_[0-9a-f]{12}$")

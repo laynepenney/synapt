@@ -59,7 +59,14 @@ def test_quick_miss_returns_scoped_absence_with_corpus_coverage() -> None:
         )
     )
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         result = recall_quick("licenses proceeding")
 
     assert "No prior keyword match found for 'licenses proceeding'" in result
@@ -81,7 +88,14 @@ def test_quick_miss_reports_semantic_search_only_when_it_ran() -> None:
         )
     )
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         result = recall_quick("licenses proceeding")
 
     assert "semantic search was also used" in result
@@ -99,7 +113,14 @@ def test_quick_miss_does_not_confuse_semantic_availability_with_use() -> None:
         )
     )
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         result = recall_quick("licenses proceeding")
 
     assert "semantic search was not used" in result
@@ -196,6 +217,11 @@ def test_real_quick_lookup_preserves_knowledge_semantic_use_at_concise_edge(
     with (
         patch("synapt.recall.hybrid.embedding_search", return_value=[]),
         patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
     ):
         result = recall_quick("semantic edge witness")
 
@@ -245,6 +271,11 @@ def test_real_quick_miss_reports_executed_semantic_search_end_to_end(
             wraps=embedding_search,
         ) as search,
         patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
     ):
         result = recall_quick("orchid astronomy")
 
@@ -269,7 +300,14 @@ def test_empty_corpus_does_not_claim_a_verified_absence() -> None:
         )
     )
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         result = recall_quick("anything")
 
     assert "No indexed recall corpus available for 'anything'" in result
@@ -288,7 +326,14 @@ def test_quick_miss_uses_the_threshold_passed_to_lookup() -> None:
         )
     )
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         recall_quick("needle")
 
     assert index.lookup_kwargs is not None
@@ -348,7 +393,14 @@ def test_no_match_coverage_uses_oldest_indexed_day(tmp_path) -> None:
 def test_real_lookup_drives_quick_verified_absence(tmp_path) -> None:
     index = _index_with_one_chunk(tmp_path)
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         result = recall_quick("xylophone marsupial zzzznonexistent")
 
     assert "No prior keyword match found for 'xylophone marsupial zzzznonexistent'" in result
@@ -362,7 +414,14 @@ def test_real_lookup_drives_quick_verified_absence(tmp_path) -> None:
 def test_cached_quick_miss_keeps_coverage_diagnostics(tmp_path) -> None:
     index = _index_with_one_chunk(tmp_path)
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         first = recall_quick("xylophone marsupial zzzznonexistent")
         first_diagnostics = index._last_diagnostics
         second = recall_quick("xylophone marsupial zzzznonexistent")
@@ -380,7 +439,14 @@ def test_real_empty_index_drives_unverified_empty_corpus_message(tmp_path) -> No
     db = RecallDB(tmp_path / "recall.db")
     index = TranscriptIndex([], use_embeddings=False, cache_dir=tmp_path, db=db)
 
-    with patch("synapt.recall.server._get_index", return_value=index):
+    with (
+        patch("synapt.recall.server._get_index", return_value=index),
+        patch("synapt.recall.server.project_index_dir", return_value=None),
+        patch(
+            "synapt.recall.server._query_freshness_line",
+            return_value="Freshness: NOT_BOUND test",
+        ),
+    ):
         result = recall_quick("anything at all")
 
     assert "No indexed recall corpus available for 'anything at all'" in result

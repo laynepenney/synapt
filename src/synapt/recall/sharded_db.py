@@ -63,6 +63,29 @@ class ShardedRecallDB:
             return list(enumerate(self._data_dbs, start=1))
         return [(0, self._index)]
 
+    @staticmethod
+    def _overlay_rowid(rowid: int) -> int:
+        return -rowid
+
+    def _overlay_ids(self) -> set[str]:
+        return set(self._index.query_tail_id_rowid_map())
+
+    def _suppressed_base_sessions(self) -> set[str]:
+        return self._index.query_tail_suppressed_sessions()
+
+    def _base_chunk_visible(self, chunk) -> bool:  # noqa: ANN001
+        return chunk.session_id not in self._suppressed_base_sessions()
+
+    def _merge_overlay_chunks(self, chunks):  # noqa: ANN001, ANN201
+        overlay = self._index.load_query_tail_chunks()
+        overlay_ids = {chunk.id for chunk in overlay}
+        suppressed = self._suppressed_base_sessions()
+        return [
+            chunk
+            for chunk in chunks
+            if chunk.id not in overlay_ids and chunk.session_id not in suppressed
+        ] + overlay
+
     def _group_encoded_rowids(self, rowids: list[int]) -> dict[int, list[int]]:
         """Group global rowids by shard index, preserving local rowids."""
         grouped: dict[int, list[int]] = {}
@@ -159,8 +182,19 @@ class ShardedRecallDB:
             all_chunks = []
             for db in self._data_dbs:
                 all_chunks.extend(db.load_chunks())
-            return all_chunks
-        return self._index.load_chunks()
+            return self._merge_overlay_chunks(all_chunks)
+        return self._merge_overlay_chunks(self._index.load_chunks())
+
+    def session_indexed_extent(self, session_id: str) -> dict | None:
+        """Return the furthest base-only byte extent across chunk shards."""
+        extents = [
+            extent
+            for _, db in self._iter_data_shards()
+            if (extent := db.session_indexed_extent(session_id)) is not None
+        ]
+        if not extents:
+            return None
+        return max(extents, key=lambda item: item["observed_complete_offset"])
 
     def load_chunk_headers(self) -> list["TranscriptChunk"]:  # noqa: F821
         """Load lightweight chunk metadata from all shards."""
@@ -168,23 +202,38 @@ class ShardedRecallDB:
             all_chunks = []
             for db in self._data_dbs:
                 all_chunks.extend(db.load_chunk_headers())
-            return all_chunks
-        return self._index.load_chunk_headers()
+            return self._merge_overlay_chunks(all_chunks)
+        return self._merge_overlay_chunks(self._index.load_chunk_headers())
 
     def load_chunk_by_rowid(self, rowid: int):  # noqa: ANN201
         """Load one chunk by shard-qualified rowid."""
+        if rowid < 0:
+            return self._index.load_query_tail_chunk_by_rowid(-rowid)
         if self._data_dbs:
             shard_idx, local_rowid = self._decode_chunk_rowid(rowid)
             if shard_idx <= 0 or shard_idx > len(self._data_dbs):
                 return None
-            return self._data_dbs[shard_idx - 1].load_chunk_by_rowid(local_rowid)
-        return self._index.load_chunk_by_rowid(rowid)
+            chunk = self._data_dbs[shard_idx - 1].load_chunk_by_rowid(local_rowid)
+        else:
+            chunk = self._index.load_chunk_by_rowid(rowid)
+        if chunk is not None and not self._base_chunk_visible(chunk):
+            return None
+        return chunk
 
     def load_chunks_by_rowids(self, rowids: list[int]):  # noqa: ANN201
         """Load multiple chunks keyed by shard-qualified rowids."""
+        overlay_rowids = [-rowid for rowid in rowids if rowid < 0]
+        overlay = {
+            -rowid: chunk
+            for rowid, chunk in self._index.load_query_tail_chunks_by_rowids(
+                overlay_rowids
+            ).items()
+        }
+        base_rowids = [rowid for rowid in rowids if rowid >= 0]
+        suppressed = self._suppressed_base_sessions()
         if self._data_dbs:
-            loaded = {}
-            for shard_idx, local_rowids in self._group_encoded_rowids(rowids).items():
+            loaded = dict(overlay)
+            for shard_idx, local_rowids in self._group_encoded_rowids(base_rowids).items():
                 if shard_idx <= 0 or shard_idx > len(self._data_dbs):
                     continue
                 partial = self._data_dbs[shard_idx - 1].load_chunks_by_rowids(local_rowids)
@@ -192,14 +241,27 @@ class ShardedRecallDB:
                     self._encode_chunk_rowid(shard_idx, local_rowid): chunk
                     for local_rowid, chunk in partial.items()
                 })
-            return loaded
-        return self._index.load_chunks_by_rowids(rowids)
+            return {
+                rowid: chunk
+                for rowid, chunk in loaded.items()
+                if rowid < 0 or chunk.session_id not in suppressed
+            }
+        loaded = self._index.load_chunks_by_rowids(base_rowids)
+        loaded.update(overlay)
+        return {
+            rowid: chunk
+            for rowid, chunk in loaded.items()
+            if rowid < 0 or chunk.session_id not in suppressed
+        }
 
     def session_overview(self) -> dict[str, dict]:
         """Return merged session metadata across all chunk shards."""
         result: dict[str, dict] = {}
+        suppressed = self._suppressed_base_sessions()
         for _, db in self._iter_data_shards():
             for session_id, overview in db.session_overview().items():
+                if session_id in suppressed:
+                    continue
                 current = result.get(session_id)
                 if current is None:
                     result[session_id] = dict(overview)
@@ -224,6 +286,25 @@ class ShardedRecallDB:
                 current["turn_count"] += overview["turn_count"]
                 if not current.get("transcript_path") and overview.get("transcript_path"):
                     current["transcript_path"] = overview["transcript_path"]
+        for chunk in self._index.load_query_tail_chunks():
+            current = result.setdefault(
+                chunk.session_id,
+                {
+                    "activity": (0, ""),
+                    "earliest_ts": "",
+                    "latest_ts": "",
+                    "turn_count": 0,
+                    "has_real_activity": False,
+                    "transcript_path": chunk.transcript_path,
+                },
+            )
+            current["earliest_ts"] = min(
+                filter(None, (current["earliest_ts"], chunk.timestamp))
+            ) if current["earliest_ts"] or chunk.timestamp else ""
+            current["latest_ts"] = max(current["latest_ts"], chunk.timestamp)
+            current["turn_count"] += int(chunk.turn_index >= 0)
+            current["has_real_activity"] = True
+            current["activity"] = (0, current["latest_ts"])
         return result
 
     def session_activity(self) -> dict[str, tuple[int, str]]:
@@ -246,10 +327,22 @@ class ShardedRecallDB:
     ):  # noqa: ANN201
         """Load a bounded set of sessions across all shards."""
         grouped = {session_id: [] for session_id in session_ids}
+        suppressed = self._suppressed_base_sessions()
         for _, db in self._iter_data_shards():
             partial = db.load_session_chunks_many(session_ids, include_journal)
             for session_id, chunks in partial.items():
+                if session_id in suppressed:
+                    continue
                 grouped.setdefault(session_id, []).extend(chunks)
+        overlay = self._index.load_query_tail_chunks()
+        overlay_ids = {chunk.id for chunk in overlay}
+        for session_id, chunks in grouped.items():
+            grouped[session_id] = [
+                chunk for chunk in chunks if chunk.id not in overlay_ids
+            ]
+        for chunk in overlay:
+            if chunk.session_id in grouped:
+                grouped[chunk.session_id].append(chunk)
         for chunks in grouped.values():
             chunks.sort(key=lambda chunk: chunk.turn_index)
         return grouped
@@ -257,10 +350,31 @@ class ShardedRecallDB:
     def load_session_listing(self, session_ids: list[str]) -> dict[str, list[dict]]:
         """Load summary fields for a bounded set of sessions across shards."""
         grouped: dict[str, list[dict]] = {session_id: [] for session_id in session_ids}
+        suppressed = self._suppressed_base_sessions()
         for _, db in self._iter_data_shards():
             partial = db.load_session_listing(session_ids)
             for session_id, rows in partial.items():
+                if session_id in suppressed:
+                    continue
                 grouped.setdefault(session_id, []).extend(rows)
+        overlay = self._index.load_query_tail_chunks()
+        overlay_ids = {chunk.id for chunk in overlay}
+        for session_id, rows in grouped.items():
+            grouped[session_id] = [
+                row for row in rows if row.get("id") not in overlay_ids
+            ]
+        for chunk in overlay:
+            if chunk.session_id not in grouped:
+                continue
+            grouped[chunk.session_id].append(
+                {
+                    "id": chunk.id,
+                    "turn_index": chunk.turn_index,
+                    "user_text": chunk.user_text,
+                    "files_touched": chunk.files_touched,
+                    "transcript_path": chunk.transcript_path,
+                }
+            )
         for rows in grouped.values():
             rows.sort(key=lambda row: row["turn_index"])
         return grouped
@@ -293,9 +407,19 @@ class ShardedRecallDB:
 
     def chunk_count(self) -> int:
         """Number of chunks across all data shards, or monolithic DB."""
-        if self._data_dbs:
-            return sum(db.chunk_count() for db in self._data_dbs)
-        return self._index.chunk_count()
+        suppressed = self._suppressed_base_sessions()
+        overlay_refs = self._index.query_tail_chunk_refs()
+        visible_overlay_ids = {
+            chunk_id
+            for chunk_id, session_id in overlay_refs
+            if session_id not in suppressed
+        }
+        base_count = 0
+        for _, db in self._iter_data_shards():
+            base_count += db.chunk_count()
+            base_count -= db.chunk_count_for_values("session_id", suppressed)
+            base_count -= db.chunk_count_for_values("id", visible_overlay_ids)
+        return base_count + self._index.query_tail_chunk_count()
 
     def content_hash(self) -> str:
         """Hash chunk content across all shards in global timestamp order.
@@ -329,33 +453,67 @@ class ShardedRecallDB:
 
     def chunk_session_map(self) -> dict[int, str]:
         """Return a global ``{rowid: session_id}`` mapping for all chunks."""
+        suppressed = self._suppressed_base_sessions()
         if self._data_dbs:
             result: dict[int, str] = {}
             for shard_idx, db in self._iter_data_shards():
                 for rowid, session_id in db.chunk_session_map().items():
+                    if session_id in suppressed:
+                        continue
                     result[self._encode_chunk_rowid(shard_idx, rowid)] = session_id
             return result
-        return self._index.chunk_session_map()
+        return {
+            rowid: session_id
+            for rowid, session_id in self._index.chunk_session_map().items()
+            if session_id not in suppressed
+        }
 
     def chunk_id_map(self) -> dict[int, str]:
         """Return a global ``{rowid: chunk_id}`` mapping for all chunks."""
+        suppressed = self._suppressed_base_sessions()
         if self._data_dbs:
             result: dict[int, str] = {}
             for shard_idx, db in self._iter_data_shards():
+                sessions = db.chunk_session_map()
                 for rowid, chunk_id in db.chunk_id_map().items():
+                    if sessions.get(rowid) in suppressed:
+                        continue
                     result[self._encode_chunk_rowid(shard_idx, rowid)] = chunk_id
             return result
-        return self._index.chunk_id_map()
+        sessions = self._index.chunk_session_map()
+        return {
+            rowid: chunk_id
+            for rowid, chunk_id in self._index.chunk_id_map().items()
+            if sessions.get(rowid) not in suppressed
+        }
 
     def get_chunk_id_rowid_map(self) -> dict[str, int]:
         """Return ``{chunk_id: global_rowid}`` across all shards."""
+        suppressed = self._suppressed_base_sessions()
         if self._data_dbs:
             result: dict[str, int] = {}
             for shard_idx, db in self._iter_data_shards():
+                sessions = db.chunk_session_map()
                 for chunk_id, rowid in db.get_chunk_id_rowid_map().items():
+                    if sessions.get(rowid) in suppressed:
+                        continue
                     result[chunk_id] = self._encode_chunk_rowid(shard_idx, rowid)
+            result.update({
+                chunk_id: self._overlay_rowid(rowid)
+                for chunk_id, rowid in self._index.query_tail_id_rowid_map().items()
+            })
             return result
-        return self._index.get_chunk_id_rowid_map()
+        sessions = self._index.chunk_session_map()
+        result = {
+            chunk_id: rowid
+            for chunk_id, rowid in self._index.get_chunk_id_rowid_map().items()
+            if sessions.get(rowid) not in suppressed
+        }
+        result.update({
+            chunk_id: self._overlay_rowid(rowid)
+            for chunk_id, rowid in self._index.query_tail_id_rowid_map().items()
+        })
+        return result
 
     def save_chunks(self, chunks: list["TranscriptChunk"]) -> None:  # noqa: F821
         """Save chunks to the appropriate database.
@@ -437,35 +595,101 @@ class ShardedRecallDB:
         logger.info("save_chunks: distributed %d chunks across %d shard(s)",
                      len(chunks), len(self._data_dbs))
 
+    def retire_absorbed_query_tails(self) -> None:
+        """Retire overlays only when the rebuilt base proves matching coverage."""
+        from synapt.recall.storage import query_tail_source_key
+
+        for cursor in self._index.load_query_tail_cursors():
+            path = Path(cursor["transcript_path"])
+            try:
+                current_key = query_tail_source_key(cursor["session_id"], path)
+            except OSError:
+                continue
+            if current_key != cursor["source_key"]:
+                continue
+            extent = self.session_indexed_extent(cursor["session_id"])
+            if extent is None:
+                continue
+            if (
+                extent["observed_complete_offset"]
+                < cursor["observed_complete_offset"]
+                or extent.get("latest_projected_timestamp", "")
+                != cursor.get("latest_projected_timestamp", "")
+            ):
+                continue
+            self._index.clear_query_tail(cursor["source_key"])
+
     def fts_search(self, query: str, limit: int = 100, **kwargs) -> list[tuple]:
         """FTS search across all shards, merging results by score.
         """
+        overlay_ids = self._overlay_ids()
+        suppressed = self._suppressed_base_sessions()
+        overlay_results = [
+            (self._overlay_rowid(rowid), score)
+            for rowid, score in self._index.query_tail_fts_search(query, limit).copy()
+        ]
         if self._data_dbs:
-            all_results = []
+            all_results = list(overlay_results)
             for shard_idx, db in self._iter_data_shards():
                 shard_hits = db.fts_search(query, limit=limit, **kwargs)
+                chunk_ids = db.chunk_id_map()
+                sessions = db.chunk_session_map()
                 all_results.extend(
                     (self._encode_chunk_rowid(shard_idx, rowid), score)
                     for rowid, score in shard_hits
+                    if chunk_ids.get(rowid) not in overlay_ids
+                    and sessions.get(rowid) not in suppressed
                 )
             # Sort by score descending (score is element [1])
             all_results.sort(key=lambda r: r[1], reverse=True)
             return all_results[:limit]
-        return self._index.fts_search(query, limit=limit, **kwargs)
+        chunk_ids = self._index.chunk_id_map()
+        sessions = self._index.chunk_session_map()
+        base = [
+            (rowid, score)
+            for rowid, score in self._index.fts_search(query, limit=limit, **kwargs)
+            if chunk_ids.get(rowid) not in overlay_ids
+            and sessions.get(rowid) not in suppressed
+        ]
+        merged = base + overlay_results
+        merged.sort(key=lambda row: row[1], reverse=True)
+        return merged[:limit]
 
     def fts_search_raw(self, fts_query: str, limit: int = 100) -> list[tuple[int, float]]:
         """Execute a pre-built FTS query across all shards."""
+        overlay_ids = self._overlay_ids()
+        suppressed = self._suppressed_base_sessions()
+        overlay = [
+            (self._overlay_rowid(rowid), score)
+            for rowid, score in self._index.query_tail_fts_search_raw(
+                fts_query, limit
+            )
+        ]
         if self._data_dbs:
-            all_results = []
+            all_results = list(overlay)
             for shard_idx, db in self._iter_data_shards():
                 shard_hits = db.fts_search_raw(fts_query, limit=limit)
+                chunk_ids = db.chunk_id_map()
+                sessions = db.chunk_session_map()
                 all_results.extend(
                     (self._encode_chunk_rowid(shard_idx, rowid), score)
                     for rowid, score in shard_hits
+                    if chunk_ids.get(rowid) not in overlay_ids
+                    and sessions.get(rowid) not in suppressed
                 )
             all_results.sort(key=lambda r: r[1], reverse=True)
             return all_results[:limit]
-        return self._index.fts_search_raw(fts_query, limit=limit)
+        chunk_ids = self._index.chunk_id_map()
+        sessions = self._index.chunk_session_map()
+        base = [
+            (rowid, score)
+            for rowid, score in self._index.fts_search_raw(fts_query, limit=limit)
+            if chunk_ids.get(rowid) not in overlay_ids
+            and sessions.get(rowid) not in suppressed
+        ]
+        merged = base + overlay
+        merged.sort(key=lambda row: row[1], reverse=True)
+        return merged[:limit]
 
     def fts_search_by_session(
         self,
@@ -474,28 +698,61 @@ class ShardedRecallDB:
         limit: int = 100,
     ) -> list[tuple[int, float]]:
         """Session-scoped FTS search across all data shards."""
+        overlay_ids = self._overlay_ids()
+        suppressed = self._suppressed_base_sessions()
+        overlay = [
+            (self._overlay_rowid(rowid), score)
+            for rowid, score in self._index.query_tail_fts_search_by_session(
+                query, session_ids, limit
+            )
+        ]
         if self._data_dbs:
-            all_results = []
+            all_results = list(overlay)
             for shard_idx, db in self._iter_data_shards():
                 shard_hits = db.fts_search_by_session(query, session_ids, limit=limit)
+                chunk_ids = db.chunk_id_map()
+                sessions = db.chunk_session_map()
                 all_results.extend(
                     (self._encode_chunk_rowid(shard_idx, rowid), score)
                     for rowid, score in shard_hits
+                    if chunk_ids.get(rowid) not in overlay_ids
+                    and sessions.get(rowid) not in suppressed
                 )
             all_results.sort(key=lambda r: r[1], reverse=True)
             return all_results[:limit]
-        return self._index.fts_search_by_session(query, session_ids, limit=limit)
+        chunk_ids = self._index.chunk_id_map()
+        sessions = self._index.chunk_session_map()
+        base = [
+            (rowid, score)
+            for rowid, score in self._index.fts_search_by_session(
+                query, session_ids, limit=limit
+            )
+            if chunk_ids.get(rowid) not in overlay_ids
+            and sessions.get(rowid) not in suppressed
+        ]
+        merged = base + overlay
+        merged.sort(key=lambda row: row[1], reverse=True)
+        return merged[:limit]
 
     def get_embeddings(self, rowids: list[int]) -> dict[int, list[float]]:
         """Fetch chunk embeddings keyed by global sharded rowids."""
+        suppressed = self._suppressed_base_sessions()
         if self._data_dbs:
             result: dict[int, list[float]] = {}
             for shard_idx, local_rowids in self._group_encoded_rowids(rowids).items():
                 db = self._data_dbs[shard_idx - 1]
+                sessions = db.chunk_session_map()
                 for rowid, emb in db.get_embeddings(local_rowids).items():
+                    if sessions.get(rowid) in suppressed:
+                        continue
                     result[self._encode_chunk_rowid(shard_idx, rowid)] = emb
             return result
-        return self._index.get_embeddings(rowids)
+        sessions = self._index.chunk_session_map()
+        return {
+            rowid: embedding
+            for rowid, embedding in self._index.get_embeddings(rowids).items()
+            if sessions.get(rowid) not in suppressed
+        }
 
     def save_embeddings(self, embeddings: dict[int, list[float]]) -> None:
         """Store chunk embeddings keyed by global sharded rowids."""
@@ -517,30 +774,56 @@ class ShardedRecallDB:
 
     def get_all_embeddings(self) -> dict[int, list[float]]:
         """Load all chunk embeddings keyed by global sharded rowids."""
+        suppressed = self._suppressed_base_sessions()
         if self._data_dbs:
             result: dict[int, list[float]] = {}
             for shard_idx, db in self._iter_data_shards():
+                sessions = db.chunk_session_map()
                 for rowid, emb in db.get_all_embeddings().items():
+                    if sessions.get(rowid) in suppressed:
+                        continue
                     result[self._encode_chunk_rowid(shard_idx, rowid)] = emb
             return result
-        return self._index.get_all_embeddings()
+        sessions = self._index.chunk_session_map()
+        return {
+            rowid: embedding
+            for rowid, embedding in self._index.get_all_embeddings().items()
+            if sessions.get(rowid) not in suppressed
+        }
 
     def get_all_embeddings_numpy(self) -> "tuple[np.ndarray, list[int]]":
         """Load chunk embeddings into a numpy matrix with global rowids."""
         import numpy as np
+        suppressed = self._suppressed_base_sessions()
         if self._data_dbs:
             matrices, all_rowids = [], []
             for shard_idx, db in self._iter_data_shards():
                 mat, rids = db.get_all_embeddings_numpy()
-                if mat.shape[0] > 0:
-                    matrices.append(mat)
+                sessions = db.chunk_session_map()
+                keep = [
+                    pos
+                    for pos, rowid in enumerate(rids)
+                    if sessions.get(rowid) not in suppressed
+                ]
+                if keep:
+                    matrices.append(mat[keep])
                     all_rowids.extend(
-                        self._encode_chunk_rowid(shard_idx, r) for r in rids
+                        self._encode_chunk_rowid(shard_idx, rids[pos])
+                        for pos in keep
                     )
             if not matrices:
                 return np.empty((0, 384), dtype=np.float32), []
             return np.vstack(matrices), all_rowids
-        return self._index.get_all_embeddings_numpy()
+        matrix, rowids = self._index.get_all_embeddings_numpy()
+        sessions = self._index.chunk_session_map()
+        keep = [
+            pos
+            for pos, rowid in enumerate(rowids)
+            if sessions.get(rowid) not in suppressed
+        ]
+        if not keep:
+            return np.empty((0, 384), dtype=np.float32), []
+        return matrix[keep], [rowids[pos] for pos in keep]
 
     # -- Access tracking (always index DB) ---------------------------------
 
