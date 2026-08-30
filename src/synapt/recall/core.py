@@ -226,7 +226,9 @@ class SearchDiagnostics:
     sessions_searched: int = 0       # Progressive mode only
     date_filter_active: bool = False
     embeddings_available: bool = True  # False when search ran without embeddings
+    semantic_search_used: bool = False
     reason: str = ""                 # empty_index, empty_query, no_matches
+    oldest_indexed_at: str | None = None
 
     def format_message(self) -> str:
         """Format diagnostic information as a user-facing message."""
@@ -260,6 +262,24 @@ class SearchResultSummary:
     chunk_blocks: int = 0
     knowledge_blocks: int = 0
     cluster_blocks: int = 0
+
+
+def _oldest_indexed_date(chunks: list[TranscriptChunk]) -> str | None:
+    """Return the oldest valid chunk timestamp as a UTC calendar date."""
+    dates: list[str] = []
+    for chunk in chunks:
+        if not chunk.timestamp:
+            continue
+        try:
+            timestamp = datetime.fromisoformat(
+                chunk.timestamp.replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        dates.append(timestamp.astimezone(timezone.utc).date().isoformat())
+    return min(dates, default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1045,7 @@ class TranscriptIndex:
     ):
         # Sort by timestamp descending (most recent first)
         self.chunks = sorted(chunks, key=lambda c: c.timestamp, reverse=True)
+        self._oldest_indexed_at = _oldest_indexed_date(self.chunks)
         self._lazy_chunks = lazy_chunks
 
         # Group by session for progressive search
@@ -1060,11 +1081,13 @@ class TranscriptIndex:
         self._last_diagnostics: SearchDiagnostics | None = None
         self._last_search_summary: SearchResultSummary | None = None
         self._last_conflicts: list[tuple[dict, dict]] = []
+        self._last_knowledge_semantic_used = False
 
         # Query result cache — avoids re-computing BM25/embedding/RRF for
         # identical queries within the same index lifetime. LRU with max 32 entries.
         self._query_cache: dict[
-            tuple, tuple[str, SearchResultSummary | None]
+            tuple,
+            tuple[str, SearchResultSummary | None, SearchDiagnostics | None],
         ] = {}
         self._query_cache_max = 32
 
@@ -1758,6 +1781,7 @@ class TranscriptIndex:
         sessions_searched: int = 0,
         reference_candidates: list[tuple[int, float]] | None = None,
         embeddings_available: bool = True,
+        semantic_search_used: bool = False,
     ) -> list[tuple[int, float]]:
         """Apply threshold filtering and record diagnostics if no candidates exist.
 
@@ -1776,7 +1800,9 @@ class TranscriptIndex:
                 date_filter_active=date_filter_active,
                 sessions_searched=sessions_searched,
                 embeddings_available=embeddings_available,
+                semantic_search_used=semantic_search_used,
                 reason="no_matches",
+                oldest_indexed_at=self._oldest_indexed_at,
             )
             return []
 
@@ -1864,7 +1890,12 @@ class TranscriptIndex:
         # (cold-start: recall_save was called but no conversations ingested)
         has_knowledge = self._db and self._db.knowledge_count() > 0
         if not self.chunks and not has_knowledge:
-            self._last_diagnostics = SearchDiagnostics(reason="empty_index")
+            self._last_diagnostics = SearchDiagnostics(
+                total_chunks=0,
+                total_sessions=0,
+                reason="empty_index",
+                oldest_indexed_at=None,
+            )
             return ""
 
         # Check query cache — skip if max_tokens=0 (diagnostics-only mode)
@@ -1876,9 +1907,14 @@ class TranscriptIndex:
         )
         cached = self._query_cache.get(cache_key)
         if cached is not None:
-            cached_result, cached_summary = cached
+            cached_result, cached_summary, cached_diagnostics = cached
             self._last_search_summary = (
                 replace(cached_summary) if cached_summary is not None else None
+            )
+            self._last_diagnostics = (
+                replace(cached_diagnostics)
+                if cached_diagnostics is not None
+                else None
             )
             return cached_result
 
@@ -1950,6 +1986,7 @@ class TranscriptIndex:
                 total_chunks=len(self.chunks),
                 total_sessions=len(self.sessions),
                 reason="empty_query",
+                oldest_indexed_at=self._oldest_indexed_at,
             )
             return ""
 
@@ -1986,7 +2023,16 @@ class TranscriptIndex:
             if self._last_search_summary is not None
             else None
         )
-        self._query_cache[cache_key] = (result, cached_summary)
+        cached_diagnostics = (
+            replace(self._last_diagnostics)
+            if self._last_diagnostics is not None
+            else None
+        )
+        self._query_cache[cache_key] = (
+            result,
+            cached_summary,
+            cached_diagnostics,
+        )
         return result
 
     def _global_lookup(
@@ -2063,6 +2109,7 @@ class TranscriptIndex:
             query_entities=query_entities, intent=intent,
             after=after, before=before,
         )
+        semantic_search_used = self._last_knowledge_semantic_used
 
         # Apply min_confidence filter (grep-style noise reduction)
         if min_confidence > 0 and knowledge_results:
@@ -2076,6 +2123,7 @@ class TranscriptIndex:
             return self._concise_lookup(
                 query, max_chunks, max_tokens, knowledge_results,
                 include_archived,
+                semantic_search_used=semantic_search_used,
             )
 
         fts_results = self._db.fts_search(query, limit=max_chunks * 10)
@@ -2236,6 +2284,7 @@ class TranscriptIndex:
                     emb_raw = embedding_search(
                         q_emb, self._all_embeddings, limit=max_chunks * 10,
                     )
+                semantic_search_used = True
                 emb_ranked = []
                 emb_ranked_ref = []
                 for rowid, sim in emb_raw:
@@ -2279,6 +2328,7 @@ class TranscriptIndex:
             date_filter_active=date_filter is not None,
             reference_candidates=reference_candidates,
             embeddings_available=has_emb,
+            semantic_search_used=semantic_search_used,
         )
 
         # Cross-encoder reranking (Phase 2): rerank after threshold so
@@ -2335,6 +2385,7 @@ class TranscriptIndex:
         max_tokens: int,
         knowledge_results: list[dict] | None = None,
         include_archived: bool = False,
+        semantic_search_used: bool = False,
     ) -> str:
         """Search clusters directly and return only summaries.
 
@@ -2351,6 +2402,16 @@ class TranscriptIndex:
                 query, limit=max_chunks * 3, include_archived=include_archived,
             )
         if not cluster_hits and not knowledge_results:
+            self._last_diagnostics = SearchDiagnostics(
+                total_chunks=len(self.chunks),
+                total_sessions=len(self.sessions),
+                candidates_found=0,
+                search_mode="concise",
+                embeddings_available=bool(self._embed_provider),
+                semantic_search_used=semantic_search_used,
+                reason="no_matches",
+                oldest_indexed_at=self._oldest_indexed_at,
+            )
             return ""
 
         wm = self._working_memory
@@ -2452,6 +2513,15 @@ class TranscriptIndex:
         """Global lookup using in-memory BM25 (legacy fallback)."""
         # BM25 path has no cluster FTS — concise mode requires FTS5
         if depth == "concise":
+            self._last_diagnostics = SearchDiagnostics(
+                total_chunks=len(self.chunks),
+                total_sessions=len(self.sessions),
+                candidates_found=0,
+                search_mode="concise",
+                embeddings_available=False,
+                reason="no_matches",
+                oldest_indexed_at=self._oldest_indexed_at,
+            )
             return ""
 
         scores = self._bm25.score(query_tokens)
@@ -2482,6 +2552,7 @@ class TranscriptIndex:
             scores = self._apply_recency_decay(scores, half_life=half_life, now=now)
 
         # Hybrid search: RRF fusion (same as FTS path but using in-memory BM25)
+        semantic_search_used = False
         if self._embeddings and self._embed_provider:
             try:
                 from synapt.recall.hybrid import (
@@ -2499,6 +2570,7 @@ class TranscriptIndex:
                 # Embedding ranked list (using in-memory embeddings)
                 emb_dict = {i: emb for i, emb in enumerate(self._embeddings)}
                 emb_raw = embedding_search(q_emb, emb_dict, limit=max_chunks * 10)
+                semantic_search_used = True
                 emb_ranked = [
                     (i, s) for i, s in emb_raw
                     if date_filter is None or i in date_filter
@@ -2535,6 +2607,7 @@ class TranscriptIndex:
             date_filter_active=date_filter is not None,
             reference_candidates=reference_ranked,
             embeddings_available=has_emb,
+            semantic_search_used=semantic_search_used,
         )
 
         # Cross-encoder reranking (Phase 2): after threshold (see fts_global)
@@ -2575,6 +2648,7 @@ class TranscriptIndex:
             )
             if self._db else []
         )
+        knowledge_semantic_search_used = self._last_knowledge_semantic_used
 
         if self._db and self._rowid_to_idx:
             return self._progressive_lookup_fts(
@@ -2587,6 +2661,7 @@ class TranscriptIndex:
                 max_knowledge=max_knowledge,
                 intent=intent,
                 agent_id=agent_id,
+                semantic_search_used=knowledge_semantic_search_used,
             )
         return self._progressive_lookup_bm25(
             query, query_tokens, max_chunks, max_tokens, max_sessions,
@@ -2612,6 +2687,7 @@ class TranscriptIndex:
         max_knowledge: int | None = None,
         intent: str = "",
         agent_id: str | None = None,
+        semantic_search_used: bool = False,
     ) -> str:
         """Progressive session search using FTS5 (SQLite backend)."""
         hits: list[tuple[int, float]] = []
@@ -2680,6 +2756,7 @@ class TranscriptIndex:
                     emb_raw = embedding_search(
                         q_emb, self._all_embeddings, limit=max_chunks * 5,
                     )
+                semantic_search_used = True
                 emb_ranked = []
                 emb_ranked_ref = []
                 for rowid, sim in emb_raw:
@@ -2719,6 +2796,7 @@ class TranscriptIndex:
             date_filter_active=date_filter is not None,
             sessions_searched=sessions_searched,
             reference_candidates=reference_hits,
+            semantic_search_used=semantic_search_used,
         )
 
         # Cross-encoder reranking (Phase 2): after threshold (see fts_global)
@@ -2837,6 +2915,7 @@ class TranscriptIndex:
         Knowledge nodes are boosted by ``knowledge_boost`` vs chunk scores.
         If include_historical is True, also returns contradicted/superseded nodes.
         """
+        self._last_knowledge_semantic_used = False
         if not self._db:
             return []
         try:
@@ -2875,6 +2954,7 @@ class TranscriptIndex:
                         q_emb, self._knowledge_embeddings,
                         limit=max_results * search_mult,
                     )
+                    self._last_knowledge_semantic_used = True
                 except Exception:
                     pass
 
