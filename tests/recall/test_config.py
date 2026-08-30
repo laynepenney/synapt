@@ -71,6 +71,25 @@ class TestRecallConfig:
         for key in DEFAULTS:
             assert key in models
 
+    def test_query_freshness_env_overrides_configured_values(self, monkeypatch):
+        cfg = RecallConfig(
+            query_freshness={
+                "age_threshold_seconds": 120.0,
+                "byte_trigger": 2048.0,
+                "step_bytes": 4096.0,
+                "byte_cap": 8192.0,
+                "wall_seconds": 2.0,
+            }
+        )
+        monkeypatch.setenv("SYNAPT_QUERY_FRESHNESS_BYTE_CAP", "16384")
+        monkeypatch.setenv("SYNAPT_QUERY_FRESHNESS_WALL_SECONDS", "3.5")
+
+        values = cfg.get_query_freshness()
+
+        assert values["age_threshold_seconds"] == 120.0
+        assert values["byte_cap"] == 16384.0
+        assert values["wall_seconds"] == 3.5
+
     def test_unknown_key_returns_empty(self):
         cfg = RecallConfig()
         assert cfg.get_model("nonexistent") == ""
@@ -135,6 +154,28 @@ class TestLoadConfig:
         }))
 
         assert load_config().get_session_start_continuity() == "explicit"
+
+    def test_project_config_controls_query_freshness(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        project_dir = tmp_path / ".synapt" / "recall"
+        project_dir.mkdir(parents=True)
+        (project_dir / "config.json").write_text(
+            json.dumps(
+                {
+                    "query_freshness": {
+                        "age_threshold_seconds": 45,
+                        "byte_trigger": 1024,
+                    }
+                }
+            )
+        )
+
+        values = load_config().get_query_freshness()
+
+        assert values["age_threshold_seconds"] == 45.0
+        assert values["byte_trigger"] == 1024.0
+        assert values["step_bytes"] == 4 * 1024 * 1024
 
     def test_env_var_overrides_config(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))

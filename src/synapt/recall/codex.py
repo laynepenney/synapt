@@ -219,6 +219,11 @@ def archive_codex_transcripts(
 def parse_codex_transcript(
     path: Path,
     seen_uuids: set[str] | None = None,
+    *,
+    start_offset: int = 0,
+    stop_offset: int | None = None,
+    turn_index_start: int = 0,
+    session_id_override: str | None = None,
 ) -> list[TranscriptChunk]:
     """Parse a Codex CLI transcript into TranscriptChunks.
 
@@ -236,7 +241,7 @@ def parse_codex_transcript(
         seen_uuids = set()
 
     chunks: list[TranscriptChunk] = []
-    session_id = ""
+    session_id = session_id_override or ""
     transcript_path = str(path)
 
     # Accumulator for current turn
@@ -249,9 +254,9 @@ def parse_codex_transcript(
     current_tool_summaries: list[str] = []
     current_custom_tool_summaries = 0
     current_custom_tool_summaries_omitted = 0
-    turn_index = 0
-    turn_start_offset = 0
-    current_offset = 0
+    turn_index = turn_index_start
+    turn_start_offset = start_offset
+    current_offset = start_offset
 
     def _record_custom_tool_call(payload: dict) -> None:
         """Record a custom Codex tool-call envelope with an input summary."""
@@ -341,8 +346,12 @@ def parse_codex_transcript(
 
     try:
         with open(path, encoding="utf-8") as f:
+            if start_offset:
+                f.seek(start_offset)
             for line in f:
                 line_bytes = len(line.encode("utf-8"))
+                if stop_offset is not None and current_offset + line_bytes > stop_offset:
+                    break
                 line = line.strip()
                 if not line:
                     current_offset += line_bytes
@@ -360,7 +369,7 @@ def parse_codex_transcript(
 
                 if entry_type == "session_meta":
                     # Extract session ID from metadata
-                    session_id = payload.get("id", path.stem)
+                    session_id = session_id_override or payload.get("id", path.stem)
                     if session_id in seen_uuids:
                         return []  # Already indexed
                     seen_uuids.add(session_id)

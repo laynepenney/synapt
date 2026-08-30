@@ -51,6 +51,13 @@ _ENV_MAP = {
 DEFAULT_MAX_TOKENS = 1500
 DEFAULT_SESSION_START_CONTINUITY = "automatic"
 SESSION_START_CONTINUITY_MODES = {"off", "explicit", "automatic", "always"}
+DEFAULT_QUERY_FRESHNESS = {
+    "age_threshold_seconds": 600.0,
+    "byte_trigger": 4 * 1024 * 1024,
+    "step_bytes": 4 * 1024 * 1024,
+    "byte_cap": 32 * 1024 * 1024,
+    "wall_seconds": 5.0,
+}
 
 # Reverse lookup: config key → env var name
 _KEY_TO_ENV = {v: k for k, v in _ENV_MAP.items()}
@@ -64,6 +71,9 @@ class RecallConfig:
     backend: str = "auto"
     max_tokens: int = DEFAULT_MAX_TOKENS
     session_start_continuity: str = DEFAULT_SESSION_START_CONTINUITY
+    query_freshness: dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_QUERY_FRESHNESS)
+    )
 
     def get_model(self, key: str) -> str:
         """Get a model name by key, with env var override."""
@@ -99,6 +109,26 @@ class RecallConfig:
             )
             return DEFAULT_SESSION_START_CONTINUITY
         return value
+
+    def get_query_freshness(self) -> dict[str, float]:
+        """Return bounded query-refresh controls with environment overrides."""
+        result = dict(self.query_freshness)
+        env_names = {
+            "age_threshold_seconds": "SYNAPT_QUERY_FRESHNESS_AGE_SECONDS",
+            "byte_trigger": "SYNAPT_QUERY_FRESHNESS_BYTE_TRIGGER",
+            "step_bytes": "SYNAPT_QUERY_FRESHNESS_STEP_BYTES",
+            "byte_cap": "SYNAPT_QUERY_FRESHNESS_BYTE_CAP",
+            "wall_seconds": "SYNAPT_QUERY_FRESHNESS_WALL_SECONDS",
+        }
+        for key, env_name in env_names.items():
+            value = os.environ.get(env_name)
+            if value is None:
+                continue
+            try:
+                result[key] = float(value)
+            except ValueError:
+                logger.warning("Invalid %s=%r, using configured value", env_name, value)
+        return result
 
     def active_models(self) -> dict[str, str]:
         """Get all active model names (with env overrides applied)."""
@@ -212,11 +242,25 @@ def load_config() -> RecallConfig:
         if isinstance(session_start, dict) and "continuity" in session_start:
             continuity = str(session_start["continuity"]).strip().lower()
 
+    query_freshness = dict(DEFAULT_QUERY_FRESHNESS)
+    for data in (global_data, project_data):
+        configured = data.get("query_freshness", {})
+        if not isinstance(configured, dict):
+            continue
+        for key in DEFAULT_QUERY_FRESHNESS:
+            if key not in configured:
+                continue
+            try:
+                query_freshness[key] = float(configured[key])
+            except (TypeError, ValueError):
+                logger.warning("Invalid query_freshness.%s, using prior value", key)
+
     config = RecallConfig(
         models=models,
         backend=backend,
         max_tokens=max_tokens,
         session_start_continuity=continuity,
+        query_freshness=query_freshness,
     )
     _cached_config = config
     _cached_mtime = current_mtime

@@ -685,7 +685,14 @@ class TestRecallQuickStatusRouting(unittest.TestCase):
                 calls.append((query, kwargs))
                 return "Past session context:\n--- journal result ---"
 
-        with patch("synapt.recall.server._get_index", return_value=MockIndex()):
+        with (
+            patch("synapt.recall.server._get_index", return_value=MockIndex()),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             result = recall_quick("what's pending")
 
         self.assertIn("journal result", result)
@@ -706,7 +713,14 @@ class TestRecallQuickStatusRouting(unittest.TestCase):
                 calls.append((query, kwargs))
                 return "Past session context:\n--- concise result ---"
 
-        with patch("synapt.recall.server._get_index", return_value=MockIndex()):
+        with (
+            patch("synapt.recall.server._get_index", return_value=MockIndex()),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             result = recall_quick("what is the database port")
 
         self.assertIn("concise result", result)
