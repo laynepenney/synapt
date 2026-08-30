@@ -163,6 +163,47 @@ def test_knowledge_vector_query_records_semantic_use(tmp_path) -> None:
     assert index._last_knowledge_semantic_used is True
 
 
+def test_real_quick_lookup_preserves_knowledge_semantic_use_at_concise_edge(
+    tmp_path,
+) -> None:
+    class _KnowledgeOnlyDB:
+        def knowledge_count(self) -> int:
+            return 1
+
+        def knowledge_fts_search(self, *args, **kwargs):
+            return []
+
+        def cluster_fts_search(self, *args, **kwargs):
+            return []
+
+        def chunk_fts_to_clusters(self, *args, **kwargs):
+            return []
+
+    class _Provider:
+        calls = 0
+
+        def embed_single(self, query: str) -> list[float]:
+            self.calls += 1
+            return [1.0, 0.0]
+
+    index = TranscriptIndex([], use_embeddings=False, cache_dir=tmp_path)
+    index._db = _KnowledgeOnlyDB()
+    index._embed_provider = _Provider()
+    index._knowledge_embeddings = {1: [0.0, 1.0]}
+    index._embeddings_loaded = True
+
+    with (
+        patch("synapt.recall.hybrid.embedding_search", return_value=[]),
+        patch("synapt.recall.server._get_index", return_value=index),
+    ):
+        result = recall_quick("semantic edge witness")
+
+    assert index._embed_provider.calls == 1
+    assert index._last_diagnostics is not None
+    assert index._last_diagnostics.semantic_search_used is True
+    assert "semantic search was also used" in result
+
+
 def test_empty_corpus_does_not_claim_a_verified_absence() -> None:
     index = _MissIndex(
         _QuickMissDiagnostics(
