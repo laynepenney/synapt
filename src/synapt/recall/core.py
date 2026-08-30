@@ -464,6 +464,78 @@ def _detect_decision_markers(user_text: str, tools_used: list[str]) -> list[str]
     return sorted(markers)
 
 
+def _joined_text_blocks(blocks: list) -> str:
+    """Join the text of a content-block list, ignoring every other block type.
+
+    Same shape ``message.content`` uses, read the same way.  A non-text block
+    can still carry a ``text`` key, so filtering on ``type`` is load-bearing
+    and not merely tidy: without it a thinking block's contents would be
+    indexed as something the operator said.
+    """
+    parts = [
+        blk.get("text", "").strip()
+        for blk in blocks
+        if isinstance(blk, dict) and blk.get("type") == "text"
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _queued_human_prompt(entry: dict) -> str | None:
+    """The operator's text if ``entry`` is a message they queued mid-turn.
+
+    A human who types while a turn is running does not produce a ``type:
+    "user"`` line.  Claude Code writes a ``queue-operation`` line (which is in
+    :data:`SKIP_TYPES`) and an ``attachment`` line carrying the text, so the
+    words never reach ``user_text`` and the operator's own question is absent
+    from the index that exists to answer it.
+
+    Measured 2026-08-30T13:44Z on one workspace, and every count here is a
+    property of that moment -- these files are appended to continuously, and
+    that workspace's ordinary-turn total read 1071, 1074, 1075 and 1076 across
+    a single afternoon.  Of 510 ``queued_command`` attachments: 352
+    ``origin.kind == "human"`` against 1075 ordinary user turns, so about a
+    quarter of what the operator said was unindexed, and 349 of the 352 appear
+    nowhere else in the file.
+
+    ``origin.kind`` is the whole safety boundary and there are at least three
+    cohorts, so it must also define the measurement cohort:
+
+    * ``human``   -- the operator typing.  The only one that is a user turn.
+    * ``peer``    -- another agent's queued message.  Excluded, deliberately.
+    * no ``origin`` key at all -- ``commandMode == "task-notification"``,
+      machine background-task events.  158 of the 510 here, and NONE of them
+      empty; an earlier draft of this docstring called them empty text and was
+      simply wrong about what they are.
+
+    Widening past ``human`` would attribute an agent's words, or a runtime
+    notification, to a person who did not write them.
+
+    ``prompt`` arrives as a string or as a list of content blocks; both are
+    read.  Only the list form was absent from the workspace this was first
+    measured on, which is exactly why it was missed: a shape your own corpus
+    cannot produce is invisible to any amount of care with your own corpus.
+
+    Returns ``None`` for every other entry, so callers can use it as the
+    queued-form branch without widening what counts as a user turn.
+    """
+    if entry.get("type") != "attachment":
+        return None
+    attachment = entry.get("attachment")
+    if not isinstance(attachment, dict):
+        return None
+    if attachment.get("type") != "queued_command":
+        return None
+    origin = attachment.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return None
+    prompt = attachment.get("prompt")
+    if isinstance(prompt, list):
+        prompt = _joined_text_blocks(prompt)
+    if not isinstance(prompt, str):
+        return None
+    return prompt.strip() or None
+
+
 def _is_real_user_message(entry: dict) -> bool:
     """True if entry is a user turn that starts a new conversation turn.
 
@@ -474,6 +546,9 @@ def _is_real_user_message(entry: dict) -> bool:
     """
     from synapt.recall.scrub import strip_system_artifacts
 
+    queued = _queued_human_prompt(entry)
+    if queued is not None:
+        return bool(strip_system_artifacts(queued))
     if entry.get("type") != "user":
         return False
     msg = entry.get("message", {})
@@ -500,6 +575,9 @@ def _extract_user_text(entry: dict) -> str:
     """
     from synapt.recall.scrub import strip_system_artifacts
 
+    queued = _queued_human_prompt(entry)
+    if queued is not None:
+        return strip_system_artifacts(queued)
     content = entry.get("message", {}).get("content")
     if isinstance(content, str):
         return strip_system_artifacts(content.strip())
@@ -4059,6 +4137,10 @@ class TranscriptIndex:
                 continue
             etype = entry.get("type", "")
             if etype in SKIP_TYPES:
+                continue
+            queued_prompt = _queued_human_prompt(entry)
+            if queued_prompt is not None:
+                parts.append(f"\n[User]\n{queued_prompt}")
                 continue
             content = entry.get("message", {}).get("content")
             if etype == "user" and isinstance(content, str) and content.strip():

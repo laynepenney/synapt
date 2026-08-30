@@ -2,6 +2,38 @@
 
 All notable changes to synapt are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **Messages the operator queued mid-turn are indexed.** Typing while a turn is
+  running does not write a `type: "user"` line: Claude Code emits a
+  `queue-operation` line, which the parser skips as unstructured noise, plus an
+  `attachment` line whose `attachment.prompt` carries the text. Neither was read,
+  so the operator's own words never reached `user_text` and a query for something
+  they said mid-turn could return the assistant's later paraphrase and never the
+  message itself.
+
+  `origin.kind` is the safety boundary and there are at least three cohorts, so
+  it also defines the measurement cohort: `human` (the operator, the only user
+  turn), `peer` (another agent's queued message), and entries with no `origin`
+  key at all (`commandMode == "task-notification"`, machine background events).
+  Presence of an `origin` cannot distinguish authorship, since both `human` and
+  `peer` have one; only `origin.kind == "human"` is accepted.
+
+  Measured on one workspace at 2026-08-30T13:44Z, and every count is a property
+  of that moment because these files are appended to continuously: of 510
+  `queued_command` attachments, 352 were `human` against 1075 ordinary user
+  turns — about a quarter of what the operator said — and 349 of the 352 appear
+  nowhere else. The remaining 158 are task-notifications, not empty text.
+
+  `prompt` arrives as a string or as a list of content blocks; both are read,
+  and only text blocks within a list are the operator's words.
+
+  **A rebuild is required for the fix to reach existing chunks.**
+  `--incremental` decides what to re-parse from an mtime-and-size manifest, so
+  transcripts that have not changed since their last index are skipped no matter
+  what the parser now understands. Run a full build, or invalidate the manifest.
+
 ## [0.21.0] — 2026-08-26
 
 **Scope.** This release promotes `v0.20.0..b8f22c4`: 7 commits and 2 first-parent
