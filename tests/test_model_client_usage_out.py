@@ -29,7 +29,7 @@ def test_base_chat_signature_accepts_optional_usage_out():
 
 
 def test_vllm_chat_populates_usage_out_from_the_real_request_output(monkeypatch):
-    pytest.importorskip("vllm")  # Modal-cloud-only dependency, not installed in every dev venv
+    pytest.importorskip("vllm")  # a runtime we do not install locally
     from synapt._models.vllm_client import VLLMClient
 
     class FakeCompletionOutput:
@@ -65,7 +65,7 @@ def test_vllm_chat_populates_usage_out_from_the_real_request_output(monkeypatch)
 def test_vllm_chat_with_no_usage_out_is_unchanged(monkeypatch):
     """The default (non-metering) call path must behave exactly as before —
     zero side effects, no new required argument."""
-    pytest.importorskip("vllm")  # Modal-cloud-only dependency, not installed in every dev venv
+    pytest.importorskip("vllm")  # a runtime we do not install locally
     from synapt._models.vllm_client import VLLMClient
 
     class FakeCompletionOutput:
@@ -156,3 +156,130 @@ def test_mlx_chat_with_no_usage_out_is_unchanged(monkeypatch):
         model="mlx-community/Ministral-3-3B-Instruct-2512-4bit",
         messages=[Message(role="user", content="hi")],
     ) == "hello"
+
+
+# --- SPEC ADDITIONS (Apollo, implementation range) ----------------------------
+# Contract-read items 2 and 3, ratified before implementation.  Both close
+# gaps the original spec could not see; neither changes an existing assertion.
+
+
+def test_mlx_accumulates_text_and_takes_counts_from_the_final_response(monkeypatch):
+    """TWO yields, because one cannot discriminate the implementation.
+
+    Real ``stream_generate`` yields the detokenizer's LAST SEGMENT as ``text``
+    -- a DELTA per yield -- while ``generation_tokens`` is cumulative and
+    ``prompt_tokens`` is constant.  The single-yield fixture above is satisfied
+    by take-first, take-last, AND accumulate, so it pins none of them: with one
+    response, "hello" is simultaneously all three.
+
+    This fixture yields "hel" then "lo".  Take-first returns "hel", take-last
+    returns "lo", and only accumulation returns "hello"; taking counts from the
+    first response returns 4 rather than 9.
+    """
+    from synapt._models.mlx_client import MLXClient
+
+    class FakeResponse:
+        def __init__(self, text, generation_tokens):
+            self.text = text
+            self.prompt_tokens = 22
+            self.generation_tokens = generation_tokens
+
+    def fake_stream_generate(model_obj, tokenizer, prompt, **kwargs):
+        yield FakeResponse("hel", 4)
+        yield FakeResponse("lo", 9)
+
+    import importlib
+
+    mlx_generate_module = importlib.import_module("mlx_lm.generate")
+    client = MLXClient.__new__(MLXClient)
+    client.options = type(
+        "Opts", (), {"top_p": 1.0, "top_k": 0, "min_p": 0.0, "max_tokens": 256},
+    )()
+    monkeypatch.setattr(client, "_load", lambda model, adapter_path=None: (object(), object()))
+    monkeypatch.setattr(client, "_format_messages", lambda messages, tokenizer: "prompt")
+    monkeypatch.setattr(mlx_generate_module, "stream_generate", fake_stream_generate)
+
+    usage_out: dict = {}
+    text = client.chat(
+        model="mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+        messages=[Message(role="user", content="hi")],
+        usage_out=usage_out,
+    )
+
+    assert text == "hello", "segments must be accumulated, not sampled"
+    assert usage_out["tokens_out"] == 9, "counts come from the FINAL response"
+    assert usage_out["tokens_in"] == 22
+    assert usage_out["cached_tokens"] is None
+
+
+def test_mlx_reports_no_counts_when_the_stream_yields_nothing(monkeypatch):
+    """An empty generation is a real runtime outcome, and the honest report is
+    ``None`` rather than a zero we did not measure.  ``generate`` returns ""
+    here too, so the text is unchanged from the previous implementation."""
+    from synapt._models.mlx_client import MLXClient
+
+    def fake_stream_generate(model_obj, tokenizer, prompt, **kwargs):
+        return iter(())
+
+    import importlib
+
+    mlx_generate_module = importlib.import_module("mlx_lm.generate")
+    client = MLXClient.__new__(MLXClient)
+    client.options = type(
+        "Opts", (), {"top_p": 1.0, "top_k": 0, "min_p": 0.0, "max_tokens": 256},
+    )()
+    monkeypatch.setattr(client, "_load", lambda model, adapter_path=None: (object(), object()))
+    monkeypatch.setattr(client, "_format_messages", lambda messages, tokenizer: "prompt")
+    monkeypatch.setattr(mlx_generate_module, "stream_generate", fake_stream_generate)
+
+    usage_out: dict = {}
+    assert client.chat(
+        model="mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+        messages=[Message(role="user", content="hi")],
+        usage_out=usage_out,
+    ) == ""
+    assert usage_out["tokens_in"] is None
+    assert usage_out["tokens_out"] is None
+
+
+def test_vllm_count_extraction_runs_without_the_vllm_runtime():
+    """The vLLM arithmetic, EXECUTED rather than typechecked.
+
+    Both end-to-end vLLM tests above are ``importorskip``'d, so on every
+    machine we develop on they are skips -- and a skip is not a green.  The
+    extraction is a pure function over the request-output object, and
+    ``vllm_client`` imports without vllm because every vllm import is
+    call-time, so it can be driven directly with the same fake shapes.
+    """
+    from synapt._models.vllm_client import usage_from_request_output
+
+    class FakeCompletionOutput:
+        text = "hello world"
+        token_ids = [1, 2, 3, 4]
+
+    class FakeRequestOutput:
+        prompt_token_ids = [10, 11, 12]
+        outputs = [FakeCompletionOutput()]
+
+    assert usage_from_request_output(FakeRequestOutput()) == {
+        "tokens_in": 3,
+        "tokens_out": 4,
+        "cached_tokens": None,
+    }
+
+
+def test_vllm_count_extraction_reports_none_rather_than_zero_when_absent():
+    """The negative control for the helper above: a runtime object that does
+    not carry the ids must produce ``None``, never a 0 nobody measured.  Widening
+    an extractor into "return a number whatever happens" is exactly how a
+    metering field starts carrying fiction."""
+    from synapt._models.vllm_client import usage_from_request_output
+
+    class Bare:
+        pass
+
+    assert usage_from_request_output(Bare()) == {
+        "tokens_in": None,
+        "tokens_out": None,
+        "cached_tokens": None,
+    }
