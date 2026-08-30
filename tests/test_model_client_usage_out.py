@@ -5,8 +5,31 @@ real token counts internally and simply discard them at the point ``chat()``
 extracts only the completion text. Extend ``chat()`` additively — an optional
 ``usage_out: dict | None = None`` param each backend populates with
 ``{"tokens_in": int|None, "tokens_out": int|None, "cached_tokens": int|None}``
-when the underlying call reports them. Non-breaking: existing callers that never
-pass ``usage_out`` see zero behavior change.
+when the underlying call reports them.
+
+SCOPE OF "NON-BREAKING", CORRECTED AT IMPLEMENTATION (Apollo, contract-read
+item 1, ratified before implementation). This spec
+originally said existing
+callers see "zero behavior change". That is true of the API SURFACE and of the
+TEXT returned, and it is not true of the runtime call on MLX. ``MLXClient.chat``
+called ``mlx_lm.generate.generate``, which returns only the text and discards
+the counts, so obtaining them required driving ``stream_generate`` directly.
+
+The text is unchanged, and that is provable rather than hopeful: ``generate``
+is, in full, for the ``verbose=False`` path recall uses::
+
+    text = ""
+    for response in stream_generate(model, tokenizer, prompt, **kwargs):
+        text += response.text
+    return text
+
+so the implementation inlines the loop ``generate`` was already running. The
+accurate claim is therefore "identical text for callers that omit
+``usage_out``", not "zero behavior change" — the second sentence would have let
+a reader believe no call site moved.
+
+vLLM is genuinely additive: the counts are already in hand at the point the
+text is extracted, and were simply being dropped.
 
 ``cached_tokens`` is structurally ``None`` for both backends in this contract.
 Neither backend reports a cache count on the runtime objects read here. Never
