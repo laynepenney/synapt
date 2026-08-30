@@ -72,6 +72,25 @@ def test_non_grep_commands_are_ignored() -> None:
     )
 
 
+def test_pattern_file_options_refuse_a_path_without_an_explicit_pattern() -> None:
+    mod = _grep_intercept()
+
+    pattern_file_only = [
+        _bash("grep -f patterns.txt src"),
+        _bash("grep -fpatterns.txt src"),
+        _bash("grep --file patterns.txt src"),
+        _bash("grep --file=patterns.txt src"),
+        _bash("rg -f patterns.txt src"),
+        _bash("rg -fpatterns.txt src"),
+        _bash("rg --file patterns.txt src"),
+        _bash("rg --file=patterns.txt src"),
+    ]
+
+    for tool_call in pattern_file_only:
+        assert mod.extract_grep_pattern(tool_call) is None
+    assert mod.extract_grep_pattern(_bash("grep -f patterns.txt -e needle src")) == "needle"
+
+
 def test_annotation_format_for_positive_recall_hit() -> None:
     mod = _grep_intercept()
     config = mod.GrepInterceptConfig(enabled=True, timeout_ms=150)

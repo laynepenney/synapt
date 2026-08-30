@@ -46,22 +46,27 @@ _VALUE_OPTIONS = {
     "grep": {
         "--after-context", "--before-context", "--binary-files", "--context",
         "--devices", "--directories", "--exclude", "--exclude-dir",
-        "--exclude-from", "--file", "--include", "--label", "--max-count",
-        "-A", "-B", "-C", "-f", "-m",
+        "--exclude-from", "--include", "--label", "--max-count",
+        "-A", "-B", "-C", "-m",
     },
     "rg": {
         "--after-context", "--before-context", "--context", "--encoding",
-        "--engine", "--file", "--glob", "--iglob", "--max-columns",
+        "--engine", "--glob", "--iglob", "--max-columns",
         "--max-count", "--max-depth", "--max-filesize", "--path-separator",
         "--pre", "--pre-glob", "--regex-size-limit", "--replace", "--sort",
         "--sortr", "--type", "--type-add", "--type-not", "-A", "-B", "-C",
-        "-E", "-M", "-T", "-f", "-g", "-j", "-m", "-r", "-t",
+        "-E", "-M", "-T", "-g", "-j", "-m", "-r", "-t",
     },
 }
 
 _PATTERN_OPTIONS = {
     "grep": {"--regexp", "-e"},
     "rg": {"--regexp", "-e"},
+}
+
+_PATTERN_FILE_OPTIONS = {
+    "grep": {"--file", "-f"},
+    "rg": {"--file", "-f"},
 }
 
 
@@ -100,9 +105,11 @@ def extract_grep_pattern(tool_call: Mapping[str, Any]) -> str | None:
     flag_options = _FLAG_OPTIONS[command_name]
     value_options = _VALUE_OPTIONS[command_name]
     pattern_options = _PATTERN_OPTIONS[command_name]
+    pattern_file_options = _PATTERN_FILE_OPTIONS[command_name]
     short_flags = {option[1:] for option in flag_options if re.fullmatch(r"-[A-Za-z]", option)}
 
     index = 1
+    pattern_file_seen = False
     while index < len(words):
         word = words[index]
         if word == "--":
@@ -117,6 +124,10 @@ def extract_grep_pattern(tool_call: Mapping[str, Any]) -> str | None:
                 return inline_value or None
             index += 1
             return words[index] if index < len(words) and words[index] else None
+        if option in pattern_file_options:
+            pattern_file_seen = True
+            index += 1 if separator else 2
+            continue
         if option in value_options:
             index += 1 if separator else 2
             continue
@@ -131,6 +142,10 @@ def extract_grep_pattern(tool_call: Mapping[str, Any]) -> str | None:
         attached_value = word[2:]
         if short_option in pattern_options and attached_value:
             return attached_value
+        if short_option in pattern_file_options and attached_value:
+            pattern_file_seen = True
+            index += 1
+            continue
         if short_option in value_options and attached_value:
             index += 1
             continue
@@ -139,6 +154,8 @@ def extract_grep_pattern(tool_call: Mapping[str, Any]) -> str | None:
             continue
         return None
     if index >= len(words):
+        return None
+    if pattern_file_seen:
         return None
     return words[index]
 
