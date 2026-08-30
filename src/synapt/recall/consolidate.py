@@ -14,17 +14,25 @@ Requires mlx-lm (pip install mlx-lm). Degrades gracefully if not installed.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
 import re
 import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from synapt.recall.usage import (
+    UsageEvent,
+    current_session_ref,
+    emit_usage_event,
+    now_iso as usage_now_iso,
+)
 from synapt.recall.journal import (
     JournalEntry,
     _journal_path,
@@ -1463,7 +1471,12 @@ def _local_conflict_judge(infer):
             "Answer with exactly one word: CONFLICT or COMPATIBLE."
         )
         try:
-            response = infer({"messages": [{"role": "user", "content": prompt}]})
+            response = infer(
+                {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stage": "B3-conflict",
+                }
+            )
         except Exception:
             return None
         answer = (response or "").strip().upper()
@@ -2604,6 +2617,51 @@ def _get_consolidation_client(max_tokens: int = MIN_RESPONSE_TOKENS):
     return MLXClient(MLXOptions(max_tokens=max_tokens))
 
 
+_USAGE_STAGE_DEFAULT = "B1"
+
+
+@contextlib.contextmanager
+def _stage_envelope(stage: str):
+    """Emit one ``consolidate_stage`` event for the wall-clock of one stage.
+
+    Tap 1 already meters the individual model calls INSIDE a stage, so this
+    carries no token counts -- it is the stage's own envelope, and publishing
+    counts here would double-count what ``infer`` events already report.
+
+    The event is emitted from a ``finally``, so a stage that raises is still
+    metered: work consumed before a failure is still work consumed, and a meter
+    that only sees successes systematically under-reports exactly when
+    something is wrong.
+    """
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        _emit_usage_safely(
+            UsageEvent(
+                ts=usage_now_iso(),
+                session_ref=current_session_ref(),
+                op="consolidate_stage",
+                detail=stage,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+        )
+
+
+def _emit_usage_safely(event) -> None:
+    """Construct-and-emit guard for the taps.
+
+    ``emit_usage_event`` already swallows sink failures, but building the event
+    is the tap's own code and a bug there would propagate into the pipeline the
+    tap exists to observe. The never-disrupt rule applies to the tap as much as
+    to a sink.
+    """
+    try:
+        emit_usage_event(event)
+    except Exception:  # pragma: no cover - defence in depth
+        logger.debug("usage tap failed to emit", exc_info=True)
+
+
 def _make_recall_infer(client, model: str):
     """Build the SYNC inference seam that extract_batch injects: a
     ``BatchInferRequest -> completion str`` callable wrapping recall's model client.
@@ -2640,12 +2698,46 @@ def _make_recall_infer(client, model: str):
         max_tokens = request.get("max_tokens") or _estimate_response_budget(
             request.get("prompt", "")
         )
-        return client.chat(
-            model=model,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=max_tokens,
-        )
+
+        # TAP 1. Every extract-path model call flows through here, so this is
+        # the one place that has to know how to meter an inference.
+        #
+        # The stage tag defaults to B1 because B1's BatchInferRequest is built
+        # by synapt-extract and is OUT OF RECALL'S CONTROL -- the same reason
+        # the max_tokens fallback above exists. B2, B4 and the B3 conflict judge
+        # all set their own "stage" explicitly at their request sites.
+        stage = request.get("stage") or _USAGE_STAGE_DEFAULT
+        usage: dict = {}
+        started = time.monotonic()
+        try:
+            return client.chat(
+                model=model,
+                messages=messages,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                usage_out=usage,
+            )
+        finally:
+            # A FAILED call is still consumed work and must stay visible to the
+            # meter, so this is a finally rather than a success path. The error
+            # itself is untouched and still propagates.
+            _emit_usage_safely(
+                UsageEvent(
+                    ts=usage_now_iso(),
+                    session_ref=current_session_ref(),
+                    op="infer",
+                    detail=stage,
+                    model=model,
+                    tokens_in=usage.get("tokens_in"),
+                    tokens_out=usage.get("tokens_out"),
+                    # Structurally null for the self-hosted tap: normalized
+                    # here rather than passed through, so a client that starts
+                    # reporting a cache count cannot silently change what this
+                    # seam publishes.
+                    cached_tokens=None,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                )
+            )
     return recall_infer
 
 
@@ -2819,7 +2911,10 @@ def _run_extract_path(
     """
     infer = _make_recall_infer(client, model)
     try:
-        envelopes = _run_coro_blocking(_extract_cluster_units(cluster, cluster_id, infer))
+        with _stage_envelope("B1"):
+            envelopes = _run_coro_blocking(
+                _extract_cluster_units(cluster, cluster_id, infer)
+            )
     except Exception as exc:
         logger.warning("extract-path failed for cluster %s: %s", cluster_id, exc)
         return None
@@ -2845,17 +2940,24 @@ def _run_extract_path(
     )
 
     # B2: decide actions for the successfully-extracted facts against existing knowledge.
-    action_items = _decide_actions(cluster, cluster_id, ok, existing_nodes, infer) if ok else []
+    # The envelope wraps the stage unconditionally: a stage that had nothing to
+    # do still ran, and a meter whose events appear only when there was work
+    # cannot tell "no work" from "stage never reached".
+    with _stage_envelope("B2"):
+        action_items = (
+            _decide_actions(cluster, cluster_id, ok, existing_nodes, infer) if ok else []
+        )
 
     # B4: rejoin CREATE-bound items into compound memories before reconcile executes.
     # Shape-preserving (see _rejoin_create_actions) — B3 below needs zero changes.
     # content_profile threaded through so B4 evaluates composed content under the SAME
     # adaptive thresholds B3 will actually apply below (Sentinel, recall#884 re-review
     # round 2: this call site already receives content_profile for B3; B4 was missing it).
-    action_items = _rejoin_create_actions(
-        action_items, cluster_id, infer,
-        decision_log_path=decision_log_path, content_profile=content_profile,
-    )
+    with _stage_envelope("B4"):
+        action_items = _rejoin_create_actions(
+            action_items, cluster_id, infer,
+            decision_log_path=decision_log_path, content_profile=content_profile,
+        )
 
     # B3: feed the SAME reconcile the monolithic path uses.
     # conflict_judge (Fix B): only the extract path wires this -- the legacy and collection
@@ -2866,11 +2968,15 @@ def _run_extract_path(
     # auto-applied winner, so the judge's own accuracy no longer needs gating (a false
     # CONFLICT call costs a confidence dip and a queue entry, never a lost fact). The prior
     # _gate_destructive_conflict_judgment wrapper is gone; this wires the raw judge directly.
-    cluster_result = _apply_consolidation_result(
-        {"nodes": action_items}, existing_nodes, cluster, kn_path,
-        decision_log_path=decision_log_path, db=db, content_profile=content_profile,
-        conflict_judge=_local_conflict_judge(infer),
-    )
+    # B3 emits a stage envelope while usually emitting NO infer event: the
+    # conflict judge only fires inside its narrow high-similarity trigger band,
+    # so most clusters reconcile without a model call at all.
+    with _stage_envelope("B3"):
+        cluster_result = _apply_consolidation_result(
+            {"nodes": action_items}, existing_nodes, cluster, kn_path,
+            decision_log_path=decision_log_path, db=db, content_profile=content_profile,
+            conflict_judge=_local_conflict_judge(infer),
+        )
     logger.info(
         "extract-path cluster %s: reconcile -> %d created, %d corroborated, "
         "%d contradicted, %d contested",
@@ -3206,6 +3312,7 @@ def _decide_actions(
         "messages": [{"role": "user", "content": prompt}],
         "capabilities": [],
         "max_tokens": budget,
+        "stage": "B2",
     }
     try:
         response = infer(request)
@@ -3794,6 +3901,10 @@ def _rejoin_create_actions(
             "messages": [{"role": "user", "content": attempt_prompt}],
             "capabilities": [],
             "max_tokens": budget,
+            # A retry is distinguishable from its first attempt, because a
+            # retry is real additional spend and a meter that folds it into the
+            # first attempt reports a cheaper pipeline than the one we ran.
+            "stage": "B4" if attempt == 0 else "B4-retry",
         }
 
         try:

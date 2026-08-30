@@ -26,17 +26,25 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import functools
 import json
 import logging
 import os
 import re
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import synapt.recall as _synapt_pkg
 from synapt.recall.config import load_config
+from synapt.recall.usage import (
+    UsageEvent,
+    current_session_ref,
+    emit_usage_event,
+    now_iso as usage_now_iso,
+)
 
 # Capture version at server startup for stale-process detection
 _STARTUP_VERSION = getattr(_synapt_pkg, "__version__", "unknown")
@@ -238,6 +246,53 @@ atexit.register(_invalidate_cache)
 # ---------------------------------------------------------------------------
 
 
+_usage_logger = logging.getLogger(__name__)
+
+
+def _memory_op_tap(op: str):
+    """TAP 2: one UsageEvent per public memory operation.
+
+    ``detail`` is the FIXED public operation name, taken from the wrapped
+    function, and is the same string on every call. That is a structural
+    guarantee rather than a convention: there is no expression here that could
+    interpolate a query, a content body, or the opaque ``session_ref``, so the
+    free-text field cannot come to carry any of them by a later edit that
+    "just adds a bit of context".
+
+    Emission is in a ``finally``, so a failed operation is still metered --
+    a failure consumed work, and a meter that only counts successes
+    under-reports exactly when something is wrong. The construct-and-emit is
+    additionally guarded: ``emit_usage_event`` already swallows sink failures,
+    but building the event is the tap's own code, and the never-disrupt rule
+    applies to the tap as much as to a sink.
+    """
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            started = time.monotonic()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                try:
+                    emit_usage_event(
+                        UsageEvent(
+                            ts=usage_now_iso(),
+                            session_ref=current_session_ref(),
+                            op=op,
+                            detail=fn.__name__,
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                        )
+                    )
+                except Exception:  # pragma: no cover - defence in depth
+                    _usage_logger.debug("usage tap failed to emit", exc_info=True)
+
+        return wrapper
+
+    return decorate
+
+
+@_memory_op_tap("mem_search")
 def recall_search(
     query: str,
     max_chunks: int = 5,
@@ -424,6 +479,7 @@ def recall_search(
         return f"Search failed: {exc}"
 
 
+@_memory_op_tap("mem_read")
 def recall_quick(query: str) -> str:
     """Quick, low-cost memory check. Use this speculatively — when you're
     not sure if past context exists but want to check.
@@ -2174,6 +2230,7 @@ def recall_journal(
         return f"Journal failed: {exc}"
 
 
+@_memory_op_tap("mem_write")
 def recall_save(
     content: str = "",
     category: str = "workflow",
