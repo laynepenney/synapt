@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from unittest.mock import patch
 
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
+from synapt.recall.hybrid import embedding_search
 from synapt.recall.server import recall_quick
 from synapt.recall.storage import RecallDB
 
@@ -199,6 +200,60 @@ def test_real_quick_lookup_preserves_knowledge_semantic_use_at_concise_edge(
         result = recall_quick("semantic edge witness")
 
     assert index._embed_provider.calls == 1
+    assert index._last_diagnostics is not None
+    assert index._last_diagnostics.semantic_search_used is True
+    assert "semantic search was also used" in result
+
+
+def test_real_quick_miss_reports_executed_semantic_search_end_to_end(
+    tmp_path,
+) -> None:
+    class _Provider:
+        calls = 0
+
+        def embed_single(self, query: str) -> list[float]:
+            self.calls += 1
+            return [1.0, 0.0]
+
+    db = RecallDB(tmp_path / "recall.db")
+    db.save_knowledge_nodes(
+        [
+            {
+                "id": "kn-semantic-control",
+                "content": "harbor deployment convention",
+                "category": "workflow",
+                "confidence": 0.9,
+                "source_sessions": [],
+                "created_at": "2026-08-30T00:00:00+00:00",
+                "updated_at": "2026-08-30T00:00:00+00:00",
+                "status": "active",
+                "tags": [],
+            }
+        ]
+    )
+    rowid = db.get_knowledge_rowid("kn-semantic-control")
+    assert rowid is not None
+
+    index = TranscriptIndex([], use_embeddings=False, cache_dir=tmp_path, db=db)
+    index._embed_provider = _Provider()
+    index._knowledge_embeddings = {rowid: [0.0, 1.0]}
+    index._embeddings_loaded = True
+
+    with (
+        patch(
+            "synapt.recall.hybrid.embedding_search",
+            wraps=embedding_search,
+        ) as search,
+        patch("synapt.recall.server._get_index", return_value=index),
+    ):
+        result = recall_quick("orchid astronomy")
+
+    assert index._embed_provider.calls == 1
+    search.assert_called_once_with(
+        [1.0, 0.0],
+        {rowid: [0.0, 1.0]},
+        limit=10,
+    )
     assert index._last_diagnostics is not None
     assert index._last_diagnostics.semantic_search_used is True
     assert "semantic search was also used" in result
