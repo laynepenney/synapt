@@ -5,6 +5,19 @@ All notable changes to synapt are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **Cross-gripspace direct messages no longer silo.** `send_message` reported
+  "Delivered" on a cross-org send while the recipient saw nothing: both the JSONL
+  inbox and the SQLite delivery-state store resolve through the gripspace-local
+  `_channels_dir(project_dir)`, so a send from gripspace A landed in A's store
+  while a read from gripspace B queried B's store and found nothing. The fix adds
+  a project-independent, org-canonical cross-org root
+  (`~/.synapt/channels/<org>/_cross-org/direct/<recipient>.jsonl`, honoring
+  `SYNAPT_SHARED_CHANNELS_DIR`): `send_message` dual-writes the local inbox and
+  the canonical inbox, and `read_inbox` unions the local SQLite delivered set
+  with the canonical messages, deduped by `message_id`, urgent-then-oldest, with
+  a local tracking row written for first-read cross-org messages so re-reads
+  dedup and `ack` transitions them. Forward-fix (dual-write + union-read), no
+  destructive migration of existing inboxes.
 - **Messages the operator queued mid-turn are indexed.** Typing while a turn is
   running does not write a `type: "user"` line: Claude Code emits a
   `queue-operation` line, which the parser skips as unstructured noise, plus an
