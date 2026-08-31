@@ -125,6 +125,29 @@ class TestGenerateStartupContext:
         for day in (1, 2):
             assert f"focus-{day}" not in text
 
+    def test_journal_read_reports_empty_rich_selection(self, tmp_path):
+        """An existing journal with no displayable entries reports an empty bound."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-08-05T12:00:00Z",
+            session_id="files-only",
+            files_modified=["src/changed.py"],
+        ), jf)
+
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            result = generate_startup_context(tmp_path)
+
+        coverage_line = next(line for line in result if line.startswith("Journal read: "))
+        coverage = json.loads(coverage_line.removeprefix("Journal read: "))
+        assert coverage == {
+            "shown": 0,
+            "withheld": 0,
+            "oldest_shown_at": None,
+        }
+
     def test_newer_raw_checkpoint_is_surfaced_after_authored_journal(self, tmp_path):
         from synapt.recall.journal import JournalEntry, append_entry, _journal_path
 
