@@ -356,6 +356,8 @@ def _kind(block: str) -> str:
     head = _first_line(block)
     if head.startswith("UNCLEAN END"):
         return "unclean_end"
+    if head.startswith("Journal read: "):
+        return "journal_coverage"
     if head.startswith("Last session") or head.startswith("Next steps:") \
             or head.startswith("Decisions:") or head.startswith("Done:"):
         return "journal"
@@ -413,6 +415,8 @@ def _clip_reminders(block: str, max_items: int) -> tuple[str, int, int]:
 
 def _counts_phrase(blocks: dict[str, list[str]], reminder_total: int) -> str:
     parts: list[str] = []
+    for b in blocks.get("journal_coverage", []):
+        parts.append(_first_line(b))
     for b in blocks.get("channel_counts", []):
         parts.append(_first_line(b).removeprefix("Channel: ").strip())
     for b in blocks.get("contradictions", []):
@@ -496,6 +500,7 @@ def render_wake(
         reminder_texts.append(text)
 
     counts = _counts_phrase(blocks, reminder_total)
+    blocks.pop("journal_coverage", None)
 
     # A previous session that ended without a handoff changes what the reader
     # does first, so it renders before everything, including the journal it

@@ -87,6 +87,67 @@ class TestGenerateStartupContext:
         text = "\n".join(result)
         assert "Codex startup parity" in text or "test-session" in text
 
+    def test_journal_read_reports_its_selection_bound(self, tmp_path):
+        """A three-entry wake view must distinguish complete from truncated."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        for day in range(1, 6):
+            append_entry(JournalEntry(
+                timestamp=f"2026-08-{day:02d}T12:00:00Z",
+                session_id=f"session-{day}",
+                focus=f"focus-{day}",
+                next_steps=[f"step-{day}"],
+            ), jf)
+
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value=None), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=None), \
+             patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch("synapt.recall.server.format_contradictions_for_session_start", return_value=""), \
+             patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            result = generate_startup_context(tmp_path)
+
+        coverage_line = next(line for line in result if line.startswith("Journal read: "))
+        coverage = json.loads(coverage_line.removeprefix("Journal read: "))
+        assert coverage == {
+            "shown": 3,
+            "withheld": 2,
+            "oldest_shown_at": "2026-08-03T12:00:00Z",
+        }
+        text = "\n".join(result)
+        for day in (3, 4, 5):
+            assert f"focus-{day}" in text
+        for day in (1, 2):
+            assert f"focus-{day}" not in text
+
+    def test_journal_read_reports_empty_rich_selection(self, tmp_path):
+        """An existing journal with no displayable entries reports an empty bound."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-08-05T12:00:00Z",
+            session_id="files-only",
+            files_modified=["src/changed.py"],
+        ), jf)
+
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            result = generate_startup_context(tmp_path)
+
+        coverage_line = next(line for line in result if line.startswith("Journal read: "))
+        coverage = json.loads(coverage_line.removeprefix("Journal read: "))
+        assert coverage == {
+            "shown": 0,
+            "withheld": 0,
+            "oldest_shown_at": None,
+        }
+
     def test_newer_raw_checkpoint_is_surfaced_after_authored_journal(self, tmp_path):
         from synapt.recall.journal import JournalEntry, append_entry, _journal_path
 

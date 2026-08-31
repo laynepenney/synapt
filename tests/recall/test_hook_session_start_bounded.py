@@ -535,20 +535,44 @@ class TestWakeOutputBudget:
         assert "source=startup" in head
         assert "NEXT-STEP-0000" in head
 
+    def test_first_two_kb_report_journal_selection_coverage(
+        self, owned_recall_root, monkeypatch, tmp_path,
+    ):
+        """The coverage report cannot sit behind the content whose omission it reports."""
+        coverage = (
+            'Journal read: {"shown":3,"withheld":9,'
+            '"oldest_shown_at":"2026-08-03T12:00:00Z"}'
+        )
+        huge_journal = "Next steps:\n" + "\n".join(
+            f"  - load-bearing-{i:04d} " + "x" * 180 for i in range(100)
+        )
+        out, _ = _run_hook(
+            monkeypatch,
+            tmp_path,
+            context_lines=[huge_journal, coverage],
+        )
+
+        preview = out.encode()[:2048].decode(errors="ignore")
+        assert coverage in preview
+        assert "load-bearing-0000" in preview
+
     def test_source_is_carried_from_the_payload(self, owned_recall_root, monkeypatch, tmp_path):
         self._seed_big_journal(tmp_path)
         out, _ = _run_hook(monkeypatch, tmp_path, source="resume")
         assert "source=resume" in out.splitlines()[0]
 
     def test_small_context_is_not_clipped(self, owned_recall_root, monkeypatch, tmp_path):
-        """Control: a context under budget passes through whole, no 'withheld'."""
+        """Control: a context under budget passes through whole."""
         jf = _journal_path(tmp_path)
         jf.parent.mkdir(parents=True, exist_ok=True)
         append_entry(JournalEntry(timestamp="2026-08-22T03:40:00Z", session_id="s", focus="f",
                                   next_steps=["one small step"]), jf)
         out, _ = _run_hook(monkeypatch, tmp_path)
         assert "one small step" in out
-        assert "withheld" not in out
+        assert '"shown":1' in out
+        assert '"withheld":0' in out
+        assert " B withheld" not in out
+        assert out.rstrip().endswith("B, complete")
 
     def test_reminder_hoard_is_counted_not_dumped(self, owned_recall_root, monkeypatch, tmp_path):
         from synapt.recall.reminders import add_reminder
