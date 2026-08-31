@@ -510,18 +510,79 @@ def test_periodic_checkpoint_rejects_non_ascii_session_ids(tmp_path, bad, monkey
         periodic_checkpoint_path(tmp_path, bad)
 
 
+@pytest.mark.parametrize("bad", ["session_aaaa", "session aaaa", "session.aaaa", "session+aaaa"])
 def test_periodic_checkpoint_session_id_grammar_is_ascii_lowercase_alnum_and_hyphen_only(
     tmp_path, bad, monkeypatch
 ):
     """Pins the accepted alphabet as exactly ASCII [a-z0-9-] rather than
     "not uppercase, not obviously non-ASCII": an implementation that merely
     special-cases the two collision classes above (uppercase, non-ASCII)
-    without adopting an explicit allow-list would still accept these."""
+    without adopting an explicit allow-list would still accept these.
+
+    Atlas r1, checkpoint-v5 P1: v5 dropped the `@pytest.mark.parametrize`
+    decorator during a slice-and-splice edit (found while inserting the
+    non-ASCII pair above), so this witness errored on a missing `bad`
+    fixture before it ever called the validator -- a test that cannot run
+    proves nothing. Restored."""
     monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
     monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
     monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
     with pytest.raises(ValueError):
         periodic_checkpoint_path(tmp_path, bad)
+
+
+def test_periodic_checkpoint_pins_session_id_length_to_a_255_byte_filename_component(
+    tmp_path, monkeypatch
+):
+    """Atlas r1, checkpoint-v5 P1: the existing overlong witness uses 300
+    characters, so an implementation accepting anything under 300 satisfies
+    it while still raising ENAMETOOLONG at actual write time for ids between
+    251 and 299 characters. Filename shape is `<session_id>.json` (matching
+    the legacy `checkpoint.json` convention, and pinned explicitly here since
+    no other test names it); the standard 255-byte NAME_MAX means the
+    session-id component itself must be <= 250 ASCII bytes."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    at_limit = "a" * 250
+    destination = periodic_checkpoint_path(tmp_path, at_limit)
+    assert destination.name == f"{at_limit}.json"
+    assert len(destination.name.encode("utf-8")) == 255
+
+    with pytest.raises(ValueError):
+        periodic_checkpoint_path(tmp_path, "a" * 251)
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    ["con", "prn", "aux", "nul", "com1", "com2", "com9", "lpt1", "lpt2", "lpt9"],
+)
+def test_periodic_checkpoint_rejects_windows_reserved_device_basenames(tmp_path, reserved, monkeypatch):
+    """Atlas r1, checkpoint-v5 P1: CON, PRN, AUX, NUL, COM1-9, and LPT1-9 are
+    reserved device names on Windows regardless of extension or case --
+    "con.json" is unopenable/aliased there exactly like bare "con". The
+    [a-z0-9-]+ grammar accepts these lowercase spellings outright since they
+    contain no character it excludes. This schema claims cross-platform
+    portability, so a session id that exactly names a reserved device is
+    refused rather than silently producing an unusable path on that
+    platform."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    with pytest.raises(ValueError):
+        periodic_checkpoint_path(tmp_path, reserved)
+
+
+def test_periodic_checkpoint_reserved_device_rejection_does_not_reject_substrings(tmp_path, monkeypatch):
+    """Only the bare reserved name is unusable on Windows (Atlas's own
+    adversarial probe on v5: "con"/"session-con" resolved to distinct,
+    valid, non-colliding files on macOS) -- a session id that merely
+    contains one as a substring is an ordinary, safe filename and must stay
+    accepted."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    assert periodic_checkpoint_path(tmp_path, "session-con") is not None
 
 
 def test_periodic_checkpoint_write_requires_session_id_in_payload(tmp_path, monkeypatch):
