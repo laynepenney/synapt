@@ -19,7 +19,14 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[test,dashboard]"
-      - run: pytest tests/ -v
+      # A collection error in one file (e.g. a TDD tests-only spec ahead of its
+      # implementation) otherwise makes pytest refuse to RUN any of the other
+      # already-collected tests, zeroing out the whole matrix's signal rather
+      # than isolating the one broken file. --continue-on-collection-errors
+      # keeps the rest of the suite validating; a genuine collection error
+      # still fails the job (pytest's exit code), it just no longer withholds
+      # every other test's result along with it.
+      - run: pytest tests/ -v --continue-on-collection-errors
 
   # requirements-mcp.lock is a hand-maintained, scoped lock (see requirements-mcp.in)
   # pinning the mcp SDK across recall's full supported Python range. The unit-tests
