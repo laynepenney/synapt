@@ -558,7 +558,15 @@ def test_periodic_checkpoint_atomic_replace_failure_preserves_prior_same_session
     assert leftover_tmp == []
 
 
-def test_periodic_checkpoint_write_and_read_both_bound_to_checkpoint_bytes(tmp_path, monkeypatch):
+def test_periodic_checkpoint_realistic_large_transcript_stays_within_bound(tmp_path, monkeypatch):
+    """Regression coverage over a realistic large input. NOT a proof of write-side
+    enforcement -- see the note on the two tests below. capture_checkpoint's own
+    per-field caps (PATH_BYTES=1024 x FILES_LIMIT=32 with escape inflation, plus
+    two TEXT_BYTES=4096 text fields) top out well under half of CHECKPOINT_BYTES
+    for any input this fixture shape can produce, so a writer with NO bound
+    enforcement at all would still pass this one. Kept as realistic-input coverage;
+    the mutation-proof witnesses are below.
+    """
     monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
     monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
     monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
@@ -585,14 +593,112 @@ def test_periodic_checkpoint_write_and_read_both_bound_to_checkpoint_bytes(tmp_p
     write_periodic_checkpoint(payload)
     destination = periodic_checkpoint_path(tmp_path, session_id)
 
-    # Write-side bound.
     assert destination.stat().st_size <= CHECKPOINT_BYTES
     assert read_periodic_checkpoint(tmp_path, session_id) is not None
 
-    # Read-side bound, independent of what the writer would ever produce: a
-    # file that somehow grew past the limit on disk must still be refused.
+
+def test_periodic_checkpoint_reader_rejects_oversized_file_regardless_of_writer(tmp_path, monkeypatch):
+    """Read-side bound, independent of what any writer would ever produce: a file
+    that somehow grew past the limit on disk must still be refused."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-nnnn"
+    destination = periodic_checkpoint_path(tmp_path, session_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(b"x" * (CHECKPOINT_BYTES + 1))
+
     assert read_periodic_checkpoint(tmp_path, session_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Mutation-proof write-bound witnesses (Sentinel r2, v2 review, P1). A realistic
+# transcript-derived checkpoint cannot exceed CHECKPOINT_BYTES under
+# capture_checkpoint's own field caps, which means the two tests above are
+# satisfiable by a writer with NO byte-bound enforcement at all -- the write
+# path's own truncate-or-refuse contract needs a fixture that is oversized
+# BEFORE the write function's bound check runs, independent of what a real
+# transcript could produce. Patching capture_checkpoint's return value is the
+# established idiom this file already uses for isolating one step of the
+# pipeline (e.g. patching checkpoint_path to isolate path resolution from
+# capture logic).
+# ---------------------------------------------------------------------------
+
+
+def _oversized_but_trimmable_checkpoint(tmp_path, session_id: str) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "source": "session-end",  # capture_checkpoint always stamps this; the
+                                   # writer under test must relabel it "periodic"
+        "captured_at": "2026-01-01T00:00:00Z",
+        "runtime": "codex",
+        "session_id": session_id,
+        "reason": "other",
+        "cwd": str(tmp_path),
+        "transcript_path": "irrelevant.jsonl",
+        "hook_event_name": "SessionEnd",
+        "last_user_text": "u" * 3000,
+        "last_assistant_text": "a" * 3000,
+        # Deliberately far past FILES_LIMIT/PATH_BYTES if the writer imposed
+        # no bound at all: serializes to well over CHECKPOINT_BYTES on its own.
+        "files_touched": [f"/deliberately/oversized/path/{i}" * 50 for i in range(2000)],
+        "tail_bytes_read": 0,
+        "transcript_size": 0,
+        "truncated": False,
+        "parse_status": "ok",
+    }
+
+
+def test_periodic_checkpoint_write_trims_an_oversized_but_trimmable_checkpoint(tmp_path, monkeypatch):
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-oversized-a"
+    transcript = tmp_path / "irrelevant.jsonl"
+    transcript.write_bytes(b"")
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = session_id
+    oversized = _oversized_but_trimmable_checkpoint(tmp_path, session_id)
+
+    # A no-bound "minimal survivor" writer -- capture, stamp source, encode,
+    # write, no truncate-or-refuse step -- would write this straight through
+    # and produce a file far past CHECKPOINT_BYTES. Assert the actual writer
+    # does not.
+    with patch("synapt.checkpoint.capture_checkpoint", return_value=oversized):
+        write_periodic_checkpoint(payload)
+
+    destination = periodic_checkpoint_path(tmp_path, session_id)
+    recovered = read_periodic_checkpoint(tmp_path, session_id)
+
+    assert destination.stat().st_size <= CHECKPOINT_BYTES
+    assert recovered is not None
+    assert recovered["source"] == "periodic"
+
+
+def test_periodic_checkpoint_write_refuses_an_untrimmable_checkpoint(tmp_path, monkeypatch):
+    """Text fields alone past the ceiling, files_touched already empty: there is
+    nothing left to trim, so the writer must refuse rather than write a
+    checkpoint the reader will reject anyway (same policy as write_checkpoint's
+    existing SessionEnd path -- see test_atomic_replace_failure_preserves_
+    previous_checkpoint's sibling, the legacy CHECKPOINT_BYTES ValueError)."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-oversized-b"
+    transcript = tmp_path / "irrelevant.jsonl"
+    transcript.write_bytes(b"")
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = session_id
+    untrimmable = _oversized_but_trimmable_checkpoint(tmp_path, session_id)
+    untrimmable["files_touched"] = []
+    untrimmable["last_user_text"] = "u" * (CHECKPOINT_BYTES + 1000)
+
+    with patch("synapt.checkpoint.capture_checkpoint", return_value=untrimmable):
+        with pytest.raises(ValueError, match=str(CHECKPOINT_BYTES)):
+            write_periodic_checkpoint(payload)
+
+    assert read_periodic_checkpoint(tmp_path, session_id) is None
+    assert list(periodic_checkpoint_path(tmp_path, session_id).parent.glob(".checkpoint.*.tmp")) == []
 
 
 def test_periodic_checkpoint_reader_rejects_session_id_mismatch_between_filename_and_content(
