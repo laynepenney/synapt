@@ -60,6 +60,8 @@ from pathlib import Path
 
 logger = logging.getLogger("synapt.recall.cli")
 
+_WAKE_JOURNAL_ENTRY_LIMIT = 3
+
 from datetime import datetime
 
 from synapt.recall.core import (
@@ -2400,7 +2402,8 @@ def generate_startup_context(
     except Exception:
         pass
 
-    # 3. Journal entries (last 3 rich entries)
+    # 3. Journal entries. The read is bounded, so its omissions are part of
+    # the result rather than an invisible implementation detail.
     try:
         from synapt.recall.journal import _read_all_entries, _journal_path, _dedup_entries
         from synapt.recall.journal import format_for_session_start
@@ -2409,6 +2412,20 @@ def generate_startup_context(
             all_entries = _dedup_entries(_read_all_entries(jf))
             rich = [e for e in all_entries if e.has_rich_content()]
             rich.sort(key=lambda e: e.timestamp, reverse=True)
+            shown_entries = rich[:_WAKE_JOURNAL_ENTRY_LIMIT]
+            journal_lines.append(
+                "Journal read: "
+                + json.dumps(
+                    {
+                        "shown": len(shown_entries),
+                        "withheld": len(rich) - len(shown_entries),
+                        "oldest_shown_at": (
+                            shown_entries[-1].timestamp if shown_entries else None
+                        ),
+                    },
+                    separators=(",", ":"),
+                )
+            )
             # A files-only authored checkpoint still supersedes an older raw
             # transcript tail even though it is not rich enough to render.
             authored = [
@@ -2419,7 +2436,7 @@ def generate_startup_context(
             authored_entries = list(authored)
             if authored:
                 latest_authored_journal_timestamp = authored[0].timestamp
-            for entry in rich[:3]:
+            for entry in shown_entries:
                 journal_lines.append(format_for_session_start(entry))
     except Exception:
         pass
