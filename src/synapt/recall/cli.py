@@ -1429,7 +1429,13 @@ def _attach_unclean_end(view, args):
         view.unclean_end = detect_unclean_end(
             sources,
             checkpoint=read_checkpoint(Path(project)),
-            authored_journals=authored_journals(_journal_path(Path(project))),
+            # Ambient journal store when the caller did not pass a deliberate
+            # project (the wake case): resolve the session-consistent store via
+            # the env override rather than cwd. An explicit args.project stays the
+            # deliberate export/import target. (dual-use wake fix)
+            authored_journals=authored_journals(
+                _journal_path(getattr(args, "project", None))
+            ),
         )
     except Exception:
         pass
@@ -2299,7 +2305,11 @@ def _catchup_archive_and_journal(project: Path, transcript_dir: Path) -> None:
     # Journal from the archive (not source) — the archive has the full pre-/clear
     # content, while the source may be truncated after /clear.
     archive_dir = project_archive_dir(project)
-    journal_path = _journal_path(project)
+    # Ambient (None): auto-journal writes must land in the SAME session-consistent
+    # store the wake reads and the manual `recall journal` verb writes. Writing to
+    # the cwd store here while readers resolve ambiently would split auto- and
+    # manual journals across two stores (dual-use wake fix).
+    journal_path = _journal_path()
     existing_ids = _read_all_session_ids(journal_path)
     journaled = 0
 
@@ -2366,7 +2376,13 @@ def generate_startup_context(
         if branch and branch not in ("main", "master"):
             from synapt.recall.journal import _read_all_entries, _journal_path
             all_entries = []
-            jf = _journal_path(project)
+            # Ambient (None): the wake must read the SAME journal store the
+            # session's own recall/journal verbs read -- workspace-aware via
+            # GRIPSPACE_ROOT -- not the cwd. An explicit project=cwd suppresses
+            # the env override (the deliberate export/import --path contract) and
+            # reads a blank/wrong store when cwd != workspace (dual-use wake fix).
+            # `project` still drives the branch legs below, which ARE cwd facts.
+            jf = _journal_path()
             if jf.exists():
                 all_entries.extend(_read_all_entries(jf))
             branch_entries = [e for e in all_entries if e.branch == branch]
@@ -2406,7 +2422,9 @@ def generate_startup_context(
     try:
         from synapt.recall.journal import _read_all_entries, _journal_path, _dedup_entries
         from synapt.recall.journal import format_for_session_start
-        jf = _journal_path(project)
+        # Ambient (None): resolve the session-consistent journal store, not cwd
+        # (see the branch-context leg above; dual-use wake fix).
+        jf = _journal_path()
         if jf.exists():
             all_entries = _dedup_entries(_read_all_entries(jf))
             rich = [e for e in all_entries if e.has_rich_content()]
@@ -2993,7 +3011,10 @@ def _precompact_journal_write(project: Path) -> None:
     if not session_id:
         return
 
-    journal_file = _journal_path(project)
+    # Ambient (None): the PreCompact auto-journal write lands in the same
+    # session-consistent store the wake reads (dual-use wake fix; see
+    # _catchup_archive_and_journal for the split-store rationale).
+    journal_file = _journal_path()
     if session_id in _read_all_session_ids(journal_file):
         logger.debug("PreCompact journal skip — session %s already journaled", session_id[:8])
         return

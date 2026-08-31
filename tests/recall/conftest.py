@@ -246,3 +246,12 @@ def owned_recall_root(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(root))
     monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", "pytest-owned")
     return root
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "store_resolution: a test that explicitly exercises recall store/root "
+        "resolution and sets its OWN roots; opts out of the startup-context "
+        "hermetic-store binding.",
+    )
