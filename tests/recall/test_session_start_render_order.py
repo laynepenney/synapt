@@ -10,7 +10,7 @@ from synapt.recall.session_start import render_wake, _CAP_UNCLEAN_END
 
 
 def _render(lines, tmp_path):
-    return render_wake(lines, project=tmp_path, source="startup",
+    return render_wake(lines, source="startup",
                        full_path=tmp_path / "latest.md")
 
 

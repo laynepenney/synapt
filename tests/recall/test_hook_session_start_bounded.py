@@ -497,11 +497,35 @@ class TestWakeOutputBudget:
         append_entry(entry, jf)
         return jf
 
+    def test_wake_pointer_is_written_to_the_ambient_store_not_cwd(
+        self, owned_recall_root, monkeypatch, tmp_path
+    ):
+        """The full-text pointer (latest.md) must resolve AMBIENTLY -- the same
+        store the wake reads its journal from -- not the cwd store. Otherwise the
+        wake reads workspace content and writes its pointer to cwd: the split-store
+        bug in miniature (Stromus ruling 2026-08-31, follow-up to the dual-use
+        wake fix). Red-first: fails while render_wake writes wake_file_path(cwd)."""
+        from synapt.recall.session_start import wake_file_path
+
+        self._seed_big_journal(tmp_path)
+        out, _ = _run_hook(monkeypatch, tmp_path)
+        ambient = wake_file_path()            # the ambient/journal store (owned_recall_root)
+        cwd_based = wake_file_path(tmp_path)  # the cwd store
+        assert ambient != cwd_based, "non-vacuous guard: the two paths must diverge"
+        assert ambient.exists(), "the pointer must be written to the ambient store"
+        assert str(ambient) in out, "stdout must name the ambient pointer"
+        # Presence in the ambient store is not enough: a dual-write (latest.md to
+        # BOTH stores) would still pass the assertions above. The pointer must be
+        # ABSENT from the cwd store -- that is what "follows the journal's store,
+        # not cwd" means (Sentinel r2 pre-freeze finding). This is the assertion a
+        # dual-write mutant goes red on.
+        assert not cwd_based.exists(), "the pointer must NOT be written to the cwd store"
+
     def test_stdout_is_within_budget_and_points_at_full_text(self, owned_recall_root, monkeypatch, tmp_path):
         from synapt.recall.session_start import WAKE_BUDGET_BYTES, wake_file_path
         self._seed_big_journal(tmp_path)
         out, _ = _run_hook(monkeypatch, tmp_path)
-        full = wake_file_path(tmp_path)
+        full = wake_file_path()
         assert full.exists()
         full_text = full.read_text()
         # Everything is on disk...

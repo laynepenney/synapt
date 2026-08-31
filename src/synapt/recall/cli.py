@@ -2923,7 +2923,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # 4. ... rendered inside the byte budget, head line first, full text
         #    on disk with a pointer. The harness previews ~2 KB of this.
         with run.phase("render"):
-            text = render_wake(lines, project=project, source=source, run=run,
+            text = render_wake(lines, source=source, run=run,
                                warning=warning, banners=banners)
         sys.stdout.write(text)
 
