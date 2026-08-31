@@ -13,12 +13,41 @@ import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
 
 from synapt.recall.cli import (
     _dev_loop_activation_prompt,
     cmd_startup,
     generate_startup_context,
 )
+
+
+@pytest.fixture(autouse=True)
+def _bind_owned_ambient_store(request, _isolate_recall_root_env, tmp_path, monkeypatch):
+    """Bind the AMBIENT recall store to this test's OWN tmp_path for EVERY
+    startup-context test.
+
+    The wake now resolves its journal store ambiently (dual-use wake fix,
+    Stromus ruling 2026-08-31). The conftest autouse ``_isolate_recall_root_env``
+    already strips an ambient SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT from the shell,
+    but with those gone ambient resolution falls through to the CWD -- which on a
+    reviewer's real checkout holds a live journal. A test that seeds
+    ``_journal_path(tmp_path)`` and reads ambiently then validates a DIFFERENT
+    store depending on the operator's cwd population: green from an empty cwd, red
+    (or silently polluted) from a populated one. That empty-cwd green is a false
+    control (Atlas r1). So bind the ambient root to tmp_path and chdir there:
+    ``_journal_path()`` (ambient, what the wake reads) is then byte-identical to
+    ``_journal_path(tmp_path)`` (explicit, what these tests seed), and no test can
+    reach the operator's store. Depends on ``_isolate_recall_root_env`` so it runs
+    AFTER the scrub. A test that explicitly exercises store RESOLUTION marks itself
+    ``@pytest.mark.store_resolution`` and sets its own roots; this binding then
+    steps aside."""
+    if request.node.get_closest_marker("store_resolution"):
+        return
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(tmp_path))
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 class TestGenerateStartupContext:
@@ -416,6 +445,7 @@ loop_interval = "1m"
         assert "sleep" in prompt
         assert "1m cadence" not in prompt
 
+    @pytest.mark.store_resolution
     def test_gripspace_root_env_resolves_sibling_griptree_config(self, tmp_path):
         """Spawned sibling griptrees use GRIPSPACE_ROOT to find agents.toml."""
         gripspace = tmp_path / "gripspace"
@@ -664,3 +694,124 @@ class TestChannelReadWidensWithBacklog:
         kwargs = self._run(3)
         assert kwargs["limit"] == 3
         assert kwargs.get("detail", "medium") != "min"
+
+
+class TestWakeStoreFollowsWorkspace:
+    """Red-first (dual-use wake `project` split, Stromus ruling 2026-08-31): the
+    wake must resolve its journal store AMBIENTLY -- workspace-aware via
+    GRIPSPACE_ROOT, the same store the session's own recall/journal verbs read --
+    not the cwd. The wake's whole contract is "show this session what THIS
+    session's verbs will see"; a wake that resolves a different store than the
+    session's journal verb is lying about the state it bridges into. Passing an
+    explicit ``project=Path.cwd()`` suppresses the env override (the deliberate
+    export/import ``--path`` contract), so an agent whose cwd is not the workspace
+    root wakes to a blank/wrong journal (recall#917 sibling). The fix is None at
+    the wake call-sites; the resolver is unchanged.
+    """
+
+    def _workspace_and_foreign_cwd(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        (workspace / ".gitgrip").mkdir(parents=True)
+        (workspace / ".gitgrip" / "griptrees.json").write_text("{}")
+        cwd = tmp_path / "agent-wt"
+        (cwd / ".git").mkdir(parents=True)
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(workspace))
+        # pin the per-worktree bucket name so both paths agree on the NAME and can
+        # differ only in the store ROOT -- the axis under test
+        monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", "agent-wt")
+        return workspace, cwd
+
+    @pytest.mark.store_resolution
+    def test_wake_surfaces_the_workspace_journal_from_a_foreign_cwd(self, tmp_path, monkeypatch):
+        """A journal the session verb wrote to the workspace store must appear in
+        the wake even though cwd is a sibling worktree, not the workspace root."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        self._workspace_and_foreign_cwd(tmp_path, monkeypatch)
+        jf = _journal_path()  # the session verb's (ambient) journal path -> workspace store
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(
+            JournalEntry(
+                timestamp="2026-08-31T12:00:00Z",
+                session_id="ws-sess",
+                focus="WORKSPACE-STORE-JOURNAL-MARKER",
+                next_steps=["carry me into the wake"],
+            ),
+            jf,
+        )
+
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            text = "\n".join(generate_startup_context(Path.cwd()))
+        assert "WORKSPACE-STORE-JOURNAL-MARKER" in text
+
+    @pytest.mark.store_resolution
+    def test_wake_resolves_the_same_journal_path_as_a_session_verb(self, tmp_path, monkeypatch):
+        """Stromus's contract sentence, pinned at the call site: every journal
+        resolution the wake performs is AMBIENT (project_dir is None) -- the same
+        call a session verb makes -- and a divergence guard proves the assertion
+        is not vacuous (the ambient path and the explicit-cwd path genuinely
+        differ here)."""
+        import synapt.recall.journal as jmod
+
+        self._workspace_and_foreign_cwd(tmp_path, monkeypatch)
+        session_path = jmod._journal_path()          # what `recall journal` reads
+        cwd_path = jmod._journal_path(Path.cwd())     # the buggy explicit-cwd path
+        assert session_path != cwd_path, "non-vacuous guard: the two paths must diverge"
+
+        calls: list = []
+        real = jmod._journal_path
+
+        def _spy(project_dir=None):
+            calls.append(project_dir)
+            return real(project_dir)
+
+        monkeypatch.setattr(jmod, "_journal_path", _spy)
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            generate_startup_context(Path.cwd())
+
+        assert calls, "the wake resolved no journal path at all"
+        assert all(p is None for p in calls), (
+            f"the wake must resolve the journal ambiently (None), like a session "
+            f"verb; it passed explicit project(s): {calls}"
+        )
+
+    @pytest.mark.store_resolution
+    def test_a_populated_unrelated_cwd_does_not_leak_into_an_owned_read(
+        self, tmp_path, monkeypatch
+    ):
+        """Discriminating witness (Atlas r1): the empty-cwd green is a false
+        control. With the wake resolving ambiently, a startup-context read bound
+        to its OWN store must NOT see a journal that lives in some other cwd's
+        store -- exactly the operator's-real-checkout leak that made five v1
+        survivors pass only because the reviewer's cwd happened to be empty.
+
+        Mutation proof: delete the ``SYNAPT_RECALL_ROOT`` binding below and the
+        read falls through to the operator cwd, so the leak marker appears and
+        this test fails -- which is what the hermetic binding on every
+        startup-context test now prevents."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        # An unrelated checkout whose ambient store HOLDS a journal (stands in for
+        # the reviewer's real cwd). No root env, so ambient resolves FROM this cwd.
+        operator = tmp_path / "operator-checkout"
+        (operator / ".git").mkdir(parents=True)
+        monkeypatch.chdir(operator)
+        for key in ("SYNAPT_RECALL_ROOT", "GRIPSPACE_ROOT", "SYNAPT_RECALL_WORKTREE"):
+            monkeypatch.delenv(key, raising=False)
+        leak = _journal_path()
+        leak.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-08-30T12:00:00Z", session_id="operator-session",
+            focus="OPERATOR-CWD-LEAK-MARKER", next_steps=["should never surface"],
+        ), leak)
+
+        # Now do what a hermetic startup test does: bind an OWNED (empty) store and
+        # read. The owned store has no journal, so nothing must surface.
+        owned = tmp_path / "owned-store"
+        owned.mkdir()
+        monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(owned))  # <-- the load-bearing binding
+        assert _journal_path() != leak, "guard: owned and operator stores must differ"
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            text = "\n".join(generate_startup_context(Path.cwd()))
+        assert "OPERATOR-CWD-LEAK-MARKER" not in text

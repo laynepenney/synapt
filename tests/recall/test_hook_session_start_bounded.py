@@ -481,7 +481,10 @@ class TestHookRunLog:
 
 class TestWakeOutputBudget:
     def _seed_big_journal(self, tmp_path, n_items=400, item_len=200):
-        jf = _journal_path(tmp_path)
+        # The wake reads the AMBIENT journal store (owned_recall_root sets it via
+        # SYNAPT_RECALL_ROOT); seed the same store, not project=tmp_path, so the
+        # wake sees what we wrote (dual-use wake fix).
+        jf = _journal_path()
         jf.parent.mkdir(parents=True, exist_ok=True)
         entry = JournalEntry(
             timestamp="2026-08-22T03:40:00Z",
@@ -563,7 +566,10 @@ class TestWakeOutputBudget:
 
     def test_small_context_is_not_clipped(self, owned_recall_root, monkeypatch, tmp_path):
         """Control: a context under budget passes through whole."""
-        jf = _journal_path(tmp_path)
+        # The wake reads the AMBIENT journal store (owned_recall_root sets it via
+        # SYNAPT_RECALL_ROOT); seed the same store, not project=tmp_path, so the
+        # wake sees what we wrote (dual-use wake fix).
+        jf = _journal_path()
         jf.parent.mkdir(parents=True, exist_ok=True)
         append_entry(JournalEntry(timestamp="2026-08-22T03:40:00Z", session_id="s", focus="f",
                                   next_steps=["one small step"]), jf)
