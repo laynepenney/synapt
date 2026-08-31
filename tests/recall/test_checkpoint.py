@@ -449,6 +449,37 @@ def test_periodic_checkpoint_rejects_a_session_id_that_is_not_a_bare_label(tmp_p
             periodic_checkpoint_path(tmp_path, bad)
 
 
+@pytest.mark.parametrize(
+    "bad", ["Session-AAAA", "SESSION-1234", "session-ABCD", "sessionAaaa"],
+)
+def test_periodic_checkpoint_rejects_a_session_id_containing_uppercase_ascii(tmp_path, bad, monkeypatch):
+    """Atlas r1, checkpoint-v3 P1: on this macOS filesystem, "session-aaaa" and
+    "Session-AAAA" are accepted labels that resolve to the SAME inode -- the
+    direct bare-label spelling cannot promise noncollision by default. The
+    filename key must be injective, so the accepted alphabet is constrained
+    to canonical lowercase rather than left to case-fold silently."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    with pytest.raises(ValueError):
+        periodic_checkpoint_path(tmp_path, bad)
+
+
+def test_periodic_checkpoint_case_distinct_session_ids_never_both_resolve(tmp_path, monkeypatch):
+    """The collision witness itself: because a mixed-case spelling is refused
+    outright rather than silently folded, only the canonical lowercase
+    spelling of a given session ever reaches the filesystem, so two spellings
+    that a case-insensitive filesystem would otherwise treat as one file can
+    never both be written."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    canonical = periodic_checkpoint_path(tmp_path, "session-aaaa")
+    assert canonical is not None
+    with pytest.raises(ValueError):
+        periodic_checkpoint_path(tmp_path, "Session-AAAA")
+
+
 def test_periodic_checkpoint_write_requires_session_id_in_payload(tmp_path, monkeypatch):
     # Interim per-test isolation (the shared process-environment fixture will supply this;
     # until it lands, these three lines are the established idiom this file
@@ -556,6 +587,42 @@ def test_periodic_checkpoint_atomic_replace_failure_preserves_prior_same_session
 
     assert recovered["last_user_text"] == "first tick, must survive"
     assert leftover_tmp == []
+
+
+def test_periodic_checkpoint_write_fsyncs_before_replace(tmp_path, monkeypatch):
+    """Atlas r1, checkpoint-v3 P1: a complete periodic write using temp write,
+    flush, and os.replace -- but no os.fsync -- passed all 22 prior periodic
+    tests. The legacy SessionEnd path fsyncs before replace (checkpoint.py:437);
+    periodic exists specifically to survive an unclean stop mid-session, so
+    the same durability seam is a requirement, not an implementation detail.
+    """
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-fsync"
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(_record("user", "must be durable"))
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = session_id
+
+    calls: list[str] = []
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def _tracked_fsync(fd):
+        calls.append("fsync")
+        return real_fsync(fd)
+
+    def _tracked_replace(src, dst):
+        calls.append("replace")
+        return real_replace(src, dst)
+
+    with patch("synapt.checkpoint.os.fsync", side_effect=_tracked_fsync) as mock_fsync, \
+         patch("synapt.checkpoint.os.replace", side_effect=_tracked_replace):
+        write_periodic_checkpoint(payload)
+
+    assert mock_fsync.called, "periodic write must fsync, same durability seam as write_checkpoint"
+    assert calls == ["fsync", "replace"], f"fsync must complete before replace, got {calls}"
 
 
 def test_periodic_checkpoint_realistic_large_transcript_stays_within_bound(tmp_path, monkeypatch):
@@ -775,9 +842,15 @@ def test_periodic_checkpoint_reader_rejects_wrong_schema_domain(tmp_path, schema
     session_id = "session-eeee"
     destination = periodic_checkpoint_path(tmp_path, session_id)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # Otherwise a fully valid periodic record (Atlas r1, checkpoint-v3 P1): a
+    # fixture missing source/session_id gets rejected by cross-field binding
+    # regardless of whether schema_version is checked at all, so a reader that
+    # ignores schema_version entirely still passed all 7 parameters here.
     destination.write_text(json.dumps({
         "schema_version": schema_version,
+        "source": "periodic",
         "captured_at": "2026-01-01T00:00:00Z",
+        "session_id": session_id,
         "last_user_text": "must not surface",
     }), encoding="utf-8")
 
