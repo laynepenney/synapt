@@ -435,7 +435,6 @@ def _counts_phrase(blocks: dict[str, list[str]], reminder_total: int) -> str:
 def render_wake(
     lines: list[str],
     *,
-    project: Path,
     source: str,
     run: HookRun | None = None,
     warning: str | None = None,
@@ -451,7 +450,13 @@ def render_wake(
     directives, then everything else clipped per source, then a footer that
     says how many bytes were shown, how many withheld, and where the rest is.
     """
-    full_path = full_path or wake_file_path(project)
+    # Ambient (None): the full-text pointer follows the STORE of the journal it
+    # renders -- the wake resolves its journal ambiently (workspace-aware via
+    # GRIPSPACE_ROOT), so its pointer must land in the same store, not the cwd.
+    # A pointer written to the cwd store while the content is workspace-resolved
+    # is the split-store bug in miniature (Stromus ruling 2026-08-31). Callers
+    # that need a specific path still pass `full_path` explicitly.
+    full_path = full_path or wake_file_path()
     blocks: dict[str, list[str]] = {}
     for block in lines:
         if not block or not block.strip():
