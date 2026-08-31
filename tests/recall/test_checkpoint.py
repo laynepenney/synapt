@@ -20,12 +20,40 @@ from synapt.checkpoint import (
     format_checkpoint,
     is_newer_than,
     main,
-    periodic_checkpoint_path,
     read_checkpoint,
-    read_periodic_checkpoint,
     write_checkpoint,
-    write_periodic_checkpoint,
 )
+
+# The periodic-checkpoint symbols below do not exist yet -- this
+# file is the TDD spec, written ahead of the implementation. A plain
+# module-level import of a name that does not exist raises ImportError DURING
+# COLLECTION, and pytest's default policy on any collection error is to
+# refuse to run every other already-collected test in the whole session, not
+# just this file's -- a full-suite signal loss, not a scoped one (found while
+# investigating why dev's CI stopped validating anything at all after this
+# file's first version merged). Guard the import instead: on failure, bind
+# each missing name to a callable that raises a clear NotImplementedError at
+# the moment a test actually calls it. Collection succeeds; every test that
+# needs the periodic API still fails, loudly and individually, with a
+# specific reason -- the visible TDD backlog this file is supposed to be.
+try:
+    from synapt.checkpoint import (
+        periodic_checkpoint_path,
+        read_periodic_checkpoint,
+        write_periodic_checkpoint,
+    )
+except ImportError as _periodic_import_error:
+
+    def _periodic_not_implemented_yet(*_args, **_kwargs):
+        raise NotImplementedError(
+            "synapt.checkpoint.periodic_checkpoint_path / read_periodic_checkpoint / "
+            "write_periodic_checkpoint do not exist yet (implementation "
+            "pending) -- this test specifies the not-yet-built contract"
+        ) from _periodic_import_error
+
+    periodic_checkpoint_path = _periodic_not_implemented_yet
+    read_periodic_checkpoint = _periodic_not_implemented_yet
+    write_periodic_checkpoint = _periodic_not_implemented_yet
 
 
 def _record(role: str, text: str) -> bytes:
