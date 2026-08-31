@@ -26,6 +26,38 @@ PATH_BYTES = 1024
 FILES_LIMIT = 32
 CHECKPOINT_BYTES = 384 * 1024
 
+# User-role lines the runtime writes on the operator's behalf. A crash bridge
+# that quotes a <task-notification> as the operator's last words hides the real
+# last request (measured 2026-08-31: the recovered tail led with a background
+# task notice while the human's question sat one turn earlier). Kept local so
+# the SessionEnd hook, which runs under a 3 s budget, imports nothing heavier.
+_HARNESS_USER_TAGS = (
+    "task-notification",
+    "system-reminder",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+)
+_HARNESS_USER_RE = re.compile(
+    rf"<({'|'.join(_HARNESS_USER_TAGS)})(?:\s[^>]*)?>.*?(?:</\1>|$)",
+    re.DOTALL,
+)
+
+
+def _is_harness_user_text(text: str) -> bool:
+    """True when a user line is ENTIRELY runtime control blocks.
+
+    Positive identification only: prose that quotes a tag keeps its author.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return not _HARNESS_USER_RE.sub("", stripped).strip()
+
+
 _CLAUDE_PREFIX = (
     "This session is being continued from a previous conversation that ran "
     "out of context. The summary below covers the earlier portion of the "
@@ -206,7 +238,11 @@ def capture_checkpoint(payload: dict) -> dict:
         text = _claude_user_text(entry)
         claude_paths: list[str] = []
         if text:
-            role = None if text.startswith(_CLAUDE_PREFIX) else "user"
+            role = (
+                None
+                if text.startswith(_CLAUDE_PREFIX) or _is_harness_user_text(text)
+                else "user"
+            )
         else:
             text, claude_paths = _claude_assistant(entry)
             if text:
@@ -449,9 +485,11 @@ def format_checkpoint(checkpoint: dict) -> str:
     assistant = checkpoint.get("last_assistant_text") or "unavailable in bounded transcript tail"
     files = checkpoint.get("files_touched") or []
     file_text = ", ".join(str(path) for path in files[:FILES_LIMIT]) or "none observed"
+    session = str(checkpoint.get("session_id") or "")[:8] or "unknown"
     return (
         "LAST CHECKPOINT\n"
         "Raw transcript tail captured at SessionEnd. Not an authored journal.\n"
+        f"Session: {session}\n"
         f"Status: {checkpoint.get('parse_status', 'unavailable')}"
         f"{' (truncated)' if checkpoint.get('truncated') else ''}\n"
         f"User: {user}\nAssistant: {assistant}\nFiles: {file_text}"

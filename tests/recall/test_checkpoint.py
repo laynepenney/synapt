@@ -439,3 +439,39 @@ def test_event_input_is_bounded(tmp_path, monkeypatch, capsys):
     event.write_bytes(b"{" + b"x" * EVENT_BYTES + b"}")
     assert main(["--event-json", str(event)]) == 1
     assert "exceeds" in capsys.readouterr().err
+
+
+def _claude_line(role: str, text: str) -> bytes:
+    content = text if role == "user" else [{"type": "text", "text": text}]
+    return (json.dumps({
+        "type": role,
+        "timestamp": "2026-08-31T12:06:07Z",
+        "message": {"role": role, "content": content},
+    }) + "\n").encode()
+
+
+def test_harness_user_lines_do_not_replace_the_operators_last_words(tmp_path):
+    """A background-task notice is written as a user turn. It is not the user."""
+    transcript = tmp_path / "claude.jsonl"
+    transcript.write_bytes(
+        _claude_line("user", "can you show me the herdr changes as html")
+        + _claude_line("assistant", "working on it")
+        + _claude_line("user", "<task-notification>\n<task-id>b1tvbumcj</task-id>\n"
+                               "<status>completed</status>\n</task-notification>")
+    )
+    result = capture_checkpoint(_payload(transcript, tmp_path))
+    assert result["last_user_text"] == "can you show me the herdr changes as html"
+    assert result["last_assistant_text"] == "working on it"
+
+
+def test_a_real_trailing_question_still_wins(tmp_path):
+    """Control for the test above: a plain user line after the reply IS the last word,
+    and prose that merely mentions a tag keeps its author."""
+    transcript = tmp_path / "claude.jsonl"
+    transcript.write_bytes(
+        _claude_line("user", "first")
+        + _claude_line("assistant", "reply")
+        + _claude_line("user", "why did the <task-notification> arrive twice?")
+    )
+    result = capture_checkpoint(_payload(transcript, tmp_path))
+    assert result["last_user_text"] == "why did the <task-notification> arrive twice?"

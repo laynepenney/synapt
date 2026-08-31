@@ -240,7 +240,11 @@ class TestSessionStartContinuityPolicy:
         with patch.object(cli, "generate_startup_context", return_value=["ambient"]) as context:
             out, _ = _run_hook(monkeypatch, tmp_path, source="clear")
 
-        context.assert_called_once_with(tmp_path.resolve(), include_continuity=False)
+        context.assert_called_once_with(
+            tmp_path.resolve(),
+            include_continuity=False,
+            current_session_id="hook-test-session",
+        )
         assert "ambient" in out
 
 

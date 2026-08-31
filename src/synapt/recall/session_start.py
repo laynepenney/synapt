@@ -45,6 +45,7 @@ HOOK_RUN_LOG_MAX_RECORDS = 100
 # Per-source byte caps. They sum to less than WAKE_BUDGET_BYTES by
 # construction, so the budget holds without a second pass; the final guard in
 # render_wake exists for the day someone adds a source and forgets this table.
+_CAP_UNCLEAN_END = 2_500
 _CAP_JOURNAL_LATEST = 6_000
 _CAP_JOURNAL_OLDER = 1_500
 _CAP_BRANCH = 1_200
@@ -353,6 +354,8 @@ def _first_line(block: str) -> str:
 
 def _kind(block: str) -> str:
     head = _first_line(block)
+    if head.startswith("UNCLEAN END"):
+        return "unclean_end"
     if head.startswith("Last session") or head.startswith("Next steps:") \
             or head.startswith("Decisions:") or head.startswith("Done:"):
         return "journal"
@@ -438,7 +441,8 @@ def render_wake(
 ) -> str:
     """Render startup context inside *budget* bytes and write the full text to disk.
 
-    Order is the point: head line, warnings, the latest journal entry (open
+    Order is the point: head line, warnings, an unclean-end block when the
+    previous session left no handoff, the latest journal entry (open
     threads first — see journal.format_for_session_start), channel state,
     directives, then everything else clipped per source, then a footer that
     says how many bytes were shown, how many withheld, and where the rest is.
@@ -493,6 +497,10 @@ def render_wake(
 
     counts = _counts_phrase(blocks, reminder_total)
 
+    # A previous session that ended without a handoff changes what the reader
+    # does first, so it renders before everything, including the journal it
+    # would otherwise be read as continuous with.
+    take("unclean_end", _CAP_UNCLEAN_END)
     take("branch", _CAP_BRANCH)
     take("open_pr", _CAP_OPEN_PR)
     take("journal", _CAP_JOURNAL_OLDER, first_cap=_CAP_JOURNAL_LATEST)

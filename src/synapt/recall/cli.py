@@ -1402,8 +1402,37 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # or turns out to be an un-archived session. Everywhere else the cheap leg
     # (~24 ms there) answers, and a stale verdict needs no second opinion.
     view = _attach_freshness(view, args)
+    view = _attach_unclean_end(view, args)
 
     print(format_resume(view))
+
+
+def _attach_unclean_end(view, args):
+    """Judge the SELECTED session, not the newest transcript: the process
+    running `synapt resume` is usually itself the newest transcript.
+    Never raises; None means NOT CHECKED."""
+    try:
+        from synapt.recall.journal import _journal_path
+        from synapt.recall.resume import (
+            authored_journals,
+            caller_transcripts,
+            detect_unclean_end,
+        )
+        from synapt.checkpoint import read_checkpoint
+
+        project = getattr(args, "project", None) or Path.cwd()
+        sources = [
+            item for item in caller_transcripts(project)
+            if item.session_id == view.session_id
+        ]
+        view.unclean_end = detect_unclean_end(
+            sources,
+            checkpoint=read_checkpoint(Path(project)),
+            authored_journals=authored_journals(_journal_path(Path(project))),
+        )
+    except Exception:
+        pass
+    return view
 
 
 def _attach_freshness(view, args):
@@ -2302,6 +2331,7 @@ def generate_startup_context(
     project: Path,
     *,
     include_continuity: bool = True,
+    current_session_id: str | None = None,
 ) -> list[str]:
     """Generate startup context lines for any tool (Claude, Codex, etc.).
 
@@ -2325,6 +2355,7 @@ def generate_startup_context(
     journal_lines: list[str] = []
     compaction_line: str | None = None
     latest_authored_journal_timestamp: str | None = None
+    authored_entries: list = []
 
     # 1. Branch-aware context
     try:
@@ -2384,6 +2415,7 @@ def generate_startup_context(
                 if not entry.auto and entry.has_content()
             ]
             authored.sort(key=lambda entry: entry.timestamp, reverse=True)
+            authored_entries = list(authored)
             if authored:
                 latest_authored_journal_timestamp = authored[0].timestamp
             for entry in rich[:3]:
@@ -2401,6 +2433,43 @@ def generate_startup_context(
         summary = latest_compaction_summary(project)
         if summary:
             compaction_line = format_compaction_summary(summary)
+    except Exception:
+        pass
+
+    # 5a. Unclean end: the newest PREVIOUS transcript has no journal within
+    # the grace window and no SessionEnd checkpoint of its own. A crash runs
+    # no SessionEnd, so the checkpoint on disk (if any) is some other
+    # session's; without this block that other tail renders as the bridge and
+    # nothing says hours of work have no record (measured 2026-08-31). The
+    # block carries the crashed session's OWN bounded tail and leads the wake.
+    try:
+        from synapt.recall.resume import format_unclean_end, gather_unclean_end
+
+        # Exclusion is a call-site guarantee: a caller that cannot name the
+        # session that is starting must not publish this verdict, or the wake
+        # reports itself (the generic `synapt recall startup` path, Atlas r1).
+        found = None
+        if current_session_id:
+            found = gather_unclean_end(
+                project,
+                exclude_session_id=current_session_id,
+                authored=authored_entries,
+            )
+        if found:
+            tail = None
+            try:
+                from synapt.checkpoint import capture_checkpoint
+
+                tail = capture_checkpoint({
+                    "transcript_path": str(found.transcript_path),
+                    "session_id": found.session_id,
+                    "cwd": str(project),
+                    "hook_event_name": "SessionStart",
+                    "reason": "unclean-end",
+                })
+            except Exception:
+                tail = None
+            continuity_lines.insert(0, format_unclean_end(found, tail))
     except Exception:
         pass
 
@@ -2464,7 +2533,17 @@ def generate_startup_context(
                 lines.append(f"Channel: {', '.join(unread_parts)} unread")
             total_unread = sum(counts.values())
             if total_unread > 0:
-                summary = channel_read("dev", limit=min(total_unread, 5), show_pins=False)
+                # A quiet night reads five messages in full. A backlog reads
+                # one line per message up to thirty, so the wake covers what
+                # happened rather than the three newest posts (2026-08-31:
+                # eleven unread, three rendered, the two verdicts that
+                # mattered withheld).
+                if total_unread > 5:
+                    summary = channel_read(
+                        "dev", limit=min(total_unread, 30), show_pins=False, detail="min",
+                    )
+                else:
+                    summary = channel_read("dev", limit=total_unread, show_pins=False)
                 if summary:
                     lines.append(f"\nRecent #dev messages:\n{summary}")
     except Exception:
@@ -2607,7 +2686,16 @@ def cmd_startup(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
-    context_lines = generate_startup_context(project)
+    # The runtime that is starting names itself in its env (Claude Code:
+    # CLAUDE_CODE_SESSION_ID, Codex: CODEX_THREAD_ID). Without it the wake
+    # cannot exclude the live transcript and does not judge an unclean end.
+    current_session_id = (
+        os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("SYNAPT_SESSION_ID")
+        or None
+    )
+    context_lines = generate_startup_context(project, current_session_id=current_session_id)
 
     if not context_lines:
         if getattr(args, "json", False):
@@ -2794,6 +2882,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
             lines = generate_startup_context(
                 project,
                 include_continuity=include_continuity,
+                current_session_id=str(payload.get("session_id") or "") or None,
             )
 
         # 4. ... rendered inside the byte budget, head line first, full text

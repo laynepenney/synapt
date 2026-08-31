@@ -36,6 +36,8 @@ from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.journal import JournalEntry, append_entry
 from synapt.recall.resume import (
     CallerTranscript,
+    UncleanEnd,
+    detect_unclean_end,
     ResumeError,
     build_resume_view,
     caller_transcripts,
@@ -45,6 +47,7 @@ from synapt.recall.resume import (
     resolve_session,
     _latest_event_timestamp,
     _source_label,
+    _timestamp_epoch,
 )
 
 SESSION_A = "aaaaaaaa-1111-2222-3333-444444444444"
@@ -1511,3 +1514,168 @@ class TestTimestampFormatDoesNotDecideOrdering(unittest.TestCase):
             _chunk(SESSION_B, 0, "c", "d", timestamp="2026-08-06T03:00:00Z"),
         ])
         self.assertEqual(resolve_session(index, None), SESSION_A)
+
+
+# ---------------------------------------------------------------------------
+# Unclean end — a crash writes neither a journal nor a SessionEnd checkpoint
+# ---------------------------------------------------------------------------
+
+
+class TestUncleanEnd(unittest.TestCase):
+    """A session that dies by host crash leaves no handoff of any kind.
+
+    Measured 2026-08-31: the coordinator's session (last activity 12:06Z) had
+    no journal after 04:54Z and no SessionEnd checkpoint, because a crash runs
+    no SessionEnd. The on-disk checkpoint belonged to a DIFFERENT session (a
+    subagent that ended cleanly at 11:58Z), and the wake rendered that tail
+    under "LAST CHECKPOINT" as if it were the bridge. Nothing said that seven
+    hours of work had no record.
+
+    Atlas's r1 on the first version added the composition rule pinned here: a
+    handoff is session-bound evidence. A journal from another session, however
+    recent, certifies nothing about this one.
+    """
+
+    LAST = "2026-08-31T12:06:07Z"
+    NOW = _timestamp_epoch("2026-08-31T13:10:24Z")
+
+    @staticmethod
+    def _source(session_id: str, latest: str) -> CallerTranscript:
+        return CallerTranscript(session_id, Path(f"/t/{session_id[:8]}.jsonl"), 0.0, 10,
+                                latest_timestamp=latest)
+
+    @staticmethod
+    def _journal(ts: str, session_id: str = "") -> JournalEntry:
+        return JournalEntry(timestamp=ts, session_id=session_id, focus="handoff")
+
+    def _judge(self, sources, *, checkpoint=None, journals=(), **kw):
+        return detect_unclean_end(sources, checkpoint=checkpoint,
+                                  authored_journals=list(journals), **kw)
+
+    def test_no_previous_transcript_is_not_a_finding(self):
+        self.assertIsNone(self._judge([]))
+
+    def test_a_checkpoint_for_this_session_means_it_was_handed_off(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            checkpoint={"session_id": SESSION_A, "captured_at": self.LAST})
+        self.assertIsNone(found)
+
+    def test_a_checkpoint_from_another_session_does_not_cover_this_one(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            checkpoint={"session_id": SESSION_B, "captured_at": "2026-08-31T11:58:20Z"})
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_A)
+        self.assertEqual(found.last_activity, self.LAST)
+        self.assertEqual(found.checkpoint_session, SESSION_B)
+        self.assertIsNone(found.last_authored_journal)
+        self.assertIsNone(found.gap_seconds)
+
+    def test_a_bound_journal_inside_the_grace_window_covers_the_session(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            journals=[self._journal("2026-08-31T12:00:00Z", SESSION_A)])
+        self.assertIsNone(found)
+
+    def test_a_bound_journal_older_than_the_grace_window_does_not(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            journals=[self._journal("2026-08-31T04:54:00Z", SESSION_A)])
+        self.assertIsNotNone(found)
+        self.assertEqual(found.last_authored_journal, "2026-08-31T04:54:00Z")
+        self.assertEqual(found.gap_seconds, 7 * 3600 + 12 * 60 + 7)
+        self.assertIsNone(found.checkpoint_session)
+
+    def test_a_later_journal_from_another_session_does_not_suppress_the_finding(self):
+        """Atlas's reproducer: crash at 12:06Z, foreign journal at 13:00Z.
+        The first version reduced journals to a timestamp and returned None."""
+        found = self._judge(
+            [self._source(SESSION_A, self.LAST)],
+            checkpoint={"session_id": SESSION_B, "captured_at": "2026-08-31T11:58:20Z"},
+            journals=[self._journal("2026-08-31T13:00:00Z", SESSION_B)],
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_A)
+        self.assertIsNone(found.last_authored_journal)
+        self.assertEqual(found.foreign_journal, "2026-08-31T13:00:00Z")
+
+    def test_a_later_journal_bound_to_the_session_does_cover_it(self):
+        """Positive control for the test above: same time, own session."""
+        found = self._judge(
+            [self._source(SESSION_A, self.LAST)],
+            checkpoint={"session_id": SESSION_B, "captured_at": "2026-08-31T11:58:20Z"},
+            journals=[self._journal("2026-08-31T13:00:00Z", SESSION_A)],
+        )
+        self.assertIsNone(found)
+
+    def test_a_sessionless_legacy_journal_covers_only_inside_the_symmetric_window(self):
+        """The explicit fallback for entries that name no session, witnessed
+        separately: inside the window it covers, an hour later it does not."""
+        inside = self._judge([self._source(SESSION_A, self.LAST)],
+                             journals=[self._journal("2026-08-31T12:10:00Z")])
+        later = self._judge([self._source(SESSION_A, self.LAST)],
+                            journals=[self._journal("2026-08-31T13:00:00Z")])
+        self.assertIsNone(inside)
+        self.assertIsNotNone(later)
+        self.assertEqual(later.last_authored_journal, "2026-08-31T13:00:00Z")
+        self.assertIsNone(later.gap_seconds)
+
+    def test_the_grace_boundary_is_inclusive_and_discriminating(self):
+        """gap == grace is covered; gap == grace + 1 s is not. A pair, so a
+        mutation that drops the comparison turns exactly one side red."""
+        sources = [self._source(SESSION_A, "2026-08-31T12:15:00Z")]
+        at_grace = self._judge(sources, journals=[self._journal("2026-08-31T12:00:00Z", SESSION_A)],
+                               grace_seconds=900)
+        past_grace = self._judge(sources, journals=[self._journal("2026-08-31T11:59:59Z", SESSION_A)],
+                                 grace_seconds=900)
+        self.assertIsNone(at_grace)
+        self.assertIsNotNone(past_grace)
+        self.assertEqual(past_grace.gap_seconds, 901)
+
+    def test_the_current_session_is_excluded_so_the_previous_one_is_judged(self):
+        """At SessionStart the newest transcript is the session that is
+        starting. Without the exclusion every wake would report itself."""
+        found = self._judge(
+            [self._source(SESSION_A, "2026-08-31T12:30:00Z"), self._source(SESSION_B, self.LAST)],
+            exclude_session_id=SESSION_A,
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_B)
+
+    def test_a_crash_followed_by_a_fast_restart_is_still_judged(self):
+        """Recency is not liveness evidence (Atlas, r1): a session that
+        crashed seconds before this wake must not be treated as live. Only
+        identity excludes."""
+        found = self._judge(
+            [self._source(SESSION_A, "2026-08-31T13:10:00Z"),  # 24 s before the wake
+             self._source(SESSION_B, self.LAST)],
+            exclude_session_id=SESSION_B,
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_A)
+
+    def test_a_source_without_a_timestamp_cannot_be_the_newest(self):
+        found = self._judge([self._source(SESSION_A, ""), self._source(SESSION_B, self.LAST)])
+        self.assertEqual(found.session_id, SESSION_B)
+
+    def test_format_resume_names_an_unclean_end_in_the_header(self):
+        index = _index([_chunk(SESSION_A, 0, "last question", "")])
+        view = build_resume_view(index, session_id=SESSION_A, journal_path=None)
+        self.assertNotIn("UNCLEAN END", format_resume(view))
+        view.unclean_end = UncleanEnd(
+            session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
+            last_activity=self.LAST, last_authored_journal="2026-08-31T04:54:00Z",
+            gap_seconds=25927.0, checkpoint_session=None,
+        )
+        text = format_resume(view)
+        self.assertIn("UNCLEAN END", text.splitlines()[0])
+        self.assertIn("7h12m", text.splitlines()[0])
+        self.assertIn("no SessionEnd checkpoint", text.splitlines()[0])
+
+    def test_the_foreign_journal_wording_says_later_only_when_it_is(self):
+        from synapt.recall.resume import format_unclean_end
+        base = dict(session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
+                    last_activity=self.LAST, last_authored_journal=None,
+                    gap_seconds=None, checkpoint_session=None)
+        after = format_unclean_end(UncleanEnd(**base, foreign_journal="2026-08-31T13:00:00Z"), None)
+        before = format_unclean_end(UncleanEnd(**base, foreign_journal="2026-08-31T11:00:00Z"), None)
+        self.assertIn("A later journal at 2026-08-31T13:00:00Z", after)
+        self.assertIn("A journal at 2026-08-31T11:00:00Z", before)
+        self.assertNotIn("later", before)
