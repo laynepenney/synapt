@@ -13,14 +13,18 @@ import pytest
 from synapt.checkpoint import (
     CHECKPOINT_BYTES,
     EVENT_BYTES,
+    SCHEMA_VERSION,
     TAIL_BYTES,
     capture_checkpoint,
     checkpoint_path,
     format_checkpoint,
     is_newer_than,
     main,
+    periodic_checkpoint_path,
     read_checkpoint,
+    read_periodic_checkpoint,
     write_checkpoint,
+    write_periodic_checkpoint,
 )
 
 
@@ -391,6 +395,324 @@ def test_writer_never_emits_a_checkpoint_the_reader_rejects(tmp_path):
     assert destination.stat().st_size <= CHECKPOINT_BYTES
     assert recovered is not None
     assert recovered["files_touched"]
+
+
+# ---------------------------------------------------------------------------
+# Periodic (per-session) checkpoint — tracked privately, deliberately not linked.
+#
+# The SessionEnd checkpoint above has ONE slot per worktree: any session's
+# write overwrites whatever the last one left, which is why a crashed
+# session's wake can show a DIFFERENT session's checkpoint entirely (recall
+# unclean-end, `UncleanEnd.checkpoint_session`). A periodic mid-session
+# checkpoint makes that worse unless it is keyed by session id -- otherwise a
+# five-minute-old periodic tick from an unrelated live session would shadow
+# the one crash recovery actually needs. These functions are strictly
+# ADDITIVE: `checkpoint_path` / `write_checkpoint` / `read_checkpoint` (the
+# SessionEnd path) are asserted unchanged by every test above and must stay
+# that way -- resume.py's consumption of periodic checkpoints is a follow-up
+# PR, scoped out here specifically to avoid the seam with the in-flight
+# GRIPSPACE_ROOT resolver work touching the same caller code.
+# ---------------------------------------------------------------------------
+
+
+def test_periodic_checkpoint_path_is_session_keyed_and_distinct_from_legacy_slot(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    legacy = checkpoint_path(tmp_path)
+    a = periodic_checkpoint_path(tmp_path, "session-aaaa")
+    b = periodic_checkpoint_path(tmp_path, "session-bbbb")
+
+    assert a != legacy
+    assert b != legacy
+    assert a != b
+    assert a.parent == b.parent == legacy.parent / "checkpoints"
+
+
+def test_periodic_checkpoint_rejects_a_session_id_that_is_not_a_bare_label(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    overlong = "a" * 300
+    for bad in ("", ".", "..", "a/b", "a\\b", "a\x00b", "a\x01b", "a\x1fb", overlong):
+        with pytest.raises(ValueError):
+            periodic_checkpoint_path(tmp_path, bad)
+
+
+def test_periodic_checkpoint_write_requires_session_id_in_payload(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(_record("user", "hello"))
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = ""
+
+    with pytest.raises(ValueError):
+        write_periodic_checkpoint(payload)
+
+
+def test_periodic_checkpoint_write_never_shadows_a_different_sessions_checkpoint(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    transcript_a = tmp_path / "a.jsonl"
+    transcript_a.write_bytes(_record("user", "session A's last words"))
+    payload_a = _payload(transcript_a, tmp_path)
+    payload_a["session_id"] = "session-aaaa"
+
+    transcript_b = tmp_path / "b.jsonl"
+    transcript_b.write_bytes(_record("user", "session B's last words"))
+    payload_b = _payload(transcript_b, tmp_path)
+    payload_b["session_id"] = "session-bbbb"
+
+    write_periodic_checkpoint(payload_a)
+    write_periodic_checkpoint(payload_b)
+
+    recovered_a = read_periodic_checkpoint(tmp_path, "session-aaaa")
+    recovered_b = read_periodic_checkpoint(tmp_path, "session-bbbb")
+
+    assert recovered_a["last_user_text"] == "session A's last words"
+    assert recovered_b["last_user_text"] == "session B's last words"
+
+
+def test_periodic_checkpoint_second_write_replaces_its_own_sessions_prior_checkpoint(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    transcript = tmp_path / "session.jsonl"
+    session_id = "session-cccc"
+
+    transcript.write_bytes(_record("user", "first tick"))
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = session_id
+    write_periodic_checkpoint(payload)
+
+    transcript.write_bytes(_record("user", "second tick"))
+    write_periodic_checkpoint(payload)
+
+    files = list(periodic_checkpoint_path(tmp_path, session_id).parent.glob(f"{session_id}*"))
+    recovered = read_periodic_checkpoint(tmp_path, session_id)
+
+    assert len(files) == 1
+    assert recovered["last_user_text"] == "second tick"
+
+
+# ---------------------------------------------------------------------------
+# Four discriminators a minimal, non-atomic, unbounded, cross-session-blind
+# implementation would still pass the tests above. Required before this spec
+# freezes -- a reviewer's mutation run confirmed the tests up to this point
+# are satisfiable by exactly that shape.
+# ---------------------------------------------------------------------------
+
+
+def test_periodic_checkpoint_atomic_replace_failure_preserves_prior_same_session_checkpoint(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-mmmm"
+    transcript = tmp_path / "session.jsonl"
+
+    transcript.write_bytes(_record("user", "first tick, must survive"))
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = session_id
+    write_periodic_checkpoint(payload)
+
+    transcript.write_bytes(_record("user", "second tick, must not land"))
+    with patch("synapt.checkpoint.os.replace", side_effect=OSError("unwritable")):
+        with pytest.raises(OSError, match="unwritable"):
+            write_periodic_checkpoint(payload)
+
+    recovered = read_periodic_checkpoint(tmp_path, session_id)
+    destination = periodic_checkpoint_path(tmp_path, session_id)
+    leftover_tmp = list(destination.parent.glob(".checkpoint.*.tmp"))
+
+    assert recovered["last_user_text"] == "first tick, must survive"
+    assert leftover_tmp == []
+
+
+def test_periodic_checkpoint_write_and_read_both_bound_to_checkpoint_bytes(tmp_path, monkeypatch):
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-nnnn"
+    transcript = tmp_path / "escaped-paths.jsonl"
+    records = []
+    for index in range(32):
+        records.append({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "arguments": json.dumps({
+                    "file_path": f"/tmp/{index}-" + ("\x01" * 1000) + ".txt",
+                }),
+            },
+        })
+    transcript.write_text(
+        "".join(json.dumps(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = session_id
+
+    write_periodic_checkpoint(payload)
+    destination = periodic_checkpoint_path(tmp_path, session_id)
+
+    # Write-side bound.
+    assert destination.stat().st_size <= CHECKPOINT_BYTES
+    assert read_periodic_checkpoint(tmp_path, session_id) is not None
+
+    # Read-side bound, independent of what the writer would ever produce: a
+    # file that somehow grew past the limit on disk must still be refused.
+    destination.write_bytes(b"x" * (CHECKPOINT_BYTES + 1))
+    assert read_periodic_checkpoint(tmp_path, session_id) is None
+
+
+def test_periodic_checkpoint_reader_rejects_session_id_mismatch_between_filename_and_content(
+    tmp_path, monkeypatch
+):
+    """A file at session A's path whose own content claims session B is not A's checkpoint."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    destination = periodic_checkpoint_path(tmp_path, "session-oooo")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({
+        "schema_version": SCHEMA_VERSION,
+        "source": "periodic",
+        "captured_at": "2026-01-01T00:00:00Z",
+        "session_id": "session-pppp",
+        "last_user_text": "must not surface under the wrong session",
+    }), encoding="utf-8")
+
+    assert read_periodic_checkpoint(tmp_path, "session-oooo") is None
+
+
+def test_periodic_checkpoint_reader_rejects_a_sessionend_labelled_file(tmp_path, monkeypatch):
+    """A file that looks like a SessionEnd checkpoint is not a periodic one, wherever it sits."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-qqqq"
+    destination = periodic_checkpoint_path(tmp_path, session_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({
+        "schema_version": SCHEMA_VERSION,
+        "source": "session-end",
+        "captured_at": "2026-01-01T00:00:00Z",
+        "session_id": session_id,
+        "last_user_text": "must not surface as a periodic checkpoint",
+    }), encoding="utf-8")
+
+    assert read_periodic_checkpoint(tmp_path, session_id) is None
+
+
+def test_periodic_checkpoint_is_labelled_periodic_not_session_end(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(_record("user", "hi"))
+    payload = _payload(transcript, tmp_path)
+    payload["session_id"] = "session-dddd"
+
+    write_periodic_checkpoint(payload)
+    recovered = read_periodic_checkpoint(tmp_path, "session-dddd")
+
+    assert recovered["source"] == "periodic"
+
+
+@pytest.mark.parametrize(
+    "schema_version", [None, False, True, 0, 1.0, 2, "1"],
+)
+def test_periodic_checkpoint_reader_rejects_wrong_schema_domain(tmp_path, schema_version, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    session_id = "session-eeee"
+    destination = periodic_checkpoint_path(tmp_path, session_id)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps({
+        "schema_version": schema_version,
+        "captured_at": "2026-01-01T00:00:00Z",
+        "last_user_text": "must not surface",
+    }), encoding="utf-8")
+
+    assert read_periodic_checkpoint(tmp_path, session_id) is None
+
+
+def test_periodic_checkpoint_reader_returns_none_when_nothing_written_yet(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    assert read_periodic_checkpoint(tmp_path, "session-never-written") is None
+
+
+def test_legacy_sessionend_checkpoint_is_unaffected_by_periodic_checkpoints_existing(tmp_path, monkeypatch):
+    # Interim per-test isolation (the shared process-environment fixture will supply this;
+    # until it lands, these three lines are the established idiom this file
+    # already uses elsewhere -- not a new mechanism). Ambient SYNAPT_RECALL_ROOT
+    # or GRIPSPACE_ROOT makes checkpoint_path() IGNORE tmp_path entirely and
+    # resolve to the real shared store; measured live in this session.
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    """Regression: writing periodic checkpoints must not change the SessionEnd path."""
+    transcript = tmp_path / "periodic.jsonl"
+    transcript.write_bytes(_record("user", "periodic write"))
+    periodic_payload = _payload(transcript, tmp_path)
+    periodic_payload["session_id"] = "session-ffff"
+    write_periodic_checkpoint(periodic_payload)
+
+    end_transcript = tmp_path / "session-end.jsonl"
+    end_transcript.write_bytes(_record("user", "session-end write"))
+    write_checkpoint(_payload(end_transcript, tmp_path))
+
+    recovered = read_checkpoint(tmp_path)
+    assert recovered["last_user_text"] == "session-end write"
+    assert recovered["source"] == "session-end"
 
 
 @pytest.mark.parametrize(
