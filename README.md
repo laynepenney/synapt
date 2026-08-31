@@ -457,11 +457,15 @@ including empty results and failures after the store has been resolved.
 
 Recall resolves its data root in this order:
 
-1. an explicit project directory, or `SYNAPT_RECALL_ROOT` when no project
-   directory was supplied
+1. an explicit project directory, or — when none was supplied —
+   `SYNAPT_RECALL_ROOT`, then `GRIPSPACE_ROOT` (the workspace root GitGrip
+   computes and exports on every spawn). Both must point at a directory that
+   exists; a mistyped root is refused, never minted.
 2. the repository's main worktree
 3. the GitGrip workspace root
-4. the current working directory
+4. the current working directory — except `$HOME`, which is never a store root
+   (a store above every project is structurally wrong). An inference that falls
+   all the way to `$HOME` is a named error, not a silent mint.
 
 The reported path is operational provenance only. Public recall does not infer
 or report the caller's identity from it.
