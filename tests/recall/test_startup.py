@@ -10,11 +10,9 @@ Verifies that:
 import argparse
 import json
 import os
-import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-import pytest
 
 from synapt.recall.cli import (
     _dev_loop_activation_prompt,
@@ -445,3 +443,163 @@ class TestStartupSubcommand:
         assert result.returncode == 0
         assert "--json" in result.stdout
         assert "--compact" in result.stdout
+
+
+class TestUncleanEndAtStartup:
+    """When the previous session ended without a handoff, the wake must SAY so,
+    first, and carry that session's own tail — not another session's checkpoint
+    dressed as the bridge (measured 2026-08-31 after a host crash)."""
+
+    _CRASHED = "65262c2c-54c3-4d58-aec6-d076f5040539"
+    _FOREIGN = "489c7e73-aeff-4138-962c-da3297847601"
+
+    def _unclean(self, tmp_path):
+        from synapt.recall.resume import UncleanEnd
+        return UncleanEnd(
+            session_id=self._CRASHED,
+            transcript_path=tmp_path / "crashed.jsonl",
+            last_activity="2026-08-31T12:06:07Z",
+            last_authored_journal="2026-08-31T04:54:00Z",
+            gap_seconds=25927.0,
+            checkpoint_session=self._FOREIGN,
+        )
+
+    def _quiet(self):
+        return [
+            patch("synapt.recall.journal._get_branch", return_value=None),
+            patch("synapt.recall.compaction.latest_compaction_summary", return_value=None),
+            patch("synapt.recall.knowledge.read_nodes", return_value=[]),
+            patch("synapt.recall.reminders.pop_pending", return_value=[]),
+            patch("synapt.recall.server.format_contradictions_for_session_start", return_value=""),
+            patch("synapt.recall.channel.channel_join"),
+            patch("synapt.recall.channel.channel_unread", return_value={}),
+            patch("synapt.recall.channel.check_directives", return_value=""),
+        ]
+
+    def test_unclean_end_leads_continuity_and_carries_its_own_tail(self, tmp_path):
+        from contextlib import ExitStack
+        foreign_checkpoint = {
+            "schema_version": 1, "session_id": self._FOREIGN,
+            "captured_at": "2026-08-31T11:58:20Z", "parse_status": "partial",
+            "last_user_text": None, "last_assistant_text": "foreign report",
+            "files_touched": [],
+        }
+        recovered = {
+            "parse_status": "partial", "truncated": True,
+            "last_user_text": "can you show me the herdr changes as html",
+            "last_assistant_text": None, "files_touched": ["/tmp/x.html"],
+        }
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=foreign_checkpoint))
+            stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=self._unclean(tmp_path)))
+            capture = stack.enter_context(patch("synapt.checkpoint.capture_checkpoint", return_value=recovered))
+            lines = generate_startup_context(tmp_path, current_session_id="new-session")
+
+        text = "\n".join(lines)
+        assert lines[0].startswith("UNCLEAN END")
+        assert "65262c2c" in lines[0]
+        assert "7h12m" in lines[0]
+        assert "489c7e73" in lines[0], "the foreign checkpoint is named so it is not read as the bridge"
+        assert "can you show me the herdr changes as html" in lines[0]
+        assert "synapt resume 65262c2c-54c3-4d58-aec6-d076f5040539" in lines[0]
+        assert text.index("UNCLEAN END") < text.index("LAST CHECKPOINT")
+        payload = capture.call_args.args[0]
+        assert payload["transcript_path"] == str(tmp_path / "crashed.jsonl")
+        assert payload["session_id"] == self._CRASHED
+
+    def test_without_a_starting_session_id_no_verdict_is_published(self, tmp_path):
+        """Call-path witness (Atlas r1): the generic startup path used to pass
+        exclude_session_id=None, so the live transcript won and every Codex
+        wake would have reported itself."""
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=None))
+            gather = stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=self._unclean(tmp_path)))
+            text = "\n".join(generate_startup_context(tmp_path))
+        assert "UNCLEAN END" not in text
+        gather.assert_not_called()
+
+    def test_cmd_startup_names_the_runtime_session_from_its_env(self, tmp_path, monkeypatch):
+        import argparse
+        from synapt.recall import cli
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CODEX_THREAD_ID", "codex-thread-7")
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        with patch("synapt.recall.cli.generate_startup_context", return_value=["ctx"]) as ctx, \
+             patch("synapt.recall.journal.compact_journal", return_value=0):
+            cli.cmd_startup(argparse.Namespace(json=False, compact=False))
+        assert ctx.call_args.kwargs["current_session_id"] == "codex-thread-7"
+        monkeypatch.delenv("CODEX_THREAD_ID")
+        with patch("synapt.recall.cli.generate_startup_context", return_value=["ctx"]) as ctx, \
+             patch("synapt.recall.journal.compact_journal", return_value=0):
+            cli.cmd_startup(argparse.Namespace(json=False, compact=False))
+        assert ctx.call_args.kwargs["current_session_id"] is None
+
+    def test_the_detector_is_told_which_session_is_starting(self, tmp_path):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=None))
+            gather = stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=None))
+            text = "\n".join(generate_startup_context(tmp_path, current_session_id="new-session"))
+        assert "UNCLEAN END" not in text
+        assert gather.call_args.kwargs["exclude_session_id"] == "new-session"
+
+    def test_the_last_checkpoint_block_names_its_session(self, tmp_path):
+        from contextlib import ExitStack
+        checkpoint = {
+            "schema_version": 1, "session_id": self._FOREIGN,
+            "captured_at": "2026-08-31T11:58:20Z", "parse_status": "ok",
+            "last_user_text": "q", "last_assistant_text": "a", "files_touched": [],
+        }
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=checkpoint))
+            stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=None))
+            text = "\n".join(generate_startup_context(tmp_path))
+        assert "LAST CHECKPOINT" in text
+        assert "Session: 489c7e73" in text
+
+
+class TestChannelReadWidensWithBacklog:
+    """Five messages at medium detail is the right read for a quiet night and
+    the wrong one after a gap: on 2026-08-31 eleven were unread, three rendered
+    inside the channel cap, and the two that mattered were withheld."""
+
+    def _run(self, unread):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in (
+                patch("synapt.recall.journal._get_branch", return_value=None),
+                patch("synapt.recall.compaction.latest_compaction_summary", return_value=None),
+                patch("synapt.checkpoint.read_checkpoint", return_value=None),
+                patch("synapt.recall.resume.gather_unclean_end", return_value=None),
+                patch("synapt.recall.knowledge.read_nodes", return_value=[]),
+                patch("synapt.recall.reminders.pop_pending", return_value=[]),
+                patch("synapt.recall.server.format_contradictions_for_session_start", return_value=""),
+                patch("synapt.recall.channel.channel_join"),
+                patch("synapt.recall.channel.check_directives", return_value=""),
+                patch("synapt.recall.channel.channel_unread", return_value={"dev": unread}),
+            ):
+                stack.enter_context(p)
+            read = stack.enter_context(patch("synapt.recall.channel.channel_read", return_value="msgs"))
+            generate_startup_context(Path("/nonexistent-for-test"))
+        return read.call_args.kwargs
+
+    def test_a_backlog_is_read_one_line_per_message_up_to_thirty(self):
+        kwargs = self._run(11)
+        assert kwargs["limit"] == 11
+        assert kwargs["detail"] == "min"
+        kwargs = self._run(48)
+        assert kwargs["limit"] == 30
+
+    def test_a_few_unread_keep_the_full_form(self):
+        kwargs = self._run(3)
+        assert kwargs["limit"] == 3
+        assert kwargs.get("detail", "medium") != "min"

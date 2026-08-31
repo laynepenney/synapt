@@ -5,6 +5,42 @@ All notable changes to synapt are documented here.
 ## [Unreleased]
 
 ### Fixed
+- **A session that ended without a handoff is named as such at the next wake.**
+  A host crash, kill, or forced shutdown runs no SessionEnd, so no checkpoint
+  is written, and nobody journals a session they did not know was ending. The
+  session-start hook then rendered whatever `checkpoint.json` held, which can be
+  another session's clean SessionEnd (measured after a crash: a subagent's tail
+  under "LAST CHECKPOINT", twelve hours of the main session's work with no
+  record, and nothing saying so). `synapt.recall.resume.detect_unclean_end`
+  judges the newest previous caller transcript against the authored journals
+  and a checkpoint bound to that session's id. A handoff is session-bound
+  evidence: a journal bound to the session covers it when written within the
+  fifteen-minute grace before its last activity or any time after; a legacy
+  sessionless journal covers only inside the symmetric window; a journal bound
+  to another session never covers, so later work by other sessions cannot erase
+  the verdict. Exclusion of the starting
+  session is by identity alone: recency is not liveness evidence, since a
+  crash followed by a fast restart sits inside any recency window;
+  when neither covers it, the wake leads with an `UNCLEAN END` block that names
+  the session, the gap, the foreign checkpoint if any, and the session's own
+  bounded recovered tail, and `synapt resume` carries the same verdict in its
+  header. The starting session is excluded by the hook payload's `session_id`
+  (or `CLAUDE_CODE_SESSION_ID` / `CODEX_THREAD_ID` on the generic
+  `synapt recall startup` path); a caller that cannot name its own session does
+  not publish the verdict, so a wake never reports itself.
+- **`LAST CHECKPOINT` names the session it belongs to**, so a checkpoint from
+  one session is not read as the bridge for another.
+- **The recovered tail skips runtime-authored user lines.** `<task-notification>`,
+  `<system-reminder>` and the slash-command echo family are written with the
+  user role but are not the operator's words; the checkpoint reader now keeps
+  the last human line instead (the crashed session's real last request, not the
+  background-task notice that followed it). Prose that merely quotes a tag keeps
+  its author.
+- **A #dev backlog is read one line per message, up to thirty.** Five messages
+  at full detail is the right read after a quiet night and the wrong one after a
+  gap: with eleven unread, three rendered inside the channel byte cap and the
+  two that mattered were withheld. Above five unread the wake switches to the
+  one-line form so it covers what happened rather than the three newest posts.
 - **Cross-gripspace direct messages no longer silo.** `send_message` reported
   "Delivered" on a cross-org send while the recipient saw nothing: both the JSONL
   inbox and the SQLite delivery-state store resolve through the gripspace-local
