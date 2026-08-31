@@ -1233,8 +1233,8 @@ def recall_export(
     """
     from synapt.recall.archive import export_recall_archive
 
-    # None => resolve via SYNAPT_RECALL_ROOT + inference. Forwarding Path.cwd()
-    # would suppress the override.
+    # None => resolve via SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT + inference.
+    # Forwarding Path.cwd() would suppress the override.
     try:
         archive_path, manifest = export_recall_archive(
             None,

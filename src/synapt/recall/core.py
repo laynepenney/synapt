@@ -4769,18 +4769,21 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
     shared data (index, knowledge) at the root, and per-worktree data
     (transcripts, journal) under ``worktrees/<name>/``.
 
-    Root resolution priority:
-      0. ``SYNAPT_RECALL_ROOT`` environment variable — an explicit workspace
-         root for multi-workspace setups, consulted only when *project_dir*
-         is not passed. The directory must already exist: silently minting a
-         fresh store under a mistyped root would present as an empty history
-         that looks exactly like a real answer. Inference below cannot replace
-         this: two workspaces that share a store may be filesystem SIBLINGS,
-         and walking up from inside one can never arrive at the other.
+    Root resolution priority (env roots consulted only when *project_dir* is
+    not passed — an explicitly-passed project_dir is a deliberate root that
+    suppresses the env override, e.g. export/import ``--path``):
+      0. ``SYNAPT_RECALL_ROOT`` — an explicit workspace root, wins. Must exist:
+         silently minting under a mistyped root presents an empty history as a
+         real answer.
+      0b. ``GRIPSPACE_ROOT`` — the workspace root gr already computes and
+         exports on every spawn. Replaces the walk-up below, which cannot reach
+         a workspace from an agent worktree that is its filesystem SIBLING. Must
+         exist (same refuse-never-mint rule).
       1. Git worktree → main worktree root
       2. GitGrip gripspace → gripspace root (all constituent repos share
          one index; each sub-repo gets its own ``worktrees/<name>/`` subdir)
-      3. CWD as fallback
+      3. CWD as fallback — EXCEPT $HOME, which is never a store root (a store
+         above every project is structurally wrong): a named error, not a mint.
 
     Auto-migrates from two legacy locations (under the explicit override
     too — an overridden root may be a pre-rename workspace):
@@ -4789,6 +4792,7 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
     """
     env_resolved: Path | None = None
     if project_dir is None:
+        # Priority 0: SYNAPT_RECALL_ROOT — explicit store root, always wins.
         env_root = os.environ.get("SYNAPT_RECALL_ROOT")
         if env_root:
             env_resolved = Path(env_root).expanduser().resolve()
@@ -4799,6 +4803,26 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
                     f"under a mistyped root — unset the variable or create "
                     f"the workspace first."
                 )
+        else:
+            # Priority 0b: GRIPSPACE_ROOT — the workspace root gr already
+            # computed via find_workspace_root() and exports on every spawn.
+            # It REPLACES the walk-up below, which cannot reach the workspace
+            # from an agent worktree that is a filesystem SIBLING of it: walking
+            # up from a sibling never arrives at the other one, so each agent
+            # silently minted its own store (tracked in a private issue). gr has the
+            # answer; recall reads it instead of guessing. Consulted only in this
+            # None-branch: an explicitly-passed project_dir is a deliberate root
+            # that suppresses the env override (cli.py cmd_export/cmd_import).
+            grip_env = os.environ.get("GRIPSPACE_ROOT")
+            if grip_env:
+                env_resolved = Path(grip_env).expanduser().resolve()
+                if not env_resolved.is_dir():
+                    raise ValueError(
+                        f"GRIPSPACE_ROOT points at a directory that does not "
+                        f"exist: {env_resolved}. Refusing to mint a fresh store "
+                        f"under a mistyped root — unset the variable or create "
+                        f"the workspace first."
+                    )
 
     if env_resolved is not None:
         # No early return: the override selects the ROOT and then flows
@@ -4821,6 +4845,20 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
         grip_root = _find_gripspace_root(root)
         if grip_root is not None:
             root = grip_root
+        elif project_dir is None and root == Path.home().resolve():
+            # AMBIENT inference (no project_dir passed) that falls all the way to
+            # $HOME — a store sitting above every project on the machine — is
+            # structurally wrong (store-resolution contract invariant 2), and a
+            # silent mint there presents an empty history as a real answer
+            # (invariant 4). Refuse with a named error. Scoped to the None-branch
+            # on purpose: an explicitly-passed project_dir is a deliberate root
+            # (export/import --path) and the caller owns that choice, just as it
+            # suppresses the env override above.
+            raise ValueError(
+                "recall could not resolve a workspace root and refuses to mint a "
+                f"store at $HOME ({root}). Set GRIPSPACE_ROOT (gr exports it on "
+                "spawn) or SYNAPT_RECALL_ROOT, or run from inside the workspace."
+            )
 
     new_dir = root / ".synapt" / "recall"
 

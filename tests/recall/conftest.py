@@ -208,13 +208,16 @@ def make_test_chunks() -> list[TranscriptChunk]:
 @pytest.fixture(autouse=True)
 def _isolate_recall_root_env(monkeypatch):
     """Recall tests measure path INFERENCE unless a test sets the override
-    itself. An ambient SYNAPT_RECALL_ROOT from the invoking shell would
-    redirect every cwd-based fixture into a live store — green in CI, where
-    nothing sets it, and red or silently store-polluting on any configured
-    dev machine: the green-where-checked inversion, prevented at birth.
+    itself. An ambient SYNAPT_RECALL_ROOT — or now GRIPSPACE_ROOT, which gr
+    exports on every spawn and recall consults in the same None-branch — from
+    the invoking shell would redirect every cwd-based fixture into a live store:
+    green in CI, where nothing sets it, and red or silently store-polluting on
+    any agent machine where gr set it. The green-where-checked inversion,
+    prevented at birth. A test that means to exercise an env root sets it back.
     """
     monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
     monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
 
 
 @pytest.fixture

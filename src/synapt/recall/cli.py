@@ -1581,8 +1581,8 @@ def cmd_export(args: argparse.Namespace) -> None:
     from synapt.recall.archive import export_recall_archive
 
     # Do NOT default to Path.cwd() here: an explicit root suppresses the
-    # SYNAPT_RECALL_ROOT override inside project_data_dir. None means "resolve
-    # like every other recall verb".
+    # SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT overrides inside project_data_dir.
+    # None means "resolve like every other recall verb".
     project = Path(args.path).expanduser().resolve() if getattr(args, "path", None) else None
     try:
         output_path, manifest = export_recall_archive(
@@ -1610,7 +1610,8 @@ def cmd_import(args: argparse.Namespace) -> None:
     """Import portable recall state from a .synapt-archive file."""
     from synapt.recall.archive import import_recall_archive
 
-    # Same rule as export: None resolves via SYNAPT_RECALL_ROOT + inference.
+    # Same rule as export: None resolves via SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT
+    # + inference.
     project = Path(args.path).expanduser().resolve() if getattr(args, "path", None) else None
     mode = "merge" if args.merge else "replace"
     try:
@@ -3584,14 +3585,14 @@ def make_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("output", nargs="?", default=None, help="Output .synapt-archive path (default: <project>.synapt-archive)")
     export_parser.add_argument("--exclude-transcripts", action="store_true", help="Skip raw transcript archives")
     export_parser.add_argument("--exclude-channels", action="store_true", help="Skip channel history files")
-    export_parser.add_argument("--path", default=None, help="Workspace root to export (default: SYNAPT_RECALL_ROOT, else inferred from git/gripspace, else cwd)")
+    export_parser.add_argument("--path", default=None, help="Workspace root to export (default: SYNAPT_RECALL_ROOT, else GRIPSPACE_ROOT, else inferred from git/gripspace, else the current directory; $HOME is refused, not used)")
 
     import_parser = subparsers.add_parser("import", help="Import portable recall data from a .synapt-archive file")
     import_parser.add_argument("archive", help="Path to a .synapt-archive file")
     import_mode = import_parser.add_mutually_exclusive_group()
     import_mode.add_argument("--merge", action="store_true", help="Merge imported data into existing recall state")
     import_mode.add_argument("--replace", action="store_true", help="Replace existing recall state (default)")
-    import_parser.add_argument("--path", default=None, help="Workspace root to import into (default: SYNAPT_RECALL_ROOT, else inferred from git/gripspace, else cwd)")
+    import_parser.add_argument("--path", default=None, help="Workspace root to import into (default: SYNAPT_RECALL_ROOT, else GRIPSPACE_ROOT, else inferred from git/gripspace, else the current directory; $HOME is refused, not used)")
 
     # Transcript (display/save a session)
     transcript_parser = subparsers.add_parser("transcript", help="Display or save a session transcript")
