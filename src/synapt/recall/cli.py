@@ -56,13 +56,8 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
-from pathlib import Path
-
-logger = logging.getLogger("synapt.recall.cli")
-
-_WAKE_JOURNAL_ENTRY_LIMIT = 3
-
 from datetime import datetime
+from pathlib import Path
 
 from synapt.recall.core import (
     atomic_json_write,
@@ -90,6 +85,10 @@ from synapt.recall.journal import (
     append_entry,
     split_journal_field,
 )
+
+logger = logging.getLogger("synapt.recall.cli")
+
+_WAKE_JOURNAL_ENTRY_LIMIT = 3
 
 
 # ---------------------------------------------------------------------------
