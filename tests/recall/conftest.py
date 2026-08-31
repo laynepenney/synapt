@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from environment_isolation import scrub_ambient_process_env
 from synapt.recall.core import TranscriptChunk
 
 
@@ -213,11 +214,11 @@ def _isolate_recall_root_env(monkeypatch):
     the invoking shell would redirect every cwd-based fixture into a live store:
     green in CI, where nothing sets it, and red or silently store-polluting on
     any agent machine where gr set it. The green-where-checked inversion,
-    prevented at birth. A test that means to exercise an env root sets it back.
+    prevented at birth. The repository-wide helper owns the variable set; this
+    subtree delegates to it instead of carrying a second spelling that can
+    drift. A test that means to exercise an env input sets it back.
     """
-    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
-    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
-    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    scrub_ambient_process_env(monkeypatch)
 
 
 @pytest.fixture

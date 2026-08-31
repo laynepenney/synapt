@@ -52,6 +52,7 @@ from recall_store_isolation import (  # noqa: E402
     contained_by,
     protected_channel_root,
 )
+from environment_isolation import scrub_ambient_process_env  # noqa: E402
 
 POLICY = StoreIsolationPolicy()
 
@@ -281,11 +282,16 @@ def _natural_resolution_per_test(monkeypatch):
     the strip belongs at repository root next to the other resolution roots, not
     beside the tests that happen to name it. A test that means to exercise
     ``GRIPSPACE_ROOT`` sets it back itself, after this fixture runs.
+
+    ``SYNAPT_AGENT_ID`` belongs at this same process boundary.  It is another
+    value exported by a real agent session, and it deliberately changes recall
+    attribution.  Letting it leak into tests that omit ``agent_id`` turns an
+    explicit backwards-compatibility case into an attributed record.  The
+    shared helper is the canonical importable seam for both resolution and
+    attribution inputs; tests that exercise either contract set their value
+    after this fixture runs.
     """
-    monkeypatch.delenv("SYNAPT_SHARED_CHANNELS_DIR", raising=False)
-    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
-    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
-    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    scrub_ambient_process_env(monkeypatch)
 
 
 @pytest.fixture(autouse=True)
