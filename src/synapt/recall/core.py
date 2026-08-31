@@ -24,7 +24,7 @@ import re
 import sqlite3
 import subprocess
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -226,7 +226,9 @@ class SearchDiagnostics:
     sessions_searched: int = 0       # Progressive mode only
     date_filter_active: bool = False
     embeddings_available: bool = True  # False when search ran without embeddings
+    semantic_search_used: bool = False
     reason: str = ""                 # empty_index, empty_query, no_matches
+    oldest_indexed_at: str | None = None
 
     def format_message(self) -> str:
         """Format diagnostic information as a user-facing message."""
@@ -260,6 +262,24 @@ class SearchResultSummary:
     chunk_blocks: int = 0
     knowledge_blocks: int = 0
     cluster_blocks: int = 0
+
+
+def _oldest_indexed_date(chunks: list[TranscriptChunk]) -> str | None:
+    """Return the oldest valid chunk timestamp as a UTC calendar date."""
+    dates: list[str] = []
+    for chunk in chunks:
+        if not chunk.timestamp:
+            continue
+        try:
+            timestamp = datetime.fromisoformat(
+                chunk.timestamp.replace("Z", "+00:00")
+            )
+        except (TypeError, ValueError):
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        dates.append(timestamp.astimezone(timezone.utc).date().isoformat())
+    return min(dates, default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +464,78 @@ def _detect_decision_markers(user_text: str, tools_used: list[str]) -> list[str]
     return sorted(markers)
 
 
+def _joined_text_blocks(blocks: list) -> str:
+    """Join the text of a content-block list, ignoring every other block type.
+
+    Same shape ``message.content`` uses, read the same way.  A non-text block
+    can still carry a ``text`` key, so filtering on ``type`` is load-bearing
+    and not merely tidy: without it a thinking block's contents would be
+    indexed as something the operator said.
+    """
+    parts = [
+        blk.get("text", "").strip()
+        for blk in blocks
+        if isinstance(blk, dict) and blk.get("type") == "text"
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _queued_human_prompt(entry: dict) -> str | None:
+    """The operator's text if ``entry`` is a message they queued mid-turn.
+
+    A human who types while a turn is running does not produce a ``type:
+    "user"`` line.  Claude Code writes a ``queue-operation`` line (which is in
+    :data:`SKIP_TYPES`) and an ``attachment`` line carrying the text, so the
+    words never reach ``user_text`` and the operator's own question is absent
+    from the index that exists to answer it.
+
+    Measured 2026-08-30T13:44Z on one workspace, and every count here is a
+    property of that moment -- these files are appended to continuously, and
+    that workspace's ordinary-turn total read 1071, 1074, 1075 and 1076 across
+    a single afternoon.  Of 510 ``queued_command`` attachments: 352
+    ``origin.kind == "human"`` against 1075 ordinary user turns, so about a
+    quarter of what the operator said was unindexed, and 349 of the 352 appear
+    nowhere else in the file.
+
+    ``origin.kind`` is the whole safety boundary and there are at least three
+    cohorts, so it must also define the measurement cohort:
+
+    * ``human``   -- the operator typing.  The only one that is a user turn.
+    * ``peer``    -- another agent's queued message.  Excluded, deliberately.
+    * no ``origin`` key at all -- ``commandMode == "task-notification"``,
+      machine background-task events.  158 of the 510 here, and NONE of them
+      empty; an earlier draft of this docstring called them empty text and was
+      simply wrong about what they are.
+
+    Widening past ``human`` would attribute an agent's words, or a runtime
+    notification, to a person who did not write them.
+
+    ``prompt`` arrives as a string or as a list of content blocks; both are
+    read.  Only the list form was absent from the workspace this was first
+    measured on, which is exactly why it was missed: a shape your own corpus
+    cannot produce is invisible to any amount of care with your own corpus.
+
+    Returns ``None`` for every other entry, so callers can use it as the
+    queued-form branch without widening what counts as a user turn.
+    """
+    if entry.get("type") != "attachment":
+        return None
+    attachment = entry.get("attachment")
+    if not isinstance(attachment, dict):
+        return None
+    if attachment.get("type") != "queued_command":
+        return None
+    origin = attachment.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return None
+    prompt = attachment.get("prompt")
+    if isinstance(prompt, list):
+        prompt = _joined_text_blocks(prompt)
+    if not isinstance(prompt, str):
+        return None
+    return prompt.strip() or None
+
+
 def _is_real_user_message(entry: dict) -> bool:
     """True if entry is a user turn that starts a new conversation turn.
 
@@ -454,6 +546,9 @@ def _is_real_user_message(entry: dict) -> bool:
     """
     from synapt.recall.scrub import strip_system_artifacts
 
+    queued = _queued_human_prompt(entry)
+    if queued is not None:
+        return bool(strip_system_artifacts(queued))
     if entry.get("type") != "user":
         return False
     msg = entry.get("message", {})
@@ -480,6 +575,9 @@ def _extract_user_text(entry: dict) -> str:
     """
     from synapt.recall.scrub import strip_system_artifacts
 
+    queued = _queued_human_prompt(entry)
+    if queued is not None:
+        return strip_system_artifacts(queued)
     content = entry.get("message", {}).get("content")
     if isinstance(content, str):
         return strip_system_artifacts(content.strip())
@@ -665,6 +763,11 @@ def parse_transcript(
     path: Path,
     seen_uuids: set[str] | None = None,
     subchunk_min_text: int | None = None,
+    *,
+    start_offset: int = 0,
+    stop_offset: int | None = None,
+    turn_index_start: int = 0,
+    session_id_override: str | None = None,
 ) -> list[TranscriptChunk]:
     """Parse a Claude Code transcript JSONL file into semantic chunks.
 
@@ -688,7 +791,7 @@ def parse_transcript(
         seen_uuids = set()
 
     chunks: list[TranscriptChunk] = []
-    session_id = path.stem  # UUID from filename
+    session_id = session_id_override or path.stem  # UUID from filename
     transcript_path = str(path)
 
     # Accumulator for current turn — segments track tool-boundary splits
@@ -700,9 +803,9 @@ def parse_transcript(
     current_tool_summaries: list[str] = []
     # Maps tool_use_id → (tool_name, tool_input) for matching results
     current_tool_use_map: dict[str, tuple[str, dict]] = {}
-    turn_index = 0
-    turn_start_offset = 0
-    current_offset = 0
+    turn_index = turn_index_start
+    turn_start_offset = start_offset
+    current_offset = start_offset
 
     # --- Sub-chunk segment tracking ---
     # Each segment represents one coherent work unit within a turn.
@@ -829,9 +932,14 @@ def parse_transcript(
         saw_tool_result = False
 
     with open(path, encoding="utf-8", newline="") as f:
+        if start_offset:
+            f.seek(start_offset)
         for raw_line in f:
             line_start = current_offset
-            current_offset += len(raw_line.encode("utf-8"))
+            line_bytes = len(raw_line.encode("utf-8"))
+            if stop_offset is not None and current_offset + line_bytes > stop_offset:
+                break
+            current_offset += line_bytes
             line = raw_line.strip()
             if not line:
                 continue
@@ -1025,6 +1133,7 @@ class TranscriptIndex:
     ):
         # Sort by timestamp descending (most recent first)
         self.chunks = sorted(chunks, key=lambda c: c.timestamp, reverse=True)
+        self._oldest_indexed_at = _oldest_indexed_date(self.chunks)
         self._lazy_chunks = lazy_chunks
 
         # Group by session for progressive search
@@ -1060,10 +1169,14 @@ class TranscriptIndex:
         self._last_diagnostics: SearchDiagnostics | None = None
         self._last_search_summary: SearchResultSummary | None = None
         self._last_conflicts: list[tuple[dict, dict]] = []
+        self._last_knowledge_semantic_used = False
 
         # Query result cache — avoids re-computing BM25/embedding/RRF for
         # identical queries within the same index lifetime. LRU with max 32 entries.
-        self._query_cache: dict[tuple, str] = {}
+        self._query_cache: dict[
+            tuple,
+            tuple[str, SearchResultSummary | None, SearchDiagnostics | None],
+        ] = {}
         self._query_cache_max = 32
 
         # Working memory — seeded from recent access_log for cross-session persistence
@@ -1756,6 +1869,7 @@ class TranscriptIndex:
         sessions_searched: int = 0,
         reference_candidates: list[tuple[int, float]] | None = None,
         embeddings_available: bool = True,
+        semantic_search_used: bool = False,
     ) -> list[tuple[int, float]]:
         """Apply threshold filtering and record diagnostics if no candidates exist.
 
@@ -1774,7 +1888,9 @@ class TranscriptIndex:
                 date_filter_active=date_filter_active,
                 sessions_searched=sessions_searched,
                 embeddings_available=embeddings_available,
+                semantic_search_used=semantic_search_used,
                 reason="no_matches",
+                oldest_indexed_at=self._oldest_indexed_at,
             )
             return []
 
@@ -1862,19 +1978,33 @@ class TranscriptIndex:
         # (cold-start: recall_save was called but no conversations ingested)
         has_knowledge = self._db and self._db.knowledge_count() > 0
         if not self.chunks and not has_knowledge:
-            self._last_diagnostics = SearchDiagnostics(reason="empty_index")
+            self._last_diagnostics = SearchDiagnostics(
+                total_chunks=0,
+                total_sessions=0,
+                reason="empty_index",
+                oldest_indexed_at=None,
+            )
             return ""
 
         # Check query cache — skip if max_tokens=0 (diagnostics-only mode)
         cache_key = (
-            query, max_chunks, max_sessions, after, before,
+            query, max_chunks, max_tokens, max_sessions, after, before,
             half_life, threshold_ratio, depth, include_archived,
             include_historical, now, knowledge_boost, max_knowledge,
             agent_id,
         )
         cached = self._query_cache.get(cache_key)
         if cached is not None:
-            return cached
+            cached_result, cached_summary, cached_diagnostics = cached
+            self._last_search_summary = (
+                replace(cached_summary) if cached_summary is not None else None
+            )
+            self._last_diagnostics = (
+                replace(cached_diagnostics)
+                if cached_diagnostics is not None
+                else None
+            )
+            return cached_result
 
         # Query intent classification — adjusts search parameters based on
         # the type of information being sought (recency, embedding weight,
@@ -1944,6 +2074,7 @@ class TranscriptIndex:
                 total_chunks=len(self.chunks),
                 total_sessions=len(self.sessions),
                 reason="empty_query",
+                oldest_indexed_at=self._oldest_indexed_at,
             )
             return ""
 
@@ -1975,7 +2106,21 @@ class TranscriptIndex:
             # Evict oldest entry
             oldest = next(iter(self._query_cache))
             del self._query_cache[oldest]
-        self._query_cache[cache_key] = result
+        cached_summary = (
+            replace(self._last_search_summary)
+            if self._last_search_summary is not None
+            else None
+        )
+        cached_diagnostics = (
+            replace(self._last_diagnostics)
+            if self._last_diagnostics is not None
+            else None
+        )
+        self._query_cache[cache_key] = (
+            result,
+            cached_summary,
+            cached_diagnostics,
+        )
         return result
 
     def _global_lookup(
@@ -2052,6 +2197,7 @@ class TranscriptIndex:
             query_entities=query_entities, intent=intent,
             after=after, before=before,
         )
+        semantic_search_used = self._last_knowledge_semantic_used
 
         # Apply min_confidence filter (grep-style noise reduction)
         if min_confidence > 0 and knowledge_results:
@@ -2065,6 +2211,7 @@ class TranscriptIndex:
             return self._concise_lookup(
                 query, max_chunks, max_tokens, knowledge_results,
                 include_archived,
+                semantic_search_used=semantic_search_used,
             )
 
         fts_results = self._db.fts_search(query, limit=max_chunks * 10)
@@ -2225,6 +2372,7 @@ class TranscriptIndex:
                     emb_raw = embedding_search(
                         q_emb, self._all_embeddings, limit=max_chunks * 10,
                     )
+                semantic_search_used = True
                 emb_ranked = []
                 emb_ranked_ref = []
                 for rowid, sim in emb_raw:
@@ -2268,6 +2416,7 @@ class TranscriptIndex:
             date_filter_active=date_filter is not None,
             reference_candidates=reference_candidates,
             embeddings_available=has_emb,
+            semantic_search_used=semantic_search_used,
         )
 
         # Cross-encoder reranking (Phase 2): rerank after threshold so
@@ -2324,6 +2473,7 @@ class TranscriptIndex:
         max_tokens: int,
         knowledge_results: list[dict] | None = None,
         include_archived: bool = False,
+        semantic_search_used: bool = False,
     ) -> str:
         """Search clusters directly and return only summaries.
 
@@ -2340,6 +2490,16 @@ class TranscriptIndex:
                 query, limit=max_chunks * 3, include_archived=include_archived,
             )
         if not cluster_hits and not knowledge_results:
+            self._last_diagnostics = SearchDiagnostics(
+                total_chunks=len(self.chunks),
+                total_sessions=len(self.sessions),
+                candidates_found=0,
+                search_mode="concise",
+                embeddings_available=bool(self._embed_provider),
+                semantic_search_used=semantic_search_used,
+                reason="no_matches",
+                oldest_indexed_at=self._oldest_indexed_at,
+            )
             return ""
 
         wm = self._working_memory
@@ -2441,6 +2601,15 @@ class TranscriptIndex:
         """Global lookup using in-memory BM25 (legacy fallback)."""
         # BM25 path has no cluster FTS — concise mode requires FTS5
         if depth == "concise":
+            self._last_diagnostics = SearchDiagnostics(
+                total_chunks=len(self.chunks),
+                total_sessions=len(self.sessions),
+                candidates_found=0,
+                search_mode="concise",
+                embeddings_available=False,
+                reason="no_matches",
+                oldest_indexed_at=self._oldest_indexed_at,
+            )
             return ""
 
         scores = self._bm25.score(query_tokens)
@@ -2471,6 +2640,7 @@ class TranscriptIndex:
             scores = self._apply_recency_decay(scores, half_life=half_life, now=now)
 
         # Hybrid search: RRF fusion (same as FTS path but using in-memory BM25)
+        semantic_search_used = False
         if self._embeddings and self._embed_provider:
             try:
                 from synapt.recall.hybrid import (
@@ -2488,6 +2658,7 @@ class TranscriptIndex:
                 # Embedding ranked list (using in-memory embeddings)
                 emb_dict = {i: emb for i, emb in enumerate(self._embeddings)}
                 emb_raw = embedding_search(q_emb, emb_dict, limit=max_chunks * 10)
+                semantic_search_used = True
                 emb_ranked = [
                     (i, s) for i, s in emb_raw
                     if date_filter is None or i in date_filter
@@ -2524,6 +2695,7 @@ class TranscriptIndex:
             date_filter_active=date_filter is not None,
             reference_candidates=reference_ranked,
             embeddings_available=has_emb,
+            semantic_search_used=semantic_search_used,
         )
 
         # Cross-encoder reranking (Phase 2): after threshold (see fts_global)
@@ -2564,6 +2736,7 @@ class TranscriptIndex:
             )
             if self._db else []
         )
+        knowledge_semantic_search_used = self._last_knowledge_semantic_used
 
         if self._db and self._rowid_to_idx:
             return self._progressive_lookup_fts(
@@ -2576,6 +2749,7 @@ class TranscriptIndex:
                 max_knowledge=max_knowledge,
                 intent=intent,
                 agent_id=agent_id,
+                semantic_search_used=knowledge_semantic_search_used,
             )
         return self._progressive_lookup_bm25(
             query, query_tokens, max_chunks, max_tokens, max_sessions,
@@ -2601,6 +2775,7 @@ class TranscriptIndex:
         max_knowledge: int | None = None,
         intent: str = "",
         agent_id: str | None = None,
+        semantic_search_used: bool = False,
     ) -> str:
         """Progressive session search using FTS5 (SQLite backend)."""
         hits: list[tuple[int, float]] = []
@@ -2669,6 +2844,7 @@ class TranscriptIndex:
                     emb_raw = embedding_search(
                         q_emb, self._all_embeddings, limit=max_chunks * 5,
                     )
+                semantic_search_used = True
                 emb_ranked = []
                 emb_ranked_ref = []
                 for rowid, sim in emb_raw:
@@ -2708,6 +2884,7 @@ class TranscriptIndex:
             date_filter_active=date_filter is not None,
             sessions_searched=sessions_searched,
             reference_candidates=reference_hits,
+            semantic_search_used=semantic_search_used,
         )
 
         # Cross-encoder reranking (Phase 2): after threshold (see fts_global)
@@ -2826,6 +3003,7 @@ class TranscriptIndex:
         Knowledge nodes are boosted by ``knowledge_boost`` vs chunk scores.
         If include_historical is True, also returns contradicted/superseded nodes.
         """
+        self._last_knowledge_semantic_used = False
         if not self._db:
             return []
         try:
@@ -2864,6 +3042,7 @@ class TranscriptIndex:
                         q_emb, self._knowledge_embeddings,
                         limit=max_results * search_mult,
                     )
+                    self._last_knowledge_semantic_used = True
                 except Exception:
                     pass
 
@@ -3499,7 +3678,7 @@ class TranscriptIndex:
                            for prev in emitted_token_sets):
                         continue  # Skip near-duplicate
             block_tokens = len(block) // 4
-            if token_count + block_tokens > max_tokens and len(lines) > 1:
+            if token_count + block_tokens > max_tokens and selected_blocks:
                 break
             selected_blocks.append((sort_ts, len(selected_blocks), block))
             token_count += block_tokens
@@ -3969,6 +4148,10 @@ class TranscriptIndex:
             etype = entry.get("type", "")
             if etype in SKIP_TYPES:
                 continue
+            queued_prompt = _queued_human_prompt(entry)
+            if queued_prompt is not None:
+                parts.append(f"\n[User]\n{queued_prompt}")
+                continue
             content = entry.get("message", {}).get("content")
             if etype == "user" and isinstance(content, str) and content.strip():
                 parts.append(f"\n[User]\n{content.strip()}")
@@ -4029,6 +4212,7 @@ class TranscriptIndex:
         if self._db is not None:
             # SQLite path
             self._db.save_chunks(self._materialize_all_chunks())
+            self._db.retire_absorbed_query_tails()
             self._db.save_manifest(manifest)
             self._refresh_rowid_map()
             return

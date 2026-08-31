@@ -45,6 +45,13 @@ COLLAPSE_SIGNATURES: tuple[str, ...] = (
     "</next_steps>",
     "</invoke>",
     "<parameter name=",
+    # Shape C (real store, 2026-08-26): every closing tag dropped, so sibling
+    # fields arrive as BARE OPENING tags inside the unclosed value.  Exact,
+    # case-sensitive field names only; "<donee>" or "<Done>" do not match.
+    "<focus>",
+    "<done>",
+    "<decisions>",
+    "<next_steps>",
 )
 
 # The journal fields a collapse can carry, in schema order.
@@ -58,6 +65,13 @@ _HEAD_BOUNDARY = re.compile(r"</(?:focus|done|decisions|next_steps)>")
 _SEGMENT = re.compile(
     r'<parameter\s+name="(?P<pname>[a-z_]+)"\s*>(?P<pval>.*?)</(?P=pname)>'
     r"|<(?P<tag>[a-z_]+)>(?P<tval>.*?)</(?P=tag)>",
+    re.DOTALL,
+)
+
+# Shape C: an opening field tag with no closer; the value runs to the next
+# opening field tag or the end of the text.
+_BARE_OPENER = re.compile(
+    r"<(?P<name>focus|done|decisions|next_steps)>(?P<val>.*?)(?=<(?:focus|done|decisions|next_steps)>|\Z)",
     re.DOTALL,
 )
 
@@ -104,6 +118,13 @@ def recover_collapsed(text: str) -> tuple[str, dict[str, list[str]]]:
         value = (value or "").strip()
         if value:
             swallowed.setdefault(name, []).append(value)
+    if not swallowed:
+        # Shape C: bare openers, no closers.  Each field runs from its opening
+        # tag to the next opening tag (or the end).
+        for match in _BARE_OPENER.finditer(remainder):
+            value = match.group("val").strip()
+            if value:
+                swallowed.setdefault(match.group("name"), []).append(value)
     return head.strip(), swallowed
 
 
@@ -513,13 +534,16 @@ def format_entry_full(entry: JournalEntry) -> str:
 def format_write_confirmation(
     entry: JournalEntry,
     explicit_next_steps: list[str] | None = None,
+    report: "CarryReport | None" = None,
 ) -> str:
     """Format a write response without conflating carried-forward work.
 
     Journal storage keeps unresolved prior next steps on the new entry so they
     remain visible next session.  The write response needs a clearer UX: steps
     supplied by the caller stay under ``Next``; unresolved prior steps are
-    rendered under a separate carry-forward heading.
+    rendered under a separate carry-forward heading that, when a ``report`` is
+    given, states what the filter did (carried / retired by done / withheld)
+    and how to retire a carried step.
     """
     explicit_steps = [
         step.strip()
@@ -542,32 +566,81 @@ def format_write_confirmation(
                 carried.append(step)
 
     text = format_entry_full(replace(entry, next_steps=display_next))
+    parts = [text]
+    if report is not None:
+        # Always, zeros included: a filter that retired something and a filter
+        # that had nothing to do must not render identically (recall#984).
+        parts.append(f"\nCarry-forward: {report.carried} carried, "
+                     f"{report.retired_by_done} retired by done, {report.withheld} withheld.")
     if carried:
-        parts = [text, "\n### Carried Forward Next Steps"]
+        parts.append("\n### Carried Forward Next Steps")
         parts.extend(f"- {step}" for step in carried)
-        return "\n".join(part for part in parts if part)
-    return text
+        parts.append("To retire a carried step next time, list its exact text under done.")
+    return "\n".join(part for part in parts if part)
+
+
+# recall#984: a carried step carries its age, the carry is bounded, and the bound
+# announces itself.  Retirement stays EXACT on purpose: a near-miss must never
+# retire (a wrongly retired step is gone; a stale one is at least visible).
+CARRY_LIMIT = 20
+WITHHELD_PREFIX = "[carry bound]"
+_STAMP_RE = re.compile(r"\s*\[carried since (\d{4}-\d{2}-\d{2})\]\s*$")
+
+
+def strip_carry_stamp(step: str) -> tuple[str, str | None]:
+    """Split ``"text [carried since YYYY-MM-DD]"`` into ``(text, date)``.
+
+    Returns ``(step, None)`` when there is no stamp.
+    """
+    m = _STAMP_RE.search(step)
+    if not m:
+        return step.strip(), None
+    return step[: m.start()].strip(), m.group(1)
+
+
+def is_withheld_marker(step: str) -> bool:
+    """True for the synthetic line that announces a bounded carry."""
+    return step.strip().startswith(WITHHELD_PREFIX)
 
 
 def _step_key(step: str) -> str:
-    """Normalize a next-step string for exact matching."""
-    return " ".join(step.split()).casefold()
+    """Normalize a next-step string for exact matching (the age stamp is ignored,
+    so ``done`` can name a carried step with or without its stamp)."""
+    bare, _ = strip_carry_stamp(step)
+    return " ".join(bare.split()).casefold()
 
 
-def merge_carried_forward_next_steps(
+@dataclass
+class CarryReport:
+    """What the carry-forward filter did, so a filter that removed nothing can
+    say so instead of looking identical to one with nothing to remove."""
+
+    carried: int = 0
+    retired_by_done: int = 0
+    withheld: int = 0
+    oldest_since: str | None = None
+
+
+def merge_carried_forward_with_report(
     current_next_steps: list[str],
     current_done: list[str],
     previous_entry: JournalEntry | None,
-) -> list[str]:
+) -> tuple[list[str], CarryReport]:
     """Merge unresolved prior-session next steps into the current entry.
 
     Carries forward prior next steps unless the current entry already includes
-    them or marks them done. New next steps stay first; carried items append.
+    them or marks them done (exact text, stamp ignored).  New next steps stay
+    first; carried items append in the previous entry's order, each stamped
+    ``[carried since YYYY-MM-DD]`` with the date of the entry it was first
+    written in (an existing stamp is preserved, never refreshed).  At most
+    ``CARRY_LIMIT`` carried items are kept; the rest are withheld and a final
+    marker line says how many and the oldest date, so the truncation is visible.
     """
+    report = CarryReport()
     merged = [
         step.strip()
         for step in current_next_steps
-        if step and step.strip() and not is_collapsed(step)
+        if step and step.strip() and not is_collapsed(step) and not is_withheld_marker(step)
     ]
     seen = {_step_key(step) for step in merged}
     # Matching still uses the RAW done list: a collapsed value recorded there
@@ -575,21 +648,54 @@ def merge_carried_forward_next_steps(
     done = {_step_key(item) for item in current_done if item and item.strip()}
 
     if not previous_entry or not previous_entry.next_steps:
-        return merged
+        return merged, report
 
+    origin_date = (previous_entry.timestamp or "")[:10]
+    carried: list[tuple[str, str]] = []  # (stamped text, since)
     for step in previous_entry.next_steps:
         clean = step.strip()
-        if not clean:
+        if not clean or is_withheld_marker(clean):
+            # The marker describes the PREVIOUS carry; it is regenerated below.
             continue
         if is_collapsed(clean):
             # The replication vector: a malformed step can never appear in a
             # done list, so without this it rides forward every session.
             continue
         key = _step_key(clean)
-        if key in seen or key in done:
+        if key in seen:
             continue
-        merged.append(clean)
+        if key in done:
+            report.retired_by_done += 1
+            continue
+        bare, since = strip_carry_stamp(clean)
+        since = since or origin_date
+        stamped = f"{bare} [carried since {since}]" if since else bare
+        carried.append((stamped, since))
         seen.add(key)
+
+    kept, withheld = carried[:CARRY_LIMIT], carried[CARRY_LIMIT:]
+    merged.extend(text for text, _ in kept)
+    report.carried = len(kept)
+    report.withheld = len(withheld)
+    dates = sorted(d for _, d in carried if d)
+    report.oldest_since = dates[0] if dates else None
+    if withheld:
+        oldest_withheld = min((d for _, d in withheld if d), default=None)
+        marker = f"{WITHHELD_PREFIX} {len(withheld)} carried steps withheld"
+        if oldest_withheld:
+            marker += f"; oldest since {oldest_withheld}"
+        marker += "; recall_journal action=pending lists every unresolved step"
+        merged.append(marker)
+    return merged, report
+
+
+def merge_carried_forward_next_steps(
+    current_next_steps: list[str],
+    current_done: list[str],
+    previous_entry: JournalEntry | None,
+) -> list[str]:
+    """Back-compatible wrapper: the merged list only (see the ``_with_report`` form)."""
+    merged, _ = merge_carried_forward_with_report(current_next_steps, current_done, previous_entry)
     return merged
 
 
@@ -620,6 +726,8 @@ def pending_next_steps(path: Path | None = None) -> list[str]:
                 continue
             if is_collapsed(step):
                 continue  # never serve tool-call markup
+            if is_withheld_marker(step):
+                continue  # the bound's own announcement is not a step
             key = _step_key(step)
             if key in all_done or key in seen:
                 continue
@@ -701,12 +809,26 @@ def repair_journal(path: Path | None = None, dry_run: bool = False) -> dict:
 
     # The recovered text must itself be clean — a repair pass that injected
     # what the guard refuses would be laundering the contamination.
+    def clean(name: str) -> list[str]:
+        return [v for v in recovered.get(name, []) if not is_collapsed(v)]
+
+    # Parsing a field is not recovering it (Atlas, r2 on v1 of shape C): the
+    # report counted a swallowed <done> that this entry then never carried.
+    # Every recovered field lands on the corrective entry's OWN surface for
+    # that field. ``done`` keeps the contaminated values FIRST and verbatim --
+    # they are the loop-breaking marker -- and the clean recovered done values
+    # follow them. ``focus`` is a scalar, so recovered focus text is appended
+    # to the repair's own focus rather than replacing it.
+    focus = "Journal field-collapse repair"
+    recovered_focus = clean("focus")
+    if recovered_focus:
+        focus += " (recovered focus: " + " | ".join(recovered_focus) + ")"
     corrective = JournalEntry(
         timestamp=datetime.now(timezone.utc).isoformat(),
-        focus="Journal field-collapse repair",
-        done=collapsed_values,
-        decisions=[v for v in recovered.get("decisions", []) if not is_collapsed(v)],
-        next_steps=[v for v in recovered.get("next_steps", []) if not is_collapsed(v)],
+        focus=focus,
+        done=collapsed_values + clean("done"),
+        decisions=clean("decisions"),
+        next_steps=clean("next_steps"),
         repair=True,
     )
     append_entry(corrective, path, allow_collapsed=True)

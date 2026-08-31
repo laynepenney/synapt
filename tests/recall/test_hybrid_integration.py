@@ -354,12 +354,36 @@ class TestQueryCache:
         assert result1 == result2
         assert result1  # Non-empty
 
+    def test_cache_hit_restores_search_summary(self, tmp_path):
+        """A cached result must carry the summary that describes its payload."""
+        index = _build_index(tmp_path)
+
+        result1 = index.lookup("database schema", max_chunks=5)
+        summary1 = index._last_search_summary
+        result2 = index.lookup("database schema", max_chunks=5)
+        summary2 = index._last_search_summary
+
+        assert result2 == result1
+        assert summary1 is not None
+        assert summary2 == summary1
+        assert summary2 is not summary1
+
     def test_different_params_different_cache(self, tmp_path):
         """Different max_chunks should not hit cache."""
         index = _build_index(tmp_path)
         result1 = index.lookup("database schema", max_chunks=2)
         result2 = index.lookup("database schema", max_chunks=5)
         # Different params → different results (or at least different cache entries)
+        assert len(index._query_cache) == 2
+
+    def test_different_max_tokens_different_cache(self, tmp_path):
+        """Changing the budget misses; repeating that budget hits."""
+        index = _build_index(tmp_path)
+        index.lookup("database schema", max_chunks=5, max_tokens=10)
+        assert len(index._query_cache) == 1
+        index.lookup("database schema", max_chunks=5, max_tokens=10_000)
+        assert len(index._query_cache) == 2
+        index.lookup("database schema", max_chunks=5, max_tokens=10_000)
         assert len(index._query_cache) == 2
 
     def test_cache_eviction(self, tmp_path):
@@ -387,7 +411,14 @@ class TestRecallQuickIntentRouting:
         mock_index = MagicMock()
         mock_index.lookup.return_value = "some result"
 
-        with patch("synapt.recall.server._get_index", return_value=mock_index):
+        with (
+            patch("synapt.recall.server._get_index", return_value=mock_index),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             recall_quick("what is the database port")
 
         call_kwargs = mock_index.lookup.call_args.kwargs
@@ -401,7 +432,14 @@ class TestRecallQuickIntentRouting:
         mock_index = MagicMock()
         mock_index.lookup.return_value = "some result"
 
-        with patch("synapt.recall.server._get_index", return_value=mock_index):
+        with (
+            patch("synapt.recall.server._get_index", return_value=mock_index),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             recall_quick("what's pending")
 
         call_kwargs = mock_index.lookup.call_args.kwargs
@@ -416,7 +454,14 @@ class TestRecallQuickIntentRouting:
         mock_index = MagicMock()
         mock_index.lookup.return_value = "some result"
 
-        with patch("synapt.recall.server._get_index", return_value=mock_index):
+        with (
+            patch("synapt.recall.server._get_index", return_value=mock_index),
+            patch("synapt.recall.server.project_index_dir", return_value=None),
+            patch(
+                "synapt.recall.server._query_freshness_line",
+                return_value="Freshness: NOT_BOUND test",
+            ),
+        ):
             recall_quick("why did the build fail")
 
         call_kwargs = mock_index.lookup.call_args.kwargs

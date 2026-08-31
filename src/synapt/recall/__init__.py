@@ -1,6 +1,6 @@
 """synapt.recall — persistent conversational memory for Claude Code and ChatGPT sessions."""
 
-__version__ = "0.21.0"
+__version__ = "0.22.0"
 
 from synapt.recall.core import (
     TranscriptChunk,

@@ -35,12 +35,16 @@ from unittest import mock
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.journal import JournalEntry, append_entry
 from synapt.recall.resume import (
+    CallerTranscript,
     ResumeError,
     build_resume_view,
+    caller_transcripts,
     format_resume,
     is_harness_authored,
     load_resume_index,
     resolve_session,
+    _latest_event_timestamp,
+    _source_label,
 )
 
 SESSION_A = "aaaaaaaa-1111-2222-3333-444444444444"
@@ -60,6 +64,7 @@ def _chunk(
     tools_used: list[str] | None = None,
     timestamp: str = "2026-08-05T10:00:00Z",
     tool_content: str = "",
+    transcript_path: str = "",
 ) -> TranscriptChunk:
     """Build a chunk the way the parsers do (short-id prefix, ``:t<n>`` suffix)."""
     return TranscriptChunk(
@@ -71,6 +76,7 @@ def _chunk(
         assistant_text=assistant_text,
         tools_used=list(tools_used or []),
         tool_content=tool_content,
+        transcript_path=transcript_path,
     )
 
 
@@ -122,6 +128,341 @@ class TestSessionSelection(unittest.TestCase):
 
     def test_default_resolves_to_newest_session(self):
         self.assertEqual(resolve_session(self.index, None), SESSION_B)
+
+    def test_default_prefers_newest_caller_session_over_newer_foreign_session(self):
+        self.assertEqual(resolve_session(self.index, None, {SESSION_A}), SESSION_A)
+
+    def test_default_falls_back_store_wide_only_when_caller_has_no_indexed_session(self):
+        self.assertEqual(resolve_session(self.index, None, {"not-indexed"}), SESSION_B)
+
+    def test_caller_unindexed_newer_transcript_is_named_on_first_line(self):
+        source = CallerTranscript(
+            session_id="cccccccc-1111-2222-3333-444444444444",
+            path=Path("/source/cccc.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+        )
+        view = build_resume_view(
+            self.index,
+            caller_sources=[source],
+            journal_path=None,
+        )
+        first = format_resume(view).splitlines()[0]
+        self.assertIn("CALLER SOURCE STALE", first)
+        self.assertIn("cccccccc", first)
+        self.assertIn("14000000 bytes", first)
+
+    def test_caller_present_but_live_extent_newer_is_named_on_first_line(self):
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-05T12:00:00Z",
+        )
+        view = build_resume_view(
+            self.index,
+            caller_sources=[source],
+            journal_path=None,
+        )
+
+        first = format_resume(view).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn(SESSION_A[:8], first)
+        self.assertIn("2026-08-01T10:00:00Z", first)
+        self.assertIn("2026-08-05T12:00:00Z", first)
+        self.assertIn("synapt recall build --no-embeddings", first)
+
+    def test_caller_matching_live_and_indexed_extents_has_no_partial_warning(self):
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T10:00:00Z",
+        )
+        first = format_resume(
+            build_resume_view(
+                self.index,
+                caller_sources=[source],
+                journal_path=None,
+            )
+        ).splitlines()[0]
+
+        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+
+    def test_mixed_iso_offsets_compare_by_instant_not_spelling(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "earlier instant",
+                "answer",
+                timestamp="2026-08-01T12:00:00+02:00",
+            ),
+            _chunk(
+                SESSION_A,
+                1,
+                "later instant",
+                "answer",
+                timestamp="2026-08-01T11:00:00Z",
+            ),
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T10:30:00Z",
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+
+    def test_partial_warning_preserves_mixed_offset_spellings(self):
+        indexed = "2026-08-01T12:00:00+01:00"
+        live = "2026-08-01T12:30:00+01:00"
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "indexed question",
+                "indexed answer",
+                timestamp=indexed,
+            )
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp=live,
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn(f"indexed through {indexed}", first)
+        self.assertIn(f"live through {live}", first)
+
+    def test_sidecar_only_session_names_missing_searchable_endpoint(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                -2,
+                "sidecar",
+                "projection",
+                timestamp="2026-08-01T12:00:00Z",
+            )
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T11:00:00Z",
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("indexed through no searchable transcript endpoint", first)
+        self.assertIn("live through 2026-08-01T11:00:00Z", first)
+
+    def test_sidecar_projection_timestamp_cannot_hide_partial_transcript(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "indexed question",
+                "indexed answer",
+                timestamp="2026-08-01T10:00:00Z",
+            ),
+            _chunk(
+                SESSION_A,
+                -2,
+                "sidecar",
+                "projection",
+                timestamp="2026-08-01T12:00:00Z",
+            ),
+        ])
+        source = CallerTranscript(
+            session_id=SESSION_A,
+            path=Path("/caller/a.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-01T11:00:00Z",
+        )
+
+        first = format_resume(
+            build_resume_view(index, caller_sources=[source], journal_path=None)
+        ).splitlines()[0]
+
+        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("indexed through 2026-08-01T10:00:00Z", first)
+
+    def test_foreign_live_extent_is_not_a_caller_partial_warning(self):
+        source = CallerTranscript(
+            session_id=SESSION_B,
+            path=Path("/foreign/b.jsonl"),
+            mtime=2_000_000_000.0,
+            size=14_000_000,
+            latest_timestamp="2026-08-06T12:00:00Z",
+        )
+        first = format_resume(
+            build_resume_view(
+                self.index,
+                session_id=SESSION_A,
+                caller_sources=[source],
+                journal_path=None,
+            )
+        ).splitlines()[0]
+
+        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+
+    def test_latest_event_timestamp_reads_backward_over_large_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"timestamp": "2026-08-01T10:00:00Z"})
+                + "\n"
+                + json.dumps(
+                    {
+                        "timestamp": "2026-08-05T12:00:00Z",
+                        "payload": "x" * 70_000,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _latest_event_timestamp(transcript),
+                "2026-08-05T12:00:00Z",
+            )
+
+    def test_store_fallback_names_selected_worktree_on_first_line(self):
+        index = _index([
+            _chunk(
+                SESSION_B,
+                0,
+                "q",
+                "a",
+                transcript_path="/repo/.synapt/recall/worktrees/foreign/transcripts/b.jsonl",
+            )
+        ])
+        first = format_resume(
+            build_resume_view(index, caller_sources=[], journal_path=None)
+        ).splitlines()[0]
+        self.assertIn("store fallback from worktree:foreign", first)
+
+    def test_caller_discovery_excludes_codex_sessions_from_another_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            caller = root / "caller"
+            caller.mkdir()
+            codex = root / "codex"
+            codex.mkdir()
+            own = codex / "rollout-own.jsonl"
+            foreign = codex / "rollout-foreign.jsonl"
+            own.write_text("{}\n")
+            foreign.write_text("{}\n")
+
+            def cwd_for(path):
+                return caller.resolve() if path == own else (root / "foreign").resolve()
+
+            def sid_for(path):
+                return "own-session" if Path(path) == own else "foreign-session"
+
+            with (
+                mock.patch("synapt.recall.core.project_transcript_dir", return_value=None),
+                mock.patch("synapt.recall.codex.discover_codex_sessions", return_value=codex),
+                mock.patch("synapt.recall.codex._session_cwd", side_effect=cwd_for),
+                mock.patch("synapt.recall.journal.extract_session_id", side_effect=sid_for),
+            ):
+                found = caller_transcripts(caller)
+
+            self.assertEqual([item.session_id for item in found], ["own-session"])
+
+    def test_caller_discovery_skips_source_removed_after_stat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            caller = root / "caller"
+            caller.mkdir()
+            transcript_root = root / "transcripts"
+            transcript_root.mkdir()
+            transcript = transcript_root / "session.jsonl"
+            transcript.write_text("{}\n")
+
+            with (
+                mock.patch(
+                    "synapt.recall.core.project_transcript_dir",
+                    return_value=transcript_root,
+                ),
+                mock.patch(
+                    "synapt.recall.codex.discover_codex_sessions",
+                    return_value=None,
+                ),
+                mock.patch(
+                    "synapt.recall.journal.extract_session_id",
+                    return_value=SESSION_A,
+                ),
+                mock.patch(
+                    "synapt.recall.resume._latest_event_timestamp",
+                    side_effect=FileNotFoundError("removed after stat"),
+                ),
+            ):
+                found = caller_transcripts(caller)
+
+            self.assertEqual(found, [])
+
+    def test_source_labels_do_not_print_absolute_non_worktree_paths(self):
+        self.assertEqual(
+            _source_label(
+                "/Users/example/.claude/projects/"
+                "-Users-example-Development-synapt/session.jsonl"
+            ),
+            "project:-Users-example-Development-synapt",
+        )
+        self.assertEqual(
+            _source_label("/var/transcripts/session.jsonl"),
+            "source:transcripts",
+        )
+
+    def test_bounded_session_listing_derives_compact_source_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _save_sqlite_index([
+                _chunk(
+                    SESSION_A,
+                    0,
+                    "question",
+                    "answer",
+                    transcript_path=(
+                        "/Users/example/.claude/projects/"
+                        "-Users-example-Development-synapt/session.jsonl"
+                    ),
+                )
+            ], root)
+
+            index = load_resume_index(root)
+            try:
+                rows = index.list_sessions()
+            finally:
+                index.close()
+
+        self.assertEqual(
+            rows[0]["source_root"],
+            "project:-Users-example-Development-synapt",
+        )
 
     def test_control_newest_is_not_the_named_session(self):
         """Without this the selection tests could pass by coincidence."""

@@ -993,7 +993,10 @@ def test_cmd_journal_write_carries_forward_unresolved_next_steps(tmp_path, capsy
 
     latest = read_latest(journal_path)
     assert latest is not None
-    assert latest.next_steps == ["close loop", "follow up with team"]
+    # recall#984: the carried step carries the date of the entry it came from
+    assert latest.next_steps[0] == "close loop"
+    assert len(latest.next_steps) == 2
+    assert latest.next_steps[1].startswith("follow up with team [carried since ")
 
     captured = capsys.readouterr()
     assert "Journal entry written" in captured.err

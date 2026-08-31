@@ -564,7 +564,8 @@ class TestNextStepCarryForward(unittest.TestCase):
             previous_entry=previous,
         )
 
-        self.assertEqual(merged, ["write tests", "follow up with team"])
+        # recall#984: a carried step carries the date of the entry it came from
+        self.assertEqual(merged, ["write tests", "follow up with team [carried since 2026-03-01]"])
 
     def test_merge_deduplicates_existing_next_steps(self):
         previous = JournalEntry(
@@ -578,7 +579,7 @@ class TestNextStepCarryForward(unittest.TestCase):
             previous_entry=previous,
         )
 
-        self.assertEqual(merged, ["write tests", "close loop", "follow up with team"])
+        self.assertEqual(merged, ["write tests", "close loop", "follow up with team [carried since 2026-03-01]"])
 
 
 class TestJournalWriteResponse(unittest.TestCase):
@@ -637,10 +638,13 @@ class TestJournalWriteResponse(unittest.TestCase):
             [
                 "write the crisis eval",
                 "update the B3 row",
-                "retrieve the missing design docs",
-                "estimate effort for prompt profiles",
+                "retrieve the missing design docs [carried since 2026-05-06]",
+                "estimate effort for prompt profiles [carried since 2026-05-06]",
             ],
         )
+        # recall#984: the confirmation says what the filter did and how to retire
+        self.assertIn("Carry-forward: 2 carried, 0 retired by done, 0 withheld", response)
+        self.assertIn("list its exact text under done", response)
 
 
 class TestPendingNextSteps(unittest.TestCase):
@@ -798,3 +802,96 @@ class TestBoundedReadLeadsWithOpenThreads(unittest.TestCase):
             text.index("### Done"),
             "two surfaces that teach different priorities are their own defect",
         )
+
+
+class TestCarryForwardAgingAndBound(unittest.TestCase):
+    """recall#984: carried next steps carry their age, the carry is bounded and announces
+    what it withheld, retirement stays exact (a near-miss never retires), and the write
+    confirmation reports what the filter did."""
+
+    def _entry(self, ts, next_steps, done=()):
+        return JournalEntry(timestamp=ts, next_steps=list(next_steps), done=list(done))
+
+    def test_carried_step_is_stamped_with_origin_date_once(self):
+        from synapt.recall.journal import merge_carried_forward_with_report
+        prev = self._entry("2026-08-20T09:00:00+00:00", ["follow up with team"])
+        merged, report = merge_carried_forward_with_report(["write tests"], [], prev)
+        self.assertEqual(merged, ["write tests", "follow up with team [carried since 2026-08-20]"])
+        self.assertEqual(report.carried, 1)
+        # a second merge must keep the ORIGINAL date, not re-stamp with the newer entry's
+        prev2 = self._entry("2026-08-25T09:00:00+00:00", merged)
+        merged2, _ = merge_carried_forward_with_report([], [], prev2)
+        self.assertEqual(merged2, ["write tests [carried since 2026-08-25]",
+                                   "follow up with team [carried since 2026-08-20]"])
+
+    def test_done_retires_stamped_step_by_bare_text_or_stamped_text(self):
+        from synapt.recall.journal import merge_carried_forward_with_report
+        prev = self._entry("2026-08-20T09:00:00+00:00",
+                           ["ship docs [carried since 2026-08-10]", "follow up with team [carried since 2026-08-11]"])
+        merged, report = merge_carried_forward_with_report(
+            [], ["Ship docs", "follow up with team [carried since 2026-08-11]"], prev)
+        self.assertEqual(merged, [])
+        self.assertEqual(report.retired_by_done, 2)
+
+    def test_near_miss_does_not_retire(self):
+        """The issue's explicit ask: rewording must NOT retire; only exact text does."""
+        from synapt.recall.journal import merge_carried_forward_with_report
+        prev = self._entry("2026-08-20T09:00:00+00:00", ["work out why the index rebuild stalls on cold start"])
+        merged, report = merge_carried_forward_with_report(
+            [], ["cold start was re-running schema DDL across every shard; cut to one pass"], prev)
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(merged[0].startswith("work out why the index rebuild stalls"))
+        self.assertEqual(report.retired_by_done, 0)
+
+    def test_carry_is_bounded_and_announces_withheld(self):
+        from synapt.recall.journal import merge_carried_forward_with_report, CARRY_LIMIT, is_withheld_marker
+        steps = [f"step {i:02d} [carried since 2026-07-{(i % 28) + 1:02d}]" for i in range(CARRY_LIMIT + 5)]
+        prev = self._entry("2026-08-20T09:00:00+00:00", steps)
+        merged, report = merge_carried_forward_with_report(["new one"], [], prev)
+        kept = [s for s in merged if not is_withheld_marker(s)]
+        markers = [s for s in merged if is_withheld_marker(s)]
+        self.assertEqual(kept[0], "new one")
+        self.assertEqual(len(kept), 1 + CARRY_LIMIT)          # authored + the first CARRY_LIMIT carried
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(merged[-1], markers[0])                # marker is last
+        self.assertIn("5 carried steps withheld", markers[0])
+        self.assertIn("2026-07-", markers[0])                   # names the oldest withheld date
+        self.assertEqual(report.withheld, 5)
+        # the marker is never itself carried into the next entry
+        prev2 = self._entry("2026-08-21T09:00:00+00:00", merged)
+        merged2, report2 = merge_carried_forward_with_report([], [], prev2)
+        self.assertFalse(any("withheld" in s and is_withheld_marker(s) for s in merged2[:-1]))
+        self.assertEqual(sum(1 for s in merged2 if is_withheld_marker(s)), 1)
+
+    def test_pending_skips_marker_and_keeps_stamps(self):
+        from synapt.recall.journal import pending_next_steps, append_entry, WITHHELD_PREFIX
+        tmp = Path(tempfile.mkdtemp()) / "journal.jsonl"
+        append_entry(self._entry("2026-08-20T09:00:00+00:00",
+                                 ["task A [carried since 2026-08-01]", f"{WITHHELD_PREFIX} 3 carried steps withheld; oldest since 2026-07-01"]),
+                     tmp)
+        self.assertEqual(pending_next_steps(tmp), ["task A [carried since 2026-08-01]"])
+
+    def test_write_confirmation_reports_filter_counts_and_retire_hint(self):
+        from synapt.recall.journal import format_write_confirmation, CarryReport
+        entry = self._entry("2026-08-26T09:00:00+00:00", ["mine", "old thing [carried since 2026-08-01]"])
+        text = format_write_confirmation(entry, explicit_next_steps=["mine"],
+                                         report=CarryReport(carried=1, retired_by_done=0, withheld=0, oldest_since="2026-08-01"))
+        self.assertIn("Carry-forward: 1 carried, 0 retired by done, 0 withheld", text)
+        self.assertIn("### Carried Forward Next Steps", text)
+        self.assertIn("old thing [carried since 2026-08-01]", text)
+        self.assertIn("list its exact text under done", text)
+
+    def test_write_confirmation_reports_counts_even_when_nothing_is_carried(self):
+        """Atlas r1 on the gate: 0 carried / 1 retired rendered nothing, so a filter that
+        retired something looked identical to one with nothing to do."""
+        from synapt.recall.journal import format_write_confirmation, CarryReport
+        entry = self._entry("2026-08-26T09:00:00+00:00", ["mine"])
+        text = format_write_confirmation(entry, explicit_next_steps=["mine"],
+                                         report=CarryReport(carried=0, retired_by_done=1, withheld=0))
+        self.assertIn("Carry-forward: 0 carried, 1 retired by done, 0 withheld", text)
+        self.assertNotIn("### Carried Forward Next Steps", text)
+        # and the all-zero case prints its zeros too: "nothing to do" must be legible
+        text0 = format_write_confirmation(entry, explicit_next_steps=["mine"], report=CarryReport())
+        self.assertIn("Carry-forward: 0 carried, 0 retired by done, 0 withheld", text0)
+        # no report supplied (legacy callers): no counts line at all
+        self.assertNotIn("Carry-forward:", format_write_confirmation(entry, explicit_next_steps=["mine"]))

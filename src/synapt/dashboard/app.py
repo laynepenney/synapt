@@ -41,6 +41,7 @@ from synapt.recall.channel import (
     _resolve_project_id,
 )
 from synapt.recall.registry import list_agents as _registry_list_agents
+from synapt.recall.session_start import _pid_alive
 
 _MD = _md.Markdown(extensions=["fenced_code", "tables", "nl2br"])
 
@@ -220,11 +221,7 @@ def _agent_color(name: str) -> str:
 
 def _is_pid_alive(pid: int) -> bool:
     """Check if a process with the given PID is still running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, OSError):
-        return False
+    return _pid_alive(pid)
 
 
 def _combined_agents_json_sync(tmux_session: str | None = None) -> list[dict]:
@@ -490,14 +487,8 @@ def _read_pid(pid_path: Path) -> int | None:
 
 
 def _pid_is_running(pid: int) -> bool:
-    """Return True when the process exists and is signalable."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    """Return True when the process is alive."""
+    return _pid_alive(pid)
 
 
 def _cleanup_stale_pidfile(pid_path: Path) -> None:

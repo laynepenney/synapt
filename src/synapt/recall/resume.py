@@ -14,15 +14,17 @@ one. So the rules below are deliberately asymmetric — they prefer showing
 something slightly noisy over hiding something real, and they label an inferred
 pairing rather than presenting it as a proven one.
 
-Runtime independence is structural, not special-cased: this module reads chunks
-and never a transcript, so anything the parsers produce — Claude Code sessions
-via ``parse_transcript``, Codex CLI rollouts via ``parse_codex_transcript`` —
-resumes identically.
+Runtime independence is structural at the rendered-tail boundary: anything the
+parsers produce resumes identically. Caller freshness additionally reads the
+last top-level timestamp from the caller-scoped live JSONL source. It does not
+interpret runtime-specific event payloads.
 """
 
 from __future__ import annotations
 
+import json
 import re
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -105,6 +107,132 @@ class ResumeView:
     # surface that was decided. ``None`` means NOT CHECKED -- which is not the
     # same as fresh, and the renderer must not treat it as such.
     freshness: "IndexFreshness | None" = None
+    selection_scope: str = "explicit"
+    source_label: str = "unknown"
+    caller_unindexed: list["CallerTranscript"] = field(default_factory=list)
+    caller_partial: "CallerExtentGap | None" = None
+
+
+@dataclass(frozen=True)
+class CallerTranscript:
+    session_id: str
+    path: Path
+    mtime: float
+    size: int
+    latest_timestamp: str = ""
+
+
+@dataclass(frozen=True)
+class CallerExtentGap:
+    source: CallerTranscript
+    indexed_latest: str
+    live_latest: str
+
+
+def _latest_event_timestamp(path: Path, *, block_size: int = 64 * 1024) -> str:
+    """Read backward until a JSONL event with a top-level timestamp appears."""
+    with path.open("rb") as stream:
+        position = stream.seek(0, 2)
+        suffix = b""
+        while position:
+            start = max(0, position - block_size)
+            stream.seek(start)
+            data = stream.read(position - start) + suffix
+            lines = data.splitlines()
+            suffix = lines.pop(0) if start and lines else b""
+            for line in reversed(lines):
+                try:
+                    event = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                timestamp = event.get("timestamp") if isinstance(event, dict) else None
+                if isinstance(timestamp, str) and timestamp:
+                    return timestamp
+            position = start
+        if suffix:
+            try:
+                event = json.loads(suffix)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                event = None
+            timestamp = event.get("timestamp") if isinstance(event, dict) else None
+            if isinstance(timestamp, str) and timestamp:
+                return timestamp
+    return ""
+
+
+def _timestamp_epoch(value: str) -> float:
+    if not value:
+        return 0.0
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
+def caller_transcripts(project_dir: Path | None = None) -> list[CallerTranscript]:
+    """Discover transcripts rooted at the caller, not the shared gripspace."""
+    from synapt.recall.codex import _session_cwd, discover_codex_sessions
+    from synapt.recall.core import project_transcript_dir
+    from synapt.recall.journal import extract_session_id
+
+    caller = (project_dir or Path.cwd()).resolve()
+    paths: list[Path] = []
+    claude_root = project_transcript_dir(caller)
+    if claude_root is not None:
+        paths.extend(sorted(claude_root.glob("*.jsonl")))
+    codex_root = discover_codex_sessions()
+    if codex_root is not None:
+        for path in sorted(codex_root.rglob("rollout-*.jsonl")):
+            if _session_cwd(path) == caller:
+                paths.append(path)
+
+    found: list[CallerTranscript] = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            session_id = extract_session_id(str(path))
+            latest_timestamp = _latest_event_timestamp(path)
+        except OSError:
+            continue
+        if session_id:
+            found.append(
+                CallerTranscript(
+                    session_id,
+                    path,
+                    stat.st_mtime,
+                    stat.st_size,
+                    latest_timestamp,
+                )
+            )
+    return sorted(found, key=lambda item: item.mtime, reverse=True)
+
+
+def _source_label(path: str) -> str:
+    if not path:
+        return "unknown"
+    parts = Path(path).parts
+    try:
+        pos = parts.index("worktrees")
+    except ValueError:
+        pos = -1
+    if pos >= 0 and len(parts) > pos + 2 and parts[pos + 2] == "transcripts":
+        return f"worktree:{parts[pos + 1]}"
+
+    # Claude stores one directory per project below ``.claude/projects``. The
+    # directory name is already the runtime's project slug, so printing the
+    # absolute parent adds a home-directory prefix without adding identity.
+    try:
+        project_pos = parts.index("projects")
+    except ValueError:
+        project_pos = -1
+    if project_pos >= 0 and len(parts) > project_pos + 1:
+        return f"project:{parts[project_pos + 1]}"
+
+    parent_name = Path(path).parent.name
+    return f"source:{parent_name}" if parent_name else "source:unknown"
 
 
 class BoundedResumeIndex:
@@ -175,6 +303,10 @@ class BoundedResumeIndex:
                     "turn_count": overview["turn_count"],
                     "first_message": first_message,
                     "files_count": len(files),
+                    "source_root": _source_label(next(
+                        (chunk["transcript_path"] for chunk in chunks if chunk.get("transcript_path")),
+                        overview.get("transcript_path", ""),
+                    )),
                 }
             )
         return results
@@ -285,7 +417,11 @@ def _carries_intent(entry: JournalEntry) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def resolve_session(index: TranscriptIndex, session_id: str | None) -> str:
+def resolve_session(
+    index: TranscriptIndex,
+    session_id: str | None,
+    caller_session_ids: set[str] | None = None,
+) -> str:
     """Resolve a session id, accepting an exact id or a unique prefix.
 
     Prefixes are supported because ``recall sessions`` prints eight characters —
@@ -309,6 +445,10 @@ def resolve_session(index: TranscriptIndex, session_id: str | None) -> str:
         raise ResumeError("No sessions indexed yet. Nothing to resume.")
 
     if not session_id:
+        if caller_session_ids:
+            for sid in order:
+                if sid in caller_session_ids and not is_channel_session(sid):
+                    return sid
         for sid in order:
             if not is_channel_session(sid):
                 return sid
@@ -380,6 +520,7 @@ def build_resume_view(
     session_id: str | None = None,
     limit: int = DEFAULT_TURNS,
     journal_path: Path | None = None,
+    caller_sources: list[CallerTranscript] | None = None,
 ) -> ResumeView:
     """Assemble the tail of a session, newest last.
 
@@ -390,8 +531,15 @@ def build_resume_view(
     if limit < 1:
         raise ResumeError(f"--turns must be at least 1 (got {limit}).")
 
-    resolved = resolve_session(index, session_id)
-    is_newest = bool(index._session_order) and index._session_order[0] == resolved
+    caller_ids = {item.session_id for item in caller_sources or []}
+    resolved = resolve_session(index, session_id, caller_ids if session_id is None else None)
+    if session_id is not None:
+        selection_scope = "explicit"
+    else:
+        selection_scope = "caller" if resolved in caller_ids else "store"
+    is_newest = (
+        session_id is None and selection_scope == "caller"
+    ) or (bool(index._session_order) and index._session_order[0] == resolved)
 
     chunks = index.session_tail(resolved)
     kept = [
@@ -434,6 +582,34 @@ def build_resume_view(
 
     journal, provenance = _select_journal(resolved, journal_path, is_newest)
 
+    source_path = next((c.transcript_path for c in chunks if c.transcript_path), "")
+    source_label = _source_label(source_path)
+    selected_latest = max(
+        (chunk.timestamp for chunk in chunks if chunk.timestamp),
+        key=_timestamp_epoch,
+        default="",
+    )
+    selected_epoch = _timestamp_epoch(selected_latest)
+    unindexed = [
+        item for item in (caller_sources or [])
+        if item.session_id not in index.sessions and item.mtime > selected_epoch
+    ]
+    selected_source = next(
+        (item for item in (caller_sources or []) if item.session_id == resolved),
+        None,
+    )
+    caller_partial = None
+    if (
+        selected_source is not None
+        and selected_source.latest_timestamp
+        and _timestamp_epoch(selected_source.latest_timestamp) > selected_epoch
+    ):
+        caller_partial = CallerExtentGap(
+            selected_source,
+            selected_latest or "no searchable transcript endpoint",
+            selected_source.latest_timestamp,
+        )
+
     return ResumeView(
         session_id=resolved,
         turns=turns,
@@ -442,6 +618,10 @@ def build_resume_view(
         total_turns=len(kept),
         excluded_count=len(chunks) - len(kept),
         omitted_between=omitted_between,
+        selection_scope=selection_scope,
+        source_label=source_label,
+        caller_unindexed=unindexed,
+        caller_partial=caller_partial,
     )
 
 
@@ -582,6 +762,23 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
     header += f" · showing {shown} of {view.total_turns} turns"
     if view.excluded_count:
         header += f" ({view.excluded_count} harness turns filtered)"
+
+    if view.selection_scope == "store":
+        header += f" · store fallback from {view.source_label}"
+    if view.caller_unindexed:
+        newest = view.caller_unindexed[0]
+        stamp = datetime.fromtimestamp(newest.mtime, timezone.utc).isoformat(timespec="seconds")
+        header = (
+            f"⚠ CALLER SOURCE STALE: {newest.session_id[:8]} "
+            f"({stamp}, {newest.size} bytes) is newer and unindexed | " + header
+        )
+    if view.caller_partial:
+        gap = view.caller_partial
+        header = (
+            f"⚠ CALLER SOURCE PARTIAL: {gap.source.session_id[:8]} "
+            f"indexed through {gap.indexed_latest}, live through {gap.live_latest} | "
+            "run `synapt recall build --no-embeddings` to refresh | " + header
+        )
 
     lines = [header]
     lines.extend(_format_freshness(view))

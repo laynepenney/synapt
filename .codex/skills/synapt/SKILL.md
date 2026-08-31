@@ -24,6 +24,7 @@ recall_quick
 recall_search
 recall_context
 recall_sessions
+recall_resume
 recall_files
 ```
 

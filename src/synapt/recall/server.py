@@ -1,6 +1,6 @@
 """synapt.recall MCP server — expose transcript search as tools for Claude Code.
 
-Provides fifteen tools via the Model Context Protocol:
+Provides recall tools via the Model Context Protocol, including:
   - recall_search: Search past session transcripts by keyword/topic
   - recall_quick: Fast, low-cost knowledge-only search for speculative checks
   - recall_context: Drill down into a search result for full raw content
@@ -8,6 +8,7 @@ Provides fifteen tools via the Model Context Protocol:
   - recall_sessions: List recent sessions with summaries
   - recall_timeline: View chronological timeline of work arcs
   - recall_build: Build or rebuild the transcript index
+  - recall_build_status: Read a durable background-build receipt
   - recall_setup: Initialize synapt recall for the current project
   - recall_stats: Get index statistics
   - recall_journal: Read or write session journal entries
@@ -25,19 +26,31 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import functools
 import json
 import logging
+import os
+import re
+import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 import synapt.recall as _synapt_pkg
 from synapt.recall.config import load_config
+from synapt.recall.usage import (
+    UsageEvent,
+    current_session_ref,
+    emit_usage_event,
+    now_iso as usage_now_iso,
+)
 
 # Capture version at server startup for stale-process detection
 _STARTUP_VERSION = getattr(_synapt_pkg, "__version__", "unknown")
 from synapt.recall.core import (
     TranscriptIndex,
+    atomic_json_write,
     format_size,
     project_data_dir,
     project_index_dir,
@@ -45,6 +58,7 @@ from synapt.recall.core import (
 from synapt.recall._llm_util import truncate_at_word as _tw
 from synapt.recall.embeddings import get_embedding_provider
 from synapt.recall.hybrid import classify_query_intent, intent_search_params
+from synapt.recall.session_start import _pid_alive
 
 
 def _cap_tokens(requested: int) -> int:
@@ -97,9 +111,24 @@ MCP_INSTRUCTIONS = (
 # ---------------------------------------------------------------------------
 
 _cached_index: TranscriptIndex | None = None
-_cached_mtime: float = 0.0
+_cached_mtime: tuple[tuple[str, int, int], ...] = ()
 _cached_dir: Path | None = None
 _cached_has_embeddings: bool = False
+
+
+def _index_cache_stamp(index_dir: Path) -> tuple[tuple[str, int, int], ...]:
+    """Fingerprint base and WAL files that can change searchable results."""
+    paths = [index_dir / "chunks.jsonl", index_dir / "recall.db", index_dir / "index.db"]
+    paths.extend(sorted(index_dir.glob("data_*.db")))
+    stamp = []
+    for path in paths:
+        for candidate in (path, Path(f"{path}-wal")):
+            try:
+                stat = candidate.stat()
+            except OSError:
+                continue
+            stamp.append((candidate.name, stat.st_size, stat.st_mtime_ns))
+    return tuple(stamp)
 
 
 def _get_index(use_embeddings: bool = True) -> TranscriptIndex | None:
@@ -112,17 +141,14 @@ def _get_index(use_embeddings: bool = True) -> TranscriptIndex | None:
     global _cached_index, _cached_mtime, _cached_dir, _cached_has_embeddings
     index_dir = project_index_dir()
 
-    # Prefer recall.db, fall back to legacy chunks.jsonl
-    db_path = index_dir / "recall.db"
-    check_path = db_path if db_path.exists() else index_dir / "chunks.jsonl"
-    if not check_path.exists():
+    stamp = _index_cache_stamp(index_dir)
+    if not stamp:
         return None
 
     try:
-        mtime = check_path.stat().st_mtime
         needs_reload = (
             _cached_index is None
-            or mtime != _cached_mtime
+            or stamp != _cached_mtime
             or index_dir != _cached_dir
             or (use_embeddings and not _cached_has_embeddings)
         )
@@ -140,7 +166,7 @@ def _get_index(use_embeddings: bool = True) -> TranscriptIndex | None:
                 len(_cached_index.chunks), _time.monotonic() - _load_t0,
             )
             _cached_has_embeddings = use_embeddings
-            _cached_mtime = mtime
+            _cached_mtime = stamp
             _cached_dir = index_dir
             # Set current session ID for access tracking (distinct_sessions)
             try:
@@ -166,9 +192,34 @@ def _invalidate_cache() -> None:
         with contextlib.suppress(Exception):
             _cached_index._db.close()
     _cached_index = None
-    _cached_mtime = 0.0
+    _cached_mtime = ()
     _cached_dir = None
     _cached_has_embeddings = False
+
+
+def _query_freshness_line(index_dir: Path) -> str:
+    """Run the bounded caller-tail preflight and return its stable label."""
+    from synapt.recall.query_freshness import (
+        QueryFreshnessResult,
+        QueryFreshnessState,
+        format_query_freshness,
+        refresh_current_session,
+    )
+
+    try:
+        result = refresh_current_session(index_dir, Path.cwd())
+    except Exception as exc:
+        result = QueryFreshnessResult(
+            state=QueryFreshnessState.ERROR,
+            reason=f"{type(exc).__name__}:{exc}",
+        )
+    if result.index_changed:
+        _invalidate_cache()
+    return format_query_freshness(result)
+
+
+def _with_query_freshness(result: str, freshness_line: str) -> str:
+    return f"{result}\n\n{freshness_line}"
 
 
 def _resolved_index_dir() -> Path:
@@ -232,6 +283,53 @@ atexit.register(_invalidate_cache)
 # ---------------------------------------------------------------------------
 
 
+_usage_logger = logging.getLogger(__name__)
+
+
+def _memory_op_tap(op: str):
+    """TAP 2: one UsageEvent per public memory operation.
+
+    ``detail`` is the FIXED public operation name, taken from the wrapped
+    function, and is the same string on every call. That is a structural
+    guarantee rather than a convention: there is no expression here that could
+    interpolate a query, a content body, or the opaque ``session_ref``, so the
+    free-text field cannot come to carry any of them by a later edit that
+    "just adds a bit of context".
+
+    Emission is in a ``finally``, so a failed operation is still metered --
+    a failure consumed work, and a meter that only counts successes
+    under-reports exactly when something is wrong. The construct-and-emit is
+    additionally guarded: ``emit_usage_event`` already swallows sink failures,
+    but building the event is the tap's own code, and the never-disrupt rule
+    applies to the tap as much as to a sink.
+    """
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            started = time.monotonic()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                try:
+                    emit_usage_event(
+                        UsageEvent(
+                            ts=usage_now_iso(),
+                            session_ref=current_session_ref(),
+                            op=op,
+                            detail=fn.__name__,
+                            duration_ms=int((time.monotonic() - started) * 1000),
+                        )
+                    )
+                except Exception:  # pragma: no cover - defence in depth
+                    _usage_logger.debug("usage tap failed to emit", exc_info=True)
+
+        return wrapper
+
+    return decorate
+
+
+@_memory_op_tap("mem_search")
 def recall_search(
     query: str,
     max_chunks: int = 5,
@@ -303,6 +401,8 @@ def recall_search(
                             in results. When multiple versions exist in the same lineage,
                             the highest-confidence one is kept (confidence-based fallback).
     """
+    index_dir = project_index_dir()
+    freshness_line = _query_freshness_line(index_dir)
     # min_score takes precedence over threshold_ratio when explicitly set
     if min_score is not None:
         threshold_ratio = min_score
@@ -342,15 +442,18 @@ def recall_search(
     if index is None:
         if historical_filter:
             index_dir = project_index_dir()
-            return (
+            return _with_query_freshness((
                 f"Historical search unavailable: no index found at {index_dir}. "
                 f"Run `synapt recall setup` first. "
                 f"Cannot satisfy date-filtered query without an index."
-            )
+            ), freshness_line)
         if live_result:
-            return live_result
+            return _with_query_freshness(live_result, freshness_line)
         index_dir = project_index_dir()
-        return f"No index found at {index_dir}. Run `synapt recall setup` first."
+        return _with_query_freshness(
+            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            freshness_line,
+        )
 
     try:
         # Pass half_life=None when caller used the MCP default (60.0) so
@@ -402,7 +505,7 @@ def recall_search(
             )
 
         if parts:
-            return "\n\n".join(parts)
+            return _with_query_freshness("\n\n".join(parts), freshness_line)
         # Surface diagnostics explaining why search returned nothing
         diag = index._last_diagnostics
         if diag:
@@ -412,12 +515,19 @@ def recall_search(
                     f"\n[Note: Embeddings unavailable — semantic search disabled. "
                     f"{index._embedding_reason}]"
                 )
-            return _label_empty_result(msg, _resolved_index_dir())
-        return _label_empty_result("No results found.", _resolved_index_dir())
+            return _with_query_freshness(
+                _label_empty_result(msg, _resolved_index_dir()),
+                freshness_line,
+            )
+        return _with_query_freshness(
+            _label_empty_result("No results found.", _resolved_index_dir()),
+            freshness_line,
+        )
     except Exception as exc:
-        return f"Search failed: {exc}"
+        return _with_query_freshness(f"Search failed: {exc}", freshness_line)
 
 
+@_memory_op_tap("mem_read")
 def recall_quick(query: str) -> str:
     """Quick, low-cost memory check. Use this speculatively — when you're
     not sure if past context exists but want to check.
@@ -433,6 +543,8 @@ def recall_quick(query: str) -> str:
     Args:
         query: Natural language query or keywords to search for.
     """
+    index_dir = project_index_dir()
+    freshness_line = _query_freshness_line(index_dir)
     quick_budget = _cap_tokens(500)
     intent = classify_query_intent(query)
     # Route depth by intent:
@@ -449,7 +561,10 @@ def recall_quick(query: str) -> str:
     index = _get_index(use_embeddings=False)
     if index is None:
         index_dir = project_index_dir()
-        return f"No index found at {index_dir}. Run `synapt recall setup` first."
+        return _with_query_freshness(
+            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            freshness_line,
+        )
 
     try:
         result = index.lookup(
@@ -463,13 +578,40 @@ def recall_quick(query: str) -> str:
             max_knowledge=params.get("max_knowledge"),
         )
         if result:
-            return result
+            return _with_query_freshness(result, freshness_line)
         diag = index._last_diagnostics
         if diag:
-            return diag.format_message()
-        return "No results found."
+            sessions = f"{diag.total_sessions} session"
+            if diag.total_sessions != 1:
+                sessions += "s"
+            chunks = f"{diag.total_chunks} indexed chunk"
+            if diag.total_chunks != 1:
+                chunks += "s"
+            if diag.reason == "empty_index":
+                return _with_query_freshness((
+                    f"No indexed recall corpus available for '{query}'.\n"
+                    f"The keyword check had {sessions} across {chunks}.\n"
+                    "Verified absence unavailable because there was no indexed "
+                    "corpus to search."
+                ), freshness_line)
+            if diag.reason == "no_matches":
+                coverage = f"searched {sessions} across {chunks}"
+                if diag.oldest_indexed_at:
+                    coverage += f", indexed back to {diag.oldest_indexed_at}"
+                semantic_note = (
+                    "semantic search was also used"
+                    if diag.semantic_search_used
+                    else "semantic search was not used"
+                )
+                return _with_query_freshness((
+                    f"No prior keyword match found for '{query}'.\n"
+                    f"The keyword check {coverage}; {semantic_note}.\n"
+                    "Proceeding fresh is reasonable after this keyword check."
+                ), freshness_line)
+            return _with_query_freshness(diag.format_message(), freshness_line)
+        return _with_query_freshness("No results found.", freshness_line)
     except Exception as exc:
-        return f"Search failed: {exc}"
+        return _with_query_freshness(f"Search failed: {exc}", freshness_line)
 
 
 def recall_files(
@@ -560,43 +702,465 @@ def recall_sessions(
         lines.append(
             f"  {s['date']}  {s['session_id'][:8]}  "
             f"{s['turn_count']} turns  {s['files_count']} files  "
-            f"\"{s['first_message']}\""
+            f"[{s['source_root']}]  \"{s['first_message']}\""
         )
     return "\n".join(lines)
 
 
-def recall_build(incremental: bool = True) -> str:
-    """Build or rebuild the transcript index from auto-discovered sources.
+def recall_resume(
+    session_id: str | None = None,
+    turns: int = 10,
+) -> str:
+    """Show the tail of the most recent session so a fresh session can pick up where it stopped.
 
-    Archives transcripts from Claude Code's source directory into the project,
-    then builds a searchable index at <project>/.synapt/recall/index/.
+    Answers by POSITION (the last N turns), not by relevance -- which is what a
+    cold "where did we leave off" needs and what search cannot give. Pairs the
+    tail with the journal entry that session wrote, if any, and labels the
+    index-freshness verdict so a stale view is never mistaken for a complete one.
+    With no explicit session ID, the MCP caller is the server process's current
+    working directory. Its newest indexed transcript wins before the shared
+    store-wide fallback is considered.
+
+    Use at session start, alongside recall_journal: the journal is what the
+    previous session chose to write, this is what actually happened last. They
+    diverge whenever work continued after the journal was written.
+
+    Same surface as the `synapt resume` CLI.
 
     Args:
-        incremental: If True, skip already-indexed files for faster rebuilds.
+        session_id: Session to resume (prefix accepted). Default: the newest
+            session rooted at the MCP server's current working directory.
+        turns: Number of tail turns to show (default 10).
     """
+    from synapt.recall.journal import _journal_path
+    from synapt.recall.resume import (
+        ResumeError,
+        build_resume_view,
+        caller_transcripts,
+        format_resume,
+        load_resume_index,
+    )
+    from synapt.recall.sharding import is_sharded
+
+    index_dir = project_index_dir()
+    freshness_line = _query_freshness_line(index_dir)
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
+        return _with_query_freshness(
+            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            freshness_line,
+        )
+
+    index = load_resume_index(index_dir)
+    try:
+        try:
+            view = build_resume_view(
+                index,
+                session_id=session_id,
+                limit=turns,
+                journal_path=_journal_path(),
+                caller_sources=caller_transcripts(Path.cwd()),
+            )
+        except ResumeError as exc:
+            if not index._session_order:
+                return _with_query_freshness(
+                    "No sessions indexed yet. Nothing to resume.", freshness_line
+                )
+            return _with_query_freshness(f"Resume failed: {exc}", freshness_line)
+    finally:
+        db = getattr(index, "_db", None)
+        if db is not None:
+            db.close()
+
+    # Freshness is attached after the view is built (same contract as the CLI):
+    # it can only change what the reader is told, never what is shown. A failure
+    # to compute it leaves the verdict None, rendered as NOT CHECKED, not fresh.
+    try:
+        import dataclasses
+
+        from synapt.recall.freshness import check_index_freshness
+
+        result = check_index_freshness(None, index_dir=index_dir)
+        if not result.stale and not view.turns:
+            result = check_index_freshness(None, index_dir=index_dir, deep=True)
+        view = dataclasses.replace(view, freshness=result)
+    except Exception:
+        pass
+
+    return _with_query_freshness(format_resume(view), freshness_line)
+
+_BUILD_RECEIPT_LOCK = threading.Lock()
+_BUILD_ID_RE = re.compile(r"^build_[0-9a-f]{12}$")
+_BUILD_SERVER_MARKER_RE = re.compile(r"^build-server-[0-9a-f]{32}\.lock$")
+_BUILD_SERVER_INSTANCE_RE = re.compile(r"^[0-9a-f]{32}$")
+_BUILD_RECEIPT_STATES = {"queued", "running", "completed", "failed", "interrupted"}
+_BUILD_RUNNING_PHASES = {
+    "starting",
+    "waiting_for_lock",
+    "lock_timeout",
+    "archiving",
+    "parsing",
+    "indexing",
+    "clustering",
+    "finalizing",
+}
+_BUILD_SERVER_INSTANCE = uuid.uuid4().hex
+_BUILD_THREADS: dict[str, threading.Thread] = {}
+_BUILD_SERVER_MARKERS: dict[str, tuple[str, int]] = {}
+
+
+def _build_receipts_dir(project: Path) -> Path:
+    return project_data_dir(project) / "builds"
+
+
+def _build_receipt_path(project: Path, build_id: str) -> Path:
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        raise ValueError("invalid build id in receipt")
+    return _build_receipts_dir(project) / f"{build_id}.json"
+
+
+def _write_build_receipt(project: Path, receipt: dict) -> None:
+    directory = _build_receipts_dir(project)
+    directory.mkdir(parents=True, exist_ok=True)
+    receipt["updated_at"] = datetime.now(timezone.utc).isoformat()
+    atomic_json_write(receipt, _build_receipt_path(project, receipt["build_id"]))
+
+
+def _read_build_receipt(path: Path) -> dict:
+    def require_timestamp(field: str) -> None:
+        raw = value.get(field)
+        if not isinstance(raw, str) or not raw:
+            raise ValueError(f"receipt {field} is invalid")
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError as exc:
+            raise ValueError(f"receipt {field} is invalid") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError(f"receipt {field} is missing a timezone")
+
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("receipt is not a JSON object")
+    build_id = value.get("build_id")
+    if not isinstance(build_id, str) or not _BUILD_ID_RE.fullmatch(build_id):
+        raise ValueError("receipt build_id is invalid")
+    if build_id != path.stem:
+        raise ValueError("receipt build_id does not match its filename")
+    state = value.get("state")
+    if not isinstance(state, str) or state not in _BUILD_RECEIPT_STATES:
+        raise ValueError("receipt state is invalid")
+    phase = value.get("phase")
+    if not isinstance(phase, str) or not phase:
+        raise ValueError("receipt phase is invalid")
+    pid = value.get("pid")
+    if type(pid) is not int or pid <= 0:
+        raise ValueError("receipt pid is invalid")
+    instance = value.get("server_instance")
+    if not isinstance(instance, str) or not _BUILD_SERVER_INSTANCE_RE.fullmatch(instance):
+        raise ValueError("receipt server_instance is invalid")
+    marker = value.get("server_marker")
+    if not isinstance(marker, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(marker):
+        raise ValueError("receipt server_marker is invalid")
+    if marker != f"build-server-{instance}.lock":
+        raise ValueError("receipt server_marker does not match server_instance")
+    if type(value.get("incremental")) is not bool:
+        raise ValueError("receipt incremental flag is invalid")
+    for field in ("created_at", "updated_at"):
+        require_timestamp(field)
+    expected_phase = {
+        "queued": "queued",
+        "completed": "completed",
+        "failed": "failed",
+        "interrupted": "interrupted",
+    }.get(state)
+    if expected_phase is not None and phase != expected_phase:
+        raise ValueError(f"receipt phase does not match state {state}")
+    if state == "running":
+        if phase not in _BUILD_RUNNING_PHASES:
+            raise ValueError("running receipt phase is invalid")
+        require_timestamp("started_at")
+    if state in {"completed", "failed", "interrupted"}:
+        require_timestamp("finished_at")
+    if state == "completed":
+        shards = value.get("updated_shards")
+        if not isinstance(shards, list) or not all(isinstance(item, str) for item in shards):
+            raise ValueError("completed receipt updated_shards is invalid")
+        if not isinstance(value.get("stats"), dict):
+            raise ValueError("completed receipt stats is invalid")
+        if not isinstance(value.get("result"), str) or not value["result"]:
+            raise ValueError("completed receipt result is invalid")
+    if state in {"failed", "interrupted"}:
+        if not isinstance(value.get("error"), str) or not value["error"]:
+            raise ValueError(f"{state} receipt error is invalid")
+    if "cache_warning" in value and not isinstance(value["cache_warning"], str):
+        raise ValueError("receipt cache_warning is invalid")
+    return value
+
+
+def _receipt_paths_newest(directory: Path) -> list[Path]:
+    return sorted(
+        directory.glob("build_*.json"),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+
+
+def _ensure_build_server_marker(project: Path) -> str:
+    from synapt.recall.cli import _acquire_build_lock
+
+    data_dir = project_data_dir(project)
+    key = str(data_dir.resolve())
+    existing = _BUILD_SERVER_MARKERS.get(key)
+    if existing is not None:
+        return existing[0]
+    name = f"build-server-{_BUILD_SERVER_INSTANCE}.lock"
+    fd = _acquire_build_lock(data_dir, timeout=0, name=name)
+    if fd is None:
+        raise RuntimeError("could not establish the build-server liveness marker")
+    _BUILD_SERVER_MARKERS[key] = (name, fd)
+    return name
+
+
+def _build_server_marker_alive(project: Path, name: str) -> bool:
+    from synapt.recall.cli import _acquire_build_lock, _release_build_lock
+
+    if not isinstance(name, str) or not _BUILD_SERVER_MARKER_RE.fullmatch(name):
+        raise ValueError("invalid build-server marker name")
+    fd = _acquire_build_lock(project_data_dir(project), timeout=0, name=name)
+    if fd is None:
+        return True
+    _release_build_lock(fd)
+    return False
+
+
+def _release_build_server_markers() -> None:
+    from synapt.recall.cli import _release_build_lock
+
+    while _BUILD_SERVER_MARKERS:
+        _, (_, fd) = _BUILD_SERVER_MARKERS.popitem()
+        _release_build_lock(fd)
+
+
+atexit.register(_release_build_server_markers)
+
+
+def _receipt_owner_alive(project: Path, receipt: dict) -> bool:
+    pid = receipt.get("pid")
+    if not _pid_alive(pid):
+        return False
+    if pid == os.getpid():
+        if receipt.get("server_instance") != _BUILD_SERVER_INSTANCE:
+            return False
+        if receipt.get("state") == "queued":
+            return True
+        thread = _BUILD_THREADS.get(str(receipt.get("build_id") or ""))
+        return thread is not None and thread.is_alive()
+    marker = receipt.get("server_marker")
+    if isinstance(marker, str) and marker:
+        return _build_server_marker_alive(project, marker)
+    return False
+
+
+def _active_build_receipt(project: Path) -> dict | None:
+    directory = _build_receipts_dir(project)
+    if not directory.exists():
+        return None
+    for path in _receipt_paths_newest(directory):
+        try:
+            receipt = _read_build_receipt(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"existing build receipt is unreadable: {path.name}: "
+                f"{type(exc).__name__}: {exc}. Remove that file to allow new "
+                "builds. It is a stale or corrupt receipt, never the build lock."
+            ) from exc
+        if receipt.get("state") not in {"queued", "running"}:
+            continue
+        if _receipt_owner_alive(project, receipt):
+            return receipt
+        receipt["state"] = "interrupted"
+        receipt["phase"] = "interrupted"
+        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+        receipt["error"] = "build process exited before writing a terminal receipt"
+        _write_build_receipt(project, receipt)
+    return None
+
+
+def _index_file_snapshot(project: Path) -> dict[str, tuple[int, ...]]:
+    index_dir = project_index_dir(project)
+    paths = list(index_dir.glob("data_*.db"))
+    paths.extend(index_dir / name for name in ("index.db", "recall.db"))
+    snapshot = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        wal = Path(f"{path}-wal")
+        base_stat = path.stat()
+        wal_stat = wal.stat() if wal.exists() else None
+        snapshot[path.name] = (
+            base_stat.st_size,
+            base_stat.st_mtime_ns,
+            wal_stat.st_size if wal_stat else -1,
+            wal_stat.st_mtime_ns if wal_stat else -1,
+        )
+    return snapshot
+
+
+def _run_build_job(project: Path, receipt: dict, incremental: bool) -> None:
     from synapt.recall.cli import _archive_and_build
 
-    project = Path.cwd().resolve()
+    before = _index_file_snapshot(project)
+
+    def report(phase: str) -> None:
+        receipt["state"] = "running"
+        receipt["phase"] = phase
+        if "started_at" not in receipt:
+            receipt["started_at"] = datetime.now(timezone.utc).isoformat()
+        _write_build_receipt(project, receipt)
+
     try:
+        report("starting")
         final_index = _archive_and_build(
-            project,
-            use_embeddings=True,
-            incremental=incremental,
+            project, use_embeddings=True, incremental=incremental, progress=report,
         )
-    except Exception as e:
-        return f"Build failed: {e}"
+        if receipt.get("phase") == "lock_timeout":
+            raise RuntimeError("timed out waiting for the build lock")
+        after = _index_file_snapshot(project)
+        receipt["state"] = "completed"
+        receipt["phase"] = "completed"
+        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+        receipt["updated_shards"] = sorted(
+            name for name, fingerprint in after.items()
+            if before.get(name) != fingerprint
+        )
+        if final_index and final_index.chunks:
+            receipt["stats"] = final_index.stats()
+            receipt["result"] = "index built"
+        else:
+            receipt["stats"] = {"chunk_count": 0, "session_count": 0}
+            receipt["result"] = "no transcripts found"
+    except BaseException as exc:
+        receipt["state"] = "failed"
+        receipt["phase"] = "failed"
+        receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+        receipt["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        _invalidate_cache()
+        try:
+            try:
+                _invalidate_cache()
+            except Exception as exc:
+                receipt["cache_warning"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                with _BUILD_RECEIPT_LOCK:
+                    _write_build_receipt(project, receipt)
+                    _BUILD_THREADS.pop(receipt["build_id"], None)
+        finally:
+            # The guarded terminal write normally removes the thread. Keep the
+            # cleanup idempotent if writing the receipt itself raises.
+            _BUILD_THREADS.pop(receipt["build_id"], None)
 
-    if not final_index or not final_index.chunks:
-        return "No Claude Code or Codex transcripts found for this project."
 
-    stats = final_index.stats()
-    index_dir = project_index_dir(project)
+def recall_build(incremental: bool = True) -> str:
+    """Start an index build and immediately return its durable build id.
+
+    Use recall_build_status with that id for progress and outcome.
+    """
+    from synapt.recall.cli import _acquire_build_lock, _release_build_lock
+
+    project = Path.cwd().resolve()
+    with _BUILD_RECEIPT_LOCK:
+        receipt_lock = _acquire_build_lock(
+            project_data_dir(project), timeout=5, name="build-receipt.lock",
+        )
+        if receipt_lock is None:
+            return "Build not started: timed out creating a durable build receipt."
+        try:
+            try:
+                active = _active_build_receipt(project)
+            except RuntimeError as exc:
+                return f"Build not started: {exc}"
+            if active is not None:
+                build_id = active["build_id"]
+                return (
+                    f"Build already running: {build_id}. "
+                    f"Check recall_build_status(build_id={build_id!r})."
+                )
+            build_id = f"build_{uuid.uuid4().hex[:12]}"
+            now = datetime.now(timezone.utc).isoformat()
+            try:
+                server_marker = _ensure_build_server_marker(project)
+            except RuntimeError as exc:
+                return f"Build not started: {exc}"
+            receipt = {
+                "build_id": build_id,
+                "state": "queued",
+                "phase": "queued",
+                "pid": os.getpid(),
+                "server_instance": _BUILD_SERVER_INSTANCE,
+                "server_marker": server_marker,
+                "incremental": incremental,
+                "created_at": now,
+                "updated_at": now,
+            }
+            _write_build_receipt(project, receipt)
+            thread = threading.Thread(
+                target=_run_build_job,
+                args=(project, receipt, incremental),
+                name=f"recall-{build_id}",
+                daemon=True,
+            )
+            _BUILD_THREADS[build_id] = thread
+            try:
+                thread.start()
+            except BaseException as exc:
+                _BUILD_THREADS.pop(build_id, None)
+                receipt["state"] = "failed"
+                receipt["phase"] = "failed"
+                receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+                receipt["error"] = f"worker did not start: {type(exc).__name__}: {exc}"
+                _write_build_receipt(project, receipt)
+                return f"Build not started: {build_id}: {receipt['error']}"
+        finally:
+            _release_build_lock(receipt_lock)
     return (
-        f"Index built: {stats['chunk_count']} chunks from "
-        f"{stats['session_count']} sessions. Saved to {index_dir}"
+        f"Build started: {build_id}. "
+        f"Check recall_build_status(build_id={build_id!r})."
     )
+
+
+def recall_build_status(build_id: str = "") -> str:
+    """Return the durable status receipt for one background recall build.
+
+    Omit build_id to read the newest receipt for the current project.
+    """
+    project = Path.cwd().resolve()
+    if build_id:
+        if not _BUILD_ID_RE.fullmatch(build_id):
+            return "Invalid build id. Expected build_<12 lowercase hex characters>."
+        path = _build_receipt_path(project, build_id)
+    else:
+        directory = _build_receipts_dir(project)
+        paths = _receipt_paths_newest(directory) if directory.exists() else []
+        if not paths:
+            return "No build receipts found for this project."
+        path = paths[0]
+    with _BUILD_RECEIPT_LOCK:
+        if not path.exists():
+            return f"Build receipt not found: {build_id}"
+        try:
+            receipt = _read_build_receipt(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return f"Build receipt unreadable: {type(exc).__name__}: {exc}"
+        if receipt.get("state") in {"queued", "running"} and not _receipt_owner_alive(project, receipt):
+            receipt["state"] = "interrupted"
+            receipt["phase"] = "interrupted"
+            receipt["finished_at"] = datetime.now(timezone.utc).isoformat()
+            receipt["error"] = "build process exited before writing a terminal receipt"
+            _write_build_receipt(project, receipt)
+    return json.dumps(receipt, indent=2, sort_keys=True)
 
 
 def recall_setup(no_hook: bool = False) -> str:
@@ -1680,7 +2244,7 @@ def recall_journal(
             format_for_session_start,
             format_write_confirmation,
             latest_transcript_path,
-            merge_carried_forward_next_steps,
+            merge_carried_forward_with_report,
             pending_next_steps,
             read_entries,
             read_latest,
@@ -1725,7 +2289,7 @@ def recall_journal(
             if next_steps:
                 entry.next_steps = split_journal_field(next_steps)
                 explicit_next_steps = list(entry.next_steps)
-            entry.next_steps = merge_carried_forward_next_steps(
+            entry.next_steps, carry_report = merge_carried_forward_with_report(
                 entry.next_steps,
                 entry.done,
                 previous_entry,
@@ -1744,7 +2308,7 @@ def recall_journal(
             append_entry(entry)
             return (
                 "Journal entry written.\n\n"
-                f"{format_write_confirmation(entry, explicit_next_steps)}"
+                f"{format_write_confirmation(entry, explicit_next_steps, report=carry_report)}"
             )
 
         return f"Unknown action: {action}. Use 'read', 'write', 'list', or 'pending'."
@@ -1752,6 +2316,7 @@ def recall_journal(
         return f"Journal failed: {exc}"
 
 
+@_memory_op_tap("mem_write")
 def recall_save(
     content: str = "",
     category: str = "workflow",
@@ -2223,11 +2788,14 @@ def recall_channel(
         unclaim: Release a previously claimed message_id.
         intent: Declare intent to create something (message = description of planned work).
     """
+    state_store = None
     try:
         from synapt.recall.actions import get_action_registry
+        from synapt.recall.channel import _db_path
 
         registry = get_action_registry()
-        return registry.dispatch(
+        state_store = _db_path().resolve()
+        result = registry.dispatch(
             action,
             channel=channel,
             message=message,
@@ -2241,8 +2809,10 @@ def recall_channel(
             detail=detail,
             msg_type=msg_type,
         )
+        return f"Channel state store: {state_store}\n{result}"
     except Exception as exc:
-        return f"Channel failed: {exc}"
+        prefix = f"Channel state store: {state_store}\n" if state_store else ""
+        return f"{prefix}Channel failed: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -2419,7 +2989,9 @@ def register_tools(mcp) -> None:
     mcp.tool()(_with_directive_check(recall_quick))
     mcp.tool()(_with_directive_check(recall_files))
     mcp.tool()(_with_directive_check(recall_sessions))
+    mcp.tool()(_with_directive_check(recall_resume))
     mcp.tool()(recall_build)
+    mcp.tool()(recall_build_status)
     mcp.tool()(recall_setup)
     mcp.tool()(recall_export)
     mcp.tool()(recall_import)

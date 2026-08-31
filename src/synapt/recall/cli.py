@@ -55,6 +55,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 logger = logging.getLogger("synapt.recall.cli")
@@ -251,6 +252,7 @@ def _archive_and_build(
     use_embeddings: bool = True,
     incremental: bool = False,
     chatgpt_archive: str | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> TranscriptIndex | None:
     """Archive transcripts and build the index. Shared by build/rebuild/setup.
 
@@ -263,14 +265,19 @@ def _archive_and_build(
     Returns the final TranscriptIndex, or None if no chunks found.
     """
     data_dir = project_data_dir(project_dir)
+    if progress:
+        progress("waiting_for_lock")
     lock_fd = _acquire_build_lock(data_dir)
     if lock_fd is None:
+        if progress:
+            progress("lock_timeout")
         print(f"  Warning: another build is in progress (timed out waiting for lock; {_build_lock_busy_message(data_dir)})")
         return None
 
     try:
         return _archive_and_build_locked(
             project_dir, source_dirs, use_embeddings, incremental, chatgpt_archive,
+            progress,
         )
     finally:
         _release_build_lock(lock_fd)
@@ -282,6 +289,7 @@ def _archive_and_build_locked(
     use_embeddings: bool,
     incremental: bool,
     chatgpt_archive: str | None,
+    progress: Callable[[str], None] | None = None,
 ) -> TranscriptIndex | None:
     """Inner build logic — caller must hold the build lock."""
     import time as _time
@@ -295,6 +303,8 @@ def _archive_and_build_locked(
     archive_dir = project_archive_dir(project_dir)
 
     # Step 1: Archive transcripts from Claude Code's source dir
+    if progress:
+        progress("archiving")
     if not source_dirs:
         source_dirs = project_transcript_dirs(project_dir)
 
@@ -442,6 +452,8 @@ def _archive_and_build_locked(
                          _profile.content_type, _subchunk_min)
 
     # Build from archived transcripts (BM25-only, no DB needed for parsing)
+    if progress:
+        progress("parsing")
     logger.info("build: parsing transcripts from %d source(s)...", len(build_sources))
     for build_source in build_sources:
         index = build_index(
@@ -568,6 +580,8 @@ def _archive_and_build_locked(
             deduped.append(chunk)
 
     # Build final index with SQLite backend
+    if progress:
+        progress("indexing")
     logger.info("build: saving %d chunks to FTS5 index...", len(deduped))
     save_t0 = _time.monotonic()
     final_index = TranscriptIndex(
@@ -580,6 +594,8 @@ def _archive_and_build_locked(
     logger.info("build: FTS5 save complete in %.1fs", _time.monotonic() - save_t0)
 
     # Cluster chunks by topic similarity
+    if progress:
+        progress("clustering")
     logger.info("build: clustering %d transcript chunks...", sum(1 for c in deduped if c.turn_index >= 0))
     from synapt.recall.clustering import cluster_chunks as _cluster_chunks, generate_concat_summary
     transcript_only = [c for c in deduped if c.turn_index >= 0]
@@ -870,6 +886,8 @@ def _archive_and_build_locked(
         print("  Note: input changed during the build; next run will not skip")
     db.save_manifest(manifest_payload)
 
+    if progress:
+        progress("finalizing")
     logger.info("build: complete in %.1fs (%d chunks)", _time.monotonic() - build_t0, len(deduped))
     return final_index
 
@@ -1316,7 +1334,7 @@ def cmd_sessions(args: argparse.Namespace) -> None:
         print(
             f"  {s['date']}  {s['session_id'][:8]}  "
             f"{s['turn_count']} turns  {s['files_count']} files  "
-            f"\"{s['first_message']}\""
+            f"[{s['source_root']}]  \"{s['first_message']}\""
         )
 
 
@@ -1332,6 +1350,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
     from synapt.recall.resume import (
         ResumeError,
         build_resume_view,
+        caller_transcripts,
         format_resume,
         load_resume_index,
     )
@@ -1356,6 +1375,9 @@ def cmd_resume(args: argparse.Namespace) -> None:
                 session_id=getattr(args, "session", None),
                 limit=getattr(args, "turns", None) or 10,
                 journal_path=_journal_path(),
+                caller_sources=caller_transcripts(
+                    getattr(args, "project", None) or Path.cwd()
+                ),
             )
         except ResumeError as exc:
             # An empty index is an honest empty state, not a failure to act on.
@@ -1705,7 +1727,7 @@ def cmd_journal(args: argparse.Namespace) -> None:
         format_for_session_start,
         format_write_confirmation,
         latest_transcript_path,
-        merge_carried_forward_next_steps,
+        merge_carried_forward_with_report,
         read_entries,
         read_latest,
         read_previous_meaningful,
@@ -1802,7 +1824,7 @@ def cmd_journal(args: argparse.Namespace) -> None:
     if args.next:
         entry.next_steps = split_journal_field(args.next)
         explicit_next_steps = list(entry.next_steps)
-    entry.next_steps = merge_carried_forward_next_steps(
+    entry.next_steps, carry_report = merge_carried_forward_with_report(
         entry.next_steps,
         entry.done,
         previous_entry,
@@ -1829,7 +1851,7 @@ def cmd_journal(args: argparse.Namespace) -> None:
 
     path = append_entry(entry)
     print(f"Journal entry written to {path}", file=sys.stderr)
-    print(format_write_confirmation(entry, explicit_next_steps))
+    print(format_write_confirmation(entry, explicit_next_steps, report=carry_report))
 
 
 def cmd_enrich(args: argparse.Namespace) -> None:
@@ -2606,6 +2628,38 @@ def cmd_startup(args: argparse.Namespace) -> None:
     else:
         for line in context_lines:
             print(line)
+
+
+def cmd_grep_intercept(args: argparse.Namespace) -> None:
+    """Emit advisory recall context for a Claude Code PreToolUse event."""
+    from synapt.integrations.grep_intercept import (
+        GrepInterceptConfig,
+        build_pretooluse_output,
+    )
+
+    try:
+        payload = json.load(sys.stdin)
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(payload, dict):
+        return
+    # This command is a JSON hook protocol. Index-load diagnostics belong to
+    # interactive commands, not to the hook's stderr channel. Logging handlers
+    # may retain the original stderr object, so redirecting stderr is not enough.
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        output = build_pretooluse_output(
+            payload,
+            config=GrepInterceptConfig(
+                enabled=True,
+                timeout_ms=max(1, args.timeout_ms),
+            ),
+        )
+    finally:
+        logging.disable(previous_logging_disable)
+    if output is not None:
+        print(json.dumps(output, separators=(",", ":")))
 
 
 def _session_start_continuity_allowed(source: str) -> bool:
@@ -3525,6 +3579,17 @@ def make_parser() -> argparse.ArgumentParser:
     startup_parser.add_argument("--compact", action="store_true",
                                 help="Single-line summary for prompt injection")
 
+    grep_intercept_parser = subparsers.add_parser(
+        "grep-intercept",
+        help="Add bounded recall context to grep-shaped PreToolUse events",
+    )
+    grep_intercept_parser.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=500,
+        help="Inner recall deadline in milliseconds (default: 500)",
+    )
+
     checkpoint_parser = subparsers.add_parser(
         "checkpoint",
         help="Capture a bounded SessionEnd recovery checkpoint",
@@ -3672,6 +3737,8 @@ def main():
         cmd_remind(args)
     elif args.command == "startup":
         cmd_startup(args)
+    elif args.command == "grep-intercept":
+        cmd_grep_intercept(args)
     elif args.command == "checkpoint":
         from synapt.checkpoint import main as checkpoint_main
         raise SystemExit(checkpoint_main(["--event-json", args.event_json]))

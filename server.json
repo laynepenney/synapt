@@ -6,12 +6,12 @@
     "url": "https://github.com/synapt-dev/recall",
     "source": "github"
   },
-  "version": "0.13.1",
+  "version": "0.21.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "synapt",
-      "version": "0.13.1",
+      "version": "0.21.0",
       "transport": {
         "type": "stdio"
       }

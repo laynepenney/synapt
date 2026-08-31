@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from synapt.recall.session_start import _pid_alive
+
 
 def _team_db_path(org_id: str) -> Path:
     """Return the path to an org's team.db."""
@@ -298,17 +300,8 @@ def detect_crashed_agents(db_path: Path) -> list[dict[str, Any]]:
     crashed = []
     for row in rows:
         pid = row["pid"]
-        try:
-            os.kill(pid, 0)  # Check if process exists
-        except (ProcessLookupError, PermissionError):
+        if not _pid_alive(pid):
             crashed.append(dict(row))
-        except OSError as e:
-            # Windows: WinError 87 (invalid parameter) means process gone
-            import errno
-            if getattr(e, "winerror", None) == 87 or e.errno == errno.EINVAL:
-                crashed.append(dict(row))
-            else:
-                raise
     return crashed
 
 

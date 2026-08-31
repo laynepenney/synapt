@@ -14,6 +14,7 @@ Schema:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -40,6 +41,16 @@ _EMBEDDING_BYTES = struct.calcsize(_EMBEDDING_FMT)
 # FTS5 column weights for bm25():
 #   user_text, assistant_text, tools_used, files_touched, tool_content, date_text
 _FTS_WEIGHTS = "1.0, 1.5, 2.0, 2.0, 1.5, 3.0"
+
+
+def query_tail_source_key(session_id: str, path: Path) -> str:
+    """Bind a query-tail cursor to one concrete transcript generation."""
+    stat = path.stat()
+    identity = (
+        f"{session_id}\0{path.resolve()}\0"
+        f"{getattr(stat, 'st_dev', 0)}\0{getattr(stat, 'st_ino', 0)}"
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 _SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS metadata (
@@ -248,6 +259,75 @@ CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF user_text, assistant_text
 END;
 """
 
+_QUERY_TAIL_SCHEMA_SQL = """\
+CREATE TABLE IF NOT EXISTS query_tail_chunks (
+    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT UNIQUE NOT NULL,
+    source_key TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    turn_index INTEGER NOT NULL,
+    user_text TEXT NOT NULL DEFAULT '',
+    assistant_text TEXT NOT NULL DEFAULT '',
+    tools_used TEXT NOT NULL DEFAULT '',
+    files_touched TEXT NOT NULL DEFAULT '',
+    tool_content TEXT NOT NULL DEFAULT '',
+    date_text TEXT NOT NULL DEFAULT '',
+    transcript_path TEXT NOT NULL DEFAULT '',
+    byte_offset INTEGER NOT NULL,
+    byte_length INTEGER NOT NULL DEFAULT 0,
+    agent_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_query_tail_source_offset
+    ON query_tail_chunks(source_key, byte_offset);
+CREATE INDEX IF NOT EXISTS idx_query_tail_session
+    ON query_tail_chunks(session_id);
+
+CREATE TABLE IF NOT EXISTS query_tail_cursors (
+    source_key TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    transcript_path TEXT NOT NULL,
+    observed_complete_offset INTEGER NOT NULL,
+    rewind_offset INTEGER NOT NULL,
+    rewind_turn_index INTEGER NOT NULL,
+    source_size INTEGER NOT NULL,
+    source_mtime_ns INTEGER NOT NULL,
+    observed_prefix_sha256 TEXT NOT NULL DEFAULT '',
+    suppresses_base INTEGER NOT NULL DEFAULT 0,
+    latest_projected_timestamp TEXT NOT NULL DEFAULT '',
+    last_attempt_at TEXT NOT NULL,
+    last_success_at TEXT NOT NULL
+);
+"""
+
+_QUERY_TAIL_FTS_TABLE_SQL = """\
+CREATE VIRTUAL TABLE query_tail_fts USING fts5(
+    user_text, assistant_text, tools_used, files_touched, tool_content, date_text,
+    content=query_tail_chunks,
+    content_rowid=rowid,
+    tokenize="porter unicode61 tokenchars '._+'"
+);
+"""
+
+_QUERY_TAIL_FTS_TRIGGERS_SQL = """\
+CREATE TRIGGER IF NOT EXISTS query_tail_ai AFTER INSERT ON query_tail_chunks BEGIN
+    INSERT INTO query_tail_fts(rowid, user_text, assistant_text, tools_used, files_touched, tool_content, date_text)
+    VALUES (new.rowid, new.user_text, new.assistant_text, new.tools_used, new.files_touched, new.tool_content, new.date_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS query_tail_ad AFTER DELETE ON query_tail_chunks BEGIN
+    INSERT INTO query_tail_fts(query_tail_fts, rowid, user_text, assistant_text, tools_used, files_touched, tool_content, date_text)
+    VALUES ('delete', old.rowid, old.user_text, old.assistant_text, old.tools_used, old.files_touched, old.tool_content, old.date_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS query_tail_au AFTER UPDATE OF user_text, assistant_text, tools_used, files_touched, tool_content, date_text ON query_tail_chunks BEGIN
+    INSERT INTO query_tail_fts(query_tail_fts, rowid, user_text, assistant_text, tools_used, files_touched, tool_content, date_text)
+    VALUES ('delete', old.rowid, old.user_text, old.assistant_text, old.tools_used, old.files_touched, old.tool_content, old.date_text);
+    INSERT INTO query_tail_fts(rowid, user_text, assistant_text, tools_used, files_touched, tool_content, date_text)
+    VALUES (new.rowid, new.user_text, new.assistant_text, new.tools_used, new.files_touched, new.tool_content, new.date_text);
+END;
+"""
+
 
 # Knowledge FTS5 table + sync triggers (same pattern as chunks_fts)
 _KNOWLEDGE_FTS_TABLE_SQL = """\
@@ -312,6 +392,24 @@ CREATE TRIGGER IF NOT EXISTS clusters_au AFTER UPDATE OF topic, search_text ON c
     VALUES (new.id, new.topic, new.search_text);
 END;
 """
+
+
+def _normalize_ddl(sql: str) -> str:
+    """Put a CREATE statement into the form ``sqlite_master`` stores it in.
+
+    ``sqlite_master.sql`` holds the statement as executed and **without** the
+    trailing statement terminator, so a module constant written as a runnable
+    script — ending in ``);`` — can never compare equal to it no matter how the
+    whitespace is handled.  Collapsing whitespace is not enough: ``strip()``
+    removes the newline after the semicolon and leaves the semicolon itself.
+
+    Both sides of a schema comparison go through this function so the two are
+    in the same form.  Comparing a stored statement against a raw constant is
+    the defect this exists to prevent.  All three detectors route through it;
+    nothing in the code compels a fourth one to, so adding an FTS table means
+    routing its detector here deliberately.
+    """
+    return " ".join(sql.strip().lower().split()).rstrip(";").rstrip()
 
 
 _FTS5_KEYWORDS = frozenset({"and", "or", "not", "near"})
@@ -453,7 +551,24 @@ class RecallDB:
 
     def _ensure_schema(self) -> None:
         self._conn.executescript(_SCHEMA_SQL)
+        self._conn.executescript(_QUERY_TAIL_SCHEMA_SQL)
         # Migrate existing tables: add columns that may be missing
+        query_tail_cursor_columns = {
+            row[1]
+            for row in self._conn.execute(
+                "PRAGMA table_info(query_tail_cursors)"
+            ).fetchall()
+        }
+        if "suppresses_base" not in query_tail_cursor_columns:
+            self._conn.execute(
+                "ALTER TABLE query_tail_cursors "
+                "ADD COLUMN suppresses_base INTEGER NOT NULL DEFAULT 0"
+            )
+        if "observed_prefix_sha256" not in query_tail_cursor_columns:
+            self._conn.execute(
+                "ALTER TABLE query_tail_cursors "
+                "ADD COLUMN observed_prefix_sha256 TEXT NOT NULL DEFAULT ''"
+            )
         self._migrate_chunks_table()
         self._migrate_knowledge_table()
         self._migrate_clusters_table()
@@ -499,6 +614,32 @@ class RecallDB:
             ).fetchall()}
             if len(existing) < 3:
                 self._conn.executescript(_FTS_TRIGGERS_SQL)
+
+        query_tail_fts = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='query_tail_fts'"
+        ).fetchone()
+        if query_tail_fts is None:
+            self._conn.executescript(_QUERY_TAIL_FTS_TABLE_SQL)
+            self._conn.executescript(_QUERY_TAIL_FTS_TRIGGERS_SQL)
+            tail_count = self._conn.execute(
+                "SELECT COUNT(*) FROM query_tail_chunks"
+            ).fetchone()[0]
+            if tail_count:
+                self._conn.execute(
+                    "INSERT INTO query_tail_fts(query_tail_fts) VALUES('rebuild')"
+                )
+                self._conn.commit()
+        else:
+            existing_tail_triggers = {
+                row[0]
+                for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger' "
+                    "AND name IN ('query_tail_ai', 'query_tail_ad', 'query_tail_au')"
+                ).fetchall()
+            }
+            if len(existing_tail_triggers) < 3:
+                self._conn.executescript(_QUERY_TAIL_FTS_TRIGGERS_SQL)
 
         # Knowledge FTS table (same pattern: check existence, create if missing)
         krow = self._conn.execute(
@@ -819,9 +960,7 @@ class RecallDB:
         ).fetchone()
         if row is None:
             return False
-        current = " ".join((row[0] or "").lower().split())
-        expected = " ".join(_CLUSTERS_FTS_TABLE_SQL.strip().lower().split())
-        return current != expected
+        return _normalize_ddl(row[0] or "") != _normalize_ddl(_CLUSTERS_FTS_TABLE_SQL)
 
     def _needs_fts_migration(self) -> bool:
         """Check if the FTS table's definition differs from the current schema.
@@ -835,9 +974,7 @@ class RecallDB:
         ).fetchone()
         if row is None:
             return False
-        current = " ".join((row[0] or "").lower().split())
-        expected = " ".join(_FTS_TABLE_SQL.strip().lower().split())
-        return current != expected
+        return _normalize_ddl(row[0] or "") != _normalize_ddl(_FTS_TABLE_SQL)
 
     def _needs_knowledge_fts_migration(self) -> bool:
         """Check if the knowledge FTS definition differs from the current schema."""
@@ -846,9 +983,7 @@ class RecallDB:
         ).fetchone()
         if row is None:
             return False
-        current = " ".join((row[0] or "").lower().split())
-        expected = " ".join(_KNOWLEDGE_FTS_TABLE_SQL.strip().lower().split())
-        return current != expected
+        return _normalize_ddl(row[0] or "") != _normalize_ddl(_KNOWLEDGE_FTS_TABLE_SQL)
 
     def close(self) -> None:
         """Close the database connection."""
@@ -879,6 +1014,297 @@ class RecallDB:
             return 0.0
 
     # -- chunks CRUD -------------------------------------------------------
+
+    @staticmethod
+    def _query_tail_chunk_from_row(row) -> TranscriptChunk:
+        from synapt.recall.core import TranscriptChunk
+
+        return TranscriptChunk(
+            id=row["id"],
+            session_id=row["session_id"],
+            timestamp=row["timestamp"],
+            turn_index=row["turn_index"],
+            user_text=row["user_text"],
+            assistant_text=row["assistant_text"],
+            tools_used=json.loads(row["tools_used"]) if row["tools_used"] else [],
+            files_touched=(
+                json.loads(row["files_touched"]) if row["files_touched"] else []
+            ),
+            tool_content=row["tool_content"] or "",
+            date_text=row["date_text"] or "",
+            transcript_path=row["transcript_path"] or "",
+            byte_offset=row["byte_offset"],
+            byte_length=row["byte_length"],
+            agent_id=row["agent_id"],
+        )
+
+    def load_query_tail_cursor(self, source_key: str) -> dict | None:
+        row = self._conn.execute(
+            "SELECT * FROM query_tail_cursors WHERE source_key = ?",
+            (source_key,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def load_query_tail_cursor_for_session(self, session_id: str) -> dict | None:
+        """Load the newest overlay cursor bound to one transcript session."""
+        row = self._conn.execute(
+            "SELECT * FROM query_tail_cursors WHERE session_id = ? "
+            "ORDER BY last_success_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def load_query_tail_cursors(self) -> list[dict]:
+        """Load every committed query-tail cursor."""
+        rows = self._conn.execute(
+            "SELECT * FROM query_tail_cursors ORDER BY source_key"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def query_tail_suppressed_sessions(self) -> set[str]:
+        """Return sessions whose replacement overlay hides every base row."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT session_id FROM query_tail_cursors "
+            "WHERE suppresses_base = 1"
+        ).fetchall()
+        return {row["session_id"] for row in rows}
+
+    def session_indexed_extent(self, session_id: str) -> dict | None:
+        """Return the last searchable transcript turn stored in base chunks."""
+        row = self._conn.execute(
+            "SELECT byte_offset, byte_length, turn_index, timestamp, transcript_path "
+            "FROM chunks WHERE session_id = ? AND turn_index >= 0 "
+            "AND byte_offset >= 0 ORDER BY byte_offset DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "observed_complete_offset": row["byte_offset"] + row["byte_length"],
+            "rewind_offset": row["byte_offset"],
+            "rewind_turn_index": row["turn_index"],
+            "latest_projected_timestamp": row["timestamp"] or "",
+            "transcript_path": row["transcript_path"] or "",
+        }
+
+    def clear_query_tail(self, source_key: str) -> None:
+        """Retire an overlay only after its coverage exists in the base index."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM query_tail_chunks WHERE source_key = ?",
+                (source_key,),
+            )
+            self._conn.execute(
+                "DELETE FROM query_tail_cursors WHERE source_key = ?",
+                (source_key,),
+            )
+
+    def clear_query_tail_session(self, session_id: str) -> None:
+        """Discard every prior source generation for one session."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM query_tail_chunks WHERE session_id = ?",
+                (session_id,),
+            )
+            self._conn.execute(
+                "DELETE FROM query_tail_cursors WHERE session_id = ?",
+                (session_id,),
+            )
+
+    def retire_absorbed_query_tails(self) -> None:
+        """Retire overlays absorbed by this monolithic base index."""
+        for cursor in self.load_query_tail_cursors():
+            path = Path(cursor["transcript_path"])
+            try:
+                current_key = query_tail_source_key(cursor["session_id"], path)
+            except OSError:
+                continue
+            if current_key != cursor["source_key"]:
+                continue
+            extent = self.session_indexed_extent(cursor["session_id"])
+            if extent is None:
+                continue
+            if (
+                extent["observed_complete_offset"]
+                < cursor["observed_complete_offset"]
+                or extent.get("latest_projected_timestamp", "")
+                != cursor.get("latest_projected_timestamp", "")
+            ):
+                continue
+            self.clear_query_tail(cursor["source_key"])
+
+    def replace_query_tail(
+        self,
+        *,
+        source_key: str,
+        session_id: str,
+        rewind_offset: int,
+        chunks: list[TranscriptChunk],
+        cursor: dict,
+    ) -> None:
+        """Atomically replace one reparsed tail and advance its cursor."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM query_tail_chunks "
+                "WHERE source_key = ? AND byte_offset >= ?",
+                (source_key, rewind_offset),
+            )
+            for chunk in chunks:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO query_tail_chunks "
+                    "(id, source_key, session_id, timestamp, turn_index, user_text, "
+                    " assistant_text, tools_used, files_touched, tool_content, date_text, "
+                    " transcript_path, byte_offset, byte_length, agent_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        chunk.id,
+                        source_key,
+                        session_id,
+                        chunk.timestamp,
+                        chunk.turn_index,
+                        chunk.user_text,
+                        chunk.assistant_text,
+                        json.dumps(chunk.tools_used),
+                        json.dumps(chunk.files_touched),
+                        chunk.tool_content,
+                        chunk.date_text,
+                        chunk.transcript_path,
+                        chunk.byte_offset,
+                        chunk.byte_length,
+                        chunk.agent_id,
+                    ),
+                )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO query_tail_cursors "
+                "(source_key, session_id, transcript_path, observed_complete_offset, "
+                " rewind_offset, rewind_turn_index, source_size, source_mtime_ns, "
+                " observed_prefix_sha256, "
+                " suppresses_base, latest_projected_timestamp, last_attempt_at, "
+                " last_success_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    source_key,
+                    session_id,
+                    cursor["transcript_path"],
+                    cursor["observed_complete_offset"],
+                    cursor["rewind_offset"],
+                    cursor["rewind_turn_index"],
+                    cursor["source_size"],
+                    cursor["source_mtime_ns"],
+                    cursor["observed_prefix_sha256"],
+                    int(cursor.get("suppresses_base", False)),
+                    cursor.get("latest_projected_timestamp", ""),
+                    cursor["last_attempt_at"],
+                    cursor["last_success_at"],
+                ),
+            )
+
+    def load_query_tail_chunks(self) -> list[TranscriptChunk]:
+        rows = self._conn.execute(
+            "SELECT * FROM query_tail_chunks ORDER BY rowid"
+        ).fetchall()
+        return [self._query_tail_chunk_from_row(row) for row in rows]
+
+    def query_tail_chunk_refs(self) -> list[tuple[str, str]]:
+        """Return lightweight ``(id, session_id)`` overlay identities."""
+        return [
+            (row["id"], row["session_id"])
+            for row in self._conn.execute(
+                "SELECT id, session_id FROM query_tail_chunks"
+            ).fetchall()
+        ]
+
+    def query_tail_chunk_count(self) -> int:
+        """Count query-tail chunks without hydrating their content."""
+        row = self._conn.execute("SELECT COUNT(*) FROM query_tail_chunks").fetchone()
+        return row[0] if row else 0
+
+    def load_query_tail_chunk_by_rowid(self, rowid: int) -> TranscriptChunk | None:
+        row = self._conn.execute(
+            "SELECT * FROM query_tail_chunks WHERE rowid = ?",
+            (rowid,),
+        ).fetchone()
+        return self._query_tail_chunk_from_row(row) if row is not None else None
+
+    def load_query_tail_chunks_by_rowids(
+        self, rowids: list[int],
+    ) -> dict[int, TranscriptChunk]:
+        if not rowids:
+            return {}
+        loaded: dict[int, TranscriptChunk] = {}
+        for offset in range(0, len(rowids), 900):
+            batch = rowids[offset:offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            rows = self._conn.execute(
+                "SELECT * FROM query_tail_chunks WHERE rowid IN (" + placeholders + ")",
+                batch,
+            ).fetchall()
+            for row in rows:
+                loaded[row["rowid"]] = self._query_tail_chunk_from_row(row)
+        return loaded
+
+    def query_tail_id_rowid_map(self) -> dict[str, int]:
+        return {
+            row["id"]: row["rowid"]
+            for row in self._conn.execute(
+                "SELECT rowid, id FROM query_tail_chunks"
+            ).fetchall()
+        }
+
+    def query_tail_fts_search(
+        self, query: str, limit: int = 100,
+    ) -> list[tuple[int, float]]:
+        fts_query = _escape_fts_query(query)
+        if not fts_query:
+            return []
+        rows = self._conn.execute(
+            f"SELECT query_tail_fts.rowid, "
+            f"-bm25(query_tail_fts, {_FTS_WEIGHTS}) AS score "
+            "FROM query_tail_fts WHERE query_tail_fts MATCH ? "
+            "ORDER BY score DESC LIMIT ?",
+            (fts_query, limit),
+        ).fetchall()
+        if not rows and len(_escape_fts_tokens(query)) > 1:
+            rows = self._conn.execute(
+                f"SELECT query_tail_fts.rowid, "
+                f"-bm25(query_tail_fts, {_FTS_WEIGHTS}) AS score "
+                "FROM query_tail_fts WHERE query_tail_fts MATCH ? "
+                "ORDER BY score DESC LIMIT ?",
+                (_escape_fts_query(query, use_or=True), limit),
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def query_tail_fts_search_raw(
+        self, fts_query: str, limit: int = 100,
+    ) -> list[tuple[int, float]]:
+        if not fts_query:
+            return []
+        rows = self._conn.execute(
+            f"SELECT query_tail_fts.rowid, "
+            f"-bm25(query_tail_fts, {_FTS_WEIGHTS}) AS score "
+            "FROM query_tail_fts WHERE query_tail_fts MATCH ? "
+            "ORDER BY score DESC LIMIT ?",
+            (fts_query, limit),
+        ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def query_tail_fts_search_by_session(
+        self, query: str, session_ids: list[str], limit: int = 100,
+    ) -> list[tuple[int, float]]:
+        fts_query = _escape_fts_query(query)
+        if not fts_query or not session_ids:
+            return []
+        placeholders = ",".join("?" for _ in session_ids)
+        rows = self._conn.execute(
+            f"SELECT query_tail_fts.rowid, "
+            f"-bm25(query_tail_fts, {_FTS_WEIGHTS}) AS score "
+            "FROM query_tail_fts JOIN query_tail_chunks c "
+            "ON c.rowid = query_tail_fts.rowid "
+            "WHERE query_tail_fts MATCH ? "
+            f"AND c.session_id IN ({placeholders}) "
+            "ORDER BY score DESC LIMIT ?",
+            (fts_query, *session_ids, limit),
+        ).fetchall()
+        return [(row[0], row[1]) for row in rows]
 
     def save_chunks(self, chunks: list[TranscriptChunk]) -> None:
         """Replace all chunks in the database and rebuild the FTS5 index.
@@ -1100,6 +1526,7 @@ class RecallDB:
             "         THEN timestamp END) AS activity_raw, "
             "MAX(julianday(timestamp)) AS fallback_jd, "
             "MAX(CASE WHEN julianday(timestamp) IS NULL THEN timestamp END) AS fallback_raw "
+            ", MIN(NULLIF(transcript_path, '')) AS transcript_path "
             "FROM chunks GROUP BY session_id"
         ).fetchall()
 
@@ -1121,6 +1548,7 @@ class RecallDB:
                 "latest_ts": row["latest_ts"] or "",
                 "turn_count": int(row["turn_count"] or 0),
                 "has_real_activity": bool(row["activity_count"]),
+                "transcript_path": row["transcript_path"] or "",
             }
         return result
 
@@ -1199,19 +1627,22 @@ class RecallDB:
                 continue
             placeholders = ",".join("?" for _ in batch)
             rows = self._conn.execute(
-                "SELECT session_id, turn_index, user_text, files_touched "
+                "SELECT id, session_id, turn_index, user_text, files_touched, "
+                "transcript_path "
                 "FROM chunks WHERE session_id IN (" + placeholders + ") "
                 "ORDER BY session_id, turn_index",
                 batch,
             ).fetchall()
             for row in rows:
                 grouped.setdefault(row["session_id"], []).append({
+                    "id": row["id"],
                     "turn_index": row["turn_index"],
                     "user_text": row["user_text"] or "",
                     "files_touched": (
                         json.loads(row["files_touched"])
                         if row["files_touched"] else []
                     ),
+                    "transcript_path": row["transcript_path"] or "",
                 })
         return grouped
 
@@ -1219,6 +1650,22 @@ class RecallDB:
         """Number of chunks in the database."""
         row = self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()
         return row[0] if row else 0
+
+    def chunk_count_for_values(self, column: str, values: set[str]) -> int:
+        """Count chunks matching a bounded set without materializing their text."""
+        if column not in {"id", "session_id"}:
+            raise ValueError(f"unsupported chunk count column: {column}")
+        ordered = sorted(values)
+        total = 0
+        for offset in range(0, len(ordered), 900):
+            batch = ordered[offset:offset + 900]
+            placeholders = ",".join("?" for _ in batch)
+            row = self._conn.execute(
+                f"SELECT COUNT(*) FROM chunks WHERE {column} IN ({placeholders})",
+                batch,
+            ).fetchone()
+            total += row[0] if row else 0
+        return total
 
     # ------------------------------------------------------------------
     # Cross-session chunk links
