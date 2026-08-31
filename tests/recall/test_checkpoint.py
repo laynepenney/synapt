@@ -480,6 +480,50 @@ def test_periodic_checkpoint_case_distinct_session_ids_never_both_resolve(tmp_pa
         periodic_checkpoint_path(tmp_path, "Session-AAAA")
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "session-\u00c4",  # LATIN CAPITAL LETTER A WITH DIAERESIS
+        "session-\u00e4",  # LATIN SMALL LETTER A WITH DIAERESIS -- case-folds to the above
+        "session-caf\u00e9",  # NFC: e-with-acute as ONE composed codepoint (U+00E9)
+        "session-cafe\u0301",  # NFD: plain "e" (U+0065) + COMBINING ACUTE ACCENT (U+0301)
+    ],
+    ids=["upper-a-diaeresis", "lower-a-diaeresis", "cafe-nfc", "cafe-nfd"],
+)
+def test_periodic_checkpoint_rejects_non_ascii_session_ids(tmp_path, bad, monkeypatch):
+    """Atlas r1, checkpoint-v4 P1: rejecting uppercase ASCII closes the ASCII
+    case class but not the general filesystem-key-injectivity contract.
+    Measured on this macOS filesystem: upper/lower a-diaeresis case-fold to
+    one inode, and the NFC/NFD spellings of the same rendered "cafe" name
+    normalize to one inode -- writing the second changed the first in both
+    pairs. "Two sessions never collide" requires an explicitly portable ASCII
+    grammar (nothing left to case-fold or normalize), not a widening list of
+    excluded Unicode classes. Written as \\uXXXX escapes rather than literal
+    source characters: a literal NFD spelling here survived this very file's
+    own on-disk write path silently renormalized to NFC, which would have
+    made the intended discriminating pair into two duplicate cases -- found
+    and fixed before freeze."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    with pytest.raises(ValueError):
+        periodic_checkpoint_path(tmp_path, bad)
+
+
+def test_periodic_checkpoint_session_id_grammar_is_ascii_lowercase_alnum_and_hyphen_only(
+    tmp_path, bad, monkeypatch
+):
+    """Pins the accepted alphabet as exactly ASCII [a-z0-9-] rather than
+    "not uppercase, not obviously non-ASCII": an implementation that merely
+    special-cases the two collision classes above (uppercase, non-ASCII)
+    without adopting an explicit allow-list would still accept these."""
+    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    with pytest.raises(ValueError):
+        periodic_checkpoint_path(tmp_path, bad)
+
+
 def test_periodic_checkpoint_write_requires_session_id_in_payload(tmp_path, monkeypatch):
     # Interim per-test isolation (the shared process-environment fixture will supply this;
     # until it lands, these three lines are the established idiom this file
