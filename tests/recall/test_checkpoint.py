@@ -42,7 +42,14 @@ try:
         read_periodic_checkpoint,
         write_periodic_checkpoint,
     )
-except ImportError as _periodic_import_error:
+except ImportError as _e:
+    # `except ... as name` deletes `name` at the end of the block (CPython
+    # breaks the traceback reference cycle), so a closure created inside the
+    # block that referenced `_e` directly would raise NameError instead of
+    # the intended NotImplementedError once actually called, much later, by
+    # a test. Rebind to a plain module-level name first (Apollo r2, caught
+    # by RAN evidence: 48/48 raised NameError, not NotImplementedError).
+    _periodic_import_error = _e
 
     def _periodic_not_implemented_yet(*_args, **_kwargs):
         raise NotImplementedError(
