@@ -186,6 +186,45 @@ def test_fresh_child_processes_use_generated_file_for_send_and_read(
     assert "fresh child" in reader.stdout
 
 
+def test_fresh_child_uses_one_generated_record_when_inline_panes_conflict(tmp_path):
+    """Configured identity cannot combine with an inline tmux route."""
+    generated = {
+        "gripspace": "synapt",
+        "qualified_alias": "synapt:stromus",
+        "agent_id": "stromus-001",
+        "store_coordinate": "synapt",
+        "target": "generated-stromus:0",
+        "runtime": "codex",
+    }
+    routing = tmp_path / "agent-panes.json"
+    routing.write_text(json.dumps({"synapt:stromus": generated, "stromus": generated}))
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        "SYNAPT_AGENT_ID": "apollo-001",
+        "SYNAPT_AGENT_PANES_FILE": str(routing),
+        "SYNAPT_AGENT_PANES": json.dumps(
+            {"stromus": {"target": "inline-stromus:0", "runtime": "claude"}}
+        ),
+        "SYNAPT_SHARED_CHANNELS_DIR": str(tmp_path / "channels"),
+    }
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from synapt.recall.direct import load_pane_map, resolve_pane, resolve_registered_recipient, speak_to_agent; r = resolve_registered_recipient('stromus'); p = resolve_pane(r.agent_id, load_pane_map()); print(f'{r.agent_id}|{r.store_coordinate}|{p.target}|{p.runtime}'); print(speak_to_agent(action='send', to='stromus', message='co-configured source'))",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    lines = child.stdout.splitlines()
+    assert lines[0] == "stromus-001|synapt|generated-stromus:0|codex"
+    assert lines[1].startswith("Sent to stromus-001:")
+
+
 @pytest.mark.parametrize("coordinate", ["../escape", "/tmp", "a/b", ".", "a..b"])
 def test_invalid_store_coordinate_refuses_before_store_access(coordinate):
     with pytest.raises(ValueError, match="invalid recipient store coordinate"):

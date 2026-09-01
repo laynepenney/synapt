@@ -976,51 +976,61 @@ def enter_count(runtime: str | None) -> int:
 def load_pane_map() -> dict[str, Any]:
     """Operator-supplied agent->pane map (neutral routing table, not identity).
 
-    Source order: the ``SYNAPT_AGENT_PANES`` env var as a JSON object, else the
-    JSON file at ``SYNAPT_AGENT_PANES_FILE``. Defaults to an empty map (which
-    makes delivery a no-op so the send falls back to inbox-only). OSS never
-    hardcodes the workspace's agent topology -- that is operator config.
+    A configured ``SYNAPT_AGENT_PANES_FILE`` is authoritative when present:
+    recipient identity and tmux target/runtime must come from one generated
+    record source.  Inline ``SYNAPT_AGENT_PANES`` remains a legacy fallback
+    only when no configured file is selected.  A malformed selected file fails
+    closed rather than silently combining its identity records with inline
+    routing.
 
     Format (operator-supplied)::
 
         {"<agent>": {"target": "<tmux-session>:<window>", "runtime": "claude|codex"}}
     """
+    path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
+    if path:
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {}
+        return _pane_map_from_payload(payload)
+
     raw = os.environ.get("SYNAPT_AGENT_PANES")
     if raw:
         try:
-            return json.loads(raw)
+            payload = json.loads(raw)
         except (ValueError, TypeError):
             return {}
-    path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
-    if path and Path(path).exists():
-        try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            records = payload.get("records") if isinstance(payload, dict) else payload
-            if isinstance(records, list):
-                return {
-                    str(record["agent_id"]): {
-                        "target": record["target"],
-                        "runtime": record["runtime"],
-                    }
-                    for record in records
-                    if isinstance(record, dict)
-                    and {"agent_id", "target", "runtime"} <= set(record)
-                }
-            if isinstance(payload, dict) and all(
-                isinstance(record, dict) for record in payload.values()
-            ):
-                return {
-                    str(record["agent_id"]): {
-                        "target": record["target"],
-                        "runtime": record["runtime"],
-                    }
-                    for record in payload.values()
-                    if {"agent_id", "target", "runtime"} <= set(record)
-                }
-            return payload if isinstance(payload, dict) else {}
-        except (ValueError, OSError):
-            return {}
+        return _pane_map_from_payload(payload)
     return {}
+
+
+def _pane_map_from_payload(payload: Any) -> dict[str, Any]:
+    """Convert either legacy panes or generated records to stable-ID pane keys."""
+    records = payload.get("records") if isinstance(payload, dict) else payload
+    if isinstance(records, list):
+        return {
+            str(record["agent_id"]): {
+                "target": record["target"],
+                "runtime": record["runtime"],
+            }
+            for record in records
+            if isinstance(record, dict)
+            and {"agent_id", "target", "runtime"} <= set(record)
+        }
+    if isinstance(payload, dict) and all(
+        isinstance(record, dict) for record in payload.values()
+    ):
+        generated = {
+            str(record["agent_id"]): {
+                "target": record["target"],
+                "runtime": record["runtime"],
+            }
+            for record in payload.values()
+            if {"agent_id", "target", "runtime"} <= set(record)
+        }
+        return generated or payload
+    return payload if isinstance(payload, dict) else {}
 
 
 def load_pane_records() -> list[dict[str, Any]]:
@@ -1032,9 +1042,16 @@ def load_pane_records() -> list[dict[str, Any]]:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return []
+    records = payload.get("records") if isinstance(payload, dict) else payload
+    required = {"qualified_alias", "agent_id", "store_coordinate", "target", "runtime"}
+    if isinstance(records, list):
+        return [
+            {**record, "_key": record["qualified_alias"]}
+            for record in records
+            if isinstance(record, dict) and required <= set(record)
+        ]
     if not isinstance(payload, dict):
         return []
-    required = {"qualified_alias", "agent_id", "store_coordinate", "target", "runtime"}
     return [
         {**record, "_key": key}
         for key, record in payload.items()
