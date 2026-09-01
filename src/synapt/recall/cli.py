@@ -1406,6 +1406,14 @@ def cmd_resume(args: argparse.Namespace) -> None:
     view = _attach_freshness(view, args)
     view = _attach_unclean_end(view, args)
 
+    # On a cold/stale resume the tail-bound journal path can miss the freshest
+    # durable entry (bound to a session the stale index never saw). Surface the
+    # newest journal above the tail when the index is stale or no caller session
+    # resolved. Read-only; gated so a fresh index with a caller shows nothing.
+    from synapt.recall.resume import attach_durable_checkpoint
+
+    view = attach_durable_checkpoint(view, _journal_path())
+
     print(format_resume(view))
 
 
