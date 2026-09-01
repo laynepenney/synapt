@@ -46,6 +46,8 @@ HOOK_RUN_LOG_MAX_RECORDS = 100
 # construction, so the budget holds without a second pass; the final guard in
 # render_wake exists for the day someone adds a source and forgets this table.
 _CAP_UNCLEAN_END = 2_500
+_CAP_CHECKPOINT = 2_500
+_CAP_COMPACTION = 4_000
 _CAP_JOURNAL_LATEST = 6_000
 _CAP_JOURNAL_OLDER = 1_500
 _CAP_BRANCH = 1_200
@@ -356,6 +358,11 @@ def _kind(block: str) -> str:
     head = _first_line(block)
     if head.startswith("UNCLEAN END"):
         return "unclean_end"
+    if head.startswith("LAST CHECKPOINT"):
+        return "checkpoint"
+    if head.startswith("LAST COMPACTION SUMMARY") \
+            or head.startswith("AGENT COMPACTION DIRECTIVE"):
+        return "compaction"
     if head.startswith("Journal read: "):
         return "journal_coverage"
     if head.startswith("Last session") or head.startswith("Next steps:") \
@@ -511,6 +518,8 @@ def render_wake(
     # does first, so it renders before everything, including the journal it
     # would otherwise be read as continuous with.
     take("unclean_end", _CAP_UNCLEAN_END)
+    take("checkpoint", _CAP_CHECKPOINT)
+    take("compaction", _CAP_COMPACTION)
     take("branch", _CAP_BRANCH)
     take("open_pr", _CAP_OPEN_PR)
     take("journal", _CAP_JOURNAL_OLDER, first_cap=_CAP_JOURNAL_LATEST)

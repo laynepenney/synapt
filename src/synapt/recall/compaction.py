@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from synapt.recall.core import atomic_json_write, project_data_dir
@@ -11,6 +12,7 @@ from synapt.recall.scrub import scrub_text
 SCHEMA_VERSION = 1
 SUMMARY_TEXT_BYTES = 32 * 1024
 SUMMARY_INDEX_LIMIT = 50
+AGENT_DIRECTIVE_BYTES = 4 * 1024
 _CLAUDE_PREFIX = (
     "This session is being continued from a previous conversation that ran "
     "out of context. The summary below covers the earlier portion of the "
@@ -276,8 +278,17 @@ def update_compaction_summary_index(
     atomic_json_write(payload, destination)
 
 
-def latest_compaction_summary(project: Path | None = None) -> dict | None:
-    """Read the newest indexed summary without opening transcript files."""
+def latest_compaction_summary(
+    project: Path | None = None,
+    *,
+    agent_id: str | None = None,
+) -> dict | None:
+    """Read the newest indexed summary without opening transcript files.
+
+    A stable agent identity is a stricter selector than worktree identity. Old
+    sidecars do not record an author, so they fail closed for an agent-scoped
+    wake instead of attaching another agent's runtime handoff by CWD alone.
+    """
     path = compaction_index_path(project)
     try:
         if path.stat().st_size > 2 * 1024 * 1024:
@@ -297,9 +308,69 @@ def latest_compaction_summary(project: Path | None = None) -> dict | None:
         if not isinstance(item, dict):
             continue
         item_worktree = _summary_worktree(item)
-        if item_worktree == expected_worktree:
-            return item
+        if item_worktree != expected_worktree:
+            continue
+        if agent_id and item.get("agent_id") != agent_id:
+            continue
+        return item
     return None
+
+
+def latest_agent_compaction_directive(
+    project: Path | None,
+    agent_name: str | None,
+) -> dict | None:
+    """Read the durable directive explicitly addressed to one agent.
+
+    ``.synapt/compact/<agent>.txt`` is identity-scoped at write time. Unlike
+    the legacy runtime-summary sidecar, it does not infer authorship from the
+    process CWD or from whichever agent happened to rebuild the shared index.
+    """
+    name = (agent_name or "").strip()
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\\" in name
+    ):
+        return None
+    # Runtime CWD is transcript context, not durable-store identity. A
+    # configured recall root must retain authority even when the historical
+    # project path moved or disappeared. Without a configured root, preserve
+    # the explicit-project behavior used by isolated callers and tests.
+    configured_root = os.environ.get("SYNAPT_RECALL_ROOT") or os.environ.get(
+        "GRIPSPACE_ROOT"
+    )
+    data_dir = project_data_dir() if configured_root else project_data_dir(project)
+    path = data_dir.parent / "compact" / f"{name}.txt"
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(AGENT_DIRECTIVE_BYTES + 1)
+    except OSError:
+        return None
+    if not raw:
+        return None
+    truncated = len(raw) > AGENT_DIRECTIVE_BYTES
+    text = raw[:AGENT_DIRECTIVE_BYTES].decode("utf-8", errors="ignore").strip()
+    if not text:
+        return None
+    if truncated:
+        text = text.rstrip() + "\n[directive clipped for startup]"
+    return {
+        "agent_name": name,
+        "source_path": str(path),
+        "text": text,
+        "truncated": truncated,
+    }
+
+
+def format_agent_compaction_directive(item: dict) -> str:
+    """Render identity-bound continuity separately from runtime inference."""
+    return (
+        "AGENT COMPACTION DIRECTIVE\n"
+        f"Durable continuity addressed to {item['agent_name']}.\n"
+        f"{item['text']}"
+    )
 
 
 def format_compaction_summary(item: dict, max_chars: int = 4000) -> str:

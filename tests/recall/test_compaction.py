@@ -10,7 +10,9 @@ from synapt.recall.compaction import (
     _CLAUDE_PREFIX,
     compaction_index_ready,
     extract_compaction_summaries,
+    format_agent_compaction_directive,
     format_compaction_summary,
+    latest_agent_compaction_directive,
     latest_compaction_summary,
     update_compaction_summary_index,
 )
@@ -201,6 +203,93 @@ def test_latest_summary_is_scoped_to_current_worktree(tmp_path):
         latest = latest_compaction_summary(tmp_path)
 
     assert latest["summary"] == "right"
+
+
+def test_agent_identity_refuses_worktree_summary_without_matching_author(tmp_path):
+    sidecar = tmp_path / "compaction-summaries.json"
+    sidecar.write_text(json.dumps({
+        "schema_version": 1,
+        "summaries": [
+            {
+                "worktree": tmp_path.name,
+                "agent_id": "foreign-agent",
+                "timestamp": "2026-02-01",
+                "summary": "foreign sediment",
+            },
+        ],
+    }), encoding="utf-8")
+
+    with patch("synapt.recall.compaction.compaction_index_path", return_value=sidecar):
+        assert latest_compaction_summary(tmp_path, agent_id="stable-agent") is None
+        assert latest_compaction_summary(tmp_path, agent_id="foreign-agent")["summary"] == (
+            "foreign sediment"
+        )
+
+
+def test_agent_identity_refuses_legacy_summary_with_no_author(tmp_path):
+    sidecar = tmp_path / "compaction-summaries.json"
+    sidecar.write_text(json.dumps({
+        "schema_version": 1,
+        "summaries": [
+            {
+                "worktree": tmp_path.name,
+                "timestamp": "2026-02-01",
+                "summary": "unattributed sediment",
+            },
+        ],
+    }), encoding="utf-8")
+
+    with patch("synapt.recall.compaction.compaction_index_path", return_value=sidecar):
+        assert latest_compaction_summary(tmp_path, agent_id="stable-agent") is None
+
+
+def test_agent_compaction_directive_is_selected_by_stable_agent_name(tmp_path):
+    data_dir = tmp_path / ".synapt" / "recall"
+    compact_dir = tmp_path / ".synapt" / "compact"
+    compact_dir.mkdir(parents=True)
+    (compact_dir / "current.txt").write_text("current continuity", encoding="utf-8")
+    (compact_dir / "foreign.txt").write_text("foreign continuity", encoding="utf-8")
+
+    with patch("synapt.recall.compaction.project_data_dir", return_value=data_dir):
+        directive = latest_agent_compaction_directive(tmp_path, "current")
+
+    rendered = format_agent_compaction_directive(directive)
+    assert "current continuity" in rendered
+    assert "foreign continuity" not in rendered
+    assert "addressed to current" in rendered
+
+
+def test_agent_compaction_directive_uses_durable_root_after_project_moves(
+    tmp_path, monkeypatch,
+):
+    durable_root = tmp_path / "durable"
+    compact_dir = durable_root / ".synapt" / "compact"
+    compact_dir.mkdir(parents=True)
+    (compact_dir / "current.txt").write_text(
+        "current continuity", encoding="utf-8"
+    )
+    (compact_dir / "foreign.txt").write_text(
+        "foreign continuity", encoding="utf-8"
+    )
+    missing_old_cwd = tmp_path / "moved-away"
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(durable_root))
+
+    directive = latest_agent_compaction_directive(missing_old_cwd, "current")
+
+    assert directive is not None
+    assert directive["text"] == "current continuity"
+    assert "foreign continuity" not in format_agent_compaction_directive(directive)
+
+
+@pytest.mark.parametrize("agent_name", [None, "", ".", "..", "nested/name", r"nested\name"])
+def test_agent_compaction_directive_refuses_unsafe_or_absent_names(
+    tmp_path, agent_name,
+):
+    with patch(
+        "synapt.recall.compaction.project_data_dir",
+        side_effect=AssertionError("unsafe identity reached the filesystem"),
+    ):
+        assert latest_agent_compaction_directive(tmp_path, agent_name) is None
 
 
 def test_index_keeps_latest_summary_per_worktree(tmp_path):

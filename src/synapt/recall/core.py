@@ -151,11 +151,11 @@ class TranscriptChunk:
     byte_offset: int = -1  # Byte position where this turn starts in raw JSONL
     byte_length: int = 0  # Total bytes of raw JSONL entries for this turn
     text: str = ""  # Combined searchable text (built at init)
-    agent_id: str | None = None  # Agent that created this chunk (from SYNAPT_AGENT_ID)
+    agent_id: str | None = field(
+        default_factory=lambda: os.environ.get("SYNAPT_AGENT_ID")
+    )  # Agent that created this chunk
 
     def __post_init__(self):
-        if self.agent_id is None:
-            self.agent_id = os.environ.get("SYNAPT_AGENT_ID")
         if not self.date_text:
             self.date_text = _build_date_text(self.timestamp)
         if not self.text:
@@ -193,6 +193,7 @@ class TranscriptChunk:
             "transcript_path": self.transcript_path,
             "byte_offset": self.byte_offset,
             "byte_length": self.byte_length,
+            "agent_id": self.agent_id,
         }
 
     @classmethod
@@ -212,6 +213,10 @@ class TranscriptChunk:
             transcript_path=d.get("transcript_path", ""),
             byte_offset=d.get("byte_offset", -1),
             byte_length=d.get("byte_length", 0),
+            # Deserialization must preserve absent authorship. Construction-time
+            # ambient identity is only valid for chunks created by this process,
+            # not legacy records read under a later agent's environment.
+            agent_id=d.get("agent_id"),
         )
 
 
@@ -5089,6 +5094,10 @@ def _journal_entry_to_chunk(entry, scrub_text) -> TranscriptChunk:
         user_text=user_text,
         assistant_text=assistant_text,
         files_touched=list(entry.files_modified),
+        # Journal entries are session-bound display metadata. The journal
+        # schema does not carry source-authored stable agent identity, so the
+        # ambient runtime must not turn them into session-routing evidence.
+        agent_id=None,
     )
 
 

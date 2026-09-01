@@ -1379,6 +1379,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
                 caller_sources=caller_transcripts(
                     getattr(args, "project", None) or Path.cwd()
                 ),
+                agent_id=os.environ.get("SYNAPT_AGENT_ID"),
             )
         except ResumeError as exc:
             # An empty index is an honest empty state, not a failure to act on.
@@ -2462,11 +2463,22 @@ def generate_startup_context(
     # by transcript indexing, so startup remains O(1) in transcript size.
     try:
         from synapt.recall.compaction import (
+            format_agent_compaction_directive,
             format_compaction_summary,
+            latest_agent_compaction_directive,
             latest_compaction_summary,
         )
-        summary = latest_compaction_summary(project)
-        if summary:
+        agent_id = os.environ.get("SYNAPT_AGENT_ID")
+        agent_name = (
+            os.environ.get("SYNAPT_AGENT_NAME") or os.environ.get("AGENT_NAME")
+        )
+        summary = None
+        directive = latest_agent_compaction_directive(project, agent_name)
+        if agent_id and directive:
+            compaction_line = format_agent_compaction_directive(directive)
+        else:
+            summary = latest_compaction_summary(project, agent_id=agent_id)
+        if not compaction_line and summary:
             compaction_line = format_compaction_summary(summary)
     except Exception:
         pass
@@ -2741,13 +2753,29 @@ def cmd_startup(args: argparse.Namespace) -> None:
         import json
         print(json.dumps({"context": "\n".join(context_lines)}, indent=2))
     elif getattr(args, "compact", False):
-        # Single line for embedding in prompts — flatten multi-line blocks
-        parts = []
-        for line in context_lines:
-            flat = " ".join(s.strip() for s in line.splitlines() if s.strip())
-            if flat:
-                parts.append(flat)
-        print(" | ".join(parts))
+        # The compact form is embedded directly into a runtime prompt. Give it
+        # the same source-aware byte budget as SessionStart before flattening;
+        # flattening an unbounded context merely turns the overflow into one
+        # enormous logical line and can bury the current assignment.
+        from synapt.recall.session_start import render_wake, WAKE_BUDGET_BYTES
+
+        rendered = render_wake(context_lines, source="startup")
+        parts = [line.strip() for line in rendered.splitlines() if line.strip()]
+        compact = " | ".join(parts)
+        # ``render_wake`` budgets its newline-delimited bytes. Replacing every
+        # newline with a three-byte separator can expand the final transport,
+        # and ``print`` adds one more byte. Enforce the promise on the bytes the
+        # runtime actually receives.
+        if len(compact.encode("utf-8")) + 1 > WAKE_BUDGET_BYTES:
+            suffix = " … (compact output clipped)"
+            room = WAKE_BUDGET_BYTES - 1 - len(suffix.encode("utf-8"))
+            compact = (
+                compact.encode("utf-8")[:room]
+                .decode("utf-8", errors="ignore")
+                .rstrip()
+                + suffix
+            )
+        print(compact)
     else:
         for line in context_lines:
             print(line)

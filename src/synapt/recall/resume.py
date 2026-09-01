@@ -641,6 +641,7 @@ def resolve_session(
     index: TranscriptIndex,
     session_id: str | None,
     caller_session_ids: set[str] | None = None,
+    agent_id: str | None = None,
 ) -> str:
     """Resolve a session id, accepting an exact id or a unique prefix.
 
@@ -665,6 +666,21 @@ def resolve_session(
         raise ResumeError("No sessions indexed yet. Nothing to resume.")
 
     if not session_id:
+        if agent_id:
+            overview = getattr(index, "_overview", {})
+            for sid in order:
+                if is_channel_session(sid):
+                    continue
+                if overview:
+                    agent_ids = overview.get(sid, {}).get("agent_ids", ())
+                else:
+                    agent_ids = {
+                        chunk.agent_id
+                        for chunk in index.sessions.get(sid, ())
+                        if chunk.turn_index != -1 and chunk.agent_id
+                    }
+                if agent_id in agent_ids:
+                    return sid
         if caller_session_ids:
             for sid in order:
                 if sid in caller_session_ids and not is_channel_session(sid):
@@ -741,6 +757,7 @@ def build_resume_view(
     limit: int = DEFAULT_TURNS,
     journal_path: Path | None = None,
     caller_sources: list[CallerTranscript] | None = None,
+    agent_id: str | None = None,
 ) -> ResumeView:
     """Assemble the tail of a session, newest last.
 
@@ -752,9 +769,27 @@ def build_resume_view(
         raise ResumeError(f"--turns must be at least 1 (got {limit}).")
 
     caller_ids = {item.session_id for item in caller_sources or []}
-    resolved = resolve_session(index, session_id, caller_ids if session_id is None else None)
+    resolved = resolve_session(
+        index,
+        session_id,
+        caller_ids if session_id is None else None,
+        agent_id=agent_id if session_id is None else None,
+    )
     if session_id is not None:
         selection_scope = "explicit"
+    elif agent_id:
+        overview = getattr(index, "_overview", {})
+        if overview:
+            selected_agent_ids = overview.get(resolved, {}).get("agent_ids", ())
+        else:
+            selected_agent_ids = {
+                chunk.agent_id
+                for chunk in index.sessions.get(resolved, ())
+                if chunk.turn_index != -1 and chunk.agent_id
+            }
+        selection_scope = "agent" if agent_id in selected_agent_ids else (
+            "caller" if resolved in caller_ids else "store"
+        )
     else:
         selection_scope = "caller" if resolved in caller_ids else "store"
     is_newest = (
@@ -983,7 +1018,9 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
     if view.excluded_count:
         header += f" ({view.excluded_count} harness turns filtered)"
 
-    if view.selection_scope == "store":
+    if view.selection_scope == "agent":
+        header += " · agent identity"
+    elif view.selection_scope == "store":
         header += f" · store fallback from {view.source_label}"
     if view.caller_unindexed:
         newest = view.caller_unindexed[0]

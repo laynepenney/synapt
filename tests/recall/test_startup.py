@@ -8,6 +8,8 @@ Verifies that:
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +22,7 @@ from synapt.recall.cli import (
     cmd_startup,
     generate_startup_context,
 )
+from synapt.recall.session_start import WAKE_BUDGET_BYTES
 
 
 @pytest.fixture(autouse=True)
@@ -233,6 +236,122 @@ class TestGenerateStartupContext:
         assert text.index("LAST CHECKPOINT") < text.index("LAST COMPACTION SUMMARY")
         assert text.index("LAST COMPACTION SUMMARY") < text.index("older journal context")
 
+    def test_stable_agent_gets_own_directive_not_foreign_runtime_summary(self, tmp_path):
+        own = {
+            "agent_name": "current",
+            "source_path": str(tmp_path / ".synapt" / "compact" / "current.txt"),
+            "text": "current agent continuity",
+            "truncated": False,
+        }
+        foreign = {
+            "runtime": "claude",
+            "timestamp": "2026-09-01T00:00:00Z",
+            "summary": "foreign runtime sediment",
+        }
+        with patch.dict(
+            os.environ,
+            {"SYNAPT_AGENT_ID": "stable-agent", "AGENT_NAME": "current"},
+            clear=False,
+        ), patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.journal._journal_path", return_value=tmp_path / "none"), \
+             patch(
+                 "synapt.recall.compaction.latest_agent_compaction_directive",
+                 return_value=own,
+             ), patch(
+                 "synapt.recall.compaction.latest_compaction_summary",
+                 return_value=foreign,
+             ) as runtime_summary, patch(
+                 "synapt.checkpoint.read_checkpoint", return_value=None
+             ), patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch(
+                 "synapt.recall.server.format_contradictions_for_session_start",
+                 return_value="",
+             ), patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        assert "current agent continuity" in text
+        assert "foreign runtime sediment" not in text
+        runtime_summary.assert_not_called()
+
+    def test_canonical_agent_name_selects_directive_without_legacy_alias(self, tmp_path):
+        own = {
+            "agent_name": "current",
+            "source_path": str(tmp_path / ".synapt" / "compact" / "current.txt"),
+            "text": "current agent continuity",
+            "truncated": False,
+        }
+        with patch.dict(
+            os.environ,
+            {"SYNAPT_AGENT_ID": "stable-agent", "SYNAPT_AGENT_NAME": "current"},
+            clear=True,
+        ), patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.journal._journal_path", return_value=tmp_path / "none"), \
+             patch(
+                 "synapt.recall.compaction.latest_agent_compaction_directive",
+                 return_value=own,
+             ) as directive, patch(
+                 "synapt.recall.compaction.latest_compaction_summary"
+             ) as runtime_summary, patch(
+                 "synapt.checkpoint.read_checkpoint", return_value=None
+             ), patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch(
+                 "synapt.recall.server.format_contradictions_for_session_start",
+                 return_value="",
+             ), patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        directive.assert_called_once_with(tmp_path, "current")
+        runtime_summary.assert_not_called()
+        assert "current agent continuity" in text
+
+    def test_old_cwd_startup_reads_only_own_directive_from_durable_root(
+        self, tmp_path
+    ):
+        durable_root = tmp_path / "durable"
+        compact_dir = durable_root / ".synapt" / "compact"
+        compact_dir.mkdir(parents=True)
+        (compact_dir / "current.txt").write_text(
+            "current agent continuity", encoding="utf-8"
+        )
+        (compact_dir / "foreign.txt").write_text(
+            "foreign runtime sediment", encoding="utf-8"
+        )
+        missing_old_cwd = tmp_path / "historical-cwd-that-moved"
+
+        with patch.dict(
+            os.environ,
+            {
+                "SYNAPT_RECALL_ROOT": str(durable_root),
+                "SYNAPT_AGENT_ID": "stable-agent",
+                "SYNAPT_AGENT_NAME": "current",
+            },
+            clear=True,
+        ), patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.journal._journal_path", return_value=tmp_path / "none"), \
+             patch(
+                 "synapt.recall.compaction.latest_compaction_summary"
+             ) as runtime_summary, patch(
+                 "synapt.checkpoint.read_checkpoint", return_value=None
+             ), patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch(
+                 "synapt.recall.server.format_contradictions_for_session_start",
+                 return_value="",
+             ), patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            text = "\n".join(generate_startup_context(missing_old_cwd))
+
+        assert "current agent continuity" in text
+        assert "foreign runtime sediment" not in text
+        runtime_summary.assert_not_called()
+
     def test_checkpoint_older_than_authored_journal_is_suppressed(self, tmp_path):
         from synapt.recall.journal import JournalEntry, append_entry, _journal_path
 
@@ -376,6 +495,59 @@ class TestCmdStartup:
         out = capsys.readouterr().out.strip()
         assert " | " in out
         assert "Journal: session xyz" in out
+
+    def test_compact_output_is_one_bounded_useful_line(self, capsys, tmp_path):
+        args = argparse.Namespace(json=False, compact=True)
+        context = [
+            "AGENT COMPACTION DIRECTIVE\nDurable continuity addressed to current.\n"
+            "current agent continuity",
+            "Last session: " + ("journal sediment " * 5000),
+            "Knowledge:\n  - [sticky] team assignment survives the budget",
+        ]
+        with patch(
+            "synapt.recall.cli.generate_startup_context", return_value=context
+        ), patch("synapt.recall.journal.compact_journal", return_value=0):
+            cmd_startup(args)
+
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1
+        assert len(out.encode("utf-8")) <= WAKE_BUDGET_BYTES
+        assert "current agent continuity" in out
+        assert "team assignment survives the budget" in out
+        assert "full context" in out
+
+    def test_compact_startup_stays_within_byte_budget_after_flattening(
+        self, tmp_path
+    ):
+        payload = "\n".join(["x" * 90 for _ in range(200)])
+        context = [
+            head + "\n" + payload
+            for head in [
+                "UNCLEAN END",
+                "LAST CHECKPOINT",
+                "AGENT COMPACTION DIRECTIVE",
+                "Branch context",
+                "Open PR",
+                "Last session:",
+                "Recent #dev",
+                "Pending directives",
+                "Knowledge:",
+                "Pending contradictions (1)",
+                "other",
+            ]
+        ]
+        output = io.StringIO()
+        with patch(
+            "synapt.recall.cli.generate_startup_context", return_value=context
+        ), patch(
+            "synapt.recall.journal.compact_journal", return_value=0
+        ), patch(
+            "synapt.recall.session_start.wake_file_path",
+            return_value=tmp_path / "wake.md",
+        ), contextlib.redirect_stdout(output):
+            cmd_startup(argparse.Namespace(json=False, compact=True))
+
+        assert len(output.getvalue().encode("utf-8")) <= WAKE_BUDGET_BYTES
 
     def test_json_output(self, capsys, tmp_path):
         """JSON mode outputs valid JSON with context key."""
