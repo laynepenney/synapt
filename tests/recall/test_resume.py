@@ -141,6 +141,52 @@ class TestSessionSelection(unittest.TestCase):
     def test_default_falls_back_store_wide_only_when_caller_has_no_indexed_session(self):
         self.assertEqual(resolve_session(self.index, None, {"not-indexed"}), SESSION_B)
 
+    def test_legacy_unattributed_chunks_do_not_acquire_resuming_agent_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                old = _chunk(
+                    SESSION_A,
+                    0,
+                    "caller continuity",
+                    "answer",
+                    timestamp="2026-01-01T00:00:00Z",
+                    agent_id=None,
+                ).to_dict()
+                newer = _chunk(
+                    SESSION_B,
+                    0,
+                    "foreign continuity",
+                    "answer",
+                    timestamp="2026-02-01T00:00:00Z",
+                    agent_id=None,
+                ).to_dict()
+            # The legacy format had no authorship field at all.
+            old.pop("agent_id", None)
+            newer.pop("agent_id", None)
+            (directory / "chunks.jsonl").write_text(
+                json.dumps(old) + "\n" + json.dumps(newer) + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ, {"SYNAPT_AGENT_ID": "stable-agent"}, clear=True
+            ):
+                index = load_resume_index(directory)
+                view = build_resume_view(
+                    index,
+                    caller_sources=[
+                        CallerTranscript(
+                            SESSION_A, Path("/old/cwd.jsonl"), 1.0, 1
+                        )
+                    ],
+                    agent_id="stable-agent",
+                    journal_path=None,
+                )
+
+            self.assertEqual(view.session_id, SESSION_A)
+            self.assertEqual(view.selection_scope, "caller")
+
     def test_agent_identity_outranks_runtime_cwd_and_store_recency(self):
         index = _index([
             _chunk(

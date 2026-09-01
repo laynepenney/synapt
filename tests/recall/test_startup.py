@@ -8,6 +8,8 @@ Verifies that:
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -513,6 +515,39 @@ class TestCmdStartup:
         assert "current agent continuity" in out
         assert "team assignment survives the budget" in out
         assert "full context" in out
+
+    def test_compact_startup_stays_within_byte_budget_after_flattening(
+        self, tmp_path
+    ):
+        payload = "\n".join(["x" * 90 for _ in range(200)])
+        context = [
+            head + "\n" + payload
+            for head in [
+                "UNCLEAN END",
+                "LAST CHECKPOINT",
+                "AGENT COMPACTION DIRECTIVE",
+                "Branch context",
+                "Open PR",
+                "Last session:",
+                "Recent #dev",
+                "Pending directives",
+                "Knowledge:",
+                "Pending contradictions (1)",
+                "other",
+            ]
+        ]
+        output = io.StringIO()
+        with patch(
+            "synapt.recall.cli.generate_startup_context", return_value=context
+        ), patch(
+            "synapt.recall.journal.compact_journal", return_value=0
+        ), patch(
+            "synapt.recall.session_start.wake_file_path",
+            return_value=tmp_path / "wake.md",
+        ), contextlib.redirect_stdout(output):
+            cmd_startup(argparse.Namespace(json=False, compact=True))
+
+        assert len(output.getvalue().encode("utf-8")) <= WAKE_BUDGET_BYTES
 
     def test_json_output(self, capsys, tmp_path):
         """JSON mode outputs valid JSON with context key."""

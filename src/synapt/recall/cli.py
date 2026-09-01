@@ -2757,11 +2757,25 @@ def cmd_startup(args: argparse.Namespace) -> None:
         # the same source-aware byte budget as SessionStart before flattening;
         # flattening an unbounded context merely turns the overflow into one
         # enormous logical line and can bury the current assignment.
-        from synapt.recall.session_start import render_wake
+        from synapt.recall.session_start import render_wake, WAKE_BUDGET_BYTES
 
         rendered = render_wake(context_lines, source="startup")
         parts = [line.strip() for line in rendered.splitlines() if line.strip()]
-        print(" | ".join(parts))
+        compact = " | ".join(parts)
+        # ``render_wake`` budgets its newline-delimited bytes. Replacing every
+        # newline with a three-byte separator can expand the final transport,
+        # and ``print`` adds one more byte. Enforce the promise on the bytes the
+        # runtime actually receives.
+        if len(compact.encode("utf-8")) + 1 > WAKE_BUDGET_BYTES:
+            suffix = " … (compact output clipped)"
+            room = WAKE_BUDGET_BYTES - 1 - len(suffix.encode("utf-8"))
+            compact = (
+                compact.encode("utf-8")[:room]
+                .decode("utf-8", errors="ignore")
+                .rstrip()
+                + suffix
+            )
+        print(compact)
     else:
         for line in context_lines:
             print(line)

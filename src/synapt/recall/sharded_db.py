@@ -321,10 +321,11 @@ class ShardedRecallDB:
             ) if current["earliest_ts"] or chunk.timestamp else ""
             current["latest_ts"] = max(current["latest_ts"], chunk.timestamp)
             current["turn_count"] += int(chunk.turn_index >= 0)
-            current["has_real_activity"] = True
-            current["activity"] = max(
-                current["activity"], _timestamp_activity(chunk.timestamp)
-            )
+            if chunk.turn_index != -1:
+                current["has_real_activity"] = True
+                current["activity"] = max(
+                    current["activity"], _timestamp_activity(chunk.timestamp)
+                )
             if chunk.agent_id:
                 current["agent_ids"] = frozenset(current.get("agent_ids", ())) | {
                     chunk.agent_id

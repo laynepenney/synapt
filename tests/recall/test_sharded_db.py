@@ -328,6 +328,61 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         self.assertEqual(view.session_id, "new-session")
         self.assertEqual(view.turns[0].user_text, "new query-tail continuity")
 
+    def test_query_tail_journal_metadata_does_not_outrank_real_agent_activity(self):
+        RecallDB(self.index_dir / "index.db").close()
+        shard = RecallDB(self.index_dir / "data_001.db")
+        shard.save_chunks([
+            self._make_chunk(
+                "real:t0",
+                "real-session",
+                "2026-01-01T00:00:00Z",
+                "real continuity",
+                agent_id="stable-agent",
+            ),
+        ])
+        shard.close()
+        index_db = RecallDB(self.index_dir / "index.db")
+        journal = self._make_chunk(
+            "journal:j0",
+            "journal-only",
+            "2026-02-01T00:00:00Z",
+            "journal metadata",
+            agent_id="stable-agent",
+        )
+        journal.turn_index = -1
+        journal.assistant_text = ""
+        index_db.replace_query_tail(
+            source_key="journal-overlay",
+            session_id="journal-only",
+            rewind_offset=0,
+            chunks=[journal],
+            cursor={
+                "transcript_path": "/runtime/journal.jsonl",
+                "observed_complete_offset": 1,
+                "rewind_offset": 0,
+                "rewind_turn_index": -1,
+                "source_size": 1,
+                "source_mtime_ns": 1,
+                "observed_prefix_sha256": "digest",
+                "suppresses_base": False,
+                "latest_projected_timestamp": "2026-02-01T00:00:00Z",
+                "last_attempt_at": "2026-02-01T00:00:00Z",
+                "last_success_at": "2026-02-01T00:00:00Z",
+            },
+        )
+        index_db.close()
+
+        index = BoundedResumeIndex(ShardedRecallDB.open_readonly(self.index_dir))
+        try:
+            view = build_resume_view(
+                index, agent_id="stable-agent", journal_path=None
+            )
+        finally:
+            index.close()
+
+        self.assertEqual(view.session_id, "real-session")
+        self.assertEqual(view.turns[0].user_text, "real continuity")
+
     def test_journal_in_a_later_shard_does_not_replace_real_activity(self):
         RecallDB(self.index_dir / "index.db").close()
         first = RecallDB(self.index_dir / "data_001.db")
