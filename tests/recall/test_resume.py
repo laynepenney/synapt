@@ -25,6 +25,7 @@ import contextlib
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -193,6 +194,40 @@ class TestSessionSelection(unittest.TestCase):
 
             self.assertEqual(view.session_id, SESSION_A)
             self.assertEqual(view.selection_scope, "caller")
+
+    def test_legacy_resume_loader_closes_migration_database_before_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            chunk = _chunk(
+                SESSION_A,
+                0,
+                "caller continuity",
+                "answer",
+                timestamp="2026-01-01T00:00:00Z",
+            ).to_dict()
+            (directory / "chunks.jsonl").write_text(
+                json.dumps(chunk) + "\n", encoding="utf-8"
+            )
+
+            closed = []
+            from synapt.recall.storage import RecallDB
+
+            original_close = RecallDB.close
+
+            def close_and_record(db):
+                original_close(db)
+                closed.append(db)
+
+            with mock.patch.object(RecallDB, "close", close_and_record):
+                index = load_resume_index(directory)
+
+            self.assertEqual(len(closed), 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                closed[0]._conn.execute("SELECT 1")
+            self.assertIsNone(getattr(index, "_db", None))
+            self.assertTrue((directory / "recall.db").exists())
+            self.assertFalse((directory / "recall.db-wal").exists())
+            self.assertFalse((directory / "recall.db-shm").exists())
 
     def test_agent_identity_outranks_runtime_cwd_and_store_recency(self):
         index = _index([
