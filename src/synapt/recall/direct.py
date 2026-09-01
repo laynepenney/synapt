@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -161,9 +162,50 @@ def resolve_registered_recipient(
     if not normalized:
         raise ValueError("recipient is required")
     if recipients is None:
-        if _recipient_resolver is None:
+        if _recipient_resolver is not None:
+            return _recipient_resolver(target)
+        records = load_pane_records()
+        if not records:
             raise ValueError("recipient resolver is not configured")
-        return _recipient_resolver(target)
+        matches = [
+            record
+            for record in records
+            if normalized == str(record.get("qualified_alias", "")).lower()
+            or normalized == str(record.get("agent_id", "")).lower()
+            or (
+                ":" not in normalized
+                and normalized == str(record.get("_key", "")).lower()
+            )
+        ]
+        recipients = [
+            RegisteredRecipient(
+                str(record["agent_id"]),
+                str(record["store_coordinate"]),
+                str(record.get("qualified_alias", record["agent_id"])),
+            )
+            for record in matches
+        ]
+        configured_unique = {
+            (recipient.store_coordinate, recipient.agent_id): recipient
+            for recipient in recipients
+        }
+        if len(configured_unique) == 1:
+            return next(iter(configured_unique.values()))
+        if not configured_unique:
+            raise ValueError(f"recipient '{target}' is not registered")
+        choices = ", ".join(
+            f"{recipient.store_coordinate}:{recipient.agent_id}"
+            for recipient in sorted(
+                configured_unique.values(),
+                key=lambda recipient: (
+                    recipient.store_coordinate,
+                    recipient.agent_id,
+                ),
+            )
+        )
+        raise ValueError(
+            f"recipient '{target}' is ambiguous ({choices}); use a qualified alias or canonical ID"
+        )
     catalog = list(recipients)
     matches = [
         recipient
@@ -217,6 +259,13 @@ def _inbox_path(agent_id: str, project_dir: Path | None = None) -> Path:
 # read_inbox union-reads from here. Design: Option A (project-independent
 # org-canonical cross-org root).
 _DEFAULT_ORG = "synapt-dev"
+_STORE_COORDINATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _validated_store_coordinate(coordinate: str) -> str:
+    if not _STORE_COORDINATE_RE.fullmatch(coordinate):
+        raise ValueError("invalid recipient store coordinate")
+    return coordinate
 
 
 def _cross_org_root(
@@ -237,10 +286,14 @@ def _cross_org_root(
     """
     from synapt.recall.channel import _resolve_org_id, _shared_channels_dir
 
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     shared = _shared_channels_dir()
     if shared:
         return shared / "_cross-org" / "direct"
-    coordinate = (
+    coordinate = _validated_store_coordinate(
         recipient_store_coordinate or _resolve_org_id(project_dir) or _DEFAULT_ORG
     )
     return Path.home() / ".synapt" / "channels" / coordinate / "_cross-org" / "direct"
@@ -305,8 +358,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(reply_to);
 def _ensure_direct_columns(conn: sqlite3.Connection) -> None:
     try:
         conn.execute("ALTER TABLE messages ADD COLUMN canonical_store TEXT")
-    except sqlite3.OperationalError:
-        pass
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "canonical_store" not in columns:
+        raise sqlite3.OperationalError("messages.canonical_store migration failed")
     conn.commit()
 
 
@@ -573,9 +630,9 @@ def _track_cross_org_read(
             msg.priority,
             STATUS_READ,
             now,
+            now,
+            now,
             recipient_store_coordinate,
-            now,
-            now,
         ),
     )
     conn.commit()
@@ -737,6 +794,7 @@ def message_history(
     limit: int = 20,
     project_dir: Path | None = None,
     include_canonical: bool = False,
+    canonical_store_coordinate: str | None = None,
 ) -> list[DirectMessage]:
     """Read message history between two agents (both directions)."""
     conn = _get_db(project_dir)
@@ -777,6 +835,8 @@ def message_history(
                 (agent_id, with_agent, with_agent, agent_id),
             ).fetchall()
         ]
+        if canonical_store_coordinate:
+            coordinates.append(canonical_store_coordinate)
         for coordinate in coordinates:
             try:
                 canonical_conn = _get_canonical_db(
@@ -890,10 +950,52 @@ def load_pane_map() -> dict[str, Any]:
     path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
     if path and Path(path).exists():
         try:
-            return json.loads(Path(path).read_text(encoding="utf-8"))
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            records = payload.get("records") if isinstance(payload, dict) else payload
+            if isinstance(records, list):
+                return {
+                    str(record["agent_id"]): {
+                        "target": record["target"],
+                        "runtime": record["runtime"],
+                    }
+                    for record in records
+                    if isinstance(record, dict)
+                    and {"agent_id", "target", "runtime"} <= set(record)
+                }
+            if isinstance(payload, dict) and all(
+                isinstance(record, dict) for record in payload.values()
+            ):
+                return {
+                    str(record["agent_id"]): {
+                        "target": record["target"],
+                        "runtime": record["runtime"],
+                    }
+                    for record in payload.values()
+                    if {"agent_id", "target", "runtime"} <= set(record)
+                }
+            return payload if isinstance(payload, dict) else {}
         except (ValueError, OSError):
             return {}
     return {}
+
+
+def load_pane_records() -> list[dict[str, Any]]:
+    """Read grip-generated routing records, never infer identity from them."""
+    path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
+    if not path:
+        return []
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    required = {"qualified_alias", "agent_id", "store_coordinate", "target", "runtime"}
+    return [
+        {**record, "_key": key}
+        for key, record in payload.items()
+        if isinstance(record, dict) and required <= set(record)
+    ]
 
 
 def _normalize_agent_key(to_agent: str) -> str:
@@ -1099,16 +1201,11 @@ def speak_to_agent(
             return f"Sent to {recipient.agent_id}: {msg.message_id}\n{status}"
 
         elif action == "read":
-            try:
-                own_recipient = resolve_registered_recipient(agent_id)
-            except ValueError:
-                own_recipient = None
+            own_recipient = resolve_registered_recipient(agent_id)
             messages = read_inbox(
                 agent_id=agent_id,
                 limit=limit,
-                recipient_store_coordinate=(
-                    own_recipient.store_coordinate if own_recipient else None
-                ),
+                recipient_store_coordinate=(own_recipient.store_coordinate),
             )
             if not messages:
                 return "No unread direct messages."
@@ -1125,16 +1222,11 @@ def speak_to_agent(
         elif action == "ack":
             if not message_id:
                 return "Error: 'message_id' is required for ack."
-            try:
-                own_recipient = resolve_registered_recipient(agent_id)
-            except ValueError:
-                own_recipient = None
+            own_recipient = resolve_registered_recipient(agent_id)
             return ack_message(
                 message_id=message_id,
                 agent_id=agent_id,
-                recipient_store_coordinate=(
-                    own_recipient.store_coordinate if own_recipient else None
-                ),
+                recipient_store_coordinate=(own_recipient.store_coordinate),
             )
 
         elif action == "status":
@@ -1162,6 +1254,7 @@ def speak_to_agent(
                 with_agent=peer.agent_id,
                 limit=limit,
                 include_canonical=True,
+                canonical_store_coordinate=peer.store_coordinate,
             )
             if not messages:
                 return f"No message history with {peer.agent_id}."

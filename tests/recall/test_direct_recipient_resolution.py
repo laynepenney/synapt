@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -103,6 +107,95 @@ def test_resolver_uses_the_injected_catalog_not_the_pane_map(monkeypatch):
     )
 
 
+def test_grip_flat_record_resolves_alias_and_routes_with_its_live_runtime(
+    tmp_path, monkeypatch
+):
+    record = {
+        "gripspace": "conversa",
+        "qualified_alias": "conversa:anchor",
+        "agent_id": "anchor-001",
+        "store_coordinate": "conversa",
+        "target": "conversa:anchor",
+        "runtime": "codex",
+    }
+    path = tmp_path / "agent-panes.json"
+    path.write_text(json.dumps({"conversa:anchor": record, "anchor": record}))
+    monkeypatch.setattr("synapt.recall.direct._recipient_resolver", None)
+    monkeypatch.delenv("SYNAPT_AGENT_PANES", raising=False)
+    monkeypatch.setenv("SYNAPT_AGENT_PANES_FILE", str(path))
+
+    assert resolve_registered_recipient("anchor").agent_id == "anchor-001"
+    from synapt.recall.direct import load_pane_map
+
+    assert load_pane_map()["anchor-001"]["runtime"] == "codex"
+
+
+def test_fresh_child_processes_use_generated_file_for_send_and_read(
+    tmp_path, monkeypatch
+):
+    def record(alias, agent_id):
+        return {
+            "gripspace": "synapt",
+            "qualified_alias": f"synapt:{alias}",
+            "agent_id": agent_id,
+            "store_coordinate": "synapt",
+            "target": f"synapt:{alias}",
+            "runtime": "codex",
+        }
+
+    routing = tmp_path / "agent-panes.json"
+    routing.write_text(
+        json.dumps(
+            {
+                "apollo": record("apollo", "apollo-001"),
+                "anchor": record("anchor", "anchor-001"),
+            }
+        )
+    )
+    shared = tmp_path / "channels"
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
+        "SYNAPT_AGENT_PANES_FILE": str(routing),
+        "SYNAPT_SHARED_CHANNELS_DIR": str(shared),
+    }
+    sender = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from synapt.recall.direct import speak_to_agent; print(speak_to_agent(action='send', to='anchor', message='fresh child'))",
+        ],
+        env={**env, "SYNAPT_AGENT_ID": "apollo-001"},
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    reader = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from synapt.recall.direct import speak_to_agent; print(speak_to_agent(action='read'))",
+        ],
+        env={**env, "SYNAPT_AGENT_ID": "anchor-001"},
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert "Sent to anchor-001" in sender.stdout
+    assert "fresh child" in reader.stdout
+
+
+@pytest.mark.parametrize("coordinate", ["../escape", "/tmp", "a/b", ".", "a..b"])
+def test_invalid_store_coordinate_refuses_before_store_access(coordinate):
+    with pytest.raises(ValueError, match="invalid recipient store coordinate"):
+        send_message(
+            from_agent="anchor-001",
+            to_agent="stromus-001",
+            body="blocked",
+            recipient_store_coordinate=coordinate,
+        )
+
+
 def test_two_gripspaces_converge_on_recipient_owned_state_and_history(
     tmp_path, monkeypatch
 ):
@@ -123,6 +216,15 @@ def test_two_gripspaces_converge_on_recipient_owned_state_and_history(
         project_dir=anchor_space,
         recipient_store_coordinate="synapt",
     )
+
+    fresh_history = message_history(
+        agent_id="anchor-001",
+        with_agent="stromus-001",
+        project_dir=anchor_space,
+        include_canonical=True,
+        canonical_store_coordinate="synapt",
+    )
+    assert [item.message_id for item in fresh_history] == [message.message_id]
 
     received = read_inbox(
         agent_id="stromus-001",
