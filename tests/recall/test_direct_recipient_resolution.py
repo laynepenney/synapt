@@ -21,6 +21,7 @@ from synapt.recall.direct import (
     send_message,
     speak_to_agent,
 )
+import synapt.recall.direct as direct
 
 
 @pytest.fixture(autouse=True)
@@ -194,6 +195,153 @@ def test_invalid_store_coordinate_refuses_before_store_access(coordinate):
             body="blocked",
             recipient_store_coordinate=coordinate,
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "kwargs"),
+    [
+        (
+            "recipient store coordinate",
+            {"to_agent": "stromus-001", "recipient_store_coordinate": "../escape"},
+        ),
+        ("agent ID", {"to_agent": "../escape", "recipient_store_coordinate": "synapt"}),
+    ],
+)
+def test_send_rejects_path_fields_before_hooks_or_storage(
+    tmp_path, monkeypatch, field, kwargs
+):
+    """Neither malformed path field may reach an inbox, DB, canonical root, or hook."""
+    calls: list[str] = []
+
+    def forbidden(name):
+        def _call(*args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(f"unexpected side effect: {name}")
+
+        return _call
+
+    monkeypatch.setattr(direct, "_inbox_path", forbidden("inbox"))
+    monkeypatch.setattr(direct, "_cross_org_inbox_path", forbidden("canonical inbox"))
+    monkeypatch.setattr(direct, "_get_db", forbidden("local db"))
+    monkeypatch.setattr(direct, "_get_canonical_db", forbidden("canonical db"))
+    direct.register_before_send_hook(forbidden("before send hook"))
+    try:
+        with pytest.raises(ValueError, match=f"invalid {field}"):
+            send_message(from_agent="anchor-001", body="blocked", **kwargs)
+    finally:
+        direct._clear_hooks()
+
+    assert calls == []
+    assert not (tmp_path / "channels").exists()
+
+
+@pytest.mark.parametrize(
+    ("operation", "kwargs", "error"),
+    [
+        (
+            read_inbox,
+            {"agent_id": "../escape", "recipient_store_coordinate": "synapt"},
+            "invalid agent ID",
+        ),
+        (
+            read_inbox,
+            {"agent_id": "stromus-001", "recipient_store_coordinate": "../escape"},
+            "invalid recipient store coordinate",
+        ),
+        (
+            ack_message,
+            {
+                "message_id": "dm_test",
+                "agent_id": "../escape",
+                "recipient_store_coordinate": "synapt",
+            },
+            "invalid agent ID",
+        ),
+        (
+            ack_message,
+            {
+                "message_id": "dm_test",
+                "agent_id": "stromus-001",
+                "recipient_store_coordinate": "../escape",
+            },
+            "invalid recipient store coordinate",
+        ),
+        (
+            message_history,
+            {
+                "agent_id": "../escape",
+                "with_agent": "anchor-001",
+                "include_canonical": True,
+            },
+            "invalid agent ID",
+        ),
+        (
+            message_history,
+            {
+                "agent_id": "stromus-001",
+                "with_agent": "../escape",
+                "include_canonical": True,
+            },
+            "invalid agent ID",
+        ),
+        (
+            message_history,
+            {
+                "agent_id": "stromus-001",
+                "with_agent": "anchor-001",
+                "include_canonical": True,
+                "canonical_store_coordinate": "../escape",
+            },
+            "invalid recipient store coordinate",
+        ),
+    ],
+)
+def test_read_ack_and_history_reject_path_fields_before_storage(
+    monkeypatch, operation, kwargs, error
+):
+    calls: list[str] = []
+
+    def forbidden(*_args, **_kwargs):
+        calls.append("storage")
+        raise AssertionError("unexpected storage access")
+
+    monkeypatch.setattr(direct, "_get_db", forbidden)
+    monkeypatch.setattr(direct, "_get_canonical_db", forbidden)
+
+    with pytest.raises(ValueError, match=error):
+        operation(**kwargs)
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("agent_id", "../escape", "invalid agent ID"),
+        ("store_coordinate", "../escape", "invalid recipient store coordinate"),
+    ],
+)
+def test_configured_file_traversal_rejects_before_a_send_can_touch_storage(
+    tmp_path, monkeypatch, field, value, error
+):
+    record = {
+        "gripspace": "conversa",
+        "qualified_alias": "conversa:anchor",
+        "agent_id": "anchor-001",
+        "store_coordinate": "conversa",
+        "target": "conversa:anchor",
+        "runtime": "codex",
+    }
+    record[field] = value
+    routing = tmp_path / "agent-panes.json"
+    routing.write_text(json.dumps({"anchor": record}))
+    monkeypatch.setattr(direct, "_recipient_resolver", None)
+    monkeypatch.delenv("SYNAPT_AGENT_PANES", raising=False)
+    monkeypatch.setenv("SYNAPT_AGENT_PANES_FILE", str(routing))
+
+    result = speak_to_agent(action="send", to="anchor", message="blocked")
+
+    assert result == f"Error: {error}"
+    assert not (tmp_path / "channels").exists()
 
 
 def test_two_gripspaces_converge_on_recipient_owned_state_and_history(

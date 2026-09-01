@@ -163,7 +163,7 @@ def resolve_registered_recipient(
         raise ValueError("recipient is required")
     if recipients is None:
         if _recipient_resolver is not None:
-            return _recipient_resolver(target)
+            return _validated_recipient(_recipient_resolver(target))
         records = load_pane_records()
         if not records:
             raise ValueError("recipient resolver is not configured")
@@ -190,7 +190,7 @@ def resolve_registered_recipient(
             for recipient in recipients
         }
         if len(configured_unique) == 1:
-            return next(iter(configured_unique.values()))
+            return _validated_recipient(next(iter(configured_unique.values())))
         if not configured_unique:
             raise ValueError(f"recipient '{target}' is not registered")
         choices = ", ".join(
@@ -214,7 +214,7 @@ def resolve_registered_recipient(
     ]
     unique = {(r.store_coordinate, r.agent_id): r for r in matches}
     if len(unique) == 1:
-        return next(iter(unique.values()))
+        return _validated_recipient(next(iter(unique.values())))
     if not unique:
         raise ValueError(f"recipient '{target}' is not registered")
     choices = ", ".join(
@@ -245,6 +245,7 @@ def _direct_dir(project_dir: Path | None = None) -> Path:
 
 
 def _inbox_path(agent_id: str, project_dir: Path | None = None) -> Path:
+    agent_id = _validated_agent_id(agent_id)
     base = _direct_dir(project_dir)
     base.mkdir(parents=True, exist_ok=True)
     return base / f"{agent_id}.jsonl"
@@ -260,12 +261,31 @@ def _inbox_path(agent_id: str, project_dir: Path | None = None) -> Path:
 # org-canonical cross-org root).
 _DEFAULT_ORG = "synapt-dev"
 _STORE_COORDINATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _validated_agent_id(agent_id: str) -> str:
+    """Return a stable inbox ID only when it cannot alter a path."""
+    if not isinstance(agent_id, str) or not _AGENT_ID_RE.fullmatch(agent_id):
+        raise ValueError("invalid agent ID")
+    return agent_id
 
 
 def _validated_store_coordinate(coordinate: str) -> str:
-    if not _STORE_COORDINATE_RE.fullmatch(coordinate):
+    if not isinstance(coordinate, str) or not _STORE_COORDINATE_RE.fullmatch(
+        coordinate
+    ):
         raise ValueError("invalid recipient store coordinate")
     return coordinate
+
+
+def _validated_recipient(recipient: RegisteredRecipient) -> RegisteredRecipient:
+    """Validate premium-provided routing values before any transport side effect."""
+    return RegisteredRecipient(
+        agent_id=_validated_agent_id(recipient.agent_id),
+        store_coordinate=_validated_store_coordinate(recipient.store_coordinate),
+        display_name=recipient.display_name,
+    )
 
 
 def _cross_org_root(
@@ -305,6 +325,7 @@ def _cross_org_inbox_path(
     *,
     recipient_store_coordinate: str | None = None,
 ) -> Path:
+    to_agent = _validated_agent_id(to_agent)
     base = _cross_org_root(
         project_dir, recipient_store_coordinate=recipient_store_coordinate
     )
@@ -452,6 +473,12 @@ def send_message(
         raise ValueError("from_agent is required")
     if not to_agent:
         raise ValueError("to_agent is required")
+    from_agent = _validated_agent_id(from_agent)
+    to_agent = _validated_agent_id(to_agent)
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     if not body or not body.strip():
         raise ValueError("message body is required")
     if len(body.encode("utf-8")) > MAX_BODY_SIZE:
@@ -659,6 +686,11 @@ def read_inbox(
     path), deduped by message_id. Urgent messages surface first, then oldest
     first; only the returned (post-limit) messages are marked READ.
     """
+    agent_id = _validated_agent_id(agent_id)
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     conn = _get_db(project_dir)
     try:
         local_rows = conn.execute(
@@ -725,6 +757,11 @@ def ack_message(
     recipient_store_coordinate: str | None = None,
 ) -> str:
     """Acknowledge a message.  Returns status string."""
+    agent_id = _validated_agent_id(agent_id)
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     conn = _get_db(project_dir)
     try:
         row = conn.execute(
@@ -797,6 +834,12 @@ def message_history(
     canonical_store_coordinate: str | None = None,
 ) -> list[DirectMessage]:
     """Read message history between two agents (both directions)."""
+    agent_id = _validated_agent_id(agent_id)
+    with_agent = _validated_agent_id(with_agent)
+    if canonical_store_coordinate is not None:
+        canonical_store_coordinate = _validated_store_coordinate(
+            canonical_store_coordinate
+        )
     conn = _get_db(project_dir)
     try:
         rows = conn.execute(
@@ -838,6 +881,7 @@ def message_history(
         if canonical_store_coordinate:
             coordinates.append(canonical_store_coordinate)
         for coordinate in coordinates:
+            coordinate = _validated_store_coordinate(coordinate)
             try:
                 canonical_conn = _get_canonical_db(
                     project_dir, recipient_store_coordinate=coordinate
