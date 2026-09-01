@@ -249,6 +249,39 @@ class TestSessionSelection(unittest.TestCase):
             SESSION_A,
         )
 
+    def test_journal_only_identity_does_not_outrank_runtime_cwd(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "foreign real continuity",
+                "answer",
+                timestamp="2026-01-01T00:00:00Z",
+                agent_id="foreign-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                -1,
+                "journal metadata",
+                "next steps",
+                timestamp="2026-02-01T00:00:00Z",
+                agent_id="stable-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            caller_sources=[
+                CallerTranscript(SESSION_A, Path("/runtime/current.jsonl"), 1.0, 1)
+            ],
+            agent_id="stable-agent",
+            journal_path=None,
+        )
+
+        self.assertEqual(view.session_id, SESSION_A)
+        self.assertEqual(view.selection_scope, "caller")
+        self.assertEqual(view.turns[0].user_text, "foreign real continuity")
+
     def test_caller_unindexed_newer_transcript_is_named_on_first_line(self):
         source = CallerTranscript(
             session_id="cccccccc-1111-2222-3333-444444444444",

@@ -5094,6 +5094,10 @@ def _journal_entry_to_chunk(entry, scrub_text) -> TranscriptChunk:
         user_text=user_text,
         assistant_text=assistant_text,
         files_touched=list(entry.files_modified),
+        # Journal entries are session-bound display metadata. The journal
+        # schema does not carry source-authored stable agent identity, so the
+        # ambient runtime must not turn them into session-routing evidence.
+        agent_id=None,
     )
 
 

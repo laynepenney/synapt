@@ -220,6 +220,28 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         finally:
             db.close()
 
+    def test_session_overview_excludes_journal_identity_from_data_shard(self):
+        RecallDB(self.index_dir / "index.db").close()
+        shard = RecallDB(self.index_dir / "data_001.db")
+        journal = self._make_chunk(
+            "journal:j0",
+            "journal-only",
+            "2026-02-01T00:00:00Z",
+            "journal metadata",
+            agent_id="ambient-agent",
+        )
+        journal.turn_index = -1
+        shard.save_chunks([journal])
+        shard.close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        try:
+            overview = db.session_overview()["journal-only"]
+            self.assertEqual(overview["agent_ids"], frozenset())
+            self.assertFalse(overview["has_real_activity"])
+        finally:
+            db.close()
+
     def test_session_overview_unions_query_tail_agent_identity_with_base(self):
         RecallDB(self.index_dir / "index.db").close()
         shard = RecallDB(self.index_dir / "data_001.db")
@@ -337,7 +359,7 @@ class TestShardedRecallDBSharded(unittest.TestCase):
                 "real-session",
                 "2026-01-01T00:00:00Z",
                 "real continuity",
-                agent_id="stable-agent",
+                agent_id="foreign-agent",
             ),
         ])
         shard.close()
@@ -374,8 +396,15 @@ class TestShardedRecallDBSharded(unittest.TestCase):
 
         index = BoundedResumeIndex(ShardedRecallDB.open_readonly(self.index_dir))
         try:
+            self.assertNotIn(
+                "stable-agent",
+                index._db.session_overview()["journal-only"]["agent_ids"],
+            )
             view = build_resume_view(
-                index, agent_id="stable-agent", journal_path=None
+                index,
+                caller_sources=[],
+                agent_id="stable-agent",
+                journal_path=None,
             )
         finally:
             index.close()

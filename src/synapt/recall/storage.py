@@ -1527,7 +1527,8 @@ class RecallDB:
             "MAX(julianday(timestamp)) AS fallback_jd, "
             "MAX(CASE WHEN julianday(timestamp) IS NULL THEN timestamp END) AS fallback_raw "
             ", MIN(NULLIF(transcript_path, '')) AS transcript_path "
-            ", GROUP_CONCAT(DISTINCT NULLIF(agent_id, '')) AS agent_ids "
+            ", GROUP_CONCAT(DISTINCT CASE WHEN turn_index != -1 "
+            "THEN NULLIF(agent_id, '') END) AS agent_ids "
             "FROM chunks GROUP BY session_id"
         ).fetchall()
 

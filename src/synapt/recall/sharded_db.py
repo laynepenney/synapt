@@ -312,7 +312,8 @@ class ShardedRecallDB:
                     "has_real_activity": False,
                     "transcript_path": chunk.transcript_path,
                     "agent_ids": frozenset(
-                        [chunk.agent_id] if chunk.agent_id else []
+                        [chunk.agent_id]
+                        if chunk.turn_index != -1 and chunk.agent_id else []
                     ),
                 },
             )
@@ -326,7 +327,7 @@ class ShardedRecallDB:
                 current["activity"] = max(
                     current["activity"], _timestamp_activity(chunk.timestamp)
                 )
-            if chunk.agent_id:
+            if chunk.turn_index != -1 and chunk.agent_id:
                 current["agent_ids"] = frozenset(current.get("agent_ids", ())) | {
                     chunk.agent_id
                 }

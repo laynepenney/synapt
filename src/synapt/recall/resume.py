@@ -677,7 +677,7 @@ def resolve_session(
                     agent_ids = {
                         chunk.agent_id
                         for chunk in index.sessions.get(sid, ())
-                        if chunk.agent_id
+                        if chunk.turn_index != -1 and chunk.agent_id
                     }
                 if agent_id in agent_ids:
                     return sid
@@ -785,7 +785,7 @@ def build_resume_view(
             selected_agent_ids = {
                 chunk.agent_id
                 for chunk in index.sessions.get(resolved, ())
-                if chunk.agent_id
+                if chunk.turn_index != -1 and chunk.agent_id
             }
         selection_scope = "agent" if agent_id in selected_agent_ids else (
             "caller" if resolved in caller_ids else "store"
