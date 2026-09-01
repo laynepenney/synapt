@@ -763,6 +763,7 @@ def recall_resume(
                 limit=turns,
                 journal_path=_journal_path(),
                 caller_sources=caller_transcripts(Path.cwd()),
+                agent_id=os.environ.get("SYNAPT_AGENT_ID"),
             )
         except ResumeError as exc:
             if not index._session_order:

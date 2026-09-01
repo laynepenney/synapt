@@ -6,6 +6,13 @@ never construct the full index, and always close the DB it opened.
 
 from unittest.mock import Mock, patch
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_agent_identity(monkeypatch):
+    monkeypatch.delenv("SYNAPT_AGENT_ID", raising=False)
+
 
 def test_recall_resume_default_selects_the_callers_session_not_store_newest(
     monkeypatch, tmp_path
@@ -83,6 +90,33 @@ def test_recall_resume_uses_server_cwd_as_the_mcp_caller_root(monkeypatch, tmp_p
 
     assert "CALLER" in out
     discover.assert_called_once_with(caller_root)
+
+
+def test_recall_resume_passes_stable_agent_identity_across_runtime_cwds(
+    monkeypatch, tmp_path
+):
+    from synapt.recall import server
+
+    index = Mock()
+    index._session_order = ["previous-claude-session"]
+    index._db = Mock()
+    view = Mock()
+    view.turns = [object()]
+    (tmp_path / "recall.db").touch()
+    monkeypatch.setenv("SYNAPT_AGENT_ID", "stable-agent")
+    monkeypatch.setattr(server, "project_index_dir", lambda: tmp_path)
+
+    with (
+        patch("synapt.recall.journal._journal_path", return_value=None),
+        patch("synapt.recall.resume.load_resume_index", return_value=index),
+        patch("synapt.recall.resume.caller_transcripts", return_value=[]),
+        patch("synapt.recall.resume.build_resume_view", return_value=view) as build,
+        patch("synapt.recall.freshness.check_index_freshness", side_effect=RuntimeError),
+        patch("synapt.recall.resume.format_resume", return_value="RESUME"),
+    ):
+        server.recall_resume()
+
+    assert build.call_args.kwargs["agent_id"] == "stable-agent"
 
 
 def test_recall_resume_reports_missing_index(monkeypatch, tmp_path):

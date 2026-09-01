@@ -18,12 +18,24 @@ from __future__ import annotations
 import heapq
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 from synapt.recall.sharding import is_sharded, list_shards
 from synapt.recall.storage import RecallDB
+
+
+def _timestamp_activity(value: str) -> tuple[int, str]:
+    """Normalize an overlay timestamp to the ordering shape used by RecallDB."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (1, f"{parsed.timestamp():020.6f}")
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return (0, value or "")
 
 
 class ShardedRecallDB:
@@ -286,6 +298,9 @@ class ShardedRecallDB:
                 current["turn_count"] += overview["turn_count"]
                 if not current.get("transcript_path") and overview.get("transcript_path"):
                     current["transcript_path"] = overview["transcript_path"]
+                current["agent_ids"] = frozenset(current.get("agent_ids", ())) | frozenset(
+                    overview.get("agent_ids", ())
+                )
         for chunk in self._index.load_query_tail_chunks():
             current = result.setdefault(
                 chunk.session_id,
@@ -296,6 +311,9 @@ class ShardedRecallDB:
                     "turn_count": 0,
                     "has_real_activity": False,
                     "transcript_path": chunk.transcript_path,
+                    "agent_ids": frozenset(
+                        [chunk.agent_id] if chunk.agent_id else []
+                    ),
                 },
             )
             current["earliest_ts"] = min(
@@ -304,7 +322,13 @@ class ShardedRecallDB:
             current["latest_ts"] = max(current["latest_ts"], chunk.timestamp)
             current["turn_count"] += int(chunk.turn_index >= 0)
             current["has_real_activity"] = True
-            current["activity"] = (0, current["latest_ts"])
+            current["activity"] = max(
+                current["activity"], _timestamp_activity(chunk.timestamp)
+            )
+            if chunk.agent_id:
+                current["agent_ids"] = frozenset(current.get("agent_ids", ())) | {
+                    chunk.agent_id
+                }
         return result
 
     def session_activity(self) -> dict[str, tuple[int, str]]:

@@ -24,6 +24,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 
@@ -68,6 +69,7 @@ def _chunk(
     timestamp: str = "2026-08-05T10:00:00Z",
     tool_content: str = "",
     transcript_path: str = "",
+    agent_id: str | None = None,
 ) -> TranscriptChunk:
     """Build a chunk the way the parsers do (short-id prefix, ``:t<n>`` suffix)."""
     return TranscriptChunk(
@@ -80,6 +82,7 @@ def _chunk(
         tools_used=list(tools_used or []),
         tool_content=tool_content,
         transcript_path=transcript_path,
+        agent_id=agent_id,
     )
 
 
@@ -137,6 +140,68 @@ class TestSessionSelection(unittest.TestCase):
 
     def test_default_falls_back_store_wide_only_when_caller_has_no_indexed_session(self):
         self.assertEqual(resolve_session(self.index, None, {"not-indexed"}), SESSION_B)
+
+    def test_agent_identity_outranks_runtime_cwd_and_store_recency(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent on the previous runtime",
+                "continuing",
+                timestamp="2026-08-31T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign runtime cwd",
+                "not the same agent",
+                timestamp="2026-08-31T11:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            caller_sources=[
+                CallerTranscript(SESSION_B, Path("/codex/current.jsonl"), 1.0, 1)
+            ],
+            agent_id="stable-agent",
+            journal_path=None,
+        )
+
+        self.assertEqual(view.session_id, SESSION_A)
+        self.assertEqual(view.selection_scope, "agent")
+        self.assertIn("same agent on the previous runtime", format_resume(view))
+        self.assertIn("agent identity", format_resume(view).splitlines()[0])
+
+    def test_explicit_session_selection_outranks_agent_identity(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "agent default", "a", agent_id="stable-agent"),
+            _chunk(SESSION_B, 0, "explicit target", "b", agent_id="foreign-agent"),
+        ])
+
+        view = build_resume_view(
+            index,
+            session_id=SESSION_B[:8],
+            agent_id="stable-agent",
+            journal_path=None,
+        )
+
+        self.assertEqual(view.session_id, SESSION_B)
+        self.assertEqual(view.selection_scope, "explicit")
+        self.assertIn("explicit target", format_resume(view))
+
+    def test_unknown_agent_identity_falls_back_to_runtime_cwd(self):
+        self.assertEqual(
+            resolve_session(
+                self.index,
+                None,
+                caller_session_ids={SESSION_A},
+                agent_id="new-agent-with-no-history",
+            ),
+            SESSION_A,
+        )
 
     def test_caller_unindexed_newer_transcript_is_named_on_first_line(self):
         source = CallerTranscript(
@@ -730,6 +795,70 @@ class TestJournalBinding(unittest.TestCase):
         self.assertIsNone(view.journal)
         self.assertIsNone(view.journal_provenance)
 
+    def test_agent_selected_session_does_not_infer_a_foreign_unbound_journal(self):
+        """Agent identity binds the session, not a sessionless shared-store journal."""
+        self._write("", "foreign unbound intent", "2026-08-05T11:00:00Z")
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent but older",
+                "a",
+                timestamp="2026-08-01T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign session",
+                "b",
+                timestamp="2026-08-05T10:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            agent_id="stable-agent",
+            limit=10,
+            journal_path=self.journal,
+        )
+
+        self.assertEqual(view.session_id, SESSION_A)
+        self.assertIsNone(view.journal)
+        self.assertIsNone(view.journal_provenance)
+
+    def test_agent_selected_session_keeps_exact_journal_binding(self):
+        self._write(SESSION_A, "bound agent intent", "2026-08-01T11:00:00Z")
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent but older",
+                "a",
+                timestamp="2026-08-01T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign session",
+                "b",
+                timestamp="2026-08-05T10:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            agent_id="stable-agent",
+            limit=10,
+            journal_path=self.journal,
+        )
+
+        self.assertEqual(view.journal.focus, "bound agent intent")
+        self.assertEqual(view.journal_provenance, "bound")
+
     def test_entry_without_a_session_id_is_shown_but_labelled_inferred(self):
         """Absence of evidence cannot contradict, so it is disclosed rather than hidden."""
         self._write("", "unbound entry", "2026-08-05T11:00:00Z")
@@ -1209,6 +1338,33 @@ class TestEmptyAndErrorStates(unittest.TestCase):
         self.assertIn("last answer", out)
         self.assertLess(out.index("first answer"), out.index("last answer"),
                         "turns must read oldest-first so the tail ends at the newest")
+
+    def test_cli_uses_stable_agent_identity_across_runtime_cwds(self):
+        _save_sqlite_index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent on another runtime cwd",
+                "continue here",
+                timestamp="2026-08-01T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign cwd",
+                "wrong continuity",
+                timestamp="2026-08-05T10:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ], self.dir)
+
+        with mock.patch.dict(os.environ, {"SYNAPT_AGENT_ID": "stable-agent"}):
+            out, _, code = _run_cli(self.dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("same agent on another runtime cwd", out)
+        self.assertNotIn("newer foreign cwd", out)
 
 
 # ---------------------------------------------------------------------------
