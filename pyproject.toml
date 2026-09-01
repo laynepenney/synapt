@@ -94,6 +94,8 @@ full = [
     "mlx-lm>=0.10; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "anthropic>=0.70",
     "openai-agents>=0.10",
+    "anthropic>=0.77.0",
+    "openai-agents>=0.10.0",
     "fastapi>=0.100",
     "uvicorn[standard]>=0.20",
     "sse-starlette>=1.0",
