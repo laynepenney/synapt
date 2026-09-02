@@ -116,6 +116,7 @@ class SourceSearchRequest:
     limit: int
     after: str | None = None
     before: str | None = None
+    include_historical: bool = False
 
     def __post_init__(self) -> None:
         if self.limit < 1:
@@ -192,6 +193,15 @@ def search_registered_sources(request: SourceSearchRequest) -> list[SourceSearch
             for candidate in candidates:
                 if not isinstance(candidate, SourceSearchResult):
                     continue
+                allowed_lifecycles = (
+                    {"current", "stale", "deleted"}
+                    if request.include_historical
+                    else {"current"}
+                )
+                if candidate.lifecycle not in allowed_lifecycles:
+                    continue
+                if not _source_result_in_window(candidate, request):
+                    continue
                 results.append(candidate)
                 if len(results) >= request.limit:
                     return results
@@ -200,6 +210,30 @@ def search_registered_sources(request: SourceSearchRequest) -> list[SourceSearch
             # provider without surfacing or logging the exception text.
             continue
     return results
+
+
+def _source_result_in_window(
+    result: SourceSearchResult, request: SourceSearchRequest
+) -> bool:
+    """Apply the caller's date window even when a provider omits that filter."""
+
+    if request.after is None and request.before is None:
+        return True
+    try:
+        observed = datetime.fromisoformat(result.observed_at.replace("Z", "+00:00"))
+        if observed.tzinfo is None:
+            return False
+        if request.after is not None:
+            after = datetime.fromisoformat(request.after.replace("Z", "+00:00"))
+            if after.tzinfo is None or observed < after:
+                return False
+        if request.before is not None:
+            before = datetime.fromisoformat(request.before.replace("Z", "+00:00"))
+            if before.tzinfo is None or observed >= before:
+                return False
+    except ValueError:
+        return False
+    return True
 
 
 class _ScanFailure(Exception):

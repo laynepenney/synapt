@@ -10,6 +10,7 @@ from synapt.recall.source_index import (
     SourceSearchResult,
     _clear_source_search_providers,
     register_source_search_provider,
+    search_registered_sources,
 )
 
 
@@ -120,3 +121,83 @@ def test_source_provider_failure_does_not_discard_existing_recall_result(
 
     assert "Past session context" in rendered
     assert "private provider detail" not in rendered
+
+
+def test_compositor_enforces_lifecycle_and_date_window_when_provider_does_not() -> None:
+    current = _result()
+    stale = SourceSearchResult(
+        content="stale source content",
+        structural_address="Decision [2]",
+        lifecycle="stale",
+        revision_token="stale-revision",
+        observed_at="2026-09-01T12:00:00+00:00",
+    )
+    too_old = SourceSearchResult(
+        content="out of window content",
+        structural_address="Decision [3]",
+        lifecycle="current",
+        revision_token="old-revision",
+        observed_at="2026-07-01T12:00:00+00:00",
+    )
+
+    class Provider:
+        def search(self, request: SourceSearchRequest):
+            return [stale, too_old, current]
+
+    register_source_search_provider("unfiltered-source", Provider())
+
+    results = search_registered_sources(
+        SourceSearchRequest(
+            query="projection",
+            limit=5,
+            after="2026-08-01T00:00:00+00:00",
+            before="2026-10-01T00:00:00+00:00",
+        )
+    )
+
+    assert results == [current]
+
+
+def test_explicit_historical_mode_can_return_stale_source_result() -> None:
+    stale = SourceSearchResult(
+        content="stale source content",
+        structural_address="Decision [2]",
+        lifecycle="stale",
+        revision_token="stale-revision",
+        observed_at="2026-09-01T12:00:00+00:00",
+    )
+
+    class Provider:
+        def search(self, request: SourceSearchRequest):
+            return [stale]
+
+    register_source_search_provider("historical-source", Provider())
+
+    results = search_registered_sources(
+        SourceSearchRequest(
+            query="projection",
+            limit=5,
+            include_historical=True,
+        )
+    )
+
+    assert results == [stale]
+
+
+def test_zero_token_search_never_invokes_registered_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    calls: list[SourceSearchRequest] = []
+
+    class Provider:
+        def search(self, request: SourceSearchRequest):
+            calls.append(request)
+            return [_result()]
+
+    register_source_search_provider("must-not-run", Provider())
+    monkeypatch.setattr(server, "_get_index", lambda: _index(""))
+    _silence_live_and_freshness(monkeypatch, tmp_path)
+
+    server.recall_search("projection", max_tokens=0)
+
+    assert calls == []

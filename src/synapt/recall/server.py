@@ -423,6 +423,7 @@ def recall_search(
                 limit=effective_max_chunks,
                 after=after,
                 before=before,
+                include_historical=include_historical,
             )
         )
         if source_results:
