@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -24,7 +25,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 MAX_BODY_SIZE = 65536  # 64KB default cap
 
@@ -101,6 +102,130 @@ class DirectMessage:
         return cls(**{k: v for k, v in mapped.items() if k in known})
 
 
+@dataclass(frozen=True)
+class RegisteredRecipient:
+    """A stable inbox identity plus its configured canonical store coordinate."""
+
+    agent_id: str
+    store_coordinate: str
+    display_name: str
+
+
+_recipient_resolver: Callable[[str], RegisteredRecipient] | None = None
+
+
+def set_recipient_resolver(
+    resolver: Callable[[str], RegisteredRecipient] | None,
+) -> Callable[[str], RegisteredRecipient] | None:
+    """Install the configured identity resolver supplied by the embedding layer.
+
+    OSS does not own identity or org truth.  Its transport accepts only the
+    stable inbox ID and opaque recipient-owned store coordinate returned here.
+    """
+    global _recipient_resolver
+    previous = _recipient_resolver
+    _recipient_resolver = resolver
+    return previous
+
+
+def _recipient_aliases(recipient: RegisteredRecipient) -> set[str]:
+    """Exact, documented spellings for one registered recipient."""
+    agent_id = recipient.agent_id.lower()
+    short_id = (
+        agent_id.rsplit("-", 1)[0]
+        if agent_id.rsplit("-", 1)[-1].isdigit()
+        else agent_id
+    )
+    name = recipient.display_name.strip().lower()
+    return {
+        agent_id,
+        short_id,
+        name,
+        f"{recipient.store_coordinate.lower()}:{agent_id}",
+        f"{recipient.store_coordinate.lower()}:{short_id}",
+        f"{recipient.store_coordinate.lower()}:{name}",
+    }
+
+
+def resolve_registered_recipient(
+    target: str,
+    *,
+    recipients: Iterable[RegisteredRecipient] | None = None,
+) -> RegisteredRecipient:
+    """Resolve a recipient spelling to one stable registered inbox identity.
+
+    Exact aliases only: canonical ID, display name, stable-ID stem, and their
+    org-qualified forms.  No match and more than one match both fail closed so
+    sending cannot manufacture an unregistered (phantom) inbox.
+    """
+    normalized = target.strip().lower()
+    if not normalized:
+        raise ValueError("recipient is required")
+    if recipients is None:
+        if _recipient_resolver is not None:
+            return _validated_recipient(_recipient_resolver(target))
+        records = load_pane_records()
+        if not records:
+            raise ValueError("recipient resolver is not configured")
+        matches = [
+            record
+            for record in records
+            if normalized == str(record.get("qualified_alias", "")).lower()
+            or normalized == str(record.get("agent_id", "")).lower()
+            or (
+                ":" not in normalized
+                and normalized == str(record.get("_key", "")).lower()
+            )
+        ]
+        recipients = [
+            RegisteredRecipient(
+                str(record["agent_id"]),
+                str(record["store_coordinate"]),
+                str(record.get("qualified_alias", record["agent_id"])),
+            )
+            for record in matches
+        ]
+        configured_unique = {
+            (recipient.store_coordinate, recipient.agent_id): recipient
+            for recipient in recipients
+        }
+        if len(configured_unique) == 1:
+            return _validated_recipient(next(iter(configured_unique.values())))
+        if not configured_unique:
+            raise ValueError(f"recipient '{target}' is not registered")
+        choices = ", ".join(
+            f"{recipient.store_coordinate}:{recipient.agent_id}"
+            for recipient in sorted(
+                configured_unique.values(),
+                key=lambda recipient: (
+                    recipient.store_coordinate,
+                    recipient.agent_id,
+                ),
+            )
+        )
+        raise ValueError(
+            f"recipient '{target}' is ambiguous ({choices}); use a qualified alias or canonical ID"
+        )
+    catalog = list(recipients)
+    matches = [
+        recipient
+        for recipient in catalog
+        if normalized in _recipient_aliases(recipient)
+    ]
+    unique = {(r.store_coordinate, r.agent_id): r for r in matches}
+    if len(unique) == 1:
+        return _validated_recipient(next(iter(unique.values())))
+    if not unique:
+        raise ValueError(f"recipient '{target}' is not registered")
+    choices = ", ".join(
+        f"{r.store_coordinate}:{r.agent_id}"
+        for r in sorted(unique.values(), key=lambda r: (r.store_coordinate, r.agent_id))
+    )
+    raise ValueError(
+        f"recipient '{target}' is ambiguous ({choices}); use an org-qualified or canonical ID"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Path helpers
 # ---------------------------------------------------------------------------
@@ -120,6 +245,7 @@ def _direct_dir(project_dir: Path | None = None) -> Path:
 
 
 def _inbox_path(agent_id: str, project_dir: Path | None = None) -> Path:
+    agent_id = _validated_agent_id(agent_id)
     base = _direct_dir(project_dir)
     base.mkdir(parents=True, exist_ok=True)
     return base / f"{agent_id}.jsonl"
@@ -134,9 +260,37 @@ def _inbox_path(agent_id: str, project_dir: Path | None = None) -> Path:
 # read_inbox union-reads from here. Design: Option A (project-independent
 # org-canonical cross-org root).
 _DEFAULT_ORG = "synapt-dev"
+_STORE_COORDINATE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 
-def _cross_org_root(project_dir: Path | None = None) -> Path:
+def _validated_agent_id(agent_id: str) -> str:
+    """Return a stable inbox ID only when it cannot alter a path."""
+    if not isinstance(agent_id, str) or not _AGENT_ID_RE.fullmatch(agent_id):
+        raise ValueError("invalid agent ID")
+    return agent_id
+
+
+def _validated_store_coordinate(coordinate: str) -> str:
+    if not isinstance(coordinate, str) or not _STORE_COORDINATE_RE.fullmatch(
+        coordinate
+    ):
+        raise ValueError("invalid recipient store coordinate")
+    return coordinate
+
+
+def _validated_recipient(recipient: RegisteredRecipient) -> RegisteredRecipient:
+    """Validate premium-provided routing values before any transport side effect."""
+    return RegisteredRecipient(
+        agent_id=_validated_agent_id(recipient.agent_id),
+        store_coordinate=_validated_store_coordinate(recipient.store_coordinate),
+        display_name=recipient.display_name,
+    )
+
+
+def _cross_org_root(
+    project_dir: Path | None = None, *, recipient_store_coordinate: str | None = None
+) -> Path:
     """Resolve the project-independent, org-canonical cross-org direct root.
 
     Resolution:
@@ -152,15 +306,29 @@ def _cross_org_root(project_dir: Path | None = None) -> Path:
     """
     from synapt.recall.channel import _resolve_org_id, _shared_channels_dir
 
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     shared = _shared_channels_dir()
     if shared:
         return shared / "_cross-org" / "direct"
-    org = _resolve_org_id(project_dir) or _DEFAULT_ORG
-    return Path.home() / ".synapt" / "channels" / org / "_cross-org" / "direct"
+    coordinate = _validated_store_coordinate(
+        recipient_store_coordinate or _resolve_org_id(project_dir) or _DEFAULT_ORG
+    )
+    return Path.home() / ".synapt" / "channels" / coordinate / "_cross-org" / "direct"
 
 
-def _cross_org_inbox_path(to_agent: str, project_dir: Path | None = None) -> Path:
-    base = _cross_org_root(project_dir)
+def _cross_org_inbox_path(
+    to_agent: str,
+    project_dir: Path | None = None,
+    *,
+    recipient_store_coordinate: str | None = None,
+) -> Path:
+    to_agent = _validated_agent_id(to_agent)
+    base = _cross_org_root(
+        project_dir, recipient_store_coordinate=recipient_store_coordinate
+    )
     base.mkdir(parents=True, exist_ok=True)
     return base / f"{to_agent}.jsonl"
 
@@ -169,6 +337,18 @@ def _db_path(project_dir: Path | None = None) -> Path:
     base = _direct_dir(project_dir)
     base.mkdir(parents=True, exist_ok=True)
     return base / "direct.db"
+
+
+def _canonical_db_path(
+    project_dir: Path | None = None, *, recipient_store_coordinate: str | None = None
+) -> Path:
+    """Delivery state colocated with the recipient-owned canonical inbox."""
+    return (
+        _cross_org_root(
+            project_dir, recipient_store_coordinate=recipient_store_coordinate
+        )
+        / "direct.db"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +376,38 @@ CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(reply_to);
 """
 
 
+def _ensure_direct_columns(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ALTER TABLE messages ADD COLUMN canonical_store TEXT")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+    if "canonical_store" not in columns:
+        raise sqlite3.OperationalError("messages.canonical_store migration failed")
+    conn.commit()
+
+
 def _get_db(project_dir: Path | None = None) -> sqlite3.Connection:
     path = _db_path(project_dir)
     conn = sqlite3.connect(str(path), timeout=5)
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
+    _ensure_direct_columns(conn)
+    return conn
+
+
+def _get_canonical_db(
+    project_dir: Path | None = None, *, recipient_store_coordinate: str | None = None
+) -> sqlite3.Connection:
+    path = _canonical_db_path(
+        project_dir, recipient_store_coordinate=recipient_store_coordinate
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=5)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(_SCHEMA)
+    _ensure_direct_columns(conn)
     return conn
 
 
@@ -259,12 +466,19 @@ def send_message(
     reply_to: str | None = None,
     priority: str = PRIORITY_NORMAL,
     project_dir: Path | None = None,
+    recipient_store_coordinate: str | None = None,
 ) -> DirectMessage:
     """Send a direct message to an agent.  Returns the sent message."""
     if not from_agent:
         raise ValueError("from_agent is required")
     if not to_agent:
         raise ValueError("to_agent is required")
+    from_agent = _validated_agent_id(from_agent)
+    to_agent = _validated_agent_id(to_agent)
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     if not body or not body.strip():
         raise ValueError("message body is required")
     if len(body.encode("utf-8")) > MAX_BODY_SIZE:
@@ -299,7 +513,9 @@ def send_message(
 
     # recall#820: dual-write to the project-independent cross-org canonical
     # inbox so a recipient in a different gripspace reads it (the silo fix).
-    cross_inbox = _cross_org_inbox_path(to_agent, project_dir)
+    cross_inbox = _cross_org_inbox_path(
+        to_agent, project_dir, recipient_store_coordinate=recipient_store_coordinate
+    )
     with open(cross_inbox, "a", encoding="utf-8") as f:
         f.write(line)
 
@@ -310,8 +526,8 @@ def send_message(
         conn.execute(
             """INSERT OR IGNORE INTO messages
                (message_id, from_agent, to_agent, timestamp, body,
-                reply_to, priority, status, created_at, delivered_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                reply_to, priority, status, created_at, delivered_at, canonical_store)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 msg.message_id,
                 msg.from_agent,
@@ -323,11 +539,39 @@ def send_message(
                 STATUS_DELIVERED,
                 now,
                 now,
+                recipient_store_coordinate,
             ),
         )
         conn.commit()
     finally:
         conn.close()
+
+    canonical_conn = _get_canonical_db(
+        project_dir, recipient_store_coordinate=recipient_store_coordinate
+    )
+    try:
+        canonical_conn.execute(
+            """INSERT OR IGNORE INTO messages
+               (message_id, from_agent, to_agent, timestamp, body,
+                reply_to, priority, status, created_at, delivered_at, canonical_store)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                msg.message_id,
+                msg.from_agent,
+                msg.to_agent,
+                msg.timestamp,
+                msg.body,
+                msg.reply_to,
+                msg.priority,
+                STATUS_DELIVERED,
+                now,
+                now,
+                recipient_store_coordinate,
+            ),
+        )
+        canonical_conn.commit()
+    finally:
+        canonical_conn.close()
 
     for hook in _state_change_hooks:
         try:
@@ -343,6 +587,7 @@ def _read_cross_org_candidates(
     conn: sqlite3.Connection,
     local_ids: set[str],
     project_dir: Path | None,
+    recipient_store_coordinate: str | None,
 ) -> list[DirectMessage]:
     """Return cross-org canonical messages for agent_id not already tracked locally.
 
@@ -354,7 +599,9 @@ def _read_cross_org_candidates(
     ones READ; messages beyond the read limit are left untracked so a later
     read re-surfaces them.
     """
-    cross_inbox = _cross_org_inbox_path(agent_id, project_dir)
+    cross_inbox = _cross_org_inbox_path(
+        agent_id, project_dir, recipient_store_coordinate=recipient_store_coordinate
+    )
     if not cross_inbox.exists():
         return []
 
@@ -382,7 +629,13 @@ def _read_cross_org_candidates(
     return candidates
 
 
-def _track_cross_org_read(conn: sqlite3.Connection, msg: DirectMessage) -> None:
+def _track_cross_org_read(
+    conn: sqlite3.Connection,
+    msg: DirectMessage,
+    *,
+    project_dir: Path | None,
+    recipient_store_coordinate: str | None,
+) -> None:
     """Insert a local SQLite tracking row (status=READ) for a cross-org message.
 
     Gives the cross-org message a local delivery-state row so re-reads dedup it
@@ -392,8 +645,8 @@ def _track_cross_org_read(conn: sqlite3.Connection, msg: DirectMessage) -> None:
     conn.execute(
         """INSERT OR IGNORE INTO messages
            (message_id, from_agent, to_agent, timestamp, body, reply_to,
-            priority, status, created_at, delivered_at, read_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            priority, status, created_at, delivered_at, read_at, canonical_store)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             msg.message_id,
             msg.from_agent,
@@ -406,9 +659,17 @@ def _track_cross_org_read(conn: sqlite3.Connection, msg: DirectMessage) -> None:
             now,
             now,
             now,
+            recipient_store_coordinate,
         ),
     )
     conn.commit()
+    canonical_conn = _get_canonical_db(
+        project_dir, recipient_store_coordinate=recipient_store_coordinate
+    )
+    try:
+        _transition_status(canonical_conn, msg.message_id, STATUS_READ)
+    finally:
+        canonical_conn.close()
 
 
 def read_inbox(
@@ -416,6 +677,7 @@ def read_inbox(
     agent_id: str,
     limit: int = 20,
     project_dir: Path | None = None,
+    recipient_store_coordinate: str | None = None,
 ) -> list[DirectMessage]:
     """Read unread messages from an agent's inbox.  Marks them as READ.
 
@@ -424,6 +686,11 @@ def read_inbox(
     path), deduped by message_id. Urgent messages surface first, then oldest
     first; only the returned (post-limit) messages are marked READ.
     """
+    agent_id = _validated_agent_id(agent_id)
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     conn = _get_db(project_dir)
     try:
         local_rows = conn.execute(
@@ -448,7 +715,9 @@ def read_inbox(
         ]
         local_ids = {m.message_id for m in local_msgs}
 
-        cross_msgs = _read_cross_org_candidates(agent_id, conn, local_ids, project_dir)
+        cross_msgs = _read_cross_org_candidates(
+            agent_id, conn, local_ids, project_dir, recipient_store_coordinate
+        )
         is_cross = {m.message_id for m in cross_msgs}
 
         combined = local_msgs + cross_msgs
@@ -459,9 +728,21 @@ def read_inbox(
 
         for msg in returned:
             if msg.message_id in is_cross:
-                _track_cross_org_read(conn, msg)
+                _track_cross_org_read(
+                    conn,
+                    msg,
+                    project_dir=project_dir,
+                    recipient_store_coordinate=recipient_store_coordinate,
+                )
             else:
                 _transition_status(conn, msg.message_id, STATUS_READ)
+                canonical_conn = _get_canonical_db(
+                    project_dir, recipient_store_coordinate=recipient_store_coordinate
+                )
+                try:
+                    _transition_status(canonical_conn, msg.message_id, STATUS_READ)
+                finally:
+                    canonical_conn.close()
 
         return returned
     finally:
@@ -473,8 +754,14 @@ def ack_message(
     message_id: str,
     agent_id: str,
     project_dir: Path | None = None,
+    recipient_store_coordinate: str | None = None,
 ) -> str:
     """Acknowledge a message.  Returns status string."""
+    agent_id = _validated_agent_id(agent_id)
+    if recipient_store_coordinate is not None:
+        recipient_store_coordinate = _validated_store_coordinate(
+            recipient_store_coordinate
+        )
     conn = _get_db(project_dir)
     try:
         row = conn.execute(
@@ -489,6 +776,13 @@ def ack_message(
             return f"message {message_id} already acknowledged"
 
         _transition_status(conn, message_id, STATUS_ACKED)
+        canonical_conn = _get_canonical_db(
+            project_dir, recipient_store_coordinate=recipient_store_coordinate
+        )
+        try:
+            _transition_status(canonical_conn, message_id, STATUS_ACKED)
+        finally:
+            canonical_conn.close()
         return f"message {message_id} acknowledged"
     finally:
         conn.close()
@@ -503,13 +797,28 @@ def check_status(
     conn = _get_db(project_dir)
     try:
         row = conn.execute(
-            """SELECT message_id, from_agent, to_agent, status,
+            """SELECT message_id, from_agent, to_agent, status, canonical_store,
                       created_at, delivered_at, read_at, acked_at
                FROM messages WHERE message_id = ?""",
             (message_id,),
         ).fetchone()
         if row is None:
             return None
+        if row["canonical_store"]:
+            canonical = _get_canonical_db(
+                project_dir, recipient_store_coordinate=row["canonical_store"]
+            )
+            try:
+                shared_row = canonical.execute(
+                    """SELECT message_id, from_agent, to_agent, status,
+                              created_at, delivered_at, read_at, acked_at
+                       FROM messages WHERE message_id = ?""",
+                    (message_id,),
+                ).fetchone()
+                if shared_row is not None:
+                    return dict(shared_row)
+            finally:
+                canonical.close()
         return dict(row)
     finally:
         conn.close()
@@ -521,8 +830,16 @@ def message_history(
     with_agent: str,
     limit: int = 20,
     project_dir: Path | None = None,
+    include_canonical: bool = False,
+    canonical_store_coordinate: str | None = None,
 ) -> list[DirectMessage]:
     """Read message history between two agents (both directions)."""
+    agent_id = _validated_agent_id(agent_id)
+    with_agent = _validated_agent_id(with_agent)
+    if canonical_store_coordinate is not None:
+        canonical_store_coordinate = _validated_store_coordinate(
+            canonical_store_coordinate
+        )
     conn = _get_db(project_dir)
     try:
         rows = conn.execute(
@@ -536,7 +853,7 @@ def message_history(
             (agent_id, with_agent, with_agent, agent_id, limit),
         ).fetchall()
 
-        return [
+        messages = [
             DirectMessage(
                 message_id=row["message_id"],
                 from_agent=row["from_agent"],
@@ -548,6 +865,56 @@ def message_history(
             )
             for row in rows
         ]
+        if not include_canonical:
+            return messages
+        seen = {message.message_id for message in messages}
+        coordinates = [
+            row[0]
+            for row in conn.execute(
+                """SELECT DISTINCT canonical_store FROM messages
+                   WHERE ((from_agent = ? AND to_agent = ?)
+                       OR (from_agent = ? AND to_agent = ?))
+                     AND canonical_store IS NOT NULL""",
+                (agent_id, with_agent, with_agent, agent_id),
+            ).fetchall()
+        ]
+        if canonical_store_coordinate:
+            coordinates.append(canonical_store_coordinate)
+        for coordinate in coordinates:
+            coordinate = _validated_store_coordinate(coordinate)
+            try:
+                canonical_conn = _get_canonical_db(
+                    project_dir, recipient_store_coordinate=coordinate
+                )
+                try:
+                    canonical_rows = canonical_conn.execute(
+                        """SELECT message_id, from_agent, to_agent, timestamp, body,
+                                  reply_to, priority
+                           FROM messages
+                           WHERE (from_agent = ? AND to_agent = ?)
+                              OR (from_agent = ? AND to_agent = ?)""",
+                        (agent_id, with_agent, with_agent, agent_id),
+                    ).fetchall()
+                finally:
+                    canonical_conn.close()
+            except sqlite3.Error:
+                continue
+            for row in canonical_rows:
+                if row["message_id"] not in seen:
+                    seen.add(row["message_id"])
+                    messages.append(
+                        DirectMessage(
+                            message_id=row["message_id"],
+                            from_agent=row["from_agent"],
+                            to_agent=row["to_agent"],
+                            timestamp=row["timestamp"],
+                            body=row["body"],
+                            reply_to=row["reply_to"],
+                            priority=row["priority"],
+                        )
+                    )
+        messages.sort(key=lambda message: message.timestamp, reverse=True)
+        return messages[:limit]
     finally:
         conn.close()
 
@@ -609,28 +976,87 @@ def enter_count(runtime: str | None) -> int:
 def load_pane_map() -> dict[str, Any]:
     """Operator-supplied agent->pane map (neutral routing table, not identity).
 
-    Source order: the ``SYNAPT_AGENT_PANES`` env var as a JSON object, else the
-    JSON file at ``SYNAPT_AGENT_PANES_FILE``. Defaults to an empty map (which
-    makes delivery a no-op so the send falls back to inbox-only). OSS never
-    hardcodes the workspace's agent topology -- that is operator config.
+    A configured ``SYNAPT_AGENT_PANES_FILE`` is authoritative when present:
+    recipient identity and tmux target/runtime must come from one generated
+    record source.  Inline ``SYNAPT_AGENT_PANES`` remains a legacy fallback
+    only when no configured file is selected.  A malformed selected file fails
+    closed rather than silently combining its identity records with inline
+    routing.
 
     Format (operator-supplied)::
 
         {"<agent>": {"target": "<tmux-session>:<window>", "runtime": "claude|codex"}}
     """
+    path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
+    if path:
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            return {}
+        return _pane_map_from_payload(payload)
+
     raw = os.environ.get("SYNAPT_AGENT_PANES")
     if raw:
         try:
-            return json.loads(raw)
+            payload = json.loads(raw)
         except (ValueError, TypeError):
             return {}
-    path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
-    if path and Path(path).exists():
-        try:
-            return json.loads(Path(path).read_text(encoding="utf-8"))
-        except (ValueError, OSError):
-            return {}
+        return _pane_map_from_payload(payload)
     return {}
+
+
+def _pane_map_from_payload(payload: Any) -> dict[str, Any]:
+    """Convert either legacy panes or generated records to stable-ID pane keys."""
+    records = payload.get("records") if isinstance(payload, dict) else payload
+    if isinstance(records, list):
+        return {
+            str(record["agent_id"]): {
+                "target": record["target"],
+                "runtime": record["runtime"],
+            }
+            for record in records
+            if isinstance(record, dict)
+            and {"agent_id", "target", "runtime"} <= set(record)
+        }
+    if isinstance(payload, dict) and all(
+        isinstance(record, dict) for record in payload.values()
+    ):
+        generated = {
+            str(record["agent_id"]): {
+                "target": record["target"],
+                "runtime": record["runtime"],
+            }
+            for record in payload.values()
+            if {"agent_id", "target", "runtime"} <= set(record)
+        }
+        return generated or payload
+    return payload if isinstance(payload, dict) else {}
+
+
+def load_pane_records() -> list[dict[str, Any]]:
+    """Read grip-generated routing records, never infer identity from them."""
+    path = os.environ.get("SYNAPT_AGENT_PANES_FILE")
+    if not path:
+        return []
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return []
+    records = payload.get("records") if isinstance(payload, dict) else payload
+    required = {"qualified_alias", "agent_id", "store_coordinate", "target", "runtime"}
+    if isinstance(records, list):
+        return [
+            {**record, "_key": record["qualified_alias"]}
+            for record in records
+            if isinstance(record, dict) and required <= set(record)
+        ]
+    if not isinstance(payload, dict):
+        return []
+    return [
+        {**record, "_key": key}
+        for key, record in payload.items()
+        if isinstance(record, dict) and required <= set(record)
+    ]
 
 
 def _normalize_agent_key(to_agent: str) -> str:
@@ -639,6 +1065,12 @@ def _normalize_agent_key(to_agent: str) -> str:
     key = to_agent.strip().lower()
     if ":" in key:
         key = key.split(":", 1)[1]
+    # Stable inbox IDs are ``name-NNN`` while legacy pane maps are commonly
+    # keyed by ``name``.  Routing remains operator-owned; this only preserves
+    # the existing map convention after recipient resolution canonicalizes IDs.
+    stem, sep, suffix = key.rpartition("-")
+    if sep and suffix.isdigit():
+        key = stem
     return key
 
 
@@ -799,27 +1231,43 @@ def speak_to_agent(
                 return "Error: 'to' (recipient agent ID) is required for send."
             if not message:
                 return "Error: 'message' body is required for send."
+            recipient = resolve_registered_recipient(to)
             msg = send_message(
                 from_agent=agent_id,
-                to_agent=to,
+                to_agent=recipient.agent_id,
                 body=message,
                 reply_to=reply_to,
                 priority=priority,
+                recipient_store_coordinate=recipient.store_coordinate,
             )
             # The inbox write above is the durable record. Now also push the
             # message into the recipient's live tmux pane so it actually lands
             # (recall#852) -- best-effort, never breaks the send.
-            delivery = _attempt_tmux_delivery(to, message)
+            delivery = _attempt_tmux_delivery(recipient.agent_id, message)
             if delivery is None:
-                status = f"Status: written to {to}'s inbox (no tmux pane configured; inbox-only)"
+                status = (
+                    f"Status: written to {recipient.agent_id}'s inbox "
+                    "(no tmux pane configured; inbox-only)"
+                )
             elif delivery.delivered:
-                status = f"Status: written to {to}'s inbox AND delivered to live pane {delivery.target} via tmux"
+                status = (
+                    f"Status: written to {recipient.agent_id}'s inbox AND "
+                    f"delivered to live pane {delivery.target} via tmux"
+                )
             else:
-                status = f"Status: written to {to}'s inbox; tmux delivery did not land ({delivery.detail})"
-            return f"Sent to {to}: {msg.message_id}\n{status}"
+                status = (
+                    f"Status: written to {recipient.agent_id}'s inbox; tmux delivery "
+                    f"did not land ({delivery.detail})"
+                )
+            return f"Sent to {recipient.agent_id}: {msg.message_id}\n{status}"
 
         elif action == "read":
-            messages = read_inbox(agent_id=agent_id, limit=limit)
+            own_recipient = resolve_registered_recipient(agent_id)
+            messages = read_inbox(
+                agent_id=agent_id,
+                limit=limit,
+                recipient_store_coordinate=(own_recipient.store_coordinate),
+            )
             if not messages:
                 return "No unread direct messages."
             lines = [f"## Direct messages ({len(messages)} unread)"]
@@ -835,7 +1283,12 @@ def speak_to_agent(
         elif action == "ack":
             if not message_id:
                 return "Error: 'message_id' is required for ack."
-            return ack_message(message_id=message_id, agent_id=agent_id)
+            own_recipient = resolve_registered_recipient(agent_id)
+            return ack_message(
+                message_id=message_id,
+                agent_id=agent_id,
+                recipient_store_coordinate=(own_recipient.store_coordinate),
+            )
 
         elif action == "status":
             if not message_id:
@@ -856,14 +1309,17 @@ def speak_to_agent(
         elif action == "history":
             if not with_agent:
                 return "Error: 'with_agent' is required for history."
+            peer = resolve_registered_recipient(with_agent)
             messages = message_history(
                 agent_id=agent_id,
-                with_agent=with_agent,
+                with_agent=peer.agent_id,
                 limit=limit,
+                include_canonical=True,
+                canonical_store_coordinate=peer.store_coordinate,
             )
             if not messages:
-                return f"No message history with {with_agent}."
-            lines = [f"## History with {with_agent} ({len(messages)} messages)"]
+                return f"No message history with {peer.agent_id}."
+            lines = [f"## History with {peer.agent_id} ({len(messages)} messages)"]
             for msg in messages:
                 direction = "→" if msg.from_agent == agent_id else "←"
                 other = msg.to_agent if msg.from_agent == agent_id else msg.from_agent

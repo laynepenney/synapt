@@ -56,11 +56,8 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
-from pathlib import Path
-
-logger = logging.getLogger("synapt.recall.cli")
-
 from datetime import datetime
+from pathlib import Path
 
 from synapt.recall.core import (
     atomic_json_write,
@@ -88,6 +85,10 @@ from synapt.recall.journal import (
     append_entry,
     split_journal_field,
 )
+
+logger = logging.getLogger("synapt.recall.cli")
+
+_WAKE_JOURNAL_ENTRY_LIMIT = 3
 
 
 # ---------------------------------------------------------------------------
@@ -1378,6 +1379,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
                 caller_sources=caller_transcripts(
                     getattr(args, "project", None) or Path.cwd()
                 ),
+                agent_id=os.environ.get("SYNAPT_AGENT_ID"),
             )
         except ResumeError as exc:
             # An empty index is an honest empty state, not a failure to act on.
@@ -1402,8 +1404,51 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # or turns out to be an un-archived session. Everywhere else the cheap leg
     # (~24 ms there) answers, and a stale verdict needs no second opinion.
     view = _attach_freshness(view, args)
+    view = _attach_unclean_end(view, args)
+
+    # On a cold/stale resume the tail-bound journal path can miss the freshest
+    # durable entry (bound to a session the stale index never saw). Surface the
+    # newest journal above the tail when the index is stale or no caller session
+    # resolved. Read-only; gated so a fresh index with a caller shows nothing.
+    from synapt.recall.resume import attach_durable_checkpoint
+
+    view = attach_durable_checkpoint(view, _journal_path())
 
     print(format_resume(view))
+
+
+def _attach_unclean_end(view, args):
+    """Judge the SELECTED session, not the newest transcript: the process
+    running `synapt resume` is usually itself the newest transcript.
+    Never raises; None means NOT CHECKED."""
+    try:
+        from synapt.recall.journal import _journal_path
+        from synapt.recall.resume import (
+            authored_journals,
+            caller_transcripts,
+            detect_unclean_end,
+        )
+        from synapt.checkpoint import read_checkpoint
+
+        project = getattr(args, "project", None) or Path.cwd()
+        sources = [
+            item for item in caller_transcripts(project)
+            if item.session_id == view.session_id
+        ]
+        view.unclean_end = detect_unclean_end(
+            sources,
+            checkpoint=read_checkpoint(Path(project)),
+            # Ambient journal store when the caller did not pass a deliberate
+            # project (the wake case): resolve the session-consistent store via
+            # the env override rather than cwd. An explicit args.project stays the
+            # deliberate export/import target. (dual-use wake fix)
+            authored_journals=authored_journals(
+                _journal_path(getattr(args, "project", None))
+            ),
+        )
+    except Exception:
+        pass
+    return view
 
 
 def _attach_freshness(view, args):
@@ -1552,8 +1597,8 @@ def cmd_export(args: argparse.Namespace) -> None:
     from synapt.recall.archive import export_recall_archive
 
     # Do NOT default to Path.cwd() here: an explicit root suppresses the
-    # SYNAPT_RECALL_ROOT override inside project_data_dir. None means "resolve
-    # like every other recall verb".
+    # SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT overrides inside project_data_dir.
+    # None means "resolve like every other recall verb".
     project = Path(args.path).expanduser().resolve() if getattr(args, "path", None) else None
     try:
         output_path, manifest = export_recall_archive(
@@ -1581,7 +1626,8 @@ def cmd_import(args: argparse.Namespace) -> None:
     """Import portable recall state from a .synapt-archive file."""
     from synapt.recall.archive import import_recall_archive
 
-    # Same rule as export: None resolves via SYNAPT_RECALL_ROOT + inference.
+    # Same rule as export: None resolves via SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT
+    # + inference.
     project = Path(args.path).expanduser().resolve() if getattr(args, "path", None) else None
     mode = "merge" if args.merge else "replace"
     try:
@@ -2268,7 +2314,11 @@ def _catchup_archive_and_journal(project: Path, transcript_dir: Path) -> None:
     # Journal from the archive (not source) — the archive has the full pre-/clear
     # content, while the source may be truncated after /clear.
     archive_dir = project_archive_dir(project)
-    journal_path = _journal_path(project)
+    # Ambient (None): auto-journal writes must land in the SAME session-consistent
+    # store the wake reads and the manual `recall journal` verb writes. Writing to
+    # the cwd store here while readers resolve ambiently would split auto- and
+    # manual journals across two stores (dual-use wake fix).
+    journal_path = _journal_path()
     existing_ids = _read_all_session_ids(journal_path)
     journaled = 0
 
@@ -2302,6 +2352,7 @@ def generate_startup_context(
     project: Path,
     *,
     include_continuity: bool = True,
+    current_session_id: str | None = None,
 ) -> list[str]:
     """Generate startup context lines for any tool (Claude, Codex, etc.).
 
@@ -2325,6 +2376,7 @@ def generate_startup_context(
     journal_lines: list[str] = []
     compaction_line: str | None = None
     latest_authored_journal_timestamp: str | None = None
+    authored_entries: list = []
 
     # 1. Branch-aware context
     try:
@@ -2333,7 +2385,13 @@ def generate_startup_context(
         if branch and branch not in ("main", "master"):
             from synapt.recall.journal import _read_all_entries, _journal_path
             all_entries = []
-            jf = _journal_path(project)
+            # Ambient (None): the wake must read the SAME journal store the
+            # session's own recall/journal verbs read -- workspace-aware via
+            # GRIPSPACE_ROOT -- not the cwd. An explicit project=cwd suppresses
+            # the env override (the deliberate export/import --path contract) and
+            # reads a blank/wrong store when cwd != workspace (dual-use wake fix).
+            # `project` still drives the branch legs below, which ARE cwd facts.
+            jf = _journal_path()
             if jf.exists():
                 all_entries.extend(_read_all_entries(jf))
             branch_entries = [e for e in all_entries if e.branch == branch]
@@ -2368,15 +2426,32 @@ def generate_startup_context(
     except Exception:
         pass
 
-    # 3. Journal entries (last 3 rich entries)
+    # 3. Journal entries. The read is bounded, so its omissions are part of
+    # the result rather than an invisible implementation detail.
     try:
         from synapt.recall.journal import _read_all_entries, _journal_path, _dedup_entries
         from synapt.recall.journal import format_for_session_start
-        jf = _journal_path(project)
+        # Ambient (None): resolve the session-consistent journal store, not cwd
+        # (see the branch-context leg above; dual-use wake fix).
+        jf = _journal_path()
         if jf.exists():
             all_entries = _dedup_entries(_read_all_entries(jf))
             rich = [e for e in all_entries if e.has_rich_content()]
             rich.sort(key=lambda e: e.timestamp, reverse=True)
+            shown_entries = rich[:_WAKE_JOURNAL_ENTRY_LIMIT]
+            journal_lines.append(
+                "Journal read: "
+                + json.dumps(
+                    {
+                        "shown": len(shown_entries),
+                        "withheld": len(rich) - len(shown_entries),
+                        "oldest_shown_at": (
+                            shown_entries[-1].timestamp if shown_entries else None
+                        ),
+                    },
+                    separators=(",", ":"),
+                )
+            )
             # A files-only authored checkpoint still supersedes an older raw
             # transcript tail even though it is not rich enough to render.
             authored = [
@@ -2384,9 +2459,10 @@ def generate_startup_context(
                 if not entry.auto and entry.has_content()
             ]
             authored.sort(key=lambda entry: entry.timestamp, reverse=True)
+            authored_entries = list(authored)
             if authored:
                 latest_authored_journal_timestamp = authored[0].timestamp
-            for entry in rich[:3]:
+            for entry in shown_entries:
                 journal_lines.append(format_for_session_start(entry))
     except Exception:
         pass
@@ -2395,12 +2471,60 @@ def generate_startup_context(
     # by transcript indexing, so startup remains O(1) in transcript size.
     try:
         from synapt.recall.compaction import (
+            format_agent_compaction_directive,
             format_compaction_summary,
+            latest_agent_compaction_directive,
             latest_compaction_summary,
         )
-        summary = latest_compaction_summary(project)
-        if summary:
+        agent_id = os.environ.get("SYNAPT_AGENT_ID")
+        agent_name = (
+            os.environ.get("SYNAPT_AGENT_NAME") or os.environ.get("AGENT_NAME")
+        )
+        summary = None
+        directive = latest_agent_compaction_directive(project, agent_name)
+        if agent_id and directive:
+            compaction_line = format_agent_compaction_directive(directive)
+        else:
+            summary = latest_compaction_summary(project, agent_id=agent_id)
+        if not compaction_line and summary:
             compaction_line = format_compaction_summary(summary)
+    except Exception:
+        pass
+
+    # 5a. Unclean end: the newest PREVIOUS transcript has no journal within
+    # the grace window and no SessionEnd checkpoint of its own. A crash runs
+    # no SessionEnd, so the checkpoint on disk (if any) is some other
+    # session's; without this block that other tail renders as the bridge and
+    # nothing says hours of work have no record (measured 2026-08-31). The
+    # block carries the crashed session's OWN bounded tail and leads the wake.
+    try:
+        from synapt.recall.resume import format_unclean_end, gather_unclean_end
+
+        # Exclusion is a call-site guarantee: a caller that cannot name the
+        # session that is starting must not publish this verdict, or the wake
+        # reports itself (the generic `synapt recall startup` path, Atlas r1).
+        found = None
+        if current_session_id:
+            found = gather_unclean_end(
+                project,
+                exclude_session_id=current_session_id,
+                authored=authored_entries,
+            )
+        if found:
+            tail = None
+            try:
+                from synapt.checkpoint import capture_checkpoint
+
+                tail = capture_checkpoint({
+                    "transcript_path": str(found.transcript_path),
+                    "session_id": found.session_id,
+                    "cwd": str(project),
+                    "hook_event_name": "SessionStart",
+                    "reason": "unclean-end",
+                })
+            except Exception:
+                tail = None
+            continuity_lines.insert(0, format_unclean_end(found, tail))
     except Exception:
         pass
 
@@ -2464,7 +2588,17 @@ def generate_startup_context(
                 lines.append(f"Channel: {', '.join(unread_parts)} unread")
             total_unread = sum(counts.values())
             if total_unread > 0:
-                summary = channel_read("dev", limit=min(total_unread, 5), show_pins=False)
+                # A quiet night reads five messages in full. A backlog reads
+                # one line per message up to thirty, so the wake covers what
+                # happened rather than the three newest posts (2026-08-31:
+                # eleven unread, three rendered, the two verdicts that
+                # mattered withheld).
+                if total_unread > 5:
+                    summary = channel_read(
+                        "dev", limit=min(total_unread, 30), show_pins=False, detail="min",
+                    )
+                else:
+                    summary = channel_read("dev", limit=total_unread, show_pins=False)
                 if summary:
                     lines.append(f"\nRecent #dev messages:\n{summary}")
     except Exception:
@@ -2607,7 +2741,16 @@ def cmd_startup(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
-    context_lines = generate_startup_context(project)
+    # The runtime that is starting names itself in its env (Claude Code:
+    # CLAUDE_CODE_SESSION_ID, Codex: CODEX_THREAD_ID). Without it the wake
+    # cannot exclude the live transcript and does not judge an unclean end.
+    current_session_id = (
+        os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CODEX_THREAD_ID")
+        or os.environ.get("SYNAPT_SESSION_ID")
+        or None
+    )
+    context_lines = generate_startup_context(project, current_session_id=current_session_id)
 
     if not context_lines:
         if getattr(args, "json", False):
@@ -2618,13 +2761,29 @@ def cmd_startup(args: argparse.Namespace) -> None:
         import json
         print(json.dumps({"context": "\n".join(context_lines)}, indent=2))
     elif getattr(args, "compact", False):
-        # Single line for embedding in prompts — flatten multi-line blocks
-        parts = []
-        for line in context_lines:
-            flat = " ".join(s.strip() for s in line.splitlines() if s.strip())
-            if flat:
-                parts.append(flat)
-        print(" | ".join(parts))
+        # The compact form is embedded directly into a runtime prompt. Give it
+        # the same source-aware byte budget as SessionStart before flattening;
+        # flattening an unbounded context merely turns the overflow into one
+        # enormous logical line and can bury the current assignment.
+        from synapt.recall.session_start import render_wake, WAKE_BUDGET_BYTES
+
+        rendered = render_wake(context_lines, source="startup")
+        parts = [line.strip() for line in rendered.splitlines() if line.strip()]
+        compact = " | ".join(parts)
+        # ``render_wake`` budgets its newline-delimited bytes. Replacing every
+        # newline with a three-byte separator can expand the final transport,
+        # and ``print`` adds one more byte. Enforce the promise on the bytes the
+        # runtime actually receives.
+        if len(compact.encode("utf-8")) + 1 > WAKE_BUDGET_BYTES:
+            suffix = " … (compact output clipped)"
+            room = WAKE_BUDGET_BYTES - 1 - len(suffix.encode("utf-8"))
+            compact = (
+                compact.encode("utf-8")[:room]
+                .decode("utf-8", errors="ignore")
+                .rstrip()
+                + suffix
+            )
+        print(compact)
     else:
         for line in context_lines:
             print(line)
@@ -2794,12 +2953,13 @@ def cmd_hook(args: argparse.Namespace) -> None:
             lines = generate_startup_context(
                 project,
                 include_continuity=include_continuity,
+                current_session_id=str(payload.get("session_id") or "") or None,
             )
 
         # 4. ... rendered inside the byte budget, head line first, full text
         #    on disk with a pointer. The harness previews ~2 KB of this.
         with run.phase("render"):
-            text = render_wake(lines, project=project, source=source, run=run,
+            text = render_wake(lines, source=source, run=run,
                                warning=warning, banners=banners)
         sys.stdout.write(text)
 
@@ -2887,7 +3047,10 @@ def _precompact_journal_write(project: Path) -> None:
     if not session_id:
         return
 
-    journal_file = _journal_path(project)
+    # Ambient (None): the PreCompact auto-journal write lands in the same
+    # session-consistent store the wake reads (dual-use wake fix; see
+    # _catchup_archive_and_journal for the split-store rationale).
+    journal_file = _journal_path()
     if session_id in _read_all_session_ids(journal_file):
         logger.debug("PreCompact journal skip — session %s already journaled", session_id[:8])
         return
@@ -3495,14 +3658,14 @@ def make_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("output", nargs="?", default=None, help="Output .synapt-archive path (default: <project>.synapt-archive)")
     export_parser.add_argument("--exclude-transcripts", action="store_true", help="Skip raw transcript archives")
     export_parser.add_argument("--exclude-channels", action="store_true", help="Skip channel history files")
-    export_parser.add_argument("--path", default=None, help="Workspace root to export (default: SYNAPT_RECALL_ROOT, else inferred from git/gripspace, else cwd)")
+    export_parser.add_argument("--path", default=None, help="Workspace root to export (default: SYNAPT_RECALL_ROOT, else GRIPSPACE_ROOT, else inferred from git/gripspace, else the current directory; $HOME is refused, not used)")
 
     import_parser = subparsers.add_parser("import", help="Import portable recall data from a .synapt-archive file")
     import_parser.add_argument("archive", help="Path to a .synapt-archive file")
     import_mode = import_parser.add_mutually_exclusive_group()
     import_mode.add_argument("--merge", action="store_true", help="Merge imported data into existing recall state")
     import_mode.add_argument("--replace", action="store_true", help="Replace existing recall state (default)")
-    import_parser.add_argument("--path", default=None, help="Workspace root to import into (default: SYNAPT_RECALL_ROOT, else inferred from git/gripspace, else cwd)")
+    import_parser.add_argument("--path", default=None, help="Workspace root to import into (default: SYNAPT_RECALL_ROOT, else GRIPSPACE_ROOT, else inferred from git/gripspace, else the current directory; $HOME is refused, not used)")
 
     # Transcript (display/save a session)
     transcript_parser = subparsers.add_parser("transcript", help="Display or save a session transcript")

@@ -8,9 +8,10 @@ Verifies that:
 """
 
 import argparse
+import contextlib
+import io
 import json
 import os
-import tempfile
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -21,6 +22,35 @@ from synapt.recall.cli import (
     cmd_startup,
     generate_startup_context,
 )
+from synapt.recall.session_start import WAKE_BUDGET_BYTES
+
+
+@pytest.fixture(autouse=True)
+def _bind_owned_ambient_store(request, _isolate_recall_root_env, tmp_path, monkeypatch):
+    """Bind the AMBIENT recall store to this test's OWN tmp_path for EVERY
+    startup-context test.
+
+    The wake now resolves its journal store ambiently (dual-use wake fix,
+    Stromus ruling 2026-08-31). The conftest autouse ``_isolate_recall_root_env``
+    already strips an ambient SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT from the shell,
+    but with those gone ambient resolution falls through to the CWD -- which on a
+    reviewer's real checkout holds a live journal. A test that seeds
+    ``_journal_path(tmp_path)`` and reads ambiently then validates a DIFFERENT
+    store depending on the operator's cwd population: green from an empty cwd, red
+    (or silently polluted) from a populated one. That empty-cwd green is a false
+    control (Atlas r1). So bind the ambient root to tmp_path and chdir there:
+    ``_journal_path()`` (ambient, what the wake reads) is then byte-identical to
+    ``_journal_path(tmp_path)`` (explicit, what these tests seed), and no test can
+    reach the operator's store. Depends on ``_isolate_recall_root_env`` so it runs
+    AFTER the scrub. A test that explicitly exercises store RESOLUTION marks itself
+    ``@pytest.mark.store_resolution`` and sets its own roots; this binding then
+    steps aside."""
+    if request.node.get_closest_marker("store_resolution"):
+        return
+    monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(tmp_path))
+    monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 class TestGenerateStartupContext:
@@ -89,6 +119,67 @@ class TestGenerateStartupContext:
         text = "\n".join(result)
         assert "Codex startup parity" in text or "test-session" in text
 
+    def test_journal_read_reports_its_selection_bound(self, tmp_path):
+        """A three-entry wake view must distinguish complete from truncated."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        for day in range(1, 6):
+            append_entry(JournalEntry(
+                timestamp=f"2026-08-{day:02d}T12:00:00Z",
+                session_id=f"session-{day}",
+                focus=f"focus-{day}",
+                next_steps=[f"step-{day}"],
+            ), jf)
+
+        with patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.compaction.latest_compaction_summary", return_value=None), \
+             patch("synapt.checkpoint.read_checkpoint", return_value=None), \
+             patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch("synapt.recall.server.format_contradictions_for_session_start", return_value=""), \
+             patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            result = generate_startup_context(tmp_path)
+
+        coverage_line = next(line for line in result if line.startswith("Journal read: "))
+        coverage = json.loads(coverage_line.removeprefix("Journal read: "))
+        assert coverage == {
+            "shown": 3,
+            "withheld": 2,
+            "oldest_shown_at": "2026-08-03T12:00:00Z",
+        }
+        text = "\n".join(result)
+        for day in (3, 4, 5):
+            assert f"focus-{day}" in text
+        for day in (1, 2):
+            assert f"focus-{day}" not in text
+
+    def test_journal_read_reports_empty_rich_selection(self, tmp_path):
+        """An existing journal with no displayable entries reports an empty bound."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        jf = _journal_path(tmp_path)
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-08-05T12:00:00Z",
+            session_id="files-only",
+            files_modified=["src/changed.py"],
+        ), jf)
+
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            result = generate_startup_context(tmp_path)
+
+        coverage_line = next(line for line in result if line.startswith("Journal read: "))
+        coverage = json.loads(coverage_line.removeprefix("Journal read: "))
+        assert coverage == {
+            "shown": 0,
+            "withheld": 0,
+            "oldest_shown_at": None,
+        }
+
     def test_newer_raw_checkpoint_is_surfaced_after_authored_journal(self, tmp_path):
         from synapt.recall.journal import JournalEntry, append_entry, _journal_path
 
@@ -144,6 +235,122 @@ class TestGenerateStartupContext:
 
         assert text.index("LAST CHECKPOINT") < text.index("LAST COMPACTION SUMMARY")
         assert text.index("LAST COMPACTION SUMMARY") < text.index("older journal context")
+
+    def test_stable_agent_gets_own_directive_not_foreign_runtime_summary(self, tmp_path):
+        own = {
+            "agent_name": "current",
+            "source_path": str(tmp_path / ".synapt" / "compact" / "current.txt"),
+            "text": "current agent continuity",
+            "truncated": False,
+        }
+        foreign = {
+            "runtime": "claude",
+            "timestamp": "2026-09-01T00:00:00Z",
+            "summary": "foreign runtime sediment",
+        }
+        with patch.dict(
+            os.environ,
+            {"SYNAPT_AGENT_ID": "stable-agent", "AGENT_NAME": "current"},
+            clear=False,
+        ), patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.journal._journal_path", return_value=tmp_path / "none"), \
+             patch(
+                 "synapt.recall.compaction.latest_agent_compaction_directive",
+                 return_value=own,
+             ), patch(
+                 "synapt.recall.compaction.latest_compaction_summary",
+                 return_value=foreign,
+             ) as runtime_summary, patch(
+                 "synapt.checkpoint.read_checkpoint", return_value=None
+             ), patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch(
+                 "synapt.recall.server.format_contradictions_for_session_start",
+                 return_value="",
+             ), patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        assert "current agent continuity" in text
+        assert "foreign runtime sediment" not in text
+        runtime_summary.assert_not_called()
+
+    def test_canonical_agent_name_selects_directive_without_legacy_alias(self, tmp_path):
+        own = {
+            "agent_name": "current",
+            "source_path": str(tmp_path / ".synapt" / "compact" / "current.txt"),
+            "text": "current agent continuity",
+            "truncated": False,
+        }
+        with patch.dict(
+            os.environ,
+            {"SYNAPT_AGENT_ID": "stable-agent", "SYNAPT_AGENT_NAME": "current"},
+            clear=True,
+        ), patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.journal._journal_path", return_value=tmp_path / "none"), \
+             patch(
+                 "synapt.recall.compaction.latest_agent_compaction_directive",
+                 return_value=own,
+             ) as directive, patch(
+                 "synapt.recall.compaction.latest_compaction_summary"
+             ) as runtime_summary, patch(
+                 "synapt.checkpoint.read_checkpoint", return_value=None
+             ), patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch(
+                 "synapt.recall.server.format_contradictions_for_session_start",
+                 return_value="",
+             ), patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            text = "\n".join(generate_startup_context(tmp_path))
+
+        directive.assert_called_once_with(tmp_path, "current")
+        runtime_summary.assert_not_called()
+        assert "current agent continuity" in text
+
+    def test_old_cwd_startup_reads_only_own_directive_from_durable_root(
+        self, tmp_path
+    ):
+        durable_root = tmp_path / "durable"
+        compact_dir = durable_root / ".synapt" / "compact"
+        compact_dir.mkdir(parents=True)
+        (compact_dir / "current.txt").write_text(
+            "current agent continuity", encoding="utf-8"
+        )
+        (compact_dir / "foreign.txt").write_text(
+            "foreign runtime sediment", encoding="utf-8"
+        )
+        missing_old_cwd = tmp_path / "historical-cwd-that-moved"
+
+        with patch.dict(
+            os.environ,
+            {
+                "SYNAPT_RECALL_ROOT": str(durable_root),
+                "SYNAPT_AGENT_ID": "stable-agent",
+                "SYNAPT_AGENT_NAME": "current",
+            },
+            clear=True,
+        ), patch("synapt.recall.journal._get_branch", return_value=None), \
+             patch("synapt.recall.journal._journal_path", return_value=tmp_path / "none"), \
+             patch(
+                 "synapt.recall.compaction.latest_compaction_summary"
+             ) as runtime_summary, patch(
+                 "synapt.checkpoint.read_checkpoint", return_value=None
+             ), patch("synapt.recall.knowledge.read_nodes", return_value=[]), \
+             patch("synapt.recall.reminders.pop_pending", return_value=[]), \
+             patch(
+                 "synapt.recall.server.format_contradictions_for_session_start",
+                 return_value="",
+             ), patch("synapt.recall.channel.channel_join"), \
+             patch("synapt.recall.channel.channel_unread", return_value={}), \
+             patch("synapt.recall.channel.check_directives", return_value=""):
+            text = "\n".join(generate_startup_context(missing_old_cwd))
+
+        assert "current agent continuity" in text
+        assert "foreign runtime sediment" not in text
+        runtime_summary.assert_not_called()
 
     def test_checkpoint_older_than_authored_journal_is_suppressed(self, tmp_path):
         from synapt.recall.journal import JournalEntry, append_entry, _journal_path
@@ -289,6 +496,59 @@ class TestCmdStartup:
         assert " | " in out
         assert "Journal: session xyz" in out
 
+    def test_compact_output_is_one_bounded_useful_line(self, capsys, tmp_path):
+        args = argparse.Namespace(json=False, compact=True)
+        context = [
+            "AGENT COMPACTION DIRECTIVE\nDurable continuity addressed to current.\n"
+            "current agent continuity",
+            "Last session: " + ("journal sediment " * 5000),
+            "Knowledge:\n  - [sticky] team assignment survives the budget",
+        ]
+        with patch(
+            "synapt.recall.cli.generate_startup_context", return_value=context
+        ), patch("synapt.recall.journal.compact_journal", return_value=0):
+            cmd_startup(args)
+
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1
+        assert len(out.encode("utf-8")) <= WAKE_BUDGET_BYTES
+        assert "current agent continuity" in out
+        assert "team assignment survives the budget" in out
+        assert "full context" in out
+
+    def test_compact_startup_stays_within_byte_budget_after_flattening(
+        self, tmp_path
+    ):
+        payload = "\n".join(["x" * 90 for _ in range(200)])
+        context = [
+            head + "\n" + payload
+            for head in [
+                "UNCLEAN END",
+                "LAST CHECKPOINT",
+                "AGENT COMPACTION DIRECTIVE",
+                "Branch context",
+                "Open PR",
+                "Last session:",
+                "Recent #dev",
+                "Pending directives",
+                "Knowledge:",
+                "Pending contradictions (1)",
+                "other",
+            ]
+        ]
+        output = io.StringIO()
+        with patch(
+            "synapt.recall.cli.generate_startup_context", return_value=context
+        ), patch(
+            "synapt.recall.journal.compact_journal", return_value=0
+        ), patch(
+            "synapt.recall.session_start.wake_file_path",
+            return_value=tmp_path / "wake.md",
+        ), contextlib.redirect_stdout(output):
+            cmd_startup(argparse.Namespace(json=False, compact=True))
+
+        assert len(output.getvalue().encode("utf-8")) <= WAKE_BUDGET_BYTES
+
     def test_json_output(self, capsys, tmp_path):
         """JSON mode outputs valid JSON with context key."""
         args = argparse.Namespace(json=True, compact=False)
@@ -357,6 +617,7 @@ loop_interval = "1m"
         assert "sleep" in prompt
         assert "1m cadence" not in prompt
 
+    @pytest.mark.store_resolution
     def test_gripspace_root_env_resolves_sibling_griptree_config(self, tmp_path):
         """Spawned sibling griptrees use GRIPSPACE_ROOT to find agents.toml."""
         gripspace = tmp_path / "gripspace"
@@ -445,3 +706,284 @@ class TestStartupSubcommand:
         assert result.returncode == 0
         assert "--json" in result.stdout
         assert "--compact" in result.stdout
+
+
+class TestUncleanEndAtStartup:
+    """When the previous session ended without a handoff, the wake must SAY so,
+    first, and carry that session's own tail — not another session's checkpoint
+    dressed as the bridge (measured 2026-08-31 after a host crash)."""
+
+    _CRASHED = "65262c2c-54c3-4d58-aec6-d076f5040539"
+    _FOREIGN = "489c7e73-aeff-4138-962c-da3297847601"
+
+    def _unclean(self, tmp_path):
+        from synapt.recall.resume import UncleanEnd
+        return UncleanEnd(
+            session_id=self._CRASHED,
+            transcript_path=tmp_path / "crashed.jsonl",
+            last_activity="2026-08-31T12:06:07Z",
+            last_authored_journal="2026-08-31T04:54:00Z",
+            gap_seconds=25927.0,
+            checkpoint_session=self._FOREIGN,
+        )
+
+    def _quiet(self):
+        return [
+            patch("synapt.recall.journal._get_branch", return_value=None),
+            patch("synapt.recall.compaction.latest_compaction_summary", return_value=None),
+            patch("synapt.recall.knowledge.read_nodes", return_value=[]),
+            patch("synapt.recall.reminders.pop_pending", return_value=[]),
+            patch("synapt.recall.server.format_contradictions_for_session_start", return_value=""),
+            patch("synapt.recall.channel.channel_join"),
+            patch("synapt.recall.channel.channel_unread", return_value={}),
+            patch("synapt.recall.channel.check_directives", return_value=""),
+        ]
+
+    def test_unclean_end_leads_continuity_and_carries_its_own_tail(self, tmp_path):
+        from contextlib import ExitStack
+        foreign_checkpoint = {
+            "schema_version": 1, "session_id": self._FOREIGN,
+            "captured_at": "2026-08-31T11:58:20Z", "parse_status": "partial",
+            "last_user_text": None, "last_assistant_text": "foreign report",
+            "files_touched": [],
+        }
+        recovered = {
+            "parse_status": "partial", "truncated": True,
+            "last_user_text": "can you show me the herdr changes as html",
+            "last_assistant_text": None, "files_touched": ["/tmp/x.html"],
+        }
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=foreign_checkpoint))
+            stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=self._unclean(tmp_path)))
+            capture = stack.enter_context(patch("synapt.checkpoint.capture_checkpoint", return_value=recovered))
+            lines = generate_startup_context(tmp_path, current_session_id="new-session")
+
+        text = "\n".join(lines)
+        assert lines[0].startswith("UNCLEAN END")
+        assert "65262c2c" in lines[0]
+        assert "7h12m" in lines[0]
+        assert "489c7e73" in lines[0], "the foreign checkpoint is named so it is not read as the bridge"
+        assert "can you show me the herdr changes as html" in lines[0]
+        assert "synapt resume 65262c2c-54c3-4d58-aec6-d076f5040539" in lines[0]
+        assert text.index("UNCLEAN END") < text.index("LAST CHECKPOINT")
+        payload = capture.call_args.args[0]
+        assert payload["transcript_path"] == str(tmp_path / "crashed.jsonl")
+        assert payload["session_id"] == self._CRASHED
+
+    def test_without_a_starting_session_id_no_verdict_is_published(self, tmp_path):
+        """Call-path witness (Atlas r1): the generic startup path used to pass
+        exclude_session_id=None, so the live transcript won and every Codex
+        wake would have reported itself."""
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=None))
+            gather = stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=self._unclean(tmp_path)))
+            text = "\n".join(generate_startup_context(tmp_path))
+        assert "UNCLEAN END" not in text
+        gather.assert_not_called()
+
+    def test_cmd_startup_names_the_runtime_session_from_its_env(self, tmp_path, monkeypatch):
+        import argparse
+        from synapt.recall import cli
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("CODEX_THREAD_ID", "codex-thread-7")
+        monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+        with patch("synapt.recall.cli.generate_startup_context", return_value=["ctx"]) as ctx, \
+             patch("synapt.recall.journal.compact_journal", return_value=0):
+            cli.cmd_startup(argparse.Namespace(json=False, compact=False))
+        assert ctx.call_args.kwargs["current_session_id"] == "codex-thread-7"
+        monkeypatch.delenv("CODEX_THREAD_ID")
+        with patch("synapt.recall.cli.generate_startup_context", return_value=["ctx"]) as ctx, \
+             patch("synapt.recall.journal.compact_journal", return_value=0):
+            cli.cmd_startup(argparse.Namespace(json=False, compact=False))
+        assert ctx.call_args.kwargs["current_session_id"] is None
+
+    def test_the_detector_is_told_which_session_is_starting(self, tmp_path):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=None))
+            gather = stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=None))
+            text = "\n".join(generate_startup_context(tmp_path, current_session_id="new-session"))
+        assert "UNCLEAN END" not in text
+        assert gather.call_args.kwargs["exclude_session_id"] == "new-session"
+
+    def test_the_last_checkpoint_block_names_its_session(self, tmp_path):
+        from contextlib import ExitStack
+        checkpoint = {
+            "schema_version": 1, "session_id": self._FOREIGN,
+            "captured_at": "2026-08-31T11:58:20Z", "parse_status": "ok",
+            "last_user_text": "q", "last_assistant_text": "a", "files_touched": [],
+        }
+        with ExitStack() as stack:
+            for p in self._quiet():
+                stack.enter_context(p)
+            stack.enter_context(patch("synapt.checkpoint.read_checkpoint", return_value=checkpoint))
+            stack.enter_context(patch("synapt.recall.resume.gather_unclean_end", return_value=None))
+            text = "\n".join(generate_startup_context(tmp_path))
+        assert "LAST CHECKPOINT" in text
+        assert "Session: 489c7e73" in text
+
+
+class TestChannelReadWidensWithBacklog:
+    """Five messages at medium detail is the right read for a quiet night and
+    the wrong one after a gap: on 2026-08-31 eleven were unread, three rendered
+    inside the channel cap, and the two that mattered were withheld."""
+
+    def _run(self, unread):
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for p in (
+                patch("synapt.recall.journal._get_branch", return_value=None),
+                patch("synapt.recall.compaction.latest_compaction_summary", return_value=None),
+                patch("synapt.checkpoint.read_checkpoint", return_value=None),
+                patch("synapt.recall.resume.gather_unclean_end", return_value=None),
+                patch("synapt.recall.knowledge.read_nodes", return_value=[]),
+                patch("synapt.recall.reminders.pop_pending", return_value=[]),
+                patch("synapt.recall.server.format_contradictions_for_session_start", return_value=""),
+                patch("synapt.recall.channel.channel_join"),
+                patch("synapt.recall.channel.check_directives", return_value=""),
+                patch("synapt.recall.channel.channel_unread", return_value={"dev": unread}),
+            ):
+                stack.enter_context(p)
+            read = stack.enter_context(patch("synapt.recall.channel.channel_read", return_value="msgs"))
+            generate_startup_context(Path("/nonexistent-for-test"))
+        return read.call_args.kwargs
+
+    def test_a_backlog_is_read_one_line_per_message_up_to_thirty(self):
+        kwargs = self._run(11)
+        assert kwargs["limit"] == 11
+        assert kwargs["detail"] == "min"
+        kwargs = self._run(48)
+        assert kwargs["limit"] == 30
+
+    def test_a_few_unread_keep_the_full_form(self):
+        kwargs = self._run(3)
+        assert kwargs["limit"] == 3
+        assert kwargs.get("detail", "medium") != "min"
+
+
+class TestWakeStoreFollowsWorkspace:
+    """Red-first (dual-use wake `project` split, Stromus ruling 2026-08-31): the
+    wake must resolve its journal store AMBIENTLY -- workspace-aware via
+    GRIPSPACE_ROOT, the same store the session's own recall/journal verbs read --
+    not the cwd. The wake's whole contract is "show this session what THIS
+    session's verbs will see"; a wake that resolves a different store than the
+    session's journal verb is lying about the state it bridges into. Passing an
+    explicit ``project=Path.cwd()`` suppresses the env override (the deliberate
+    export/import ``--path`` contract), so an agent whose cwd is not the workspace
+    root wakes to a blank/wrong journal (recall#917 sibling). The fix is None at
+    the wake call-sites; the resolver is unchanged.
+    """
+
+    def _workspace_and_foreign_cwd(self, tmp_path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        (workspace / ".gitgrip").mkdir(parents=True)
+        (workspace / ".gitgrip" / "griptrees.json").write_text("{}")
+        cwd = tmp_path / "agent-wt"
+        (cwd / ".git").mkdir(parents=True)
+        monkeypatch.chdir(cwd)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(workspace))
+        # pin the per-worktree bucket name so both paths agree on the NAME and can
+        # differ only in the store ROOT -- the axis under test
+        monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", "agent-wt")
+        return workspace, cwd
+
+    @pytest.mark.store_resolution
+    def test_wake_surfaces_the_workspace_journal_from_a_foreign_cwd(self, tmp_path, monkeypatch):
+        """A journal the session verb wrote to the workspace store must appear in
+        the wake even though cwd is a sibling worktree, not the workspace root."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        self._workspace_and_foreign_cwd(tmp_path, monkeypatch)
+        jf = _journal_path()  # the session verb's (ambient) journal path -> workspace store
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(
+            JournalEntry(
+                timestamp="2026-08-31T12:00:00Z",
+                session_id="ws-sess",
+                focus="WORKSPACE-STORE-JOURNAL-MARKER",
+                next_steps=["carry me into the wake"],
+            ),
+            jf,
+        )
+
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            text = "\n".join(generate_startup_context(Path.cwd()))
+        assert "WORKSPACE-STORE-JOURNAL-MARKER" in text
+
+    @pytest.mark.store_resolution
+    def test_wake_resolves_the_same_journal_path_as_a_session_verb(self, tmp_path, monkeypatch):
+        """Stromus's contract sentence, pinned at the call site: every journal
+        resolution the wake performs is AMBIENT (project_dir is None) -- the same
+        call a session verb makes -- and a divergence guard proves the assertion
+        is not vacuous (the ambient path and the explicit-cwd path genuinely
+        differ here)."""
+        import synapt.recall.journal as jmod
+
+        self._workspace_and_foreign_cwd(tmp_path, monkeypatch)
+        session_path = jmod._journal_path()          # what `recall journal` reads
+        cwd_path = jmod._journal_path(Path.cwd())     # the buggy explicit-cwd path
+        assert session_path != cwd_path, "non-vacuous guard: the two paths must diverge"
+
+        calls: list = []
+        real = jmod._journal_path
+
+        def _spy(project_dir=None):
+            calls.append(project_dir)
+            return real(project_dir)
+
+        monkeypatch.setattr(jmod, "_journal_path", _spy)
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            generate_startup_context(Path.cwd())
+
+        assert calls, "the wake resolved no journal path at all"
+        assert all(p is None for p in calls), (
+            f"the wake must resolve the journal ambiently (None), like a session "
+            f"verb; it passed explicit project(s): {calls}"
+        )
+
+    @pytest.mark.store_resolution
+    def test_a_populated_unrelated_cwd_does_not_leak_into_an_owned_read(
+        self, tmp_path, monkeypatch
+    ):
+        """Discriminating witness (Atlas r1): the empty-cwd green is a false
+        control. With the wake resolving ambiently, a startup-context read bound
+        to its OWN store must NOT see a journal that lives in some other cwd's
+        store -- exactly the operator's-real-checkout leak that made five v1
+        survivors pass only because the reviewer's cwd happened to be empty.
+
+        Mutation proof: delete the ``SYNAPT_RECALL_ROOT`` binding below and the
+        read falls through to the operator cwd, so the leak marker appears and
+        this test fails -- which is what the hermetic binding on every
+        startup-context test now prevents."""
+        from synapt.recall.journal import JournalEntry, append_entry, _journal_path
+
+        # An unrelated checkout whose ambient store HOLDS a journal (stands in for
+        # the reviewer's real cwd). No root env, so ambient resolves FROM this cwd.
+        operator = tmp_path / "operator-checkout"
+        (operator / ".git").mkdir(parents=True)
+        monkeypatch.chdir(operator)
+        for key in ("SYNAPT_RECALL_ROOT", "GRIPSPACE_ROOT", "SYNAPT_RECALL_WORKTREE"):
+            monkeypatch.delenv(key, raising=False)
+        leak = _journal_path()
+        leak.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(
+            timestamp="2026-08-30T12:00:00Z", session_id="operator-session",
+            focus="OPERATOR-CWD-LEAK-MARKER", next_steps=["should never surface"],
+        ), leak)
+
+        # Now do what a hermetic startup test does: bind an OWNED (empty) store and
+        # read. The owned store has no journal, so nothing must surface.
+        owned = tmp_path / "owned-store"
+        owned.mkdir()
+        monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(owned))  # <-- the load-bearing binding
+        assert _journal_path() != leak, "guard: owned and operator stores must differ"
+        with patch("synapt.recall.journal._get_branch", return_value=None):
+            text = "\n".join(generate_startup_context(Path.cwd()))
+        assert "OPERATOR-CWD-LEAK-MARKER" not in text

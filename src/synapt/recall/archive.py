@@ -45,12 +45,13 @@ def _data_dir(project_dir: Path) -> Path:
 
 
 def _resolve_project_dir(project_dir: Path | None) -> Path:
-    """Resolve the workspace root, honoring ``SYNAPT_RECALL_ROOT`` when unset.
+    """Resolve the workspace root, honoring the env roots when unset.
 
     ``project_data_dir`` returns ``<root>/.synapt/recall``; the archive code
-    wants ``<root>``. Derive it from the resolved data dir so the env override,
-    git-worktree, and gripspace inference all apply identically to the archive
-    verbs and to every other recall surface -- and verify the expected suffix
+    wants ``<root>``. Derive it from the resolved data dir so the env overrides
+    (``SYNAPT_RECALL_ROOT``, then ``GRIPSPACE_ROOT``), git-worktree, and
+    gripspace inference all apply identically to the archive verbs and to every
+    other recall surface -- and verify the expected suffix
     before stripping it (the same defense ``channel.py`` uses) rather than
     trusting a blind ``parents[1]``.
     """
@@ -237,7 +238,8 @@ def export_recall_archive(
 
     *project_dir* is the workspace root to export. Pass ``None`` to resolve it
     the same way every other recall surface does -- ``SYNAPT_RECALL_ROOT``
-    first, then git/gripspace inference, then cwd. Callers should only pass an
+    first, then ``GRIPSPACE_ROOT``, then git/gripspace inference, then the
+    current directory ($HOME is refused, never used). Callers should only pass an
     explicit root when they genuinely know it: ``project_data_dir`` consults
     the env override ONLY when no root is passed, so a caller that forwards
     ``Path.cwd()`` does not merely skip the override, it suppresses it. That
@@ -583,8 +585,9 @@ def import_recall_archive(
     and reconstructs a merged monolithic recall index from both sources.
 
     *project_dir* follows the same rule as :func:`export_recall_archive`:
-    ``None`` resolves via ``SYNAPT_RECALL_ROOT`` and inference; an explicit
-    root suppresses the override, so pass one only when you truly know it.
+    ``None`` resolves via ``SYNAPT_RECALL_ROOT`` / ``GRIPSPACE_ROOT`` and
+    inference; an explicit root suppresses the override, so pass one only when
+    you truly know it.
 
     The returned summary's ``data_dir`` is the RESOLVED destination store
     this import wrote into, recorded after inference. The archive's own

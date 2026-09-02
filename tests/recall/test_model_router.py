@@ -169,19 +169,62 @@ class TestBackendRegistry:
         client = get_client(RecallTask.ENRICH)
         assert client is sentinel
 
-    def test_entry_point_discovery(self):
-        """synapt.backends entry points are discovered when plugins installed."""
+    def test_entry_point_discovery(self, monkeypatch):
+        """A loadable synapt.backends entry point registers its backend."""
         import synapt.recall._model_router as router
+
+        sentinel = object()
+
+        class ControlledEntryPoint:
+            name = "controlled"
+
+            @staticmethod
+            def load():
+                class Plugin:
+                    @staticmethod
+                    def register(register_fn):
+                        register_fn("controlled", lambda _max_tokens: sentinel)
+
+                return Plugin
+
+        def controlled_entry_points(*, group):
+            assert group == "synapt.backends"
+            return [ControlledEntryPoint()]
+
+        monkeypatch.setattr(router, "_extra_backends", {})
+        monkeypatch.setattr(router, "_backends_loaded", False)
+        monkeypatch.setattr(
+            router.importlib.metadata,
+            "entry_points",
+            controlled_entry_points,
+        )
         router._load_extra_backends()
-        # If a plugin package providing a modal backend is editable-installed, it is discovered.
-        # In CI (public repo only), no plugin backends are expected.
-        from importlib.metadata import entry_points
-        eps = entry_points(group="synapt.backends")
-        if any(ep.name == "modal" for ep in eps):
-            assert "modal" in router._extra_backends
-        else:
-            # No plugin backends installed — just verify loading didn't crash
-            assert isinstance(router._extra_backends, dict)
+
+        assert router._extra_backends["controlled"](300) is sentinel
+
+    def test_broken_entry_point_does_not_break_routing(self, monkeypatch):
+        """Installed metadata is not proof that an optional plugin can load."""
+        import synapt.recall._model_router as router
+
+        class BrokenEntryPoint:
+            name = "broken"
+
+            @staticmethod
+            def load():
+                raise ModuleNotFoundError("optional plugin package is unavailable")
+
+        monkeypatch.setattr(router, "_extra_backends", {})
+        monkeypatch.setattr(router, "_backends_loaded", False)
+        monkeypatch.setattr(
+            router.importlib.metadata,
+            "entry_points",
+            lambda *, group: [BrokenEntryPoint()],
+        )
+
+        router._load_extra_backends()
+
+        assert router._backends_loaded is True
+        assert router._extra_backends == {}
 
 
 class TestIsEncoderDecoder:

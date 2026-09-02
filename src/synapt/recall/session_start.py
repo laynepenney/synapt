@@ -45,6 +45,9 @@ HOOK_RUN_LOG_MAX_RECORDS = 100
 # Per-source byte caps. They sum to less than WAKE_BUDGET_BYTES by
 # construction, so the budget holds without a second pass; the final guard in
 # render_wake exists for the day someone adds a source and forgets this table.
+_CAP_UNCLEAN_END = 2_500
+_CAP_CHECKPOINT = 2_500
+_CAP_COMPACTION = 4_000
 _CAP_JOURNAL_LATEST = 6_000
 _CAP_JOURNAL_OLDER = 1_500
 _CAP_BRANCH = 1_200
@@ -353,6 +356,15 @@ def _first_line(block: str) -> str:
 
 def _kind(block: str) -> str:
     head = _first_line(block)
+    if head.startswith("UNCLEAN END"):
+        return "unclean_end"
+    if head.startswith("LAST CHECKPOINT"):
+        return "checkpoint"
+    if head.startswith("LAST COMPACTION SUMMARY") \
+            or head.startswith("AGENT COMPACTION DIRECTIVE"):
+        return "compaction"
+    if head.startswith("Journal read: "):
+        return "journal_coverage"
     if head.startswith("Last session") or head.startswith("Next steps:") \
             or head.startswith("Decisions:") or head.startswith("Done:"):
         return "journal"
@@ -410,6 +422,8 @@ def _clip_reminders(block: str, max_items: int) -> tuple[str, int, int]:
 
 def _counts_phrase(blocks: dict[str, list[str]], reminder_total: int) -> str:
     parts: list[str] = []
+    for b in blocks.get("journal_coverage", []):
+        parts.append(_first_line(b))
     for b in blocks.get("channel_counts", []):
         parts.append(_first_line(b).removeprefix("Channel: ").strip())
     for b in blocks.get("contradictions", []):
@@ -428,7 +442,6 @@ def _counts_phrase(blocks: dict[str, list[str]], reminder_total: int) -> str:
 def render_wake(
     lines: list[str],
     *,
-    project: Path,
     source: str,
     run: HookRun | None = None,
     warning: str | None = None,
@@ -438,12 +451,19 @@ def render_wake(
 ) -> str:
     """Render startup context inside *budget* bytes and write the full text to disk.
 
-    Order is the point: head line, warnings, the latest journal entry (open
+    Order is the point: head line, warnings, an unclean-end block when the
+    previous session left no handoff, the latest journal entry (open
     threads first — see journal.format_for_session_start), channel state,
     directives, then everything else clipped per source, then a footer that
     says how many bytes were shown, how many withheld, and where the rest is.
     """
-    full_path = full_path or wake_file_path(project)
+    # Ambient (None): the full-text pointer follows the STORE of the journal it
+    # renders -- the wake resolves its journal ambiently (workspace-aware via
+    # GRIPSPACE_ROOT), so its pointer must land in the same store, not the cwd.
+    # A pointer written to the cwd store while the content is workspace-resolved
+    # is the split-store bug in miniature (Stromus ruling 2026-08-31). Callers
+    # that need a specific path still pass `full_path` explicitly.
+    full_path = full_path or wake_file_path()
     blocks: dict[str, list[str]] = {}
     for block in lines:
         if not block or not block.strip():
@@ -492,7 +512,14 @@ def render_wake(
         reminder_texts.append(text)
 
     counts = _counts_phrase(blocks, reminder_total)
+    blocks.pop("journal_coverage", None)
 
+    # A previous session that ended without a handoff changes what the reader
+    # does first, so it renders before everything, including the journal it
+    # would otherwise be read as continuous with.
+    take("unclean_end", _CAP_UNCLEAN_END)
+    take("checkpoint", _CAP_CHECKPOINT)
+    take("compaction", _CAP_COMPACTION)
     take("branch", _CAP_BRANCH)
     take("open_pr", _CAP_OPEN_PR)
     take("journal", _CAP_JOURNAL_OLDER, first_cap=_CAP_JOURNAL_LATEST)

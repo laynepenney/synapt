@@ -240,7 +240,11 @@ class TestSessionStartContinuityPolicy:
         with patch.object(cli, "generate_startup_context", return_value=["ambient"]) as context:
             out, _ = _run_hook(monkeypatch, tmp_path, source="clear")
 
-        context.assert_called_once_with(tmp_path.resolve(), include_continuity=False)
+        context.assert_called_once_with(
+            tmp_path.resolve(),
+            include_continuity=False,
+            current_session_id="hook-test-session",
+        )
         assert "ambient" in out
 
 
@@ -477,7 +481,10 @@ class TestHookRunLog:
 
 class TestWakeOutputBudget:
     def _seed_big_journal(self, tmp_path, n_items=400, item_len=200):
-        jf = _journal_path(tmp_path)
+        # The wake reads the AMBIENT journal store (owned_recall_root sets it via
+        # SYNAPT_RECALL_ROOT); seed the same store, not project=tmp_path, so the
+        # wake sees what we wrote (dual-use wake fix).
+        jf = _journal_path()
         jf.parent.mkdir(parents=True, exist_ok=True)
         entry = JournalEntry(
             timestamp="2026-08-22T03:40:00Z",
@@ -490,11 +497,35 @@ class TestWakeOutputBudget:
         append_entry(entry, jf)
         return jf
 
+    def test_wake_pointer_is_written_to_the_ambient_store_not_cwd(
+        self, owned_recall_root, monkeypatch, tmp_path
+    ):
+        """The full-text pointer (latest.md) must resolve AMBIENTLY -- the same
+        store the wake reads its journal from -- not the cwd store. Otherwise the
+        wake reads workspace content and writes its pointer to cwd: the split-store
+        bug in miniature (Stromus ruling 2026-08-31, follow-up to the dual-use
+        wake fix). Red-first: fails while render_wake writes wake_file_path(cwd)."""
+        from synapt.recall.session_start import wake_file_path
+
+        self._seed_big_journal(tmp_path)
+        out, _ = _run_hook(monkeypatch, tmp_path)
+        ambient = wake_file_path()            # the ambient/journal store (owned_recall_root)
+        cwd_based = wake_file_path(tmp_path)  # the cwd store
+        assert ambient != cwd_based, "non-vacuous guard: the two paths must diverge"
+        assert ambient.exists(), "the pointer must be written to the ambient store"
+        assert str(ambient) in out, "stdout must name the ambient pointer"
+        # Presence in the ambient store is not enough: a dual-write (latest.md to
+        # BOTH stores) would still pass the assertions above. The pointer must be
+        # ABSENT from the cwd store -- that is what "follows the journal's store,
+        # not cwd" means (Sentinel r2 pre-freeze finding). This is the assertion a
+        # dual-write mutant goes red on.
+        assert not cwd_based.exists(), "the pointer must NOT be written to the cwd store"
+
     def test_stdout_is_within_budget_and_points_at_full_text(self, owned_recall_root, monkeypatch, tmp_path):
         from synapt.recall.session_start import WAKE_BUDGET_BYTES, wake_file_path
         self._seed_big_journal(tmp_path)
         out, _ = _run_hook(monkeypatch, tmp_path)
-        full = wake_file_path(tmp_path)
+        full = wake_file_path()
         assert full.exists()
         full_text = full.read_text()
         # Everything is on disk...
@@ -531,20 +562,47 @@ class TestWakeOutputBudget:
         assert "source=startup" in head
         assert "NEXT-STEP-0000" in head
 
+    def test_first_two_kb_report_journal_selection_coverage(
+        self, owned_recall_root, monkeypatch, tmp_path,
+    ):
+        """The coverage report cannot sit behind the content whose omission it reports."""
+        coverage = (
+            'Journal read: {"shown":3,"withheld":9,'
+            '"oldest_shown_at":"2026-08-03T12:00:00Z"}'
+        )
+        huge_journal = "Next steps:\n" + "\n".join(
+            f"  - load-bearing-{i:04d} " + "x" * 180 for i in range(100)
+        )
+        out, _ = _run_hook(
+            monkeypatch,
+            tmp_path,
+            context_lines=[huge_journal, coverage],
+        )
+
+        preview = out.encode()[:2048].decode(errors="ignore")
+        assert coverage in preview
+        assert "load-bearing-0000" in preview
+
     def test_source_is_carried_from_the_payload(self, owned_recall_root, monkeypatch, tmp_path):
         self._seed_big_journal(tmp_path)
         out, _ = _run_hook(monkeypatch, tmp_path, source="resume")
         assert "source=resume" in out.splitlines()[0]
 
     def test_small_context_is_not_clipped(self, owned_recall_root, monkeypatch, tmp_path):
-        """Control: a context under budget passes through whole, no 'withheld'."""
-        jf = _journal_path(tmp_path)
+        """Control: a context under budget passes through whole."""
+        # The wake reads the AMBIENT journal store (owned_recall_root sets it via
+        # SYNAPT_RECALL_ROOT); seed the same store, not project=tmp_path, so the
+        # wake sees what we wrote (dual-use wake fix).
+        jf = _journal_path()
         jf.parent.mkdir(parents=True, exist_ok=True)
         append_entry(JournalEntry(timestamp="2026-08-22T03:40:00Z", session_id="s", focus="f",
                                   next_steps=["one small step"]), jf)
         out, _ = _run_hook(monkeypatch, tmp_path)
         assert "one small step" in out
-        assert "withheld" not in out
+        assert '"shown":1' in out
+        assert '"withheld":0' in out
+        assert " B withheld" not in out
+        assert out.rstrip().endswith("B, complete")
 
     def test_reminder_hoard_is_counted_not_dumped(self, owned_recall_root, monkeypatch, tmp_path):
         from synapt.recall.reminders import add_reminder

@@ -48,6 +48,16 @@ class TestParseJournalEntries:
         assert c.session_id == FULL_ENTRY["session_id"]
         assert c.timestamp == FULL_ENTRY["timestamp"]
 
+    def test_ambient_agent_identity_does_not_attribute_journal(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("SYNAPT_AGENT_ID", "current-runtime-agent")
+        path = _write_journal(tmp_path, [FULL_ENTRY])
+
+        chunks = parse_journal_entries(path)
+
+        assert chunks[0].agent_id is None
+
     def test_user_text_from_focus(self, tmp_path):
         path = _write_journal(tmp_path, [FULL_ENTRY])
         chunks = parse_journal_entries(path)

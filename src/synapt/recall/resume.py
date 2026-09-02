@@ -22,6 +22,7 @@ interpret runtime-specific event payloads.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from datetime import datetime, timezone
@@ -109,8 +110,24 @@ class ResumeView:
     freshness: "IndexFreshness | None" = None
     selection_scope: str = "explicit"
     source_label: str = "unknown"
+    # The runtime that WROTE the rendered tail (codex / claude-code /
+    # recall-store), or "" when the path carries no marker. On a cold
+    # cross-runtime launch this is often not the runtime now reading, and saying
+    # so keeps a fallback tail from being read as the caller's own.
+    source_runtime: str = ""
     caller_unindexed: list["CallerTranscript"] = field(default_factory=list)
     caller_partial: "CallerExtentGap | None" = None
+    # Set by the CLI when the selected session has no journal or checkpoint
+    # covering its last activity. None means NOT CHECKED, not clean.
+    unclean_end: "UncleanEnd | None" = None
+    # Set by the CLI on a cold/stale resume: the newest durable journal entry,
+    # shown as the checkpoint of record above a tail the stale index cannot
+    # refresh. On a cold cross-runtime launch there is no caller transcript and
+    # the shared index may be months old, so the freshest surface is the
+    # append-only journal, which the tail-bound _select_journal never reaches.
+    # None means not applicable (fresh index with a caller, or no journal).
+    durable_checkpoint: "JournalEntry | None" = None
+    durable_lag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +144,48 @@ class CallerExtentGap:
     source: CallerTranscript
     indexed_latest: str
     live_latest: str
+
+
+# A journal written this close to the session's last activity counts as its
+# handoff. Fifteen minutes covers an EOD "journal, then a few closing turns".
+UNCLEAN_END_GRACE_SECONDS = 15 * 60
+
+
+@dataclass(frozen=True)
+class UncleanEnd:
+    """The newest previous session has no handoff of any kind.
+
+    A crash, kill, or forced shutdown runs no SessionEnd, so no checkpoint is
+    written, and nobody journals a session they did not know was ending. The
+    wake then shows whatever checkpoint IS on disk, which may belong to another
+    session entirely, and nothing says that hours of work have no record.
+
+    A handoff is SESSION-BOUND evidence (Atlas, r1 on the first version of
+    this): a journal certifies only the session it names. Reduced to a
+    timestamp, any later journal from any later session would erase the crash
+    verdict for good. So ``last_authored_journal`` is the newest journal that
+    could be this session's (bound to it, or legacy sessionless), and
+    ``foreign_journal`` is the newest one that belongs to someone else, kept so
+    the wake can say why it does not count. ``gap_seconds`` is the time from
+    that own-or-sessionless journal to the last activity, ``None`` when there
+    is none before the activity. ``checkpoint_session`` names the session the
+    on-disk checkpoint belongs to when it is not this one.
+
+    Known limit: only the NEWEST previous transcript is judged. A short clean
+    session after a crash (a subagent, a `claude -p` probe) becomes the newest
+    and hides the crash, and with one checkpoint slot an older session that
+    ended cleanly is indistinguishable from one that crashed once its
+    checkpoint is overwritten. Per-session checkpoints keyed by id remove that
+    limit; until then the wake judges one session and says which.
+    """
+
+    session_id: str
+    transcript_path: Path
+    last_activity: str
+    last_authored_journal: str | None
+    gap_seconds: float | None
+    checkpoint_session: str | None
+    foreign_journal: str | None = None
 
 
 def _latest_event_timestamp(path: Path, *, block_size: int = 64 * 1024) -> str:
@@ -210,6 +269,181 @@ def caller_transcripts(project_dir: Path | None = None) -> list[CallerTranscript
     return sorted(found, key=lambda item: item.mtime, reverse=True)
 
 
+def _journal_covers(entry: JournalEntry, session_id: str, last_epoch: float, grace: float) -> bool | None:
+    """True: covers. False: cannot (bound elsewhere). None: not a cover, but not foreign."""
+    jt = _timestamp_epoch(entry.timestamp)
+    if entry.session_id and entry.session_id != session_id:
+        return False
+    if entry.session_id == session_id:
+        # Its own handoff: written near the end, or any time after it.
+        return jt >= last_epoch - grace or None
+    # Legacy sessionless entry: only inside the symmetric window around the end.
+    return abs(jt - last_epoch) <= grace or None
+
+
+def detect_unclean_end(
+    sources: list[CallerTranscript],
+    *,
+    checkpoint: dict | None,
+    authored_journals: list[JournalEntry],
+    exclude_session_id: str | None = None,
+    grace_seconds: float = UNCLEAN_END_GRACE_SECONDS,
+) -> UncleanEnd | None:
+    """Judge whether the newest previous transcript was handed off. Pure.
+
+    ``exclude_session_id`` is the session that is starting: at SessionStart it
+    is the newest transcript on disk and would otherwise report itself. The
+    exclusion is by IDENTITY alone and is a CALL-SITE guarantee; a caller that
+    cannot name its own session must not publish this verdict. Recency is
+    deliberately not treated as liveness evidence (Atlas, r1): a crash
+    followed by a fast restart sits inside any recency window, and hiding a
+    real crash costs more than a visible self-report from a caller whose id
+    failed to match, which the reader can see and correct.
+    """
+    candidates = [
+        item for item in sources
+        if item.latest_timestamp and item.session_id != exclude_session_id
+    ]
+    if not candidates:
+        return None
+    newest = max(candidates, key=lambda item: _timestamp_epoch(item.latest_timestamp))
+    last_epoch = _timestamp_epoch(newest.latest_timestamp)
+
+    checkpoint_session = None
+    if checkpoint:
+        checkpoint_session = str(checkpoint.get("session_id") or "") or None
+        if checkpoint_session == newest.session_id:
+            return None
+
+    own_or_sessionless: list[JournalEntry] = []
+    foreign: list[JournalEntry] = []
+    for entry in authored_journals:
+        verdict = _journal_covers(entry, newest.session_id, last_epoch, grace_seconds)
+        if verdict is True:
+            return None
+        (foreign if verdict is False else own_or_sessionless).append(entry)
+
+    latest_own = max(own_or_sessionless, key=lambda e: _timestamp_epoch(e.timestamp), default=None)
+    latest_foreign = max(foreign, key=lambda e: _timestamp_epoch(e.timestamp), default=None)
+    gap: float | None = None
+    if latest_own is not None:
+        own_epoch = _timestamp_epoch(latest_own.timestamp)
+        if own_epoch <= last_epoch:
+            gap = last_epoch - own_epoch
+
+    return UncleanEnd(
+        session_id=newest.session_id,
+        transcript_path=newest.path,
+        last_activity=newest.latest_timestamp,
+        last_authored_journal=latest_own.timestamp if latest_own else None,
+        gap_seconds=gap,
+        checkpoint_session=checkpoint_session,
+        foreign_journal=latest_foreign.timestamp if latest_foreign else None,
+    )
+
+
+def authored_journals(journal_path: Path | None) -> list[JournalEntry]:
+    """Non-auto entries with content. Auto stubs are not handoffs."""
+    if journal_path is None or not journal_path.exists():
+        return []
+    from synapt.recall.journal import _read_all_entries
+
+    return [
+        entry for entry in _read_all_entries(journal_path)
+        if not entry.auto and entry.has_content()
+    ]
+
+
+def gather_unclean_end(
+    project: Path,
+    *,
+    exclude_session_id: str | None = None,
+    authored: list[JournalEntry] | None = None,
+    journal_path: Path | None = None,
+) -> UncleanEnd | None:
+    """The I/O half of the detector: caller transcripts, checkpoint, journal.
+
+    Bounded: transcript discovery reads one tail block per file and the
+    checkpoint is one small JSON file. Never raises; a failure to judge is
+    reported as no finding, which is the same as today's behaviour.
+    """
+    try:
+        from synapt.checkpoint import read_checkpoint
+
+        if authored is None:
+            authored = authored_journals(journal_path)
+        return detect_unclean_end(
+            caller_transcripts(project),
+            checkpoint=read_checkpoint(project),
+            authored_journals=authored,
+            exclude_session_id=exclude_session_id,
+        )
+    except Exception:
+        return None
+
+
+def _gap_phrase(seconds: float | None) -> str:
+    if seconds is None:
+        return "no authored journal at all"
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    return f"{hours}h{minutes:02d}m"
+
+
+def format_unclean_end(found: UncleanEnd, tail: dict | None) -> str:
+    """The wake block. Header first, then the facts, then this session's own tail."""
+    short = found.session_id[:8]
+    if found.last_authored_journal and found.gap_seconds is not None:
+        journal_line = (
+            f"Last authored journal that could be this session's: {found.last_authored_journal}; "
+            f"{_gap_phrase(found.gap_seconds)} of work after it has no journal."
+        )
+    elif found.last_authored_journal:
+        journal_line = (
+            f"The latest journal that could be this session's ({found.last_authored_journal}) "
+            "is later than its last activity and outside the handoff window."
+        )
+    else:
+        journal_line = "No authored journal exists for this session."
+    if found.foreign_journal:
+        later = (
+            "later "
+            if _timestamp_epoch(found.foreign_journal) > _timestamp_epoch(found.last_activity)
+            else ""
+        )
+        journal_line += (
+            f" A {later}journal at {found.foreign_journal} belongs to a different session"
+            " and does not count."
+        )
+    lines = [
+        f"UNCLEAN END — session {short} ended without a handoff",
+        f"Last activity {found.last_activity}. {journal_line}",
+    ]
+    if found.checkpoint_session:
+        lines.append(
+            f"No SessionEnd checkpoint for this session; checkpoint.json holds session "
+            f"{found.checkpoint_session[:8]}, which is NOT this one's bridge."
+        )
+    else:
+        lines.append("No SessionEnd checkpoint for this session (a crash runs no SessionEnd).")
+    lines.append(f"Bridge: the tail below, then #dev since {found.last_authored_journal or 'the start of that session'}.")
+    if tail:
+        user = tail.get("last_user_text") or "unavailable in bounded transcript tail"
+        assistant = tail.get("last_assistant_text") or "unavailable in bounded transcript tail"
+        files = tail.get("files_touched") or []
+        lines.append(
+            "RECOVERED TAIL (raw, bounded; not an authored journal; "
+            f"status {tail.get('parse_status', 'unavailable')}"
+            f"{' truncated' if tail.get('truncated') else ''}):"
+        )
+        lines.append(f"User: {user}")
+        lines.append(f"Assistant: {assistant}")
+        lines.append("Files: " + (", ".join(str(f) for f in files[:8]) or "none observed"))
+    lines.append(f"Full tail: synapt resume {found.session_id}")
+    return "\n".join(lines)
+
+
 def _source_label(path: str) -> str:
     if not path:
         return "unknown"
@@ -233,6 +467,27 @@ def _source_label(path: str) -> str:
 
     parent_name = Path(path).parent.name
     return f"source:{parent_name}" if parent_name else "source:unknown"
+
+
+def _runtime_root(path: str) -> str:
+    """Name the RUNTIME a transcript came from, not just its project slug.
+
+    On a cold cross-runtime launch the resolved tail is a store fallback from
+    whatever runtime last wrote — often not the one now reading. ``_source_label``
+    names the project; this names the runtime, so a Claude session resuming a
+    Codex tail is told so instead of reading it as its own. ``""`` means the path
+    carries no runtime marker (do not print a guess).
+    """
+    if not path:
+        return ""
+    parts = Path(path).parts
+    if ".codex" in parts:
+        return "codex"
+    if ".claude" in parts:
+        return "claude-code"
+    if "worktrees" in parts:
+        return "recall-store"
+    return ""
 
 
 class BoundedResumeIndex:
@@ -321,7 +576,39 @@ def load_resume_index(directory: Path) -> TranscriptIndex | BoundedResumeIndex:
 
     if (directory / "recall.db").exists() or is_sharded(directory):
         return BoundedResumeIndex(ShardedRecallDB.open_readonly(directory))
-    return TranscriptIndex.load(directory, use_embeddings=False)
+
+    # Legacy JSONL migration is eager.  TranscriptIndex.load creates and saves
+    # a RecallDB, then returns an index whose in-memory chunks are complete but
+    # whose backend remains attached.  Resume only reads those chunks, so
+    # retaining that connection through a caller-owned TemporaryDirectory can
+    # prevent Windows from removing recall.db (and its WAL/SHM companions).
+    index = TranscriptIndex.load(directory, use_embeddings=False)
+    if not getattr(index, "_lazy_chunks", False):
+        db = getattr(index, "_db", None)
+        if db is not None:
+            index._db = None
+            # The migration connection enables WAL.  Checkpoint it while this
+            # loader still owns the only connection so the temporary legacy
+            # store does not retain -wal/-shm companions through teardown.
+            connection = getattr(db, "_conn", None)
+            checkpointed = False
+            if connection is not None:
+                try:
+                    result = connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    checkpointed = not result or result[0] == 0
+                except Exception:
+                    pass
+            # Closing this connection is the ownership boundary.  Do not hide
+            # a close failure and return a resume index that can still pin the
+            # caller's temporary store on Windows.
+            db.close()
+            if checkpointed:
+                for suffix in ("-wal", "-shm"):
+                    with contextlib.suppress(OSError):
+                        (directory / f"recall.db{suffix}").unlink()
+    return index
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +708,7 @@ def resolve_session(
     index: TranscriptIndex,
     session_id: str | None,
     caller_session_ids: set[str] | None = None,
+    agent_id: str | None = None,
 ) -> str:
     """Resolve a session id, accepting an exact id or a unique prefix.
 
@@ -445,6 +733,21 @@ def resolve_session(
         raise ResumeError("No sessions indexed yet. Nothing to resume.")
 
     if not session_id:
+        if agent_id:
+            overview = getattr(index, "_overview", {})
+            for sid in order:
+                if is_channel_session(sid):
+                    continue
+                if overview:
+                    agent_ids = overview.get(sid, {}).get("agent_ids", ())
+                else:
+                    agent_ids = {
+                        chunk.agent_id
+                        for chunk in index.sessions.get(sid, ())
+                        if chunk.turn_index != -1 and chunk.agent_id
+                    }
+                if agent_id in agent_ids:
+                    return sid
         if caller_session_ids:
             for sid in order:
                 if sid in caller_session_ids and not is_channel_session(sid):
@@ -521,6 +824,7 @@ def build_resume_view(
     limit: int = DEFAULT_TURNS,
     journal_path: Path | None = None,
     caller_sources: list[CallerTranscript] | None = None,
+    agent_id: str | None = None,
 ) -> ResumeView:
     """Assemble the tail of a session, newest last.
 
@@ -532,9 +836,27 @@ def build_resume_view(
         raise ResumeError(f"--turns must be at least 1 (got {limit}).")
 
     caller_ids = {item.session_id for item in caller_sources or []}
-    resolved = resolve_session(index, session_id, caller_ids if session_id is None else None)
+    resolved = resolve_session(
+        index,
+        session_id,
+        caller_ids if session_id is None else None,
+        agent_id=agent_id if session_id is None else None,
+    )
     if session_id is not None:
         selection_scope = "explicit"
+    elif agent_id:
+        overview = getattr(index, "_overview", {})
+        if overview:
+            selected_agent_ids = overview.get(resolved, {}).get("agent_ids", ())
+        else:
+            selected_agent_ids = {
+                chunk.agent_id
+                for chunk in index.sessions.get(resolved, ())
+                if chunk.turn_index != -1 and chunk.agent_id
+            }
+        selection_scope = "agent" if agent_id in selected_agent_ids else (
+            "caller" if resolved in caller_ids else "store"
+        )
     else:
         selection_scope = "caller" if resolved in caller_ids else "store"
     is_newest = (
@@ -584,6 +906,7 @@ def build_resume_view(
 
     source_path = next((c.transcript_path for c in chunks if c.transcript_path), "")
     source_label = _source_label(source_path)
+    source_runtime = _runtime_root(source_path)
     selected_latest = max(
         (chunk.timestamp for chunk in chunks if chunk.timestamp),
         key=_timestamp_epoch,
@@ -620,6 +943,7 @@ def build_resume_view(
         omitted_between=omitted_between,
         selection_scope=selection_scope,
         source_label=source_label,
+        source_runtime=source_runtime,
         caller_unindexed=unindexed,
         caller_partial=caller_partial,
     )
@@ -689,6 +1013,104 @@ def _describe_behind(f) -> str:
         n = len(f.changed_files)
         parts.append(f"{n} indexed file{'' if n == 1 else 's'} grown since the build")
     return " and ".join(parts) if parts else "behind"
+
+
+def _lag_phrase(build_ts: str, journal_ts: str) -> str:
+    """Say how far the index build lags the newest journal, not a file count."""
+    b = _timestamp_epoch(build_ts)
+    j = _timestamp_epoch(journal_ts)
+    if b <= 0.0 or j <= 0.0:
+        return "index build time unrecorded"
+    span = j - b
+    days = int(span // 86400)
+    if days >= 1:
+        return f"index {days} day{'' if days == 1 else 's'} behind the journal"
+    hours = int(span // 3600)
+    if hours >= 1:
+        return f"index {hours}h behind the journal"
+    return "index within the hour of the journal"
+
+
+def select_durable_checkpoint(
+    journal_path: Path | None,
+    freshness,
+    has_caller: bool,
+    tail_newest: str,
+) -> tuple[JournalEntry | None, str | None]:
+    """Pick the newest durable journal entry to show above a stale/cold tail.
+
+    Fires only when the index is stale OR no caller session resolved, AND the
+    journal is newer than the rendered tail -- so a fresh index with a caller,
+    or a journal older than the tail, shows nothing and the tail stays
+    authoritative. Read-only; never raises. Unlike ``_select_journal`` this does
+    not require the entry to be sessionless: on a cold launch the freshest entry
+    is usually bound to a session the stale index has never seen, which is
+    exactly the entry the tail-bound path drops.
+    """
+    if journal_path is None:
+        return None, None
+    try:
+        entries = read_entries(journal_path, n=50)
+    except Exception:
+        return None, None
+    # Same intent bar _select_journal uses: skip auto-extracted stubs whose
+    # only "focus" is a /clear control block, and file-list-only activity
+    # records. Surfacing one of those as the checkpoint of record would read as
+    # a real handoff while carrying nothing a returning reader can act on.
+    newest = next((e for e in entries if _carries_intent(e)), None)
+    if newest is None:
+        return None, None
+    stale = freshness is not None and getattr(freshness, "stale", False)
+    if not (stale or not has_caller):
+        return None, None
+    if _timestamp_epoch(newest.timestamp) <= _timestamp_epoch(tail_newest):
+        return None, None
+    build_ts = getattr(freshness, "build_timestamp", "") if freshness is not None else ""
+    return newest, _lag_phrase(build_ts, newest.timestamp)
+
+
+def attach_durable_checkpoint(view: ResumeView, journal_path: Path | None) -> ResumeView:
+    """Compute the durable-checkpoint block from the already-built view.
+
+    Runs in the CLI after freshness is attached, so build_resume_view keeps its
+    no-implicit-I/O contract and the block can only add to what the reader is
+    told, never change the tail.
+    """
+    has_caller = view.selection_scope in ("caller", "agent", "explicit")
+    tail_newest = max(
+        (t.timestamp for t in view.turns), key=_timestamp_epoch, default=""
+    )
+    entry, lag = select_durable_checkpoint(
+        journal_path, view.freshness, has_caller, tail_newest
+    )
+    view.durable_checkpoint = entry
+    view.durable_lag = lag
+    return view
+
+
+def _format_durable_checkpoint(view: ResumeView) -> list[str]:
+    entry = view.durable_checkpoint
+    if entry is None:
+        return []
+    head = f"DURABLE CHECKPOINT — latest journal entry {entry.timestamp}"
+    if view.durable_lag:
+        head += f" · {view.durable_lag}"
+    tail_origin = (
+        f"was written by the {view.source_runtime} runtime"
+        if view.source_runtime
+        else "may be from another runtime"
+    )
+    lines = [
+        "",
+        head,
+        "  The append-only journal is fresher than this index; the tail below "
+        f"predates it and {tail_origin}.",
+    ]
+    if entry.focus:
+        lines.append(f"  Focus: {entry.focus}")
+    if entry.next_steps:
+        lines.append(f"  Next: {entry.next_steps[0]}")
+    return lines
 
 
 def _format_freshness(view: ResumeView) -> list[str]:
@@ -763,8 +1185,12 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
     if view.excluded_count:
         header += f" ({view.excluded_count} harness turns filtered)"
 
-    if view.selection_scope == "store":
+    if view.selection_scope == "agent":
+        header += " · agent identity"
+    elif view.selection_scope == "store":
         header += f" · store fallback from {view.source_label}"
+        if view.source_runtime:
+            header += f" · runtime {view.source_runtime}"
     if view.caller_unindexed:
         newest = view.caller_unindexed[0]
         stamp = datetime.fromtimestamp(newest.mtime, timezone.utc).isoformat(timespec="seconds")
@@ -779,9 +1205,18 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
             f"indexed through {gap.indexed_latest}, live through {gap.live_latest} | "
             "run `synapt recall build --no-embeddings` to refresh | " + header
         )
+    if view.unclean_end:
+        found = view.unclean_end
+        header = (
+            f"⚠ UNCLEAN END: last activity {found.last_activity}, "
+            + (f"{_gap_phrase(found.gap_seconds)} after the last journal that could be its own, "
+               if found.gap_seconds is not None else "no journal of its own covers it, ")
+            + "no SessionEnd checkpoint for this session | " + header
+        )
 
     lines = [header]
     lines.extend(_format_freshness(view))
+    lines.extend(_format_durable_checkpoint(view))
     lines.extend(_format_journal(view))
 
     if not view.turns:

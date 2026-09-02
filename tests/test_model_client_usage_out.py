@@ -113,6 +113,7 @@ def test_vllm_chat_with_no_usage_out_is_unchanged(monkeypatch):
 
 
 def test_mlx_chat_populates_usage_out_from_the_real_stream_response(monkeypatch):
+    pytest.importorskip("mlx_lm")  # pyproject marks this darwin/arm64-only; absent by design elsewhere
     from synapt._models.mlx_client import MLXClient
 
     class FakeResponse:
@@ -154,6 +155,7 @@ def test_mlx_chat_populates_usage_out_from_the_real_stream_response(monkeypatch)
 
 
 def test_mlx_chat_with_no_usage_out_is_unchanged(monkeypatch):
+    pytest.importorskip("mlx_lm")  # pyproject marks this darwin/arm64-only; absent by design elsewhere
     from synapt._models.mlx_client import MLXClient
 
     class FakeResponse:
@@ -199,6 +201,7 @@ def test_mlx_accumulates_text_and_takes_counts_from_the_final_response(monkeypat
     returns "lo", and only accumulation returns "hello"; taking counts from the
     first response returns 4 rather than 9.
     """
+    pytest.importorskip("mlx_lm")  # pyproject marks this darwin/arm64-only; absent by design elsewhere
     from synapt._models.mlx_client import MLXClient
 
     class FakeResponse:
@@ -239,6 +242,7 @@ def test_mlx_reports_no_counts_when_the_stream_yields_nothing(monkeypatch):
     """An empty generation is a real runtime outcome, and the honest report is
     ``None`` rather than a zero we did not measure.  ``generate`` returns ""
     here too, so the text is unchanged from the previous implementation."""
+    pytest.importorskip("mlx_lm")  # pyproject marks this darwin/arm64-only; absent by design elsewhere
     from synapt._models.mlx_client import MLXClient
 
     def fake_stream_generate(model_obj, tokenizer, prompt, **kwargs):

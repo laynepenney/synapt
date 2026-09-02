@@ -95,6 +95,40 @@ class TestFindGripspaceRoot:
         (repo / ".git").mkdir()
         assert _find_gripspace_root(repo) is None
 
+    def test_finds_standalone_clone_gripspace_via_manifest_marker(self, tmp_path):
+        """new-agent-gripspace.sh creates a standalone clone: no
+        griptree.json, no griptrees.json, no .grip -- only
+        .gitgrip/spaces/main/gripspace.yml. Before this fix, such a
+        gripspace was invisible to _find_gripspace_root and every
+        recall/channel write fell through to $HOME. Same family as
+        recall#974 and recall#936."""
+        grip = tmp_path / "standalone-space"
+        grip.mkdir()
+        spaces_main = grip / ".gitgrip" / "spaces" / "main"
+        spaces_main.mkdir(parents=True)
+        (spaces_main / "gripspace.yml").write_text("version: 2\nrepos: {}\n")
+
+        assert _find_gripspace_root(grip) == grip
+
+    def test_finds_standalone_clone_gripspace_from_child(self, tmp_path):
+        grip = tmp_path / "standalone-space"
+        spaces_main = grip / ".gitgrip" / "spaces" / "main"
+        spaces_main.mkdir(parents=True)
+        (spaces_main / "gripspace.yml").write_text("version: 2\nrepos: {}\n")
+        child = grip / "synapt"
+        child.mkdir()
+
+        assert _find_gripspace_root(child) == grip
+
+    def test_gitgrip_dir_without_the_manifest_marker_still_returns_none(self, tmp_path):
+        """A bare .gitgrip/ with none of the three markers (griptree.json,
+        griptrees.json, spaces/main/gripspace.yml) must not match --
+        pins the marker to the exact path, not the directory's mere
+        existence."""
+        repo = tmp_path / "myrepo"
+        (repo / ".gitgrip").mkdir(parents=True)
+        assert _find_gripspace_root(repo) is None
+
     def test_linked_griptree_resolves_to_parent_gripspace(self, tmp_path):
         """A linked griptree (griptree.json singular) should resolve
         to the parent gripspace via git worktree pointers."""
@@ -819,3 +853,76 @@ def test_env_worktree_rejects_path_components(tmp_path, monkeypatch):
         monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", bad)
         with pytest.raises(ValueError, match="SYNAPT_RECALL_WORKTREE"):
             project_worktree_dir(None)
+
+
+class TestGripspaceRootEnv:
+    """recall honors GRIPSPACE_ROOT (exported by the workspace tool's
+    find_workspace_root) so a fresh gripspace whose agent worktree is a
+    filesystem SIBLING of the workspace root resolves to the SHARED store
+    instead of silently minting one at cwd or $HOME. Walking up from a sibling
+    can never reach the workspace, which is the live bug: a fresh session sees
+    'no index', an empty shared channel, and no journal entries.
+
+    Ordering: explicit SYNAPT_RECALL_ROOT > GRIPSPACE_ROOT > walk-up > $HOME
+    NAMED ERROR. Both env roots are consulted only in the None-branch ('resolve
+    like every recall verb'); an explicitly-passed project_dir suppresses them,
+    preserving the deliberate export/import --path contract (cli.py:1583).
+    """
+
+    def setup_method(self):
+        _gripspace_cache.clear()
+
+    def test_gripspace_root_env_resolves_the_shared_store(self, tmp_path, monkeypatch):
+        grip = _make_gr2_workspace(tmp_path)  # the workspace root, has .grip
+        sibling = tmp_path / "agent-worktree"  # sibling of grip, NOT inside it
+        sibling.mkdir()
+        monkeypatch.chdir(sibling)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
+        assert project_data_dir() == grip / ".synapt" / "recall"
+
+    def test_walk_up_alone_cannot_reach_a_sibling_workspace(self, tmp_path, monkeypatch):
+        # The bug, pinned: with no GRIPSPACE_ROOT, a sibling worktree does NOT
+        # resolve to the workspace (walk-up misses it).
+        grip = _make_gr2_workspace(tmp_path)
+        sibling = tmp_path / "agent-worktree"
+        sibling.mkdir()
+        monkeypatch.chdir(sibling)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert project_data_dir() != grip / ".synapt" / "recall"
+
+    def test_explicit_recall_root_beats_gripspace_root(self, tmp_path, monkeypatch):
+        grip = _make_gr2_workspace(tmp_path)
+        store = tmp_path / "explicit-store"
+        store.mkdir()
+        monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(store))
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
+        assert project_data_dir() == store / ".synapt" / "recall"
+
+    def test_refuses_nonexistent_gripspace_root(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(tmp_path / "does-not-exist"))
+        with pytest.raises(ValueError, match="GRIPSPACE_ROOT"):
+            project_data_dir()
+
+    def test_home_is_never_a_store_root(self, tmp_path, monkeypatch):
+        # No env roots and inference lands on $HOME -> NAMED ERROR, never a mint.
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+        monkeypatch.chdir(fake_home)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        with pytest.raises(ValueError, match="(?i)home"):
+            project_data_dir()
+
+    def test_explicit_project_dir_suppresses_gripspace_root(self, tmp_path, monkeypatch):
+        # The deliberate export/import --path contract: an explicitly-passed
+        # project_dir suppresses the env override (cli.py:1583).
+        grip = _make_gr2_workspace(tmp_path)
+        deliberate = tmp_path / "deliberate-target"
+        deliberate.mkdir()
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        assert project_data_dir(deliberate) == deliberate / ".synapt" / "recall"

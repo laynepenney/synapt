@@ -52,6 +52,7 @@ from recall_store_isolation import (  # noqa: E402
     contained_by,
     protected_channel_root,
 )
+from environment_isolation import scrub_ambient_process_env  # noqa: E402
 
 POLICY = StoreIsolationPolicy()
 
@@ -270,10 +271,27 @@ def _natural_resolution_per_test(monkeypatch):
     entirely to Layer 2 — which refuses the real store without altering where
     anything legitimately resolves. A harness that changes what the suite
     measures has stopped being a harness.
+
+    ``GRIPSPACE_ROOT`` is stripped here — repository-globally, every suite, not
+    only under ``tests/recall`` — because recall now consults it in the same
+    resolution None-branch, and gr exports it on every spawn. A recall-local
+    scrub left it ambient for the rest of the tree: on an agent machine a matched
+    full run showed head-only dashboard provenance failures where a
+    ``project_data_dir()`` resolved to the shell's GRIPSPACE_ROOT instead of the
+    test's own root. The new env var must not leak into ANY test's resolution, so
+    the strip belongs at repository root next to the other resolution roots, not
+    beside the tests that happen to name it. A test that means to exercise
+    ``GRIPSPACE_ROOT`` sets it back itself, after this fixture runs.
+
+    ``SYNAPT_AGENT_ID`` belongs at this same process boundary.  It is another
+    value exported by a real agent session, and it deliberately changes recall
+    attribution.  Letting it leak into tests that omit ``agent_id`` turns an
+    explicit backwards-compatibility case into an attributed record.  The
+    shared helper is the canonical importable seam for both resolution and
+    attribution inputs; tests that exercise either contract set their value
+    after this fixture runs.
     """
-    monkeypatch.delenv("SYNAPT_SHARED_CHANNELS_DIR", raising=False)
-    monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
-    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    scrub_ambient_process_env(monkeypatch)
 
 
 @pytest.fixture(autouse=True)
@@ -437,6 +455,14 @@ _PREVIOUS = []
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "live_channel_store: touches the live store")
+    # A real session carries GRIPSPACE_ROOT (gr exports it on spawn), and recall
+    # now consults it; without one, an incidental project_data_dir() would fall
+    # to the pytester's tmp $HOME, which recall refuses as a store root. Model a
+    # real session by pointing it at a concrete dir this nested run owns.
+    import os
+    grip_root = Path(__file__).parent / "grip-root"
+    grip_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("GRIPSPACE_ROOT", str(grip_root))
     POLICY.register_extra_root(DECOY)
     POLICY.allow_live = config.getoption("--allow-live-channel-store-tests")
     from synapt.recall import channel as channel_mod

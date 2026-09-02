@@ -25,6 +25,44 @@ TEXT_BYTES = 4 * 1024
 PATH_BYTES = 1024
 FILES_LIMIT = 32
 CHECKPOINT_BYTES = 384 * 1024
+_PERIODIC_SESSION_RE = re.compile(r"[a-z0-9-]{1,250}\Z")
+_WINDOWS_DEVICE_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
+
+# User-role lines the runtime writes on the operator's behalf. A crash bridge
+# that quotes a <task-notification> as the operator's last words hides the real
+# last request (measured 2026-08-31: the recovered tail led with a background
+# task notice while the human's question sat one turn earlier). Kept local so
+# the SessionEnd hook, which runs under a 3 s budget, imports nothing heavier.
+_HARNESS_USER_TAGS = (
+    "task-notification",
+    "system-reminder",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+)
+_HARNESS_USER_RE = re.compile(
+    rf"<({'|'.join(_HARNESS_USER_TAGS)})(?:\s[^>]*)?>.*?(?:</\1>|$)",
+    re.DOTALL,
+)
+
+
+def _is_harness_user_text(text: str) -> bool:
+    """True when a user line is ENTIRELY runtime control blocks.
+
+    Positive identification only: prose that quotes a tag keeps its author.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    return not _HARNESS_USER_RE.sub("", stripped).strip()
+
 
 _CLAUDE_PREFIX = (
     "This session is being continued from a previous conversation that ran "
@@ -206,7 +244,11 @@ def capture_checkpoint(payload: dict) -> dict:
         text = _claude_user_text(entry)
         claude_paths: list[str] = []
         if text:
-            role = None if text.startswith(_CLAUDE_PREFIX) else "user"
+            role = (
+                None
+                if text.startswith(_CLAUDE_PREFIX) or _is_harness_user_text(text)
+                else "user"
+            )
         else:
             text, claude_paths = _claude_assistant(entry)
             if text:
@@ -377,6 +419,20 @@ def checkpoint_path(cwd: Path) -> Path:
     return root / ".synapt" / "recall" / "worktrees" / worktree / "checkpoint.json"
 
 
+def _periodic_session_id(session_id: object) -> str:
+    """Accept only an injective, cross-platform filename component."""
+    if type(session_id) is not str or not _PERIODIC_SESSION_RE.fullmatch(session_id):
+        raise ValueError("periodic checkpoint session_id must be lowercase ASCII alnum/hyphen")
+    if session_id in _WINDOWS_DEVICE_NAMES:
+        raise ValueError("periodic checkpoint session_id is a reserved Windows device name")
+    return session_id
+
+
+def periodic_checkpoint_path(cwd: Path, session_id: str) -> Path:
+    """Return the session-keyed periodic checkpoint without touching storage."""
+    return checkpoint_path(cwd).parent / "checkpoints" / f"{_periodic_session_id(session_id)}.json"
+
+
 def _encoded(checkpoint: dict) -> bytes:
     return (json.dumps(checkpoint, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
@@ -393,6 +449,37 @@ def write_checkpoint(payload: dict) -> tuple[Path, dict]:
     if len(encoded) > CHECKPOINT_BYTES:
         raise ValueError(f"checkpoint exceeds {CHECKPOINT_BYTES} serialized bytes")
 
+    fd, temp_name = tempfile.mkstemp(prefix=".checkpoint.", suffix=".tmp", dir=destination.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_name, destination)
+    except BaseException:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+    return destination, checkpoint
+
+
+def write_periodic_checkpoint(payload: dict) -> tuple[Path, dict]:
+    """Atomically replace only this session's bounded periodic checkpoint."""
+    checkpoint = capture_checkpoint(payload)
+    session_id = _periodic_session_id(checkpoint.get("session_id"))
+    destination = periodic_checkpoint_path(Path(checkpoint["cwd"]), session_id)
+    checkpoint["source"] = "periodic"
+    checkpoint["session_id"] = session_id
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = _encoded(checkpoint)
+    while len(encoded) > CHECKPOINT_BYTES and checkpoint["files_touched"]:
+        checkpoint["files_touched"].pop()
+        checkpoint["truncated"] = True
+        encoded = _encoded(checkpoint)
+    if len(encoded) > CHECKPOINT_BYTES:
+        raise ValueError(f"checkpoint exceeds {CHECKPOINT_BYTES} serialized bytes")
     fd, temp_name = tempfile.mkstemp(prefix=".checkpoint.", suffix=".tmp", dir=destination.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -428,6 +515,29 @@ def read_checkpoint(project: Path) -> dict | None:
     )
 
 
+def read_periodic_checkpoint(project: Path, session_id: str) -> dict | None:
+    """Read one exact session record, refusing malformed or cross-session data."""
+    try:
+        safe_session_id = _periodic_session_id(session_id)
+        path = periodic_checkpoint_path(project, safe_session_id)
+        if path.stat().st_size > CHECKPOINT_BYTES:
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return (
+        value
+        if (
+            isinstance(value, dict)
+            and type(value.get("schema_version")) is int
+            and value["schema_version"] == SCHEMA_VERSION
+            and value.get("source") == "periodic"
+            and value.get("session_id") == safe_session_id
+        )
+        else None
+    )
+
+
 def _timestamp(value: str) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -449,9 +559,11 @@ def format_checkpoint(checkpoint: dict) -> str:
     assistant = checkpoint.get("last_assistant_text") or "unavailable in bounded transcript tail"
     files = checkpoint.get("files_touched") or []
     file_text = ", ".join(str(path) for path in files[:FILES_LIMIT]) or "none observed"
+    session = str(checkpoint.get("session_id") or "")[:8] or "unknown"
     return (
         "LAST CHECKPOINT\n"
         "Raw transcript tail captured at SessionEnd. Not an authored journal.\n"
+        f"Session: {session}\n"
         f"Status: {checkpoint.get('parse_status', 'unavailable')}"
         f"{' (truncated)' if checkpoint.get('truncated') else ''}\n"
         f"User: {user}\nAssistant: {assistant}\nFiles: {file_text}"

@@ -763,6 +763,7 @@ def recall_resume(
                 limit=turns,
                 journal_path=_journal_path(),
                 caller_sources=caller_transcripts(Path.cwd()),
+                agent_id=os.environ.get("SYNAPT_AGENT_ID"),
             )
         except ResumeError as exc:
             if not index._session_order:
@@ -1233,8 +1234,8 @@ def recall_export(
     """
     from synapt.recall.archive import export_recall_archive
 
-    # None => resolve via SYNAPT_RECALL_ROOT + inference. Forwarding Path.cwd()
-    # would suppress the override.
+    # None => resolve via SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT + inference.
+    # Forwarding Path.cwd() would suppress the override.
     try:
         archive_path, manifest = export_recall_archive(
             None,

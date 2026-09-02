@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
+from synapt.recall.resume import BoundedResumeIndex, build_resume_view
 from synapt.recall.sharded_db import ShardedRecallDB
 from synapt.recall.storage import RecallDB
 
@@ -111,6 +112,7 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         session_id: str,
         timestamp: str,
         text: str,
+        agent_id: str | None = None,
     ) -> TranscriptChunk:
         return TranscriptChunk(
             id=chunk_id,
@@ -119,6 +121,7 @@ class TestShardedRecallDBSharded(unittest.TestCase):
             turn_index=0,
             user_text=text,
             assistant_text="assistant",
+            agent_id=agent_id,
         )
 
     def _create_two_shard_layout(self) -> ShardedRecallDB:
@@ -182,6 +185,232 @@ class TestShardedRecallDBSharded(unittest.TestCase):
             )
         finally:
             db.close()
+
+    def test_session_overview_unions_agent_identity_across_shards(self):
+        RecallDB(self.index_dir / "index.db").close()
+        first = RecallDB(self.index_dir / "data_001.db")
+        second = RecallDB(self.index_dir / "data_002.db")
+        first.save_chunks([
+            self._make_chunk(
+                "shared:t0",
+                "shared",
+                "2026-01-01T00:00:00Z",
+                "claude runtime",
+                agent_id="runtime-a",
+            ),
+        ])
+        second.save_chunks([
+            self._make_chunk(
+                "shared:t1",
+                "shared",
+                "2026-01-02T00:00:00Z",
+                "codex runtime",
+                agent_id="runtime-b",
+            ),
+        ])
+        first.close()
+        second.close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        try:
+            self.assertEqual(
+                db.session_overview()["shared"]["agent_ids"],
+                frozenset({"runtime-a", "runtime-b"}),
+            )
+        finally:
+            db.close()
+
+    def test_session_overview_excludes_journal_identity_from_data_shard(self):
+        RecallDB(self.index_dir / "index.db").close()
+        shard = RecallDB(self.index_dir / "data_001.db")
+        journal = self._make_chunk(
+            "journal:j0",
+            "journal-only",
+            "2026-02-01T00:00:00Z",
+            "journal metadata",
+            agent_id="ambient-agent",
+        )
+        journal.turn_index = -1
+        shard.save_chunks([journal])
+        shard.close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        try:
+            overview = db.session_overview()["journal-only"]
+            self.assertEqual(overview["agent_ids"], frozenset())
+            self.assertFalse(overview["has_real_activity"])
+        finally:
+            db.close()
+
+    def test_session_overview_unions_query_tail_agent_identity_with_base(self):
+        RecallDB(self.index_dir / "index.db").close()
+        shard = RecallDB(self.index_dir / "data_001.db")
+        shard.save_chunks([
+            self._make_chunk(
+                "shared:t0",
+                "shared",
+                "2026-01-01T00:00:00Z",
+                "base",
+                agent_id="claude-agent",
+            ),
+        ])
+        shard.close()
+        index = RecallDB(self.index_dir / "index.db")
+        index.replace_query_tail(
+            source_key="runtime-source",
+            session_id="shared",
+            rewind_offset=1,
+            chunks=[
+                self._make_chunk(
+                    "shared:t1",
+                    "shared",
+                    "2026-01-02T00:00:00Z",
+                    "fresh overlay",
+                    agent_id="codex-agent",
+                )
+            ],
+            cursor={
+                "transcript_path": "/runtime/shared.jsonl",
+                "observed_complete_offset": 2,
+                "rewind_offset": 1,
+                "rewind_turn_index": 1,
+                "source_size": 2,
+                "source_mtime_ns": 2,
+                "observed_prefix_sha256": "digest",
+                "suppresses_base": False,
+                "latest_projected_timestamp": "2026-01-02T00:00:00Z",
+                "last_attempt_at": "2026-01-02T00:00:00Z",
+                "last_success_at": "2026-01-02T00:00:00Z",
+            },
+        )
+        index.close()
+
+        db = ShardedRecallDB.open_readonly(self.index_dir)
+        try:
+            self.assertEqual(
+                db.session_overview()["shared"]["agent_ids"],
+                frozenset({"claude-agent", "codex-agent"}),
+            )
+        finally:
+            db.close()
+
+    def test_bounded_resume_prefers_newest_agent_session_from_query_tail(self):
+        RecallDB(self.index_dir / "index.db").close()
+        shard = RecallDB(self.index_dir / "data_001.db")
+        shard.save_chunks([
+            self._make_chunk(
+                "old:t0",
+                "old-session",
+                "2026-01-01T00:00:00Z",
+                "old base continuity",
+                agent_id="stable-agent",
+            ),
+        ])
+        shard.close()
+        index_db = RecallDB(self.index_dir / "index.db")
+        index_db.replace_query_tail(
+            source_key="new-runtime-source",
+            session_id="new-session",
+            rewind_offset=0,
+            chunks=[
+                self._make_chunk(
+                    "new:t0",
+                    "new-session",
+                    "2026-02-01T00:00:00Z",
+                    "new query-tail continuity",
+                    agent_id="stable-agent",
+                )
+            ],
+            cursor={
+                "transcript_path": "/runtime/new-session.jsonl",
+                "observed_complete_offset": 1,
+                "rewind_offset": 0,
+                "rewind_turn_index": 0,
+                "source_size": 1,
+                "source_mtime_ns": 1,
+                "observed_prefix_sha256": "digest",
+                "suppresses_base": False,
+                "latest_projected_timestamp": "2026-02-01T00:00:00Z",
+                "last_attempt_at": "2026-02-01T00:00:00Z",
+                "last_success_at": "2026-02-01T00:00:00Z",
+            },
+        )
+        index_db.close()
+
+        index = BoundedResumeIndex(ShardedRecallDB.open_readonly(self.index_dir))
+        try:
+            view = build_resume_view(
+                index,
+                agent_id="stable-agent",
+                journal_path=None,
+            )
+        finally:
+            index.close()
+
+        self.assertEqual(view.session_id, "new-session")
+        self.assertEqual(view.turns[0].user_text, "new query-tail continuity")
+
+    def test_query_tail_journal_metadata_does_not_outrank_real_agent_activity(self):
+        RecallDB(self.index_dir / "index.db").close()
+        shard = RecallDB(self.index_dir / "data_001.db")
+        shard.save_chunks([
+            self._make_chunk(
+                "real:t0",
+                "real-session",
+                "2026-01-01T00:00:00Z",
+                "real continuity",
+                agent_id="foreign-agent",
+            ),
+        ])
+        shard.close()
+        index_db = RecallDB(self.index_dir / "index.db")
+        journal = self._make_chunk(
+            "journal:j0",
+            "journal-only",
+            "2026-02-01T00:00:00Z",
+            "journal metadata",
+            agent_id="stable-agent",
+        )
+        journal.turn_index = -1
+        journal.assistant_text = ""
+        index_db.replace_query_tail(
+            source_key="journal-overlay",
+            session_id="journal-only",
+            rewind_offset=0,
+            chunks=[journal],
+            cursor={
+                "transcript_path": "/runtime/journal.jsonl",
+                "observed_complete_offset": 1,
+                "rewind_offset": 0,
+                "rewind_turn_index": -1,
+                "source_size": 1,
+                "source_mtime_ns": 1,
+                "observed_prefix_sha256": "digest",
+                "suppresses_base": False,
+                "latest_projected_timestamp": "2026-02-01T00:00:00Z",
+                "last_attempt_at": "2026-02-01T00:00:00Z",
+                "last_success_at": "2026-02-01T00:00:00Z",
+            },
+        )
+        index_db.close()
+
+        index = BoundedResumeIndex(ShardedRecallDB.open_readonly(self.index_dir))
+        try:
+            self.assertNotIn(
+                "stable-agent",
+                index._db.session_overview()["journal-only"]["agent_ids"],
+            )
+            view = build_resume_view(
+                index,
+                caller_sources=[],
+                agent_id="stable-agent",
+                journal_path=None,
+            )
+        finally:
+            index.close()
+
+        self.assertEqual(view.session_id, "real-session")
+        self.assertEqual(view.turns[0].user_text, "real continuity")
 
     def test_journal_in_a_later_shard_does_not_replace_real_activity(self):
         RecallDB(self.index_dir / "index.db").close()

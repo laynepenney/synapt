@@ -24,6 +24,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -34,8 +36,14 @@ from unittest import mock
 
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.journal import JournalEntry, append_entry
+from synapt.recall.freshness import IndexFreshness
 from synapt.recall.resume import (
     CallerTranscript,
+    ResumeTurn,
+    ResumeView,
+    UncleanEnd,
+    attach_durable_checkpoint,
+    detect_unclean_end,
     ResumeError,
     build_resume_view,
     caller_transcripts,
@@ -43,8 +51,12 @@ from synapt.recall.resume import (
     is_harness_authored,
     load_resume_index,
     resolve_session,
+    select_durable_checkpoint,
     _latest_event_timestamp,
+    _lag_phrase,
+    _runtime_root,
     _source_label,
+    _timestamp_epoch,
 )
 
 SESSION_A = "aaaaaaaa-1111-2222-3333-444444444444"
@@ -65,6 +77,7 @@ def _chunk(
     timestamp: str = "2026-08-05T10:00:00Z",
     tool_content: str = "",
     transcript_path: str = "",
+    agent_id: str | None = None,
 ) -> TranscriptChunk:
     """Build a chunk the way the parsers do (short-id prefix, ``:t<n>`` suffix)."""
     return TranscriptChunk(
@@ -77,6 +90,7 @@ def _chunk(
         tools_used=list(tools_used or []),
         tool_content=tool_content,
         transcript_path=transcript_path,
+        agent_id=agent_id,
     )
 
 
@@ -134,6 +148,181 @@ class TestSessionSelection(unittest.TestCase):
 
     def test_default_falls_back_store_wide_only_when_caller_has_no_indexed_session(self):
         self.assertEqual(resolve_session(self.index, None, {"not-indexed"}), SESSION_B)
+
+    def test_legacy_unattributed_chunks_do_not_acquire_resuming_agent_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                old = _chunk(
+                    SESSION_A,
+                    0,
+                    "caller continuity",
+                    "answer",
+                    timestamp="2026-01-01T00:00:00Z",
+                    agent_id=None,
+                ).to_dict()
+                newer = _chunk(
+                    SESSION_B,
+                    0,
+                    "foreign continuity",
+                    "answer",
+                    timestamp="2026-02-01T00:00:00Z",
+                    agent_id=None,
+                ).to_dict()
+            # The legacy format had no authorship field at all.
+            old.pop("agent_id", None)
+            newer.pop("agent_id", None)
+            (directory / "chunks.jsonl").write_text(
+                json.dumps(old) + "\n" + json.dumps(newer) + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                os.environ, {"SYNAPT_AGENT_ID": "stable-agent"}, clear=True
+            ):
+                index = load_resume_index(directory)
+                view = build_resume_view(
+                    index,
+                    caller_sources=[
+                        CallerTranscript(
+                            SESSION_A, Path("/old/cwd.jsonl"), 1.0, 1
+                        )
+                    ],
+                    agent_id="stable-agent",
+                    journal_path=None,
+                )
+
+            self.assertEqual(view.session_id, SESSION_A)
+            self.assertEqual(view.selection_scope, "caller")
+
+    def test_legacy_resume_loader_closes_migration_database_before_return(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            chunk = _chunk(
+                SESSION_A,
+                0,
+                "caller continuity",
+                "answer",
+                timestamp="2026-01-01T00:00:00Z",
+            ).to_dict()
+            (directory / "chunks.jsonl").write_text(
+                json.dumps(chunk) + "\n", encoding="utf-8"
+            )
+
+            closed = []
+            from synapt.recall.storage import RecallDB
+
+            original_close = RecallDB.close
+
+            def close_and_record(db):
+                original_close(db)
+                closed.append(db)
+
+            with mock.patch.object(RecallDB, "close", close_and_record):
+                index = load_resume_index(directory)
+
+            self.assertEqual(len(closed), 1)
+            with self.assertRaises(sqlite3.ProgrammingError):
+                closed[0]._conn.execute("SELECT 1")
+            self.assertIsNone(getattr(index, "_db", None))
+            self.assertTrue((directory / "recall.db").exists())
+            self.assertFalse((directory / "recall.db-wal").exists())
+            self.assertFalse((directory / "recall.db-shm").exists())
+
+    def test_agent_identity_outranks_runtime_cwd_and_store_recency(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent on the previous runtime",
+                "continuing",
+                timestamp="2026-08-31T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign runtime cwd",
+                "not the same agent",
+                timestamp="2026-08-31T11:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            caller_sources=[
+                CallerTranscript(SESSION_B, Path("/codex/current.jsonl"), 1.0, 1)
+            ],
+            agent_id="stable-agent",
+            journal_path=None,
+        )
+
+        self.assertEqual(view.session_id, SESSION_A)
+        self.assertEqual(view.selection_scope, "agent")
+        self.assertIn("same agent on the previous runtime", format_resume(view))
+        self.assertIn("agent identity", format_resume(view).splitlines()[0])
+
+    def test_explicit_session_selection_outranks_agent_identity(self):
+        index = _index([
+            _chunk(SESSION_A, 0, "agent default", "a", agent_id="stable-agent"),
+            _chunk(SESSION_B, 0, "explicit target", "b", agent_id="foreign-agent"),
+        ])
+
+        view = build_resume_view(
+            index,
+            session_id=SESSION_B[:8],
+            agent_id="stable-agent",
+            journal_path=None,
+        )
+
+        self.assertEqual(view.session_id, SESSION_B)
+        self.assertEqual(view.selection_scope, "explicit")
+        self.assertIn("explicit target", format_resume(view))
+
+    def test_unknown_agent_identity_falls_back_to_runtime_cwd(self):
+        self.assertEqual(
+            resolve_session(
+                self.index,
+                None,
+                caller_session_ids={SESSION_A},
+                agent_id="new-agent-with-no-history",
+            ),
+            SESSION_A,
+        )
+
+    def test_journal_only_identity_does_not_outrank_runtime_cwd(self):
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "foreign real continuity",
+                "answer",
+                timestamp="2026-01-01T00:00:00Z",
+                agent_id="foreign-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                -1,
+                "journal metadata",
+                "next steps",
+                timestamp="2026-02-01T00:00:00Z",
+                agent_id="stable-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            caller_sources=[
+                CallerTranscript(SESSION_A, Path("/runtime/current.jsonl"), 1.0, 1)
+            ],
+            agent_id="stable-agent",
+            journal_path=None,
+        )
+
+        self.assertEqual(view.session_id, SESSION_A)
+        self.assertEqual(view.selection_scope, "caller")
+        self.assertEqual(view.turns[0].user_text, "foreign real continuity")
 
     def test_caller_unindexed_newer_transcript_is_named_on_first_line(self):
         source = CallerTranscript(
@@ -727,6 +916,70 @@ class TestJournalBinding(unittest.TestCase):
         self.assertIsNone(view.journal)
         self.assertIsNone(view.journal_provenance)
 
+    def test_agent_selected_session_does_not_infer_a_foreign_unbound_journal(self):
+        """Agent identity binds the session, not a sessionless shared-store journal."""
+        self._write("", "foreign unbound intent", "2026-08-05T11:00:00Z")
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent but older",
+                "a",
+                timestamp="2026-08-01T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign session",
+                "b",
+                timestamp="2026-08-05T10:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            agent_id="stable-agent",
+            limit=10,
+            journal_path=self.journal,
+        )
+
+        self.assertEqual(view.session_id, SESSION_A)
+        self.assertIsNone(view.journal)
+        self.assertIsNone(view.journal_provenance)
+
+    def test_agent_selected_session_keeps_exact_journal_binding(self):
+        self._write(SESSION_A, "bound agent intent", "2026-08-01T11:00:00Z")
+        index = _index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent but older",
+                "a",
+                timestamp="2026-08-01T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign session",
+                "b",
+                timestamp="2026-08-05T10:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ])
+
+        view = build_resume_view(
+            index,
+            agent_id="stable-agent",
+            limit=10,
+            journal_path=self.journal,
+        )
+
+        self.assertEqual(view.journal.focus, "bound agent intent")
+        self.assertEqual(view.journal_provenance, "bound")
+
     def test_entry_without_a_session_id_is_shown_but_labelled_inferred(self):
         """Absence of evidence cannot contradict, so it is disclosed rather than hidden."""
         self._write("", "unbound entry", "2026-08-05T11:00:00Z")
@@ -1207,6 +1460,33 @@ class TestEmptyAndErrorStates(unittest.TestCase):
         self.assertLess(out.index("first answer"), out.index("last answer"),
                         "turns must read oldest-first so the tail ends at the newest")
 
+    def test_cli_uses_stable_agent_identity_across_runtime_cwds(self):
+        _save_sqlite_index([
+            _chunk(
+                SESSION_A,
+                0,
+                "same agent on another runtime cwd",
+                "continue here",
+                timestamp="2026-08-01T10:00:00Z",
+                agent_id="stable-agent",
+            ),
+            _chunk(
+                SESSION_B,
+                0,
+                "newer foreign cwd",
+                "wrong continuity",
+                timestamp="2026-08-05T10:00:00Z",
+                agent_id="foreign-agent",
+            ),
+        ], self.dir)
+
+        with mock.patch.dict(os.environ, {"SYNAPT_AGENT_ID": "stable-agent"}):
+            out, _, code = _run_cli(self.dir)
+
+        self.assertEqual(code, 0)
+        self.assertIn("same agent on another runtime cwd", out)
+        self.assertNotIn("newer foreign cwd", out)
+
 
 # ---------------------------------------------------------------------------
 # Cross-runtime
@@ -1315,6 +1595,174 @@ class TestTopLevelWiring(unittest.TestCase):
                                    ["synapt recall", "resume", "abc123"]):
                 recall_cli.main()
         self.assertEqual(cmd.call_args[0][0].session, "abc123")
+
+
+# A stale index built months ago, as on a cold cross-runtime launch.
+_STALE = IndexFreshness(
+    stale=True, build_timestamp="2026-04-08T12:23:34", scanned="archive",
+    new_files=["a"] * 3, changed_files=["b"] * 2,
+)
+_FRESH = IndexFreshness(stale=False, build_timestamp="2026-09-01T22:40:00", scanned="archive")
+
+
+def _view(scope="store", tail_ts="2026-06-01T09:00:00Z", freshness=_STALE, runtime="codex"):
+    return ResumeView(
+        session_id="0af31c22-dead-beef-0000-000000000000",
+        turns=[ResumeTurn(chunk_id="0af31c22:t0", turn_index=0, timestamp=tail_ts,
+                          user_text="an old tail the stale index still calls newest",
+                          assistant_text="…done.", tools_used=[])],
+        total_turns=1, selection_scope=scope, source_label="worktree:foreign",
+        source_runtime=runtime, freshness=freshness,
+    )
+
+
+def _write_journal(tmp, entries):
+    path = Path(tmp) / "journal.jsonl"
+    for e in entries:
+        append_entry(e, path=path)
+    return path
+
+
+class TestDurableCheckpointOnColdResume(unittest.TestCase):
+    """On a cold/stale resume the tail-bound journal path can miss the freshest
+    durable entry (originating issue tracked privately). The durable-checkpoint
+    block surfaces the newest
+    intent-bearing journal above the tail — but only when it would tell the
+    reader something the tail cannot, so every control below must NOT fire."""
+
+    def test_witness1_fires_on_stale_no_caller_with_newer_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s-fresh",
+                             focus="RE-ENTRY SPARK from Stromus",
+                             next_steps=["resume feat/x at HEAD"]),
+            ])
+            view = attach_durable_checkpoint(_view(), j)
+            out = format_resume(view)
+        self.assertIsNotNone(view.durable_checkpoint)
+        self.assertIn("DURABLE CHECKPOINT — latest journal entry 2026-08-14T21:10:00Z", out)
+        self.assertIn("RE-ENTRY SPARK from Stromus", out)
+        self.assertIn("Next: resume feat/x at HEAD", out)
+        self.assertIn("behind the journal", out)  # lag line, not a file count
+
+    def test_control_fresh_index_with_caller_and_older_journal_does_not_fire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-05-01T00:00:00Z", session_id="s",
+                             focus="old", next_steps=["old step"]),
+            ])
+            # fresh index, a caller session, tail NEWER than the journal
+            view = attach_durable_checkpoint(
+                _view(scope="caller", tail_ts="2026-06-01T00:00:00Z", freshness=_FRESH), j)
+            out = format_resume(view)
+        self.assertIsNone(view.durable_checkpoint)
+        self.assertNotIn("DURABLE CHECKPOINT", out)
+
+    def test_control_journal_absent_keeps_stale_label_no_block(self):
+        view = attach_durable_checkpoint(_view(), Path("/nonexistent/journal.jsonl"))
+        out = format_resume(view)
+        self.assertIsNone(view.durable_checkpoint)
+        self.assertNotIn("DURABLE CHECKPOINT", out)
+        self.assertIn("STALE", out)  # existing disclosure survives
+
+    def test_control_stale_but_journal_older_than_tail_does_not_fire(self):
+        # The gate is not "stale" alone: a journal older than the rendered tail
+        # would mislead, so it must stay silent even on a stale index.
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-05-01T00:00:00Z", session_id="s",
+                             focus="older than tail", next_steps=["x"]),
+            ])
+            view = attach_durable_checkpoint(_view(tail_ts="2026-07-01T00:00:00Z"), j)
+        self.assertIsNone(view.durable_checkpoint)
+
+    def test_selection_skips_intentless_stub_and_picks_real_entry(self):
+        # The newest entry is a /clear auto-stub whose only focus is harness
+        # markup. _carries_intent must skip it, exactly as _select_journal does,
+        # or the checkpoint of record reads as a real handoff carrying nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-10T00:00:00Z", session_id="s-real",
+                             focus="real handoff", next_steps=["do the thing"]),
+                JournalEntry(timestamp="2026-08-20T00:00:00Z", session_id="s-stub",
+                             focus="<command-name>/clear</command-name>"),
+            ])
+            entry, _ = select_durable_checkpoint(j, _STALE, has_caller=False,
+                                                 tail_newest="2026-06-01T00:00:00Z")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.focus, "real handoff")
+
+    def test_block_does_not_alter_the_tail(self):
+        # Depth: the durable block only ADDS; the rendered turns must be
+        # byte-identical with and without it.
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s",
+                             focus="f", next_steps=["n"]),
+            ])
+            base = _view()
+            base_turn_lines = [l for l in format_resume(base).splitlines()
+                               if l.startswith("── ") or l.startswith("  YOU:") or l.startswith("  ASSISTANT:")]
+            withblock = attach_durable_checkpoint(_view(), j)
+            block_turn_lines = [l for l in format_resume(withblock).splitlines()
+                                if l.startswith("── ") or l.startswith("  YOU:") or l.startswith("  ASSISTANT:")]
+        self.assertTrue(withblock.durable_checkpoint is not None)
+        self.assertEqual(base_turn_lines, block_turn_lines)
+
+
+class TestRuntimeRootLabel(unittest.TestCase):
+    """The rendered tail is labelled by the runtime that WROTE it, so a cold
+    cross-runtime launch does not read another runtime's tail as its own."""
+
+    def test_runtime_root_classifies_paths(self):
+        self.assertEqual(_runtime_root("/w/.codex/sessions/2026/09/01/rollout-a.jsonl"), "codex")
+        self.assertEqual(_runtime_root("/w/.claude/projects/slug/a.jsonl"), "claude-code")
+        self.assertEqual(_runtime_root("/repo/.synapt/recall/worktrees/foo/transcripts/a.jsonl"), "recall-store")
+        self.assertEqual(_runtime_root("/tmp/loose/a.jsonl"), "")
+        self.assertEqual(_runtime_root(""), "")
+
+    def test_store_fallback_header_names_runtime_root(self):
+        index = _index([
+            _chunk(SESSION_B, 0, "q", "a",
+                   transcript_path="/w/.codex/sessions/2026/09/01/rollout-a.jsonl"),
+        ])
+        view = build_resume_view(index, caller_sources=[], journal_path=None)
+        self.assertEqual(view.source_runtime, "codex")
+        self.assertIn("runtime codex", format_resume(view).splitlines()[0])
+
+    def test_durable_block_names_the_writing_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s",
+                             focus="f", next_steps=["n"]),
+            ])
+            view = attach_durable_checkpoint(_view(runtime="codex"), j)
+            out = format_resume(view)
+        self.assertIn("was written by the codex runtime", out)
+
+    def test_no_runtime_marker_falls_back_to_generic_phrase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s",
+                             focus="f", next_steps=["n"]),
+            ])
+            view = attach_durable_checkpoint(_view(runtime=""), j)
+            out = format_resume(view)
+        self.assertIn("may be from another runtime", out)
+
+
+class TestLagPhrase(unittest.TestCase):
+    def test_days(self):
+        self.assertIn("128 days behind", _lag_phrase("2026-04-08T12:00:00Z", "2026-08-14T12:00:00Z"))
+
+    def test_hours(self):
+        self.assertIn("5h behind", _lag_phrase("2026-09-01T12:00:00Z", "2026-09-01T17:30:00Z"))
+
+    def test_within_hour(self):
+        self.assertIn("within the hour", _lag_phrase("2026-09-01T12:00:00Z", "2026-09-01T12:20:00Z"))
+
+    def test_unrecorded_build_time(self):
+        self.assertIn("unrecorded", _lag_phrase("", "2026-09-01T12:00:00Z"))
 
 
 if __name__ == "__main__":
@@ -1511,3 +1959,168 @@ class TestTimestampFormatDoesNotDecideOrdering(unittest.TestCase):
             _chunk(SESSION_B, 0, "c", "d", timestamp="2026-08-06T03:00:00Z"),
         ])
         self.assertEqual(resolve_session(index, None), SESSION_A)
+
+
+# ---------------------------------------------------------------------------
+# Unclean end — a crash writes neither a journal nor a SessionEnd checkpoint
+# ---------------------------------------------------------------------------
+
+
+class TestUncleanEnd(unittest.TestCase):
+    """A session that dies by host crash leaves no handoff of any kind.
+
+    Measured 2026-08-31: the coordinator's session (last activity 12:06Z) had
+    no journal after 04:54Z and no SessionEnd checkpoint, because a crash runs
+    no SessionEnd. The on-disk checkpoint belonged to a DIFFERENT session (a
+    subagent that ended cleanly at 11:58Z), and the wake rendered that tail
+    under "LAST CHECKPOINT" as if it were the bridge. Nothing said that seven
+    hours of work had no record.
+
+    Atlas's r1 on the first version added the composition rule pinned here: a
+    handoff is session-bound evidence. A journal from another session, however
+    recent, certifies nothing about this one.
+    """
+
+    LAST = "2026-08-31T12:06:07Z"
+    NOW = _timestamp_epoch("2026-08-31T13:10:24Z")
+
+    @staticmethod
+    def _source(session_id: str, latest: str) -> CallerTranscript:
+        return CallerTranscript(session_id, Path(f"/t/{session_id[:8]}.jsonl"), 0.0, 10,
+                                latest_timestamp=latest)
+
+    @staticmethod
+    def _journal(ts: str, session_id: str = "") -> JournalEntry:
+        return JournalEntry(timestamp=ts, session_id=session_id, focus="handoff")
+
+    def _judge(self, sources, *, checkpoint=None, journals=(), **kw):
+        return detect_unclean_end(sources, checkpoint=checkpoint,
+                                  authored_journals=list(journals), **kw)
+
+    def test_no_previous_transcript_is_not_a_finding(self):
+        self.assertIsNone(self._judge([]))
+
+    def test_a_checkpoint_for_this_session_means_it_was_handed_off(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            checkpoint={"session_id": SESSION_A, "captured_at": self.LAST})
+        self.assertIsNone(found)
+
+    def test_a_checkpoint_from_another_session_does_not_cover_this_one(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            checkpoint={"session_id": SESSION_B, "captured_at": "2026-08-31T11:58:20Z"})
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_A)
+        self.assertEqual(found.last_activity, self.LAST)
+        self.assertEqual(found.checkpoint_session, SESSION_B)
+        self.assertIsNone(found.last_authored_journal)
+        self.assertIsNone(found.gap_seconds)
+
+    def test_a_bound_journal_inside_the_grace_window_covers_the_session(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            journals=[self._journal("2026-08-31T12:00:00Z", SESSION_A)])
+        self.assertIsNone(found)
+
+    def test_a_bound_journal_older_than_the_grace_window_does_not(self):
+        found = self._judge([self._source(SESSION_A, self.LAST)],
+                            journals=[self._journal("2026-08-31T04:54:00Z", SESSION_A)])
+        self.assertIsNotNone(found)
+        self.assertEqual(found.last_authored_journal, "2026-08-31T04:54:00Z")
+        self.assertEqual(found.gap_seconds, 7 * 3600 + 12 * 60 + 7)
+        self.assertIsNone(found.checkpoint_session)
+
+    def test_a_later_journal_from_another_session_does_not_suppress_the_finding(self):
+        """Atlas's reproducer: crash at 12:06Z, foreign journal at 13:00Z.
+        The first version reduced journals to a timestamp and returned None."""
+        found = self._judge(
+            [self._source(SESSION_A, self.LAST)],
+            checkpoint={"session_id": SESSION_B, "captured_at": "2026-08-31T11:58:20Z"},
+            journals=[self._journal("2026-08-31T13:00:00Z", SESSION_B)],
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_A)
+        self.assertIsNone(found.last_authored_journal)
+        self.assertEqual(found.foreign_journal, "2026-08-31T13:00:00Z")
+
+    def test_a_later_journal_bound_to_the_session_does_cover_it(self):
+        """Positive control for the test above: same time, own session."""
+        found = self._judge(
+            [self._source(SESSION_A, self.LAST)],
+            checkpoint={"session_id": SESSION_B, "captured_at": "2026-08-31T11:58:20Z"},
+            journals=[self._journal("2026-08-31T13:00:00Z", SESSION_A)],
+        )
+        self.assertIsNone(found)
+
+    def test_a_sessionless_legacy_journal_covers_only_inside_the_symmetric_window(self):
+        """The explicit fallback for entries that name no session, witnessed
+        separately: inside the window it covers, an hour later it does not."""
+        inside = self._judge([self._source(SESSION_A, self.LAST)],
+                             journals=[self._journal("2026-08-31T12:10:00Z")])
+        later = self._judge([self._source(SESSION_A, self.LAST)],
+                            journals=[self._journal("2026-08-31T13:00:00Z")])
+        self.assertIsNone(inside)
+        self.assertIsNotNone(later)
+        self.assertEqual(later.last_authored_journal, "2026-08-31T13:00:00Z")
+        self.assertIsNone(later.gap_seconds)
+
+    def test_the_grace_boundary_is_inclusive_and_discriminating(self):
+        """gap == grace is covered; gap == grace + 1 s is not. A pair, so a
+        mutation that drops the comparison turns exactly one side red."""
+        sources = [self._source(SESSION_A, "2026-08-31T12:15:00Z")]
+        at_grace = self._judge(sources, journals=[self._journal("2026-08-31T12:00:00Z", SESSION_A)],
+                               grace_seconds=900)
+        past_grace = self._judge(sources, journals=[self._journal("2026-08-31T11:59:59Z", SESSION_A)],
+                                 grace_seconds=900)
+        self.assertIsNone(at_grace)
+        self.assertIsNotNone(past_grace)
+        self.assertEqual(past_grace.gap_seconds, 901)
+
+    def test_the_current_session_is_excluded_so_the_previous_one_is_judged(self):
+        """At SessionStart the newest transcript is the session that is
+        starting. Without the exclusion every wake would report itself."""
+        found = self._judge(
+            [self._source(SESSION_A, "2026-08-31T12:30:00Z"), self._source(SESSION_B, self.LAST)],
+            exclude_session_id=SESSION_A,
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_B)
+
+    def test_a_crash_followed_by_a_fast_restart_is_still_judged(self):
+        """Recency is not liveness evidence (Atlas, r1): a session that
+        crashed seconds before this wake must not be treated as live. Only
+        identity excludes."""
+        found = self._judge(
+            [self._source(SESSION_A, "2026-08-31T13:10:00Z"),  # 24 s before the wake
+             self._source(SESSION_B, self.LAST)],
+            exclude_session_id=SESSION_B,
+        )
+        self.assertIsNotNone(found)
+        self.assertEqual(found.session_id, SESSION_A)
+
+    def test_a_source_without_a_timestamp_cannot_be_the_newest(self):
+        found = self._judge([self._source(SESSION_A, ""), self._source(SESSION_B, self.LAST)])
+        self.assertEqual(found.session_id, SESSION_B)
+
+    def test_format_resume_names_an_unclean_end_in_the_header(self):
+        index = _index([_chunk(SESSION_A, 0, "last question", "")])
+        view = build_resume_view(index, session_id=SESSION_A, journal_path=None)
+        self.assertNotIn("UNCLEAN END", format_resume(view))
+        view.unclean_end = UncleanEnd(
+            session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
+            last_activity=self.LAST, last_authored_journal="2026-08-31T04:54:00Z",
+            gap_seconds=25927.0, checkpoint_session=None,
+        )
+        text = format_resume(view)
+        self.assertIn("UNCLEAN END", text.splitlines()[0])
+        self.assertIn("7h12m", text.splitlines()[0])
+        self.assertIn("no SessionEnd checkpoint", text.splitlines()[0])
+
+    def test_the_foreign_journal_wording_says_later_only_when_it_is(self):
+        from synapt.recall.resume import format_unclean_end
+        base = dict(session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
+                    last_activity=self.LAST, last_authored_journal=None,
+                    gap_seconds=None, checkpoint_session=None)
+        after = format_unclean_end(UncleanEnd(**base, foreign_journal="2026-08-31T13:00:00Z"), None)
+        before = format_unclean_end(UncleanEnd(**base, foreign_journal="2026-08-31T11:00:00Z"), None)
+        self.assertIn("A later journal at 2026-08-31T13:00:00Z", after)
+        self.assertIn("A journal at 2026-08-31T11:00:00Z", before)
+        self.assertNotIn("later", before)
