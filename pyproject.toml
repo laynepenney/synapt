@@ -117,6 +117,7 @@ dev = ["watchfiles>=0.20"]
 test = [
     "build>=1.0",
     "pytest>=7.0",
+    "tomli>=2.0; python_version < '3.11'",
     "numpy",
     "pytest-benchmark>=4.0",
     "fastapi>=0.100",
