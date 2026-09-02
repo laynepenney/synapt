@@ -191,12 +191,21 @@ def check_index_freshness(
     *,
     index_dir: Path | None = None,
     deep: bool = False,
+    source_dir: Path | None = None,
 ) -> IndexFreshness:
     """Return whether the index is behind its sources, and over which surface.
 
     ``deep=False`` compares the index manifest against the archive. ``deep=True``
     additionally compares the archive against the live transcript sources, which
     is the only leg that sees a session appended to but never re-archived.
+
+    ``source_dir`` splits the SOURCE scope from the STORE. By default the deep
+    leg enumerates live sources under the store root derived from ``index_dir``.
+    On a spawned desk whose cwd is a filesystem SIBLING of the store's root, the
+    live sources belong to cwd while the archive/manifest belong to the store, so
+    the caller passes ``source_dir=cwd`` to enumerate the RIGHT live files against
+    the store's archive. When it is ``None`` the store root is the source scope,
+    which is exactly the common case where cwd IS the store root.
 
     Costs are stated in the module docstring with the store they were measured
     on, because a bare millisecond figure invites being quoted against a
@@ -219,8 +228,15 @@ def check_index_freshness(
     #
     # `<root>/.synapt/recall/index` is the index dir, so the project root is
     # three parents up. Derived rather than passed so there is one binding, not
-    # two that can disagree.
-    live_root = index_dir.parents[2] if index_dir is not None else project_dir
+    # two that can disagree. An explicit source_dir overrides it: the cold
+    # no-caller refresh's source is cwd, which on a spawned desk is NOT the
+    # store root three parents above index_dir — comparing the store's archive
+    # against the store root's live files there would miss cwd's fresher source
+    # entirely (the store/source split, same seam _archive_and_build_locked uses).
+    if source_dir is not None:
+        live_root = source_dir
+    else:
+        live_root = index_dir.parents[2] if index_dir is not None else project_dir
 
     manifest = _read_manifest(project_dir, index_dir)
     if manifest is None:

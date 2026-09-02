@@ -420,31 +420,277 @@ def test_cmd_resume_stays_quiet_when_the_index_is_current(owned_recall_root, sto
     assert "a real question" in out, "the turns must still render"
 
 
-def test_cmd_resume_runs_the_deep_leg_only_when_cheap_is_fresh_and_view_empty(owned_recall_root, store, monkeypatch):
-    """The deep-trigger path, pinned at the call site rather than described."""
+def test_cmd_resume_cold_trigger_is_deep_and_source_aware_and_carries_the_verdict(owned_recall_root, store, monkeypatch):
+    """The cold no-caller trigger path, pinned at the call site rather than described.
+
+    Fix-forward 1+2: on a no-caller resume the cold trigger now runs ONE
+    SOURCE-AWARE (deep=True, source_dir=cwd) freshness probe, and its verdict is
+    CARRIED into the render — so `_attach_freshness` does not scan again and
+    cannot reclassify a known-stale index. This pins every half at the call site:
+    the trigger fires only with no caller, it is deep and source-aware, and when
+    it runs the attach leg is skipped. The with-caller cases are the controls that
+    keep the original attach contract (cheap, plus deep on an empty view) intact.
+    """
     import synapt.recall.freshness as fresh_mod
 
-    calls: list[bool] = []
+    calls: list[tuple[bool, object]] = []
     fresh = IndexFreshness(stale=False, build_timestamp="t", scanned="archive")
 
-    def record(project_dir=None, *, index_dir=None, deep=False):
-        calls.append(deep)
+    def record(project_dir=None, *, index_dir=None, deep=False, source_dir=None):
+        calls.append((deep, source_dir))
         return fresh
 
     monkeypatch.setattr(fresh_mod, "check_index_freshness", record)
 
     _real_index(store)
     _set_manifest(store, [])
-    _run_resume_cli(store)
-    assert calls == [False], "a view with turns must not pay for the deep leg"
 
+    # Control A: a caller is present, so the cold trigger is skipped. A view with
+    # turns pays for exactly one cheap attach leg, no deep, no source_dir.
+    from synapt.recall.resume import CallerTranscript
+    _caller = CallerTranscript(session_id="caller-0000", path=store / "caller.jsonl", mtime=0.0, size=0)
+    monkeypatch.setattr("synapt.recall.resume.caller_transcripts", lambda project: [_caller])
+    _run_resume_cli(store)
+    assert calls == [(False, None)], "with a caller + turns: one cheap attach leg, no cold trigger, no deep"
+
+    # Control B: a caller is present with an EMPTY view — the attach leg still runs
+    # cheap then deep (this leg is unchanged; source_dir stays None on attach).
     calls.clear()
     monkeypatch.setattr(
         "synapt.recall.resume.build_resume_view",
         lambda index, **kw: ResumeView(session_id="aaaaaaaa", turns=[], total_turns=0),
     )
     _run_resume_cli(store)
-    assert calls == [False, True], "an empty view with a fresh cheap leg must run deep"
+    assert calls == [(False, None), (True, None)], "with a caller + empty view: attach runs cheap then deep"
+
+    # No caller + empty view: the cold trigger runs ONE deep source-aware probe
+    # (source_dir == the render's project/cwd), and because that verdict is carried
+    # the attach leg does NOT scan again — exactly one call, deep, source-aware.
+    calls.clear()
+    monkeypatch.setattr("synapt.recall.resume.caller_transcripts", lambda project: [])
+    _run_resume_cli(store)
+    assert calls == [(True, store)], "no caller: one deep source-aware trigger probe, attach carries it (no re-scan)"
+
+    # No caller + a view WITH turns: same single deep source-aware trigger, still
+    # carried — a non-empty view does not add an attach scan on the cold path.
+    calls.clear()
+    from synapt.recall.resume import ResumeTurn
+    monkeypatch.setattr(
+        "synapt.recall.resume.build_resume_view",
+        lambda index, **kw: ResumeView(
+            session_id="aaaaaaaa",
+            turns=[ResumeTurn(chunk_id="aaaaaaaa:t0", turn_index=0, timestamp="t",
+                              user_text="q", assistant_text="a", tools_used=[], is_continuation=False)],
+            total_turns=1,
+        ),
+    )
+    _run_resume_cli(store)
+    assert calls == [(True, store)], "no caller + turns: still one carried deep source-aware probe"
+
+
+def test_cmd_resume_cold_refresh_discovery_oserror_degrades_no_lock_no_build(owned_recall_root, store, monkeypatch):
+    """this change's R2 (Atlas) closure witness, driven through the real cmd_resume.
+
+    On a cold, stale, no-caller resume the pre-load refresh walks the filesystem
+    for the newest source, and that walk can raise OSError (denied root, racing
+    unlink). It must degrade to the stale render — never abort the read, never
+    acquire the lock, never build. Removing the discovery try/except re-escapes
+    the OSError through cmd_resume (mutation-verified in
+    test_cold_no_caller_refresh)."""
+    _real_index(store)
+    _set_manifest(store, [])
+
+    lock_calls: list[int] = []
+    build_calls: list[int] = []
+    monkeypatch.setattr(
+        "synapt.recall.freshness.check_index_freshness",
+        lambda *a, **k: IndexFreshness(stale=True, build_timestamp="t", scanned="archive"),
+    )
+    monkeypatch.setattr("synapt.recall.resume.caller_transcripts", lambda project: [])
+
+    def _raise(*a, **k):
+        raise OSError("denied")
+
+    monkeypatch.setattr("synapt.recall.cli._newest_source_file", _raise)
+    monkeypatch.setattr("synapt.recall.cli._acquire_build_lock", lambda *a, **k: lock_calls.append(1))
+    monkeypatch.setattr("synapt.recall.cli._archive_and_build_locked", lambda *a, **k: build_calls.append(1))
+
+    out = _run_resume_cli(store)  # must NOT raise
+
+    assert lock_calls == [], "discovery failed before the lock; nothing acquired"
+    assert build_calls == [], "nothing built"
+    assert "Session" in out, "the read still produced a resume render"
+
+
+# ---------------------------------------------------------------------------
+# Fix-forward 1+2 (this change's R1, Sentinel): the cold no-caller trigger must be
+# SOURCE-AWARE and its verdict CARRIED. The measured defect was a live source
+# newer than its archive (deep-stale, cheap-fresh) rendering an old tail with NO
+# STALE: the cheap trigger never saw it and the cheap attach called the
+# un-refreshed index fresh. These three witnesses drive the real cmd_resume.
+# ---------------------------------------------------------------------------
+
+
+def _write_turn(db_path: Path, cid: str, turn_index: int, q: str, a: str) -> None:
+    from synapt.recall.storage import RecallDB
+
+    db = RecallDB(db_path)
+    db.save_chunks([TranscriptChunk(
+        id=cid, session_id="aaaaaaaa-0000-0000-0000-000000000000",
+        timestamp="2026-08-06T10:00:00Z", turn_index=turn_index,
+        user_text=q, assistant_text=a, tools_used=[], files_touched=[],
+        tool_content="", transcript_path="", byte_offset=0, byte_length=0,
+    )])
+    db.close()
+
+
+def test_cmd_resume_cold_pristine_lock_held_still_renders_stale(owned_recall_root, store, monkeypatch):
+    """Lock-held leg of the carry: a deep-stale/cheap-fresh index with the build
+    lock HELD builds nothing, so the ONLY thing that can warn the reader is the
+    carried source-aware verdict. Before the fix this rendered an old tail with no
+    STALE (the measured refresh_calls=0 case)."""
+    _real_index(store)
+    f = _archive_file(_archive_dir(store), "a.jsonl", "one")
+    _set_manifest(store, [_entry(f)])                       # cheap: archive == manifest -> FRESH
+
+    monkeypatch.setattr("synapt.recall.resume.caller_transcripts", lambda project: [])
+    # deep: a live source the archive has never seen; source scope == the render's cwd.
+    # It must EXIST on disk — the deep leg stats each live file and skips OSErrors.
+    live = store / "rollout-live-newer.jsonl"
+    live.write_text("a live turn never archived")
+    monkeypatch.setattr(
+        "synapt.recall.freshness._live_source_files",
+        lambda root: [live] if Path(root) == store else [],
+    )
+    # a real newest source so the refresh reaches the lock rather than no_source
+    monkeypatch.setattr("synapt.recall.cli._newest_source_file", lambda p: live)
+    monkeypatch.setattr("synapt.recall.cli._acquire_build_lock", lambda *a, **k: None)  # HELD
+    build_calls: list[int] = []
+    monkeypatch.setattr("synapt.recall.cli._archive_and_build_locked",
+                        lambda *a, **k: build_calls.append(1))
+
+    out = _run_resume_cli(store)
+
+    assert build_calls == [], "lock held: nothing built"
+    assert "STALE" in out.upper(), "a known-stale index with the lock held must still say STALE"
+    assert "a real question" in out, "the old turn still renders under the banner"
+
+
+def test_cmd_resume_cold_pristine_lock_error_still_renders_stale(owned_recall_root, store, monkeypatch):
+    """Error leg of the carry: the same deep-stale/cheap-fresh index, but the lock
+    ACQUIRE raises. The refresh degrades to `error`, builds nothing, and the
+    carried verdict still renders STALE — a failure to refresh must never present
+    as a fresh index."""
+    _real_index(store)
+    f = _archive_file(_archive_dir(store), "a.jsonl", "one")
+    _set_manifest(store, [_entry(f)])
+
+    monkeypatch.setattr("synapt.recall.resume.caller_transcripts", lambda project: [])
+    live = store / "rollout-live-newer.jsonl"
+    live.write_text("a live turn never archived")
+    monkeypatch.setattr(
+        "synapt.recall.freshness._live_source_files",
+        lambda root: [live] if Path(root) == store else [],
+    )
+    monkeypatch.setattr("synapt.recall.cli._newest_source_file", lambda p: live)
+
+    def _boom(*a, **k):
+        raise OSError("lock parent is a file")
+
+    monkeypatch.setattr("synapt.recall.cli._acquire_build_lock", _boom)
+    build_calls: list[int] = []
+    monkeypatch.setattr("synapt.recall.cli._archive_and_build_locked",
+                        lambda *a, **k: build_calls.append(1))
+
+    out = _run_resume_cli(store)
+
+    assert build_calls == [], "acquire raised before the build; nothing built"
+    assert "STALE" in out.upper(), "a refresh error must still surface the known-stale index"
+    assert "a real question" in out, "the old turn still renders"
+
+
+def test_cmd_resume_cold_ab_store_split_builds_into_A_and_renders_the_new_turn(owned_recall_root, tmp_path, monkeypatch):
+    """The happy path across a store split. GRIPSPACE_ROOT store A owns the index
+    the render loads; cwd B is a filesystem SIBLING owning a live source newer than
+    A's archive. The source-aware trigger (source=B, archive=A) detects it, the
+    refresh targets A (store=A, source=B, no B/.synapt), and the reloaded A renders
+    the NEW turn.
+
+    The heavy archive+build is replaced by a side-effect that writes the turn the
+    build would produce into A's index, so the RELOAD+RENDER path is exercised for
+    real (archiver/builder are covered by their own suites). Real fs, real lock.
+
+    MUTATION deep->cheap: a cheap trigger reads A cheap-fresh, skips the refresh,
+    the side-effect never runs, and only the OLD turn renders -> this test reds.
+    """
+    from argparse import Namespace
+
+    a = tmp_path / "canonical"
+    b = tmp_path / "agent-desk"
+    a_index = a / ".synapt" / "recall" / "index"
+    a_index.mkdir(parents=True)
+    b.mkdir()
+
+    # A: one OLD turn, and an archive+manifest that AGREE (cheap FRESH).
+    _write_turn(a_index / "recall.db", "aaaaaaaa:t0", 0, "the OLD question", "old answer")
+    arch = a / ".synapt" / "recall" / "worktrees" / "wt" / "transcripts"
+    arch.mkdir(parents=True)
+    af = arch / "a.jsonl"
+    af.write_text("one")
+    con = sqlite3.connect(a_index / "recall.db")
+    con.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('source_files', ?)",
+                (json.dumps([_entry(af)]),))
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('build_timestamp', 'ts-old')")
+    con.commit()
+    con.close()
+
+    # B owns a live source A has never archived (deep-stale, source-scoped to B).
+    # It must EXIST on disk — the deep leg stats each live file.
+    b_live = b / "rollout-new.jsonl"
+    b_live.write_text("a fresh session over on B")
+    monkeypatch.setattr("synapt.recall.resume.caller_transcripts", lambda project: [])
+    monkeypatch.setattr(
+        "synapt.recall.freshness._live_source_files",
+        lambda root: [b_live] if Path(root) == b else [],
+    )
+    monkeypatch.setattr("synapt.recall.cli._newest_source_file", lambda p: b_live)
+
+    captured: dict[str, object] = {}
+
+    def spy_build(project_dir, source_dirs, **kw):
+        captured["store"] = Path(project_dir)
+        captured["source"] = kw.get("source_dir")
+        # write the turn the real incremental build would produce, INTO A.
+        _write_turn(_index_dir(Path(project_dir)) / "recall.db",
+                    "aaaaaaaa:t1", 1, "the FRESH question", "fresh answer")
+        return None
+
+    monkeypatch.setattr("synapt.recall.cli._archive_and_build_locked", spy_build)
+
+    args = Namespace(index=str(a_index), session=None, turns=10, project=b)
+    out = _io_run_resume(args)
+
+    assert captured.get("store") == a.resolve(), "the build must target store A (GRIPSPACE_ROOT), resolved"
+    assert captured.get("source") == b, "the SOURCE scope stays cwd B"
+    assert not (b / ".synapt").exists(), "no cwd-derived secondary store"
+    assert "the FRESH question" in out, "the reloaded A must render the newly-built turn"
+
+
+def _io_run_resume(args) -> str:
+    """Run cmd_resume against a hand-built Namespace (project/index may differ)."""
+    import contextlib as _cl
+    import io as _io
+
+    from synapt.recall.cli import cmd_resume
+
+    out = _io.StringIO()
+    try:
+        with _cl.redirect_stdout(out), _cl.redirect_stderr(_io.StringIO()):
+            cmd_resume(args)
+    except SystemExit:
+        pass
+    return out.getvalue()
 
 
 # ---------------------------------------------------------------------------

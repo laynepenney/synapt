@@ -56,6 +56,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -225,6 +226,184 @@ def _release_build_lock(fd: int) -> None:
         os.close(fd)
 
 
+@dataclass(frozen=True)
+class ColdRefreshOutcome:
+    """Result of a cold no-caller resume refresh, for the render label and tests.
+
+    ``reason`` is one of: ``refreshed`` (the incremental build advanced the
+    index), ``up_to_date`` (build ran, nothing to commit), ``lock_held`` (the
+    build lock was busy -- including a recall#1018 ghost lock -- so NOTHING was
+    built and the read never waited), ``no_source`` (no source to refresh from),
+    ``custom_store`` (a non-canonical ``--index`` this refresh cannot map to a
+    build root), ``error`` (ANY refresh failure -- source discovery, data-dir
+    resolution, lock acquisition, the build, or lock release; the read proceeds
+    on the stale index). The two cursor fields are the index build timestamps
+    before and after, so a reader can tell a freshened tail from a stale one.
+    """
+
+    attempted: bool
+    refreshed: bool
+    source: str
+    cursor_before: str
+    cursor_after: str
+    reason: str
+
+
+def _newest_source_file(project_dir: Path) -> Path | None:
+    """The most recently modified transcript source that BELONGS to this project.
+
+    Pure filesystem discovery over the same roots the build reads -- this
+    worktree's live transcript dirs, every worktree's archive, and the Codex
+    sessions dir. No caller resolution, no identity: on a cold launch there is
+    no caller, and the freshest source is simply the newest file by mtime.
+
+    Project scope is load-bearing (this change's R1 (Sentinel)). The transcript-dir
+    and archive roots are already project-owned by construction, so an rglob of
+    them stays in scope. The Codex sessions dir is NOT -- it holds every
+    project's rollouts under one tree -- so it is filtered through
+    list_codex_transcripts(project_dir=...) rather than rglob'd raw. Without the
+    filter, an unrelated newer rollout from another project is selected as "the
+    freshest source" and triggers a build for a project that owns no sources,
+    violating the no_source/no-build bound.
+    """
+    from synapt.recall.codex import discover_codex_sessions, list_codex_transcripts
+
+    # Roots that are project-scoped by construction; rglob stays in scope.
+    roots: list[Path] = []
+    roots.extend(project_transcript_dirs(project_dir))
+    roots.extend(all_worktree_archive_dirs(project_dir))
+    archive = project_archive_dir(project_dir)
+    if archive.exists():
+        roots.append(archive)
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved in seen or not root.exists():
+            continue
+        seen.add(resolved)
+        candidates.extend(root.rglob("*.jsonl"))
+
+    # Codex: filter to this project's rollouts only, never the whole tree.
+    codex = discover_codex_sessions()
+    if codex is not None:
+        candidates.extend(list_codex_transcripts(codex, project_dir=project_dir))
+
+    newest: Path | None = None
+    newest_mtime = -1.0
+    for path in candidates:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if mtime > newest_mtime:
+            newest, newest_mtime = path, mtime
+    return newest
+
+
+def cold_no_caller_refresh(project_dir: Path, index_dir: Path) -> ColdRefreshOutcome:
+    """Incrementally refresh the newest source before a cold, stale resume.
+
+    Contract (durable-checkpoint follow-on): the caller is resume, which has already
+    established there is NO caller session and the index is STALE. This tries to
+    make the tail fresher. It NEVER WAITS ON A HELD BUILD LOCK:
+
+      * try-acquire the build lock NON-BLOCKING (timeout 0). If it is held --
+        the recall#1018 ghost-lock case included -- return immediately having
+        built NOTHING, so resume falls back to the durable-checkpoint block.
+      * otherwise run the OSS incremental build (no embeddings) under that lock.
+        This build is SYNCHRONOUS: when the lock is free it runs inline and
+        delays the render by the incremental build's own duration. It never
+        waits on ANOTHER holder, but it is not free on the success path. It
+        reports the index build timestamp before and after so the render can
+        say what it refreshed.
+
+    Never raises: EVERY failure in the refresh -- source discovery, data-dir
+    resolution, lock acquisition, the build, and lock release -- degrades to the
+    stale render, which is strictly what resume did before this existed.
+    """
+    from synapt.recall.freshness import check_index_freshness
+
+    def _build_ts() -> str:
+        try:
+            return check_index_freshness(project_dir, index_dir=index_dir).build_timestamp or ""
+        except Exception:
+            return ""
+
+    before = _build_ts()
+    # Source discovery walks the filesystem (rglob/stat/resolve/exists) and can
+    # itself raise OSError — a permission-denied root, a racing unlink, a broken
+    # mount. That is BEFORE the lock, so it sat outside the build-error/lock
+    # degradation boundary and could abort the cold read instead of falling back
+    # to the durable-checkpoint block. Catch it here so discovery, like the build,
+    # degrades to the stale render (this change's R2 (Atlas)).
+    try:
+        source = _newest_source_file(project_dir)
+    except OSError:
+        return ColdRefreshOutcome(True, False, "", before, before, "error")
+    if source is None:
+        return ColdRefreshOutcome(True, False, "", before, before, "no_source")
+
+    # Resolve the STORE separately from the SOURCE. resume LOADS the index from
+    # index_dir; the refresh must lock, archive and build into THAT SAME store,
+    # or a spawned desk whose cwd is a filesystem SIBLING of the store's root
+    # would freshen a cwd-derived SECONDARY store and reload the untouched stale
+    # one, leaving the durable-checkpoint fruit stale (this change's R2 (Atlas)). Thread the
+    # ALREADY-RESOLVED index_dir the caller loaded, not a re-resolution from cwd:
+    # project_dir (cwd) stays the SOURCE scope for _newest_source_file above and
+    # for the transcript/rollout discovery threaded below.
+    #
+    # A canonical store index is ``<root>/.synapt/recall/index``, so its root is
+    # three parents up. A --index that is NOT that layout is a store we cannot map
+    # to a build root (checking the layout rather than blindly trusting
+    # index.parent — this change's R2 (Atlas)), so degrade to the stale render rather
+    # than freshen a DIFFERENT store.
+    _p = index_dir.parent
+    if not (index_dir.name == "index" and _p.name == "recall" and _p.parent.name == ".synapt"):
+        return ColdRefreshOutcome(True, False, source.name, before, before, "custom_store")
+    # Resolving the store data dir and acquiring the lock touch the filesystem (an
+    # unresolvable root raises ValueError; mkdir + os.open on the lock parent raise
+    # OSError — a lock parent that is a regular file yields NotADirectoryError).
+    # Those sat outside the degradation boundary and escaped cmd_resume; guard the
+    # whole acquire lifecycle so it degrades like the build.
+    try:
+        store_root = index_dir.resolve().parent.parent.parent
+        data_dir = project_data_dir(store_root)
+        lock_fd = _acquire_build_lock(data_dir, timeout=0.0)
+    except (OSError, ValueError):
+        return ColdRefreshOutcome(True, False, source.name, before, before, "error")
+    if lock_fd is None:
+        # Ghost-lock control: the lock is held (possibly by a dead holder,
+        # recall#1018). Build nothing, wait for nothing; the caller renders the
+        # durable-checkpoint block and only that.
+        return ColdRefreshOutcome(True, False, source.name, before, before, "lock_held")
+    try:
+        _archive_and_build_locked(
+            store_root, None, use_embeddings=False, incremental=True, chatgpt_archive=None,
+            source_dir=project_dir,
+        )
+    except Exception:
+        return ColdRefreshOutcome(True, False, source.name, before, before, "error")
+    finally:
+        # Releasing the lock can itself raise OSError (a closed/invalid fd, an
+        # unlink on a vanished lock file). In a finally it would OVERRIDE the
+        # outcome above: a release failure after a successful build is still a
+        # successful refresh, and after a build error is still that build error.
+        # Swallow it to the same non-raising contract this function promises.
+        try:
+            _release_build_lock(lock_fd)
+        except OSError:
+            pass
+
+    after = _build_ts()
+    refreshed = bool(after) and after != before
+    return ColdRefreshOutcome(
+        True, refreshed, source.name, before, after,
+        "refreshed" if refreshed else "up_to_date",
+    )
+
+
 def _build_journal_files(project_dir: Path) -> list[Path]:
     """Every journal file this build reads: local, plus each other worktree's.
 
@@ -291,14 +470,26 @@ def _archive_and_build_locked(
     incremental: bool,
     chatgpt_archive: str | None,
     progress: Callable[[str], None] | None = None,
+    source_dir: Path | None = None,
 ) -> TranscriptIndex | None:
-    """Inner build logic — caller must hold the build lock."""
+    """Inner build logic — caller must hold the build lock.
+
+    *project_dir* is the STORE scope: index, archive, worktree, channel, journal
+    and knowledge paths all resolve from it. *source_dir*, when given, is the
+    SOURCE scope — the only two inputs that live OUTSIDE the store (raw Claude
+    transcripts and the project-owned Codex rollouts). It defaults to
+    *project_dir*, so every existing caller is unchanged. The two differ only for
+    a cold no-caller resume, where the source is cwd but the store must be the
+    GRIPSPACE_ROOT one the load reads, never a cwd-derived secondary store
+    (this change's R2 (Atlas)).
+    """
     import time as _time
 
     from synapt.recall.archive import archive_transcripts
     from synapt.recall.codex import archive_codex_transcripts
     from synapt.recall.storage import RecallDB
 
+    effective_source = source_dir if source_dir is not None else project_dir
     build_t0 = _time.monotonic()
     index_dir = project_index_dir(project_dir)
     archive_dir = project_archive_dir(project_dir)
@@ -307,7 +498,7 @@ def _archive_and_build_locked(
     if progress:
         progress("archiving")
     if not source_dirs:
-        source_dirs = project_transcript_dirs(project_dir)
+        source_dirs = project_transcript_dirs(effective_source)
 
     if source_dirs:
         for src in source_dirs:
@@ -315,7 +506,12 @@ def _archive_and_build_locked(
             if copied:
                 print(f"  Archived {len(copied)} new transcript(s) from {src}")
 
-    codex_copied = archive_codex_transcripts(project_dir)
+    # Only pass the store split when source and store actually differ, so the
+    # common single-store call stays byte-identical for existing callers/mocks.
+    if effective_source is project_dir:
+        codex_copied = archive_codex_transcripts(project_dir)
+    else:
+        codex_copied = archive_codex_transcripts(effective_source, store_dir=project_dir)
     if codex_copied:
         print(f"  Archived {len(codex_copied)} Codex transcript(s)")
 
@@ -1367,6 +1563,63 @@ def cmd_resume(args: argparse.Namespace) -> None:
         print("Run 'synapt recall build' or 'synapt init' first.", file=sys.stderr)
         sys.exit(1)
 
+    project = getattr(args, "project", None) or Path.cwd()
+    caller_sources = caller_transcripts(project)
+
+    # Cold no-caller refresh (durable-checkpoint follow-on): on a cold cross-runtime
+    # launch there is no caller transcript, so the caller-tail refresh has
+    # nothing to act on and the shared index may be months stale. When there is
+    # no caller AND the index is stale, try a NON-BLOCKING incremental refresh of
+    # the newest source before loading, and label what it refreshed. It never
+    # WAITS ON A HELD BUILD LOCK: a held lock or any refresh error degrades to the
+    # stale render plus the durable-checkpoint block. A free-lock build
+    # runs synchronously and delays the render by its own (no-embeddings) duration.
+    refresh_label = None
+    cold_freshness = None  # source-aware verdict carried into _attach_freshness
+    if not caller_sources:
+        from synapt.recall.freshness import check_index_freshness
+
+        # The cold trigger must be SOURCE-AWARE. The cheap archive-vs-index check
+        # cannot see a live source appended to but never re-archived (deep says
+        # stale, cheap says fresh), so the cheap trigger left the pristine cold
+        # case rendering an old tail with NO stale banner — the "honest stale
+        # index plus durable block" fallback was not honest, it was silent.
+        # Go DEEP, and scope the live enumeration to cwd (the SOURCE) against the
+        # store's archive so a spawned desk sees its own fresher source. This
+        # costs one archive+sources scan on every cold no-caller resume (~1.2 s
+        # on the store it was measured against; the module docstring carries the
+        # size caveat).
+        try:
+            cold_freshness = check_index_freshness(
+                project, index_dir=index_dir, deep=True, source_dir=project
+            )
+        except Exception:
+            cold_freshness = None
+        if cold_freshness is not None and cold_freshness.stale:
+            outcome = cold_no_caller_refresh(project, index_dir)
+            if outcome.refreshed:
+                refresh_label = (
+                    f"source {outcome.source}, index "
+                    f"{outcome.cursor_before or '(unrecorded)'} → {outcome.cursor_after}"
+                )
+            # Carry the verdict so the later cheap _attach_freshness cannot erase a
+            # known-stale state. After a build ran (refreshed / up_to_date)
+            # RECOMPUTE the source-aware verdict against the same source/store so
+            # the render reflects the post-build state; on a no-build leg
+            # (lock_held / error / custom_store) KEEP the known-stale verdict, or
+            # the cheap attach would report the un-refreshed index as fresh —
+            # exactly the missing-STALE-banner defect this fixes.
+            if outcome.reason in ("refreshed", "up_to_date"):
+                try:
+                    cold_freshness = check_index_freshness(
+                        project, index_dir=index_dir, deep=True, source_dir=project
+                    )
+                except Exception:
+                    # Keep the pre-build stale verdict: a stale banner over a
+                    # freshened index is safe; a missing banner over a stale one is
+                    # the defect this change fixes.
+                    pass
+
     index = load_resume_index(index_dir)
 
     try:
@@ -1376,9 +1629,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
                 session_id=getattr(args, "session", None),
                 limit=getattr(args, "turns", None) or 10,
                 journal_path=_journal_path(),
-                caller_sources=caller_transcripts(
-                    getattr(args, "project", None) or Path.cwd()
-                ),
+                caller_sources=caller_sources,
                 agent_id=os.environ.get("SYNAPT_AGENT_ID"),
             )
         except ResumeError as exc:
@@ -1403,7 +1654,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # because it is the moment an "empty" verdict either becomes load-bearing
     # or turns out to be an un-archived session. Everywhere else the cheap leg
     # (~24 ms there) answers, and a stale verdict needs no second opinion.
-    view = _attach_freshness(view, args)
+    view = _attach_freshness(view, args, precomputed=cold_freshness)
     view = _attach_unclean_end(view, args)
 
     # On a cold/stale resume the tail-bound journal path can miss the freshest
@@ -1413,6 +1664,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
     from synapt.recall.resume import attach_durable_checkpoint
 
     view = attach_durable_checkpoint(view, _journal_path())
+    view.refresh_label = refresh_label
 
     # The MCP recall_resume tool wraps its output with the
     # query-time freshness line (server.py:_query_freshness_line /
@@ -1462,16 +1714,26 @@ def _attach_unclean_end(view, args):
     return view
 
 
-def _attach_freshness(view, args):
+def _attach_freshness(view, args, *, precomputed=None):
     """Return *view* with an index-freshness verdict attached.
 
     Never raises: a failure to compute freshness must not break the command it
     annotates. On failure the verdict stays ``None``, which the renderer treats
     as NOT CHECKED rather than as fresh.
+
+    ``precomputed`` is a verdict the caller already computed for THIS render — the
+    cold no-caller path computes a source-aware (deep) verdict at its trigger and,
+    on a no-build leg, that verdict is the only record that the index is stale.
+    When it is given it is attached verbatim and no scan runs here, so the later
+    cheap check cannot silently reclassify a known-stale index as fresh, and the
+    deep scan is not paid twice.
     """
     import dataclasses
 
     from synapt.recall.freshness import check_index_freshness
+
+    if precomputed is not None:
+        return dataclasses.replace(view, freshness=precomputed)
 
     # Bind to the index the RENDER loaded, not to a separately-resolved
     # project. `resume` has no --project, so resolving one here meant freshness
