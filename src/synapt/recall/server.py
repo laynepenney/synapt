@@ -2859,12 +2859,23 @@ def recall_channel(
         intent: Declare intent to create something (message = description of planned work).
     """
     state_store = None
+    log_store = None
     try:
         from synapt.recall.actions import get_action_registry
-        from synapt.recall.channel import _db_path
+        from synapt.recall.channel import _channels_dir, _db_path
 
         registry = get_action_registry()
         state_store = _db_path().resolve()
+        # _db_path is ALWAYS Tier-3 local by design (presence/cursors/pins/
+        # mutes stay per-gripspace even when channels are shared); _channels_dir
+        # can resolve to the Tier-2 GLOBAL store. So the JSONL log this call
+        # actually reads/writes can live in a different directory than the
+        # state store just named above -- naming only the state store let a
+        # gripspace-local dev.jsonl "look live" after the real log moved to
+        # the global path, since nothing in the output ever said
+        # the log was elsewhere. Named unconditionally, not only when they
+        # diverge: a caller should never have to infer agreement from silence.
+        log_store = _channels_dir().resolve()
         result = registry.dispatch(
             action,
             channel=channel,
@@ -2879,9 +2890,13 @@ def recall_channel(
             detail=detail,
             msg_type=msg_type,
         )
-        return f"Channel state store: {state_store}\n{result}"
+        return f"Channel state store: {state_store}\nChannel log store: {log_store}\n{result}"
     except Exception as exc:
-        prefix = f"Channel state store: {state_store}\n" if state_store else ""
+        prefix = ""
+        if state_store:
+            prefix += f"Channel state store: {state_store}\n"
+        if log_store:
+            prefix += f"Channel log store: {log_store}\n"
         return f"{prefix}Channel failed: {exc}"
 
 
