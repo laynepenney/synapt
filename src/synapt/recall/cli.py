@@ -1414,7 +1414,18 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
     view = attach_durable_checkpoint(view, _journal_path())
 
-    print(format_resume(view))
+    # The MCP recall_resume tool wraps its output with the
+    # query-time freshness line (server.py:_query_freshness_line /
+    # _with_query_freshness); this CLI command never did, so a CLI caller
+    # saw only the older archive-staleness warning above and no signal at
+    # all about whether THIS session's own tail is fresh. Reuse the same
+    # helpers server.py already built and tested rather than duplicating
+    # the logic -- refresh-current-session exceptions render as an
+    # ERROR-state line; _with_query_freshness appends that line.
+    from synapt.recall.server import _query_freshness_line, _with_query_freshness
+
+    freshness_line = _query_freshness_line(index_dir)
+    print(_with_query_freshness(format_resume(view), freshness_line))
 
 
 def _attach_unclean_end(view, args):
