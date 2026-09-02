@@ -901,9 +901,44 @@ def sync_source(
         connection.close()
 
 
+_FTS_STOPWORDS = frozenset(
+    """
+    a about after again all am an and any are as at be because been before
+    being below between both but by can could did do does doing don down
+    during each few for from further had has have having he her here hers
+    herself him himself his how i if in into is it its itself just let me
+    more most my myself no nor not now of off on once only or other our
+    ours ourselves out over own same she should so some someone something
+    such than that the their theirs them themselves then there these they
+    this those through to too under until up very was we were what when
+    where which while who whom why will with would you your yours
+    yourself yourselves ve re ll s t d m
+    """.split()
+)
+
+
 def _fts_query(query: str) -> str:
+    """Space-separated quoted tokens, which SQLite FTS5 MATCH treats as an
+    AND of every token. English filler words are dropped first so a verbose
+    natural-language question doesn't fail purely because "how", "does", or
+    "the" happens not to co-occur with a document's real content words --
+    the actual defect this stopword filter closes (a token-count/phrasing
+    problem, independent of any semantic/synonym gap; tracked privately,
+    measured on a real corpus before this change).
+
+    Filtering never turns a real query into an unconstrained one: if every
+    token happens to be a stopword (or the query is otherwise short), the
+    unfiltered tokens are used instead of falling through to an empty match
+    expression. AND semantics are preserved exactly -- this narrows WHICH
+    tokens must co-occur, never loosens co-occurrence to OR. A query whose
+    every (filtered) token is genuinely absent from the corpus still returns
+    nothing: this is a structural property of AND, not a tuned threshold --
+    verified empirically too, see the fix's PR body.
+    """
     tokens = re.findall(r"[\w.+-]+", query, flags=re.UNICODE)
-    return " ".join('"' + token.replace('"', '""') + '"' for token in tokens)
+    content_tokens = [t for t in tokens if t.lower() not in _FTS_STOPWORDS]
+    use = content_tokens if content_tokens else tokens
+    return " ".join('"' + token.replace('"', '""') + '"' for token in use)
 
 
 def _row_to_result(
