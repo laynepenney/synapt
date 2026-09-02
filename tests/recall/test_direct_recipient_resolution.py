@@ -34,9 +34,8 @@ def _isolated_direct_store(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("synapt.recall.channel._agent_id", lambda: "apollo-001")
     # Patch Path.home() for tests that remove SYNAPT_SHARED_CHANNELS_DIR.
-    # Both direct and registry import the same pathlib.Path class; one patch
-    # affects all references. This ensures Path.home() returns the test's
-    # isolated tmp_path, not the real home, for all code in the test file.
+    # Ensures Path.home() returns the test's isolated tmp_path, not the real
+    # home, for all code in the test file.
     fake_home = tmp_path / "home"
     fake_home.mkdir(exist_ok=True)
     monkeypatch.setattr("synapt.recall.direct.Path.home", classmethod(lambda cls: fake_home))
@@ -468,15 +467,14 @@ def test_parametrized_tests_do_not_escape_isolation_to_shared_store(
     multiple times (e.g., from parametrization), each instance should register
     agents to its own isolated team.db, not to the shared ~/.synapt/orgs/<org>/team.db.
 
-    The _isolated_direct_store autouse fixture patches Path.home() in both
-    synapt.recall.direct and synapt.recall.registry modules so that:
+    The _isolated_direct_store autouse fixture patches Path.home() so that:
     1. _team_db_path() returns a path in the isolated fake_home
     2. When SYNAPT_SHARED_CHANNELS_DIR is removed, fallback still uses fake_home
     3. Multiple test instances all write to their own tmp_path, not the real home
 
     This test verifies that isolation holds even when env vars are manipulated.
     """
-    from synapt.recall.registry import register_agent, _team_db_path, _check_org_entitlement
+    from synapt.recall.registry import register_agent, _team_db_path
     import sqlite3
 
     # The _isolated_direct_store fixture has already set up isolation with:
