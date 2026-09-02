@@ -190,22 +190,53 @@ class IndexStats:
     imports: int = 0
     rows_written: int = 0
     errors: list[str] = field(default_factory=list)
+    #: True when tree-sitter-language-pack (the ``code-index`` extra) could
+    #: not be imported at all, distinct from a genuine per-file parse
+    #: failure — see the module-level note above _parser_stack_available().
+    parser_stack_missing: bool = False
 
 
 # --------------------------------------------------------------------------
 # Parsing
 # --------------------------------------------------------------------------
 
+#: Tri-state cache for _parser_stack_available(): None = not yet checked this
+#: process. Checked once per process rather than once per file, so a repo
+#: with hundreds of files doesn't retry the same failing import hundreds of
+#: times, and so index_repo can surface ONE clear signal instead of one
+#: generic per-file error.
+_PARSER_STACK_AVAILABLE: bool | None = None
+
+
+def _parser_stack_available() -> bool:
+    """Whether tree-sitter-language-pack (the ``code-index`` extra) can be
+    imported at all. Cached at module level — see ``_PARSER_STACK_AVAILABLE``.
+    """
+    global _PARSER_STACK_AVAILABLE
+    if _PARSER_STACK_AVAILABLE is None:
+        try:
+            import tree_sitter_language_pack  # noqa: F401
+        except ImportError:
+            _PARSER_STACK_AVAILABLE = False
+        else:
+            _PARSER_STACK_AVAILABLE = True
+    return _PARSER_STACK_AVAILABLE
+
 
 def _get_parser(lang: str):
     """Return a parser, or ``None`` when the grammar is unavailable.
 
     Imported lazily so that importing this module — and the rest of recall —
-    does not require the tree-sitter stack to be installed.
+    does not require the tree-sitter stack to be installed. Whether the
+    absence is the whole package missing or just this one grammar name is
+    not this function's concern — index_repo() asks _parser_stack_available()
+    separately, once, to tell those two cases apart.
     """
+    if not _parser_stack_available():
+        return None
     try:
         from tree_sitter_language_pack import get_parser
-    except ImportError:  # pragma: no cover - exercised by environments without the extra
+    except ImportError:  # pragma: no cover - _parser_stack_available() already checked this
         return None
     try:
         return get_parser(lang)
@@ -445,6 +476,8 @@ def index_repo(
     """
     root = Path(root).resolve()
     stats = IndexStats()
+    stats.parser_stack_missing = not _parser_stack_available()
+    stack_missing_reported = False
     conn = _connect(db_path)
     changes_before = conn.total_changes
 
@@ -464,6 +497,21 @@ def index_repo(
             suffix = source_path.suffix.lower()
             grammar = EXT_TO_LANG[suffix]
             lang = LANG_ALIAS.get(grammar, grammar)
+
+            if stats.parser_stack_missing:
+                # No write at all, and NOT counted as indexed: writing a row
+                # here would carry the file's real content_hash with empty
+                # symbols/imports, so a later run with the stack installed
+                # would see "unchanged" and skip it forever — silently
+                # poisoning the index against ever actually being built.
+                if not stack_missing_reported:
+                    stats.errors.append(
+                        "tree-sitter-language-pack is not installed — code "
+                        "indexing is disabled; install with "
+                        "pip install 'synapt[code-index]'"
+                    )
+                    stack_missing_reported = True
+                continue
 
             try:
                 raw = source_path.read_bytes()
