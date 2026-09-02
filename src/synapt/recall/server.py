@@ -268,6 +268,19 @@ def _label_empty_result(result: str, index_dir: Path) -> str:
             f"{verdict.build_timestamp or 'at an unrecorded time'}, "
             f"checked: {verdict.scanned}."
         )
+    if verdict.skipped_oversize:
+        # Deliberately printed regardless of stale/current above: a
+        # skipped-oversize file was examined and rejected, not merely
+        # unindexed, so it belongs in neither branch above and must not be
+        # silent just because everything ELSE is current.
+        skipped_desc = "; ".join(
+            f"{s.get('name', '?')} ({s.get('size', 0):,} bytes)"
+            for s in verdict.skipped_oversize
+        )
+        status += (
+            f"\nSkipped (oversize, not searchable): {len(verdict.skipped_oversize)} "
+            f"file(s) -- {skipped_desc}. Raise SYNAPT_MAX_TRANSCRIPT_FILE_BYTES to include."
+        )
     return f"{result}\n\nIndex root: {index_dir}\n{status}"
 
 
@@ -1074,6 +1087,12 @@ def _run_build_job(project: Path, receipt: dict, incremental: bool) -> None:
         else:
             receipt["stats"] = {"chunk_count": 0, "session_count": 0}
             receipt["result"] = "no transcripts found"
+        # Visible even on the "no transcripts found" branch: a
+        # store whose only source content is one oversize file still needs
+        # its skip on the receipt, not just a silent zero-chunk result.
+        receipt["skipped_oversize"] = (
+            final_index.skipped_oversize if final_index is not None else []
+        )
     except BaseException as exc:
         receipt["state"] = "failed"
         receipt["phase"] = "failed"

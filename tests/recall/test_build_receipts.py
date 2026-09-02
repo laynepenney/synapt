@@ -24,6 +24,7 @@ def _release_server_markers():
 
 class _FakeIndex:
     chunks = [object()]
+    skipped_oversize: list = []
 
     @staticmethod
     def stats() -> dict:
