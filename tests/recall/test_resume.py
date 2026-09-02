@@ -1460,6 +1460,39 @@ class TestEmptyAndErrorStates(unittest.TestCase):
         self.assertLess(out.index("first answer"), out.index("last answer"),
                         "turns must read oldest-first so the tail ends at the newest")
 
+    def test_cli_emits_the_same_freshness_line_the_mcp_tool_does(self):
+        """server.py's recall_resume wraps format_resume with
+        _query_freshness_line/_with_query_freshness (server.py:794); cmd_resume
+        never did, so a CLI caller never saw a "Freshness: ..." line at all --
+        only the older, unrelated archive-staleness warning.
+        refresh-current-session exceptions render as an ERROR-state line
+        (see test_cli_survives_a_refresh_current_session_failure below for
+        that specific boundary); _with_query_freshness appends whatever
+        line it is given, so this line must appear regardless of the
+        surrounding environment."""
+        _save_sqlite_index([_chunk(SESSION_A, 0, "q", "a")], self.dir)
+        out, _, code = _run_cli(self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn("Freshness:", out)
+
+    def test_cli_survives_a_refresh_current_session_failure(self):
+        """The specific boundary the parity test above assumes but does not
+        exercise: _query_freshness_line catches refresh_current_session
+        exceptions and renders an ERROR-state line rather than propagating.
+        _with_query_freshness itself has no such handling -- it is a bare
+        f-string append and cannot raise from a well-formed string input --
+        so the protection is entirely refresh_current_session's boundary,
+        not a property of both helpers. A mutation removing that try/except
+        must turn this red."""
+        _save_sqlite_index([_chunk(SESSION_A, 0, "q", "a")], self.dir)
+        with mock.patch(
+            "synapt.recall.query_freshness.refresh_current_session",
+            side_effect=RuntimeError("boom"),
+        ):
+            out, _, code = _run_cli(self.dir)
+        self.assertEqual(code, 0)
+        self.assertIn("Freshness: ERROR", out)
+
     def test_cli_uses_stable_agent_identity_across_runtime_cwds(self):
         _save_sqlite_index([
             _chunk(
