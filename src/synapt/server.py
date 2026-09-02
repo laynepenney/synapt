@@ -71,7 +71,7 @@ def _find_watch_paths() -> list[str]:
 
     Discovers the synapt package's source directory by walking up from
     the package's __file__ location. Also watches any editable-install
-    plugin sources (synapt_private, etc.).
+    downstream plugin sources.
     """
     import synapt
 
@@ -82,12 +82,12 @@ def _find_watch_paths() -> list[str]:
     for ns_dir in synapt.__path__:
         paths.append(os.path.abspath(ns_dir))
 
-    # Also watch plugin packages (e.g., synapt_private) if installed editable
+    # Also watch downstream plugin packages if installed editable
     try:
         import importlib.metadata
         for ep in importlib.metadata.entry_points(group="synapt.plugins"):
-            mod = ep.value.split(":")[0]  # e.g., "synapt_private.plugins"
-            top_pkg = mod.split(".")[0]   # e.g., "synapt_private"
+            mod = ep.value.split(":")[0]  # e.g., "your_package.plugins"
+            top_pkg = mod.split(".")[0]   # e.g., "your_package"
             try:
                 pkg = __import__(top_pkg)
                 plugin_dir = os.path.dirname(os.path.abspath(pkg.__file__))
