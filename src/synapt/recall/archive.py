@@ -30,6 +30,7 @@ from synapt.recall.core import project_data_dir, project_archive_dir
 ARCHIVE_FORMAT_VERSION = "1"
 ARCHIVE_EXTENSION = ".synapt-archive"
 _ROOT_EXPORT_FILES = (
+    "compaction-summaries.json",
     "config.json",
     "dedup_decisions.jsonl",
     "knowledge.jsonl",
@@ -669,7 +670,12 @@ def import_recall_archive(
         if imported_dedup.is_file():
             _merge_jsonl_lines(imported_dedup, data_dir / "dedup_decisions.jsonl")
 
-        for name in ("config.json", "upload_manifest.json", "last_sync_time"):
+        for name in (
+            "compaction-summaries.json",
+            "config.json",
+            "upload_manifest.json",
+            "last_sync_time",
+        ):
             src = extracted_dir / name
             dst = data_dir / name
             if src.is_file() and not dst.exists():

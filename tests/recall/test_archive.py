@@ -270,6 +270,56 @@ def test_export_import_replace_roundtrip(tmp_path):
     assert reminders[0]["id"] == "rem-a"
 
 
+def test_export_import_replace_roundtrip_carries_compaction_summaries(tmp_path):
+    """compaction-summaries.json survives an export/import round trip.
+
+    Measured: the file existed in a store before export, was absent from the
+    archive's own manifest, and was absent after import -- present before,
+    silently dropped, gone after. _ROOT_EXPORT_FILES is what export
+    enumerates as root-level state; the file's absence there, not any
+    generic archive/extract logic, was the whole defect."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _seed_recall_project(
+        source,
+        session_id="sess-b",
+        chunk_id="sess-b:t0",
+        knowledge_id="know-b",
+        journal_focus="source focus",
+        channel_id="msg-b",
+        reminder_id="rem-b",
+    )
+    compaction_content = json.dumps({
+        "schema_version": 1,
+        "summaries": [
+            {
+                "runtime": "claude",
+                "session_id": "sess-b",
+                "timestamp": "2026-03-20T09:03:00+00:00",
+                "source_path": "/tmp/sess-b.jsonl",
+                "summary": "a compaction summary that must round-trip",
+                "status": "available",
+                "truncated": False,
+                "worktree": "source",
+            }
+        ],
+    })
+    (source / ".synapt" / "recall" / "compaction-summaries.json").write_text(compaction_content)
+
+    archive_path = tmp_path / "backup.synapt-archive"
+    export_recall_archive(source, archive_path)
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    import_recall_archive(dest, archive_path, mode="replace")
+
+    dest_path = dest / ".synapt" / "recall" / "compaction-summaries.json"
+    assert dest_path.exists(), "compaction-summaries.json must exist after import"
+    assert dest_path.read_text() == compaction_content, (
+        "compaction-summaries.json content must round-trip byte-identical"
+    )
+
+
 def test_import_merge_unions_chunks_knowledge_journal_and_channels(tmp_path):
     """Merge import unions semantic recall state without dropping local data."""
     local = tmp_path / "local"
