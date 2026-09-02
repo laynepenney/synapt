@@ -2951,11 +2951,14 @@ def channel_search(
     for ch in all_channels:
         path = _channel_path(ch, project_dir)
         for msg in _read_messages(path):
-            # Type filter
-            if msg_type:
-                if msg.type != msg_type:
-                    continue
-            elif msg.type not in ("message", "directive"):
+            # Type filter: apply ONLY when a type is given. recall#982 --
+            # an untyped search used to implicitly restrict to
+            # ("message", "directive"), silently excluding every "pr",
+            # "status", "claim", "code", "update" (and join/leave) post --
+            # the majority of real traffic. A search is the instrument used
+            # to prove a post is absent; a default that hides most types
+            # makes every negative from this tool false.
+            if msg_type and msg.type != msg_type:
                 continue
 
             if match_all:
