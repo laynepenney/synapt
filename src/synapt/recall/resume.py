@@ -109,11 +109,24 @@ class ResumeView:
     freshness: "IndexFreshness | None" = None
     selection_scope: str = "explicit"
     source_label: str = "unknown"
+    # The runtime that WROTE the rendered tail (codex / claude-code /
+    # recall-store), or "" when the path carries no marker. On a cold
+    # cross-runtime launch this is often not the runtime now reading, and saying
+    # so keeps a fallback tail from being read as the caller's own.
+    source_runtime: str = ""
     caller_unindexed: list["CallerTranscript"] = field(default_factory=list)
     caller_partial: "CallerExtentGap | None" = None
     # Set by the CLI when the selected session has no journal or checkpoint
     # covering its last activity. None means NOT CHECKED, not clean.
     unclean_end: "UncleanEnd | None" = None
+    # Set by the CLI on a cold/stale resume: the newest durable journal entry,
+    # shown as the checkpoint of record above a tail the stale index cannot
+    # refresh. On a cold cross-runtime launch there is no caller transcript and
+    # the shared index may be months old, so the freshest surface is the
+    # append-only journal, which the tail-bound _select_journal never reaches.
+    # None means not applicable (fresh index with a caller, or no journal).
+    durable_checkpoint: "JournalEntry | None" = None
+    durable_lag: str | None = None
 
 
 @dataclass(frozen=True)
@@ -453,6 +466,27 @@ def _source_label(path: str) -> str:
 
     parent_name = Path(path).parent.name
     return f"source:{parent_name}" if parent_name else "source:unknown"
+
+
+def _runtime_root(path: str) -> str:
+    """Name the RUNTIME a transcript came from, not just its project slug.
+
+    On a cold cross-runtime launch the resolved tail is a store fallback from
+    whatever runtime last wrote — often not the one now reading. ``_source_label``
+    names the project; this names the runtime, so a Claude session resuming a
+    Codex tail is told so instead of reading it as its own. ``""`` means the path
+    carries no runtime marker (do not print a guess).
+    """
+    if not path:
+        return ""
+    parts = Path(path).parts
+    if ".codex" in parts:
+        return "codex"
+    if ".claude" in parts:
+        return "claude-code"
+    if "worktrees" in parts:
+        return "recall-store"
+    return ""
 
 
 class BoundedResumeIndex:
@@ -839,6 +873,7 @@ def build_resume_view(
 
     source_path = next((c.transcript_path for c in chunks if c.transcript_path), "")
     source_label = _source_label(source_path)
+    source_runtime = _runtime_root(source_path)
     selected_latest = max(
         (chunk.timestamp for chunk in chunks if chunk.timestamp),
         key=_timestamp_epoch,
@@ -875,6 +910,7 @@ def build_resume_view(
         omitted_between=omitted_between,
         selection_scope=selection_scope,
         source_label=source_label,
+        source_runtime=source_runtime,
         caller_unindexed=unindexed,
         caller_partial=caller_partial,
     )
@@ -944,6 +980,104 @@ def _describe_behind(f) -> str:
         n = len(f.changed_files)
         parts.append(f"{n} indexed file{'' if n == 1 else 's'} grown since the build")
     return " and ".join(parts) if parts else "behind"
+
+
+def _lag_phrase(build_ts: str, journal_ts: str) -> str:
+    """Say how far the index build lags the newest journal, not a file count."""
+    b = _timestamp_epoch(build_ts)
+    j = _timestamp_epoch(journal_ts)
+    if b <= 0.0 or j <= 0.0:
+        return "index build time unrecorded"
+    span = j - b
+    days = int(span // 86400)
+    if days >= 1:
+        return f"index {days} day{'' if days == 1 else 's'} behind the journal"
+    hours = int(span // 3600)
+    if hours >= 1:
+        return f"index {hours}h behind the journal"
+    return "index within the hour of the journal"
+
+
+def select_durable_checkpoint(
+    journal_path: Path | None,
+    freshness,
+    has_caller: bool,
+    tail_newest: str,
+) -> tuple[JournalEntry | None, str | None]:
+    """Pick the newest durable journal entry to show above a stale/cold tail.
+
+    Fires only when the index is stale OR no caller session resolved, AND the
+    journal is newer than the rendered tail -- so a fresh index with a caller,
+    or a journal older than the tail, shows nothing and the tail stays
+    authoritative. Read-only; never raises. Unlike ``_select_journal`` this does
+    not require the entry to be sessionless: on a cold launch the freshest entry
+    is usually bound to a session the stale index has never seen, which is
+    exactly the entry the tail-bound path drops.
+    """
+    if journal_path is None:
+        return None, None
+    try:
+        entries = read_entries(journal_path, n=50)
+    except Exception:
+        return None, None
+    # Same intent bar _select_journal uses: skip auto-extracted stubs whose
+    # only "focus" is a /clear control block, and file-list-only activity
+    # records. Surfacing one of those as the checkpoint of record would read as
+    # a real handoff while carrying nothing a returning reader can act on.
+    newest = next((e for e in entries if _carries_intent(e)), None)
+    if newest is None:
+        return None, None
+    stale = freshness is not None and getattr(freshness, "stale", False)
+    if not (stale or not has_caller):
+        return None, None
+    if _timestamp_epoch(newest.timestamp) <= _timestamp_epoch(tail_newest):
+        return None, None
+    build_ts = getattr(freshness, "build_timestamp", "") if freshness is not None else ""
+    return newest, _lag_phrase(build_ts, newest.timestamp)
+
+
+def attach_durable_checkpoint(view: ResumeView, journal_path: Path | None) -> ResumeView:
+    """Compute the durable-checkpoint block from the already-built view.
+
+    Runs in the CLI after freshness is attached, so build_resume_view keeps its
+    no-implicit-I/O contract and the block can only add to what the reader is
+    told, never change the tail.
+    """
+    has_caller = view.selection_scope in ("caller", "agent", "explicit")
+    tail_newest = max(
+        (t.timestamp for t in view.turns), key=_timestamp_epoch, default=""
+    )
+    entry, lag = select_durable_checkpoint(
+        journal_path, view.freshness, has_caller, tail_newest
+    )
+    view.durable_checkpoint = entry
+    view.durable_lag = lag
+    return view
+
+
+def _format_durable_checkpoint(view: ResumeView) -> list[str]:
+    entry = view.durable_checkpoint
+    if entry is None:
+        return []
+    head = f"DURABLE CHECKPOINT — latest journal entry {entry.timestamp}"
+    if view.durable_lag:
+        head += f" · {view.durable_lag}"
+    tail_origin = (
+        f"was written by the {view.source_runtime} runtime"
+        if view.source_runtime
+        else "may be from another runtime"
+    )
+    lines = [
+        "",
+        head,
+        "  The append-only journal is fresher than this index; the tail below "
+        f"predates it and {tail_origin}.",
+    ]
+    if entry.focus:
+        lines.append(f"  Focus: {entry.focus}")
+    if entry.next_steps:
+        lines.append(f"  Next: {entry.next_steps[0]}")
+    return lines
 
 
 def _format_freshness(view: ResumeView) -> list[str]:
@@ -1022,6 +1156,8 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
         header += " · agent identity"
     elif view.selection_scope == "store":
         header += f" · store fallback from {view.source_label}"
+        if view.source_runtime:
+            header += f" · runtime {view.source_runtime}"
     if view.caller_unindexed:
         newest = view.caller_unindexed[0]
         stamp = datetime.fromtimestamp(newest.mtime, timezone.utc).isoformat(timespec="seconds")
@@ -1047,6 +1183,7 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
 
     lines = [header]
     lines.extend(_format_freshness(view))
+    lines.extend(_format_durable_checkpoint(view))
     lines.extend(_format_journal(view))
 
     if not view.turns:

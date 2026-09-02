@@ -35,9 +35,13 @@ from unittest import mock
 
 from synapt.recall.core import TranscriptChunk, TranscriptIndex
 from synapt.recall.journal import JournalEntry, append_entry
+from synapt.recall.freshness import IndexFreshness
 from synapt.recall.resume import (
     CallerTranscript,
+    ResumeTurn,
+    ResumeView,
     UncleanEnd,
+    attach_durable_checkpoint,
     detect_unclean_end,
     ResumeError,
     build_resume_view,
@@ -46,7 +50,10 @@ from synapt.recall.resume import (
     is_harness_authored,
     load_resume_index,
     resolve_session,
+    select_durable_checkpoint,
     _latest_event_timestamp,
+    _lag_phrase,
+    _runtime_root,
     _source_label,
     _timestamp_epoch,
 )
@@ -1553,6 +1560,174 @@ class TestTopLevelWiring(unittest.TestCase):
                                    ["synapt recall", "resume", "abc123"]):
                 recall_cli.main()
         self.assertEqual(cmd.call_args[0][0].session, "abc123")
+
+
+# A stale index built months ago, as on a cold cross-runtime launch.
+_STALE = IndexFreshness(
+    stale=True, build_timestamp="2026-04-08T12:23:34", scanned="archive",
+    new_files=["a"] * 3, changed_files=["b"] * 2,
+)
+_FRESH = IndexFreshness(stale=False, build_timestamp="2026-09-01T22:40:00", scanned="archive")
+
+
+def _view(scope="store", tail_ts="2026-06-01T09:00:00Z", freshness=_STALE, runtime="codex"):
+    return ResumeView(
+        session_id="0af31c22-dead-beef-0000-000000000000",
+        turns=[ResumeTurn(chunk_id="0af31c22:t0", turn_index=0, timestamp=tail_ts,
+                          user_text="an old tail the stale index still calls newest",
+                          assistant_text="…done.", tools_used=[])],
+        total_turns=1, selection_scope=scope, source_label="worktree:foreign",
+        source_runtime=runtime, freshness=freshness,
+    )
+
+
+def _write_journal(tmp, entries):
+    path = Path(tmp) / "journal.jsonl"
+    for e in entries:
+        append_entry(e, path=path)
+    return path
+
+
+class TestDurableCheckpointOnColdResume(unittest.TestCase):
+    """On a cold/stale resume the tail-bound journal path can miss the freshest
+    durable entry (originating issue tracked privately). The durable-checkpoint
+    block surfaces the newest
+    intent-bearing journal above the tail — but only when it would tell the
+    reader something the tail cannot, so every control below must NOT fire."""
+
+    def test_witness1_fires_on_stale_no_caller_with_newer_journal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s-fresh",
+                             focus="RE-ENTRY SPARK from Stromus",
+                             next_steps=["resume feat/x at HEAD"]),
+            ])
+            view = attach_durable_checkpoint(_view(), j)
+            out = format_resume(view)
+        self.assertIsNotNone(view.durable_checkpoint)
+        self.assertIn("DURABLE CHECKPOINT — latest journal entry 2026-08-14T21:10:00Z", out)
+        self.assertIn("RE-ENTRY SPARK from Stromus", out)
+        self.assertIn("Next: resume feat/x at HEAD", out)
+        self.assertIn("behind the journal", out)  # lag line, not a file count
+
+    def test_control_fresh_index_with_caller_and_older_journal_does_not_fire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-05-01T00:00:00Z", session_id="s",
+                             focus="old", next_steps=["old step"]),
+            ])
+            # fresh index, a caller session, tail NEWER than the journal
+            view = attach_durable_checkpoint(
+                _view(scope="caller", tail_ts="2026-06-01T00:00:00Z", freshness=_FRESH), j)
+            out = format_resume(view)
+        self.assertIsNone(view.durable_checkpoint)
+        self.assertNotIn("DURABLE CHECKPOINT", out)
+
+    def test_control_journal_absent_keeps_stale_label_no_block(self):
+        view = attach_durable_checkpoint(_view(), Path("/nonexistent/journal.jsonl"))
+        out = format_resume(view)
+        self.assertIsNone(view.durable_checkpoint)
+        self.assertNotIn("DURABLE CHECKPOINT", out)
+        self.assertIn("STALE", out)  # existing disclosure survives
+
+    def test_control_stale_but_journal_older_than_tail_does_not_fire(self):
+        # The gate is not "stale" alone: a journal older than the rendered tail
+        # would mislead, so it must stay silent even on a stale index.
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-05-01T00:00:00Z", session_id="s",
+                             focus="older than tail", next_steps=["x"]),
+            ])
+            view = attach_durable_checkpoint(_view(tail_ts="2026-07-01T00:00:00Z"), j)
+        self.assertIsNone(view.durable_checkpoint)
+
+    def test_selection_skips_intentless_stub_and_picks_real_entry(self):
+        # The newest entry is a /clear auto-stub whose only focus is harness
+        # markup. _carries_intent must skip it, exactly as _select_journal does,
+        # or the checkpoint of record reads as a real handoff carrying nothing.
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-10T00:00:00Z", session_id="s-real",
+                             focus="real handoff", next_steps=["do the thing"]),
+                JournalEntry(timestamp="2026-08-20T00:00:00Z", session_id="s-stub",
+                             focus="<command-name>/clear</command-name>"),
+            ])
+            entry, _ = select_durable_checkpoint(j, _STALE, has_caller=False,
+                                                 tail_newest="2026-06-01T00:00:00Z")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.focus, "real handoff")
+
+    def test_block_does_not_alter_the_tail(self):
+        # Depth: the durable block only ADDS; the rendered turns must be
+        # byte-identical with and without it.
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s",
+                             focus="f", next_steps=["n"]),
+            ])
+            base = _view()
+            base_turn_lines = [l for l in format_resume(base).splitlines()
+                               if l.startswith("── ") or l.startswith("  YOU:") or l.startswith("  ASSISTANT:")]
+            withblock = attach_durable_checkpoint(_view(), j)
+            block_turn_lines = [l for l in format_resume(withblock).splitlines()
+                                if l.startswith("── ") or l.startswith("  YOU:") or l.startswith("  ASSISTANT:")]
+        self.assertTrue(withblock.durable_checkpoint is not None)
+        self.assertEqual(base_turn_lines, block_turn_lines)
+
+
+class TestRuntimeRootLabel(unittest.TestCase):
+    """The rendered tail is labelled by the runtime that WROTE it, so a cold
+    cross-runtime launch does not read another runtime's tail as its own."""
+
+    def test_runtime_root_classifies_paths(self):
+        self.assertEqual(_runtime_root("/w/.codex/sessions/2026/09/01/rollout-a.jsonl"), "codex")
+        self.assertEqual(_runtime_root("/w/.claude/projects/slug/a.jsonl"), "claude-code")
+        self.assertEqual(_runtime_root("/repo/.synapt/recall/worktrees/foo/transcripts/a.jsonl"), "recall-store")
+        self.assertEqual(_runtime_root("/tmp/loose/a.jsonl"), "")
+        self.assertEqual(_runtime_root(""), "")
+
+    def test_store_fallback_header_names_runtime_root(self):
+        index = _index([
+            _chunk(SESSION_B, 0, "q", "a",
+                   transcript_path="/w/.codex/sessions/2026/09/01/rollout-a.jsonl"),
+        ])
+        view = build_resume_view(index, caller_sources=[], journal_path=None)
+        self.assertEqual(view.source_runtime, "codex")
+        self.assertIn("runtime codex", format_resume(view).splitlines()[0])
+
+    def test_durable_block_names_the_writing_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s",
+                             focus="f", next_steps=["n"]),
+            ])
+            view = attach_durable_checkpoint(_view(runtime="codex"), j)
+            out = format_resume(view)
+        self.assertIn("was written by the codex runtime", out)
+
+    def test_no_runtime_marker_falls_back_to_generic_phrase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            j = _write_journal(tmp, [
+                JournalEntry(timestamp="2026-08-14T21:10:00Z", session_id="s",
+                             focus="f", next_steps=["n"]),
+            ])
+            view = attach_durable_checkpoint(_view(runtime=""), j)
+            out = format_resume(view)
+        self.assertIn("may be from another runtime", out)
+
+
+class TestLagPhrase(unittest.TestCase):
+    def test_days(self):
+        self.assertIn("128 days behind", _lag_phrase("2026-04-08T12:00:00Z", "2026-08-14T12:00:00Z"))
+
+    def test_hours(self):
+        self.assertIn("5h behind", _lag_phrase("2026-09-01T12:00:00Z", "2026-09-01T17:30:00Z"))
+
+    def test_within_hour(self):
+        self.assertIn("within the hour", _lag_phrase("2026-09-01T12:00:00Z", "2026-09-01T12:20:00Z"))
+
+    def test_unrecorded_build_time(self):
+        self.assertIn("unrecorded", _lag_phrase("", "2026-09-01T12:00:00Z"))
 
 
 if __name__ == "__main__":
