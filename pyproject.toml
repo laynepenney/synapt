@@ -146,12 +146,12 @@ x = "synapt.x.server"
 [project.entry-points."synapt.backends"]
 # Plugins register model backends here. Each entry point must reference
 # a module with a register(register_fn) callable. Example:
-# modal = "synapt_private.backends"
+# modal = "your_package.backends"
 
 [project.entry-points."synapt.commands"]
 # Plugins register CLI subcommands here. Each entry point must reference
 # a callable main() function. Example:
-# repair = "synapt_private.repair.cli:cli_main"
+# repair = "your_package.repair.cli:cli_main"
 
 [tool.pytest.ini_options]
 addopts = "--benchmark-disable"
