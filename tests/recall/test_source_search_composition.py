@@ -8,6 +8,7 @@ import pytest
 
 from synapt.recall import server
 from synapt.recall.source_index import (
+    SOURCE_INDEX_SUPPORTED,
     DescriptorSourceAdapter,
     IndexedSourceSearchProvider,
     SourceAdmission,
@@ -95,6 +96,10 @@ def test_registered_source_result_flows_through_ordinary_recall_search(
     assert "opaque-revision" in rendered
 
 
+@pytest.mark.skipif(
+    not SOURCE_INDEX_SUPPORTED,
+    reason="descriptor adapter is POSIX-only: os.O_DIRECTORY unavailable",
+)
 def test_indexed_markdown_flows_through_ordinary_recall_search(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

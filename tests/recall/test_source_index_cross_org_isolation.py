@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from synapt.recall.source_index import (
+    SOURCE_INDEX_SUPPORTED,
     DescriptorSourceAdapter,
     SourceAdmission,
     search_source,
@@ -15,7 +16,8 @@ from synapt.recall.source_index import (
 
 
 pytestmark = pytest.mark.skipif(
-    os.name == "nt", reason="descriptor adapter fails closed on Windows"
+    not SOURCE_INDEX_SUPPORTED,
+    reason="descriptor adapter is POSIX-only: os.O_DIRECTORY unavailable",
 )
 
 

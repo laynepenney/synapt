@@ -6,9 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from synapt.recall import source_index
 from synapt.recall.source_index import (
+    SOURCE_INDEX_SUPPORTED,
     DescriptorSourceAdapter,
     SourceAdmission,
+    SourceLimits,
     compose_source_results,
     parse_markdown,
     render_source_results,
@@ -18,7 +21,8 @@ from synapt.recall.source_index import (
 
 
 pytestmark = pytest.mark.skipif(
-    os.name == "nt", reason="descriptor adapter fails closed on Windows"
+    not SOURCE_INDEX_SUPPORTED,
+    reason="descriptor adapter is POSIX-only: os.O_DIRECTORY unavailable",
 )
 
 
@@ -174,3 +178,32 @@ def test_unauthorized_calls_open_nothing_and_return_no_corpus_metadata(
     assert results == []
     assert store_calls == []
     assert not (tmp_path / "must-not-exist.db").exists()
+
+
+def test_enumerate_refuses_cleanly_when_platform_unsupported(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """SOURCE_INDEX_SUPPORTED False must raise a clear _ScanFailure("unsupported")
+    before any os.O_DIRECTORY use -- not let its absence surface as a raw
+    AttributeError deep in the walk, which is the actual failure this
+    platform ever produces on Windows.
+
+    Setup happens with the real O_DIRECTORY still present (this test only
+    runs where it exists, per the module skip); the attribute is deleted
+    only after the admission fd is built, so removing the guard below (as a
+    manual mutation check) makes enumerate() reach the deleted attribute and
+    raise a genuine AttributeError -- proving this test is bound to the
+    guard, not merely to the derived flag."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "child").mkdir()
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        monkeypatch.setattr(source_index, "SOURCE_INDEX_SUPPORTED", False)
+        monkeypatch.delattr(os, "O_DIRECTORY", raising=False)
+        admission = _admission(root_fd)
+        with pytest.raises(source_index._ScanFailure) as exc_info:
+            list(DescriptorSourceAdapter().enumerate(admission, SourceLimits()))
+        assert exc_info.value.state == "unsupported"
+    finally:
+        os.close(root_fd)
