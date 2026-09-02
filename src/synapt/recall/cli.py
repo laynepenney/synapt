@@ -652,6 +652,7 @@ def _archive_and_build_locked(
     if progress:
         progress("parsing")
     logger.info("build: parsing transcripts from %d source(s)...", len(build_sources))
+    skipped_oversize: list[dict] = []
     for build_source in build_sources:
         index = build_index(
             build_source,
@@ -660,6 +661,7 @@ def _archive_and_build_locked(
             subchunk_min_text=_subchunk_min,
         )
         all_chunks.extend(index.chunks)
+        skipped_oversize.extend(index.skipped_oversize)
     logger.info("build: parsed %d chunks in %.1fs", len(all_chunks), _time.monotonic() - build_t0)
 
     # ChatGPT archive (separate source)
@@ -766,6 +768,20 @@ def _archive_and_build_locked(
                 all_chunks.extend(journal_chunks)
 
     if not all_chunks:
+        # A store whose ONLY source content is an oversize-skipped file (no
+        # other transcripts, journal entries or channel messages) never
+        # reaches the manifest write below -- still print the skip here so
+        # it is visible in this build's own output, even though it will not
+        # persist into the freshness banner until a build with other content
+        # runs. Narrow edge case; the manifest/freshness path above handles
+        # the realistic one (a pathological file alongside real content).
+        if skipped_oversize:
+            total_skipped_bytes = sum(s["size"] for s in skipped_oversize)
+            print(
+                f"  Skipped (oversize): {len(skipped_oversize)} file(s), "
+                f"{format_size(total_skipped_bytes)} not indexed -- see "
+                "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES"
+            )
         return None
 
     # Dedup by chunk id
@@ -787,6 +803,7 @@ def _archive_and_build_locked(
         cache_dir=index_dir,
         db=db,
     )
+    final_index.skipped_oversize = skipped_oversize
     final_index.save(index_dir)
     logger.info("build: FTS5 save complete in %.1fs", _time.monotonic() - save_t0)
 
@@ -984,9 +1001,23 @@ def _archive_and_build_locked(
             logger.debug("Cross-session linking failed: %s", exc)
 
     # Store source file info in DB metadata
+    #
+    # Oversize-skipped files are EXCLUDED from source_files
+    # deliberately: this list is what the next incremental build's
+    # already_indexed stamp-match reads (core.py build_index), and a stamp
+    # match there means "unchanged since a successful parse" -- true for
+    # every entry here except an oversize file, which was never parsed at
+    # all. Including it would make it match its own stamp on the very next
+    # build and vanish into the ordinary "already indexed" skip path forever,
+    # indistinguishable from content that WAS successfully searched. Leaving
+    # it out means the ceiling check re-runs (one cheap stat) and re-reports
+    # it every build instead.
+    oversize_names = {(s["dir"], s["name"]) for s in skipped_oversize}
     source_files = []
     for build_source in build_sources:
         for fp in sorted(build_source.glob("*.jsonl")):
+            if (build_source.name, fp.name) in oversize_names:
+                continue
             st = fp.stat()
             source_files.append({
                 "name": fp.name,
@@ -1065,7 +1096,14 @@ def _archive_and_build_locked(
         compaction_indexed = False
         logger.warning("Compaction summary indexing failed: %s", exc)
 
-    manifest_payload = {"source_files": source_files}
+    manifest_payload = {"source_files": source_files, "skipped_oversize": skipped_oversize}
+    if skipped_oversize:
+        total_skipped_bytes = sum(s["size"] for s in skipped_oversize)
+        print(
+            f"  Skipped (oversize): {len(skipped_oversize)} file(s), "
+            f"{format_size(total_skipped_bytes)} not indexed -- see "
+            "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES"
+        )
     inputs_stable = (
         readonly_at_read.digest == readonly_before.digest
         and compute_input_signature(

@@ -1293,6 +1293,76 @@ def test_build_index_skips_unchanged_files():
         )
 
 
+def test_build_index_skips_oversize_file_and_reports_it():
+    """One pathological transcript must not hold up the rest of a build, and
+    the skip must be visible rather than silently dropped.
+
+    Before this: no per-file size cap existed anywhere in the builder, so a
+    single runaway transcript in a source directory would be handed straight
+    to parse_transcript() with no way to opt out short of never building that
+    store again.
+    """
+    from synapt.recall.core import build_index
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        normal = tmpdir / "normal-session.jsonl"
+        write_jsonl(normal, [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        ])
+
+        oversize = tmpdir / "oversize-session.jsonl"
+        write_jsonl(oversize, [
+            user_text_entry("this one is too big", uuid="u2", ts="2026-03-01T11:00:00Z"),
+            assistant_entry(text="ok", uuid="a2", ts="2026-03-01T11:00:30Z"),
+        ])
+        oversize_size = oversize.stat().st_size
+        ceiling = oversize_size - 1  # strictly below the oversize file's size
+
+        index = build_index(tmpdir, max_file_bytes=ceiling)
+
+        # The build completes and the NORMAL file is still parsed — one
+        # pathological file must not take the rest of the build down with it.
+        assert len(index.chunks) == 1, (
+            f"Expected the normal file's 1 chunk despite the oversize sibling, "
+            f"got {len(index.chunks)}"
+        )
+        assert index.chunks[0].session_id == "normal-session"
+
+        # The skip is REPORTED, not silent: visible on the returned index
+        # with the file's real size, distinct from the ordinary
+        # already-indexed skip path (which would make it look identical to a
+        # file that WAS successfully searched).
+        assert hasattr(index, "skipped_oversize"), (
+            "build_index() must expose which files it skipped for size, "
+            "not just drop them"
+        )
+        assert len(index.skipped_oversize) == 1
+        skipped = index.skipped_oversize[0]
+        assert skipped["name"] == "oversize-session.jsonl"
+        assert skipped["size"] == oversize_size
+
+
+def test_build_index_default_ceiling_does_not_affect_normal_files():
+    """The default ceiling must not touch any realistically-sized transcript."""
+    from synapt.recall.core import build_index
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        transcript = tmpdir / "normal-session.jsonl"
+        write_jsonl(transcript, [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        ])
+
+        index = build_index(tmpdir)  # no explicit ceiling — production default
+
+        assert len(index.chunks) == 1
+        assert index.skipped_oversize == []
+
+
 # ---------------------------------------------------------------------------
 # Tests: _summarize_tool_result
 # ---------------------------------------------------------------------------

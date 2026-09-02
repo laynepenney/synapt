@@ -5170,6 +5170,29 @@ def parse_journal_entries(journal_path: Path) -> list[TranscriptChunk]:
 # Multi-file index builder
 # ---------------------------------------------------------------------------
 
+#: One pathological transcript must not be able to hold a store's only index
+#: build indefinitely -- a 3.5 GB transcript in one project directory froze a
+#: store's index for 20+ minutes with no visible cause. Measured throughput
+#: is linear, ~10 MB/s (synapt.dev, 2026-09-02) -- the cost of parsing a file
+#: this size is bounded, not runaway -- but a real, currently-active,
+#: NON-pathological session was independently found at 1.41 GB, so the
+#: ceiling must sit clearly above legitimate large sessions, not just above
+#: "normal-looking" ones. 2 GiB is ~30% above that observed legitimate file
+#: and ~40% below the flagged 3.5 GB pathological one -- a judgment call from
+#: two data points, which is exactly why it is env-overridable.
+DEFAULT_MAX_TRANSCRIPT_FILE_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _max_transcript_file_bytes() -> int:
+    override = os.environ.get("SYNAPT_MAX_TRANSCRIPT_FILE_BYTES")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            pass
+    return DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+
+
 def build_index(
     source_dir: Path,
     use_embeddings: bool = False,
@@ -5177,6 +5200,7 @@ def build_index(
     incremental_manifest: dict | None = None,
     db: RecallDB | None = None,
     subchunk_min_text: int | None = None,
+    max_file_bytes: int | None = None,
 ) -> TranscriptIndex:
     """Build a TranscriptIndex from a directory of .jsonl transcript files.
 
@@ -5186,14 +5210,26 @@ def build_index(
         cache_dir: Directory for caching embeddings.
         incremental_manifest: If provided, skip files already indexed
                              (by checking source_files in manifest).
+        max_file_bytes: Per-file size ceiling. A file over this is skipped,
+                       not parsed, so one pathological transcript cannot hold
+                       up the rest of the build. Defaults to
+                       SYNAPT_MAX_TRANSCRIPT_FILE_BYTES, or
+                       DEFAULT_MAX_TRANSCRIPT_FILE_BYTES when unset.
 
     Returns:
-        TranscriptIndex over all parsed chunks.
+        TranscriptIndex over all parsed chunks. Carries a `.skipped_oversize`
+        attribute: a list of {"name", "dir", "size"} dicts for every file this
+        call skipped for size, always present (empty when nothing was
+        skipped) so a caller can rely on it without a hasattr check.
     """
+    ceiling = max_file_bytes if max_file_bytes is not None else _max_transcript_file_bytes()
+
     jsonl_files = sorted(source_dir.glob("*.jsonl"))
     if not jsonl_files:
         print(f"[synapt] No .jsonl files found in {source_dir}")
-        return TranscriptIndex([])
+        empty = TranscriptIndex([])
+        empty.skipped_oversize = []
+        return empty
 
     forced_subchunk = os.environ.get("SYNAPT_FORCE_SUBCHUNK_MIN_TEXT")
     if subchunk_min_text is None and forced_subchunk:
@@ -5235,6 +5271,7 @@ def build_index(
     seen_uuids: set[str] = set()
     skipped = 0
     parsed_files: list[Path] = []  # Track which files were actually parsed
+    skipped_oversize: list[dict] = []
 
     for filepath in jsonl_files:
         stamp = already_indexed.get((filepath.parent.name, filepath.name))
@@ -5246,6 +5283,27 @@ def build_index(
             if stat.st_mtime == stored_mtime and stat.st_size == stored_size:
                 skipped += 1
                 continue
+        else:
+            stat = filepath.stat()
+        # An oversize file is NEVER recorded into `already_indexed`'s source --
+        # that list is built by the caller (cli.py) unconditionally globbing
+        # the archive, deliberately excluding whatever this call reports here
+        # (see skipped_oversize). So this check re-runs, cheaply (one stat,
+        # already paid above), on every build: the file is re-reported every
+        # time rather than silently absorbed into "already indexed" forever,
+        # which would look identical to a file that WAS successfully parsed.
+        if stat.st_size > ceiling:
+            skipped_oversize.append({
+                "name": filepath.name,
+                "dir": filepath.parent.name,
+                "size": stat.st_size,
+            })
+            print(
+                f"  {filepath.name}: SKIPPED (oversize, {stat.st_size:,} bytes > "
+                f"ceiling {ceiling:,} bytes; override with "
+                f"SYNAPT_MAX_TRANSCRIPT_FILE_BYTES)"
+            )
+            continue
         try:
             if is_codex_transcript(filepath):
                 chunks = parse_codex_transcript(filepath, seen_uuids=seen_uuids)
@@ -5260,6 +5318,9 @@ def build_index(
 
     if skipped:
         print(f"[synapt] Skipped {skipped} already-indexed files")
+    if skipped_oversize:
+        print(f"[synapt] Skipped {len(skipped_oversize)} oversize file(s) "
+              f"(not indexed, not searchable)")
     print(f"[synapt] Total: {len(all_chunks)} chunks from {len(jsonl_files) - skipped} files")
 
     # Auto-detect content profile and re-parse if sub-chunking should differ.
@@ -5294,4 +5355,6 @@ def build_index(
                         pass
                 print(f"[synapt] Re-parsed: {len(all_chunks)} chunks (sub-chunking disabled)")
 
-    return TranscriptIndex(all_chunks, use_embeddings=use_embeddings, cache_dir=cache_dir, db=db)
+    result = TranscriptIndex(all_chunks, use_embeddings=use_embeddings, cache_dir=cache_dir, db=db)
+    result.skipped_oversize = skipped_oversize
+    return result

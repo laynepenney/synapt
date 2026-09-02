@@ -40,7 +40,12 @@ from synapt.recall.freshness import IndexFreshness, check_index_freshness
 # ---------------------------------------------------------------------------
 
 
-def _write_index(index_dir: Path, source_files: list[dict], build_ts: str = "2026-08-06T00:00:00") -> None:
+def _write_index(
+    index_dir: Path,
+    source_files: list[dict],
+    build_ts: str = "2026-08-06T00:00:00",
+    skipped_oversize: list[dict] | None = None,
+) -> None:
     """Create a minimal index carrying only the metadata freshness reads."""
     index_dir.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(index_dir / "recall.db")
@@ -48,6 +53,8 @@ def _write_index(index_dir: Path, source_files: list[dict], build_ts: str = "202
     con.execute("INSERT OR REPLACE INTO metadata VALUES ('source_files', ?)",
                 (json.dumps(source_files),))
     con.execute("INSERT OR REPLACE INTO metadata VALUES ('build_timestamp', ?)", (build_ts,))
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('skipped_oversize', ?)",
+                (json.dumps(skipped_oversize or []),))
     con.commit()
     con.close()
 
@@ -133,6 +140,43 @@ def test_grown_archive_file_is_stale(store):
     assert result.stale is True
     assert "a.jsonl" in result.changed_files
     assert result.new_files == []
+
+
+def test_skipped_oversize_file_is_not_reported_as_new(store):
+    """A file the build examined and rejected for size must be
+    labelled distinctly, not folded into "new" -- which would falsely imply a
+    plain rebuild resolves it, when the same build will skip it again."""
+    archived = _archive_file(_archive_dir(store), "huge.jsonl", "x" * 100)
+    _write_index(
+        _index_dir(store),
+        source_files=[],  # never recorded as known -- it was never parsed
+        skipped_oversize=[{"name": "huge.jsonl", "size": archived.stat().st_size}],
+    )
+
+    result = check_index_freshness(store)
+
+    assert "huge.jsonl" not in result.new_files
+    assert len(result.skipped_oversize) == 1
+    assert result.skipped_oversize[0]["name"] == "huge.jsonl"
+    assert result.skipped_oversize[0]["size"] == archived.stat().st_size
+
+
+def test_only_a_skipped_oversize_file_is_not_stale(store):
+    """A store whose sole gap is a known, permanent, oversize exclusion is
+    CURRENT with respect to everything it is able to index -- staleness means
+    "a rebuild would help," which is not true for a file the ceiling refuses
+    every time."""
+    _archive_file(_archive_dir(store), "huge.jsonl", "x" * 100)
+    _write_index(
+        _index_dir(store),
+        source_files=[],
+        skipped_oversize=[{"name": "huge.jsonl", "size": 100}],
+    )
+
+    result = check_index_freshness(store)
+
+    assert result.stale is False
+    assert result.skipped_oversize != []
 
 
 def test_verdict_names_the_surface_it_scanned(store):
