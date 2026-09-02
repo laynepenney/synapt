@@ -467,6 +467,51 @@ class TestOrphanedLocalChannelStoreIsReported(unittest.TestCase):
 
         self.assertNotIn("orphan", result.lower())
 
+    def test_local_dir_with_only_state_db_and_no_jsonl_is_not_reported(self) -> None:
+        """A local dir that exists (holding only channels.db, as it does
+        once anything opens the state db there) but has never held a
+        channel JSONL is NOT a leftover -- there is no log to have gone
+        stale, only the state db that is supposed to live there. The
+        prior version of this suite never constructed this exact shape,
+        so a mutant that reports an orphan
+        purely because the DIRECTORY exists (dropping the "*.jsonl"
+        condition down to an unconditional True) survived undetected.
+        """
+        from synapt.recall.channel import _channels_dir, _local_channels_dir
+        from synapt.recall.server import recall_channel
+
+        # The local dir exists (as it would once something opens the
+        # state db there) but was never used to write a channel JSONL,
+        # while Tier-2 still resolves for the log -- "a local dir exists,
+        # and the log for this call comes from elsewhere".
+        local_dir = _local_channels_dir().resolve()
+        local_dir.mkdir(parents=True, exist_ok=True)
+        (local_dir / "channels.db").touch()
+        log_store = _channels_dir().resolve()
+        self.assertNotEqual(
+            log_store,
+            local_dir,
+            "fixture did not reproduce Tier-2 resolution -- cannot "
+            "demonstrate the no-jsonl negative case",
+        )
+        self.assertTrue(local_dir.is_dir(), "state db mkdir side effect did not create the local dir")
+        self.assertEqual(
+            list(local_dir.glob("*.jsonl")),
+            [],
+            "fixture leaked a jsonl file into the local dir -- this test "
+            "targets the case where NONE exists",
+        )
+
+        result = recall_channel(action="who")
+
+        self.assertNotIn(
+            "orphan",
+            result.lower(),
+            "a local dir with no channel JSONL was reported as an "
+            "orphaned leftover -- there was never a log there to go "
+            "stale, only the state db that belongs there by design",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
