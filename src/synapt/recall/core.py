@@ -4610,6 +4610,19 @@ def _find_gripspace_root(path: Path) -> Path | None:
             if (gitgrip / "griptrees.json").exists():
                 _gripspace_cache[cache_key] = (current, time.monotonic())
                 return current
+            # Standalone-clone gripspace (new-agent-gripspace.sh) carries
+            # neither griptree.json nor griptrees.json -- it registers as
+            # an entry in a DIFFERENT gripspace's registry rather than
+            # owning its own. Its own manifest at
+            # .gitgrip/spaces/main/gripspace.yml is real, populated, and
+            # is the only marker this shape of gripspace has, so accept
+            # it as a fourth root signal. Without this, such a gripspace
+            # is invisible to every store this function feeds (recall,
+            # journal, channel) and the walk falls through to $HOME.
+            # Same family as recall#974 and recall#936.
+            if (gitgrip / "spaces" / "main" / "gripspace.yml").exists():
+                _gripspace_cache[cache_key] = (current, time.monotonic())
+                return current
 
         # MEMBERSHIP BEATS LOCALITY. gr2 owns one .grip/ namespace at the
         # workspace root, and spawned units live beneath it, so recognizing

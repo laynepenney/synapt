@@ -95,6 +95,40 @@ class TestFindGripspaceRoot:
         (repo / ".git").mkdir()
         assert _find_gripspace_root(repo) is None
 
+    def test_finds_standalone_clone_gripspace_via_manifest_marker(self, tmp_path):
+        """new-agent-gripspace.sh creates a standalone clone: no
+        griptree.json, no griptrees.json, no .grip -- only
+        .gitgrip/spaces/main/gripspace.yml. Before this fix, such a
+        gripspace was invisible to _find_gripspace_root and every
+        recall/channel write fell through to $HOME. Same family as
+        recall#974 and recall#936."""
+        grip = tmp_path / "standalone-space"
+        grip.mkdir()
+        spaces_main = grip / ".gitgrip" / "spaces" / "main"
+        spaces_main.mkdir(parents=True)
+        (spaces_main / "gripspace.yml").write_text("version: 2\nrepos: {}\n")
+
+        assert _find_gripspace_root(grip) == grip
+
+    def test_finds_standalone_clone_gripspace_from_child(self, tmp_path):
+        grip = tmp_path / "standalone-space"
+        spaces_main = grip / ".gitgrip" / "spaces" / "main"
+        spaces_main.mkdir(parents=True)
+        (spaces_main / "gripspace.yml").write_text("version: 2\nrepos: {}\n")
+        child = grip / "synapt"
+        child.mkdir()
+
+        assert _find_gripspace_root(child) == grip
+
+    def test_gitgrip_dir_without_the_manifest_marker_still_returns_none(self, tmp_path):
+        """A bare .gitgrip/ with none of the three markers (griptree.json,
+        griptrees.json, spaces/main/gripspace.yml) must not match --
+        pins the marker to the exact path, not the directory's mere
+        existence."""
+        repo = tmp_path / "myrepo"
+        (repo / ".gitgrip").mkdir(parents=True)
+        assert _find_gripspace_root(repo) is None
+
     def test_linked_griptree_resolves_to_parent_gripspace(self, tmp_path):
         """A linked griptree (griptree.json singular) should resolve
         to the parent gripspace via git worktree pointers."""
