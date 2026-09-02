@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import assistant_entry, user_text_entry, write_jsonl
+from conftest import assistant_entry, user_text_entry, user_tool_result_entry, write_jsonl
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +610,42 @@ def test_maintain_passes_the_limit_through_and_reports_backlog(tmp_path, monkeyp
 #
 # A fast build and a broken build look identical from the outside unless the
 # build states which stages it skipped and why.
+
+def test_skipped_lines_round_trip_through_the_manifest_and_final_index(tmp_path, monkeypatch):
+    """The real, unmocked chain: build_index()'s skipped_lines must reach
+    both the returned index AND the persisted manifest that a later
+    check_index_freshness() call reads back -- every other
+    skipped_lines test in this branch monkeypatches around
+    _archive_and_build_locked's own wiring (the collection loop, the
+    final_index assignment, the manifest_payload key); this is the one that
+    proves the wiring itself, unmocked, end to end."""
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.freshness import check_index_freshness
+
+    monkeypatch.setenv("SYNAPT_MAX_TRANSCRIPT_LINE_BYTES", "1000")
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    write_jsonl(source / "s1.jsonl", [
+        user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+        assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        user_tool_result_entry(content="x" * 5000, uuid="tr1", ts="2026-03-01T10:01:00Z"),
+    ])
+
+    final_index = _archive_and_build(
+        project, source_dirs=[source], use_embeddings=False, incremental=False,
+    )
+
+    assert final_index is not None
+    assert len(final_index.skipped_lines) == 1
+    assert final_index.skipped_lines[0]["size"] > 1000
+
+    verdict = check_index_freshness(project)
+    assert len(verdict.skipped_lines) == 1
+    assert verdict.skipped_lines[0]["size"] > 1000
+
 
 def test_second_build_reports_that_it_skipped(tmp_path, capsys):
     from synapt.recall.cli import _archive_and_build

@@ -25,6 +25,8 @@ def _release_server_markers():
 class _FakeIndex:
     chunks = [object()]
     skipped_oversize: list = []
+    config_warnings: list = []
+    skipped_lines: list = []
 
     @staticmethod
     def stats() -> dict:
@@ -98,6 +100,33 @@ def test_returns_receipt_before_completion_and_reuses_active_job(monkeypatch, tm
     completed = _wait_status(server, build_id, "completed")
     assert completed["stats"] == {"chunk_count": 7, "session_count": 3}
     assert completed["updated_shards"] == ["data_002.db"]
+
+
+def test_receipt_surfaces_skipped_lines_alongside_config_warnings(monkeypatch, tmp_path):
+    """A line-level skip must reach the build receipt the same way
+    skipped_oversize and config_warnings already do -- the
+    prior version left skipped_lines as a print-only local on build_index(),
+    invisible to the in-process MCP build path that writes this receipt."""
+    from synapt.recall import cli, server
+
+    class _FakeIndexWithSkippedLines(_FakeIndex):
+        skipped_lines = [{"session_id": "huge", "byte_offset": 0, "size": 6_000_000}]
+
+    def fake_build(project, *, use_embeddings, incremental, progress):
+        progress("parsing")
+        return _FakeIndexWithSkippedLines()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_archive_and_build", fake_build)
+    monkeypatch.setattr(server, "_invalidate_cache", lambda: None)
+
+    response = server.recall_build(incremental=False)
+    build_id = _build_id(response)
+    completed = _wait_status(server, build_id, "completed")
+
+    assert completed["skipped_lines"] == [
+        {"session_id": "huge", "byte_offset": 0, "size": 6_000_000}
+    ]
 
 
 def test_same_process_status_does_not_reprobe_its_own_marker(monkeypatch, tmp_path):

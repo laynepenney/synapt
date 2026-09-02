@@ -85,3 +85,27 @@ def test_get_index_recognizes_a_sharded_index_without_legacy_files(
     )
 
     assert server._get_index(use_embeddings=False) is fake_index
+
+
+def test_label_empty_result_surfaces_skipped_lines(tmp_path, monkeypatch):
+    """A line-level skip must reach the MCP-facing freshness banner the same
+    way a skipped-oversize FILE already does -- the prior
+    version never wired skipped_lines past a local variable in build_index(),
+    so this banner path (and the freshness manifest key it reads from) never
+    existed for it."""
+    from synapt.recall import freshness as freshness_module
+    from synapt.recall.freshness import IndexFreshness
+
+    verdict = IndexFreshness(
+        stale=False,
+        build_timestamp="2026-08-06T11:00:00",
+        scanned="archive",
+        skipped_lines=[{"session_id": "huge-session", "byte_offset": 42, "size": 6_000_000}],
+    )
+    monkeypatch.setattr(freshness_module, "check_index_freshness", lambda **kw: verdict)
+
+    out = server._label_empty_result("No results found.", tmp_path)
+
+    assert "huge-session" in out
+    assert "6,000,000" in out
+    assert "SYNAPT_MAX_TRANSCRIPT_LINE_BYTES" in out
