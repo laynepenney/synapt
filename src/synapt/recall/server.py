@@ -2923,6 +2923,49 @@ def _check_version_stale() -> str:
     return ""
 
 
+def _resolved_install_kind() -> str:
+    """"editable", "non-editable", or "unknown" for the running synapt install.
+
+    A declared version string does not pin which code ran: an editable
+    install's dist-info version can stay unchanged while the linked
+    worktree underneath it is repointed -- the incident this whole
+    disclosure line exists to make visible without hand diagnosis.
+    PEP 660's ``direct_url.json`` is the one place this is
+    recorded, under ``dir_info.editable``; a normal (non-editable) install
+    either has no ``direct_url.json`` or has one without that key.
+    """
+    try:
+        from importlib.metadata import distribution
+        raw = distribution("synapt").read_text("direct_url.json")
+        if raw is None:
+            return "non-editable"
+        data = json.loads(raw)
+        return "editable" if data.get("dir_info", {}).get("editable") else "non-editable"
+    except Exception:
+        return "unknown"
+
+
+def _resolved_provenance_line() -> str:
+    """One line naming the version AND the resolved import location this
+    process is actually running -- version alone does not pin which code
+    ran (recall#952): under an editable install, the same reported version
+    can execute different bytes minutes apart if the linked worktree is
+    repointed, silently, with nothing else changed.
+    """
+    try:
+        location = str(Path(_synapt_pkg.__file__).resolve().parent)
+    except Exception:
+        location = "unknown"
+    return f"synapt v{_STARTUP_VERSION} — running from {location} ({_resolved_install_kind()} install)"
+
+
+def _with_provenance(text: str) -> str:
+    """Append the resolved-provenance line to a CLI result, same composition
+    shape as ``_with_query_freshness`` -- the caller's text is never mutated
+    beyond adding this one trailing line."""
+    return f"{text}\n\nProvenance: {_resolved_provenance_line()}"
+
+
 def _check_channel_activity() -> str:
     """Lightweight check for new channel messages since last tool call.
 

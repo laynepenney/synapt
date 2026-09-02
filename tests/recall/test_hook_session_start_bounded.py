@@ -151,7 +151,9 @@ def _begin_finish_one(log_path: str) -> str:
 
 
 def _run_hook(monkeypatch, tmp_path, *, source="startup", context_lines=None, transcript_dirs=None,
-              channel_unread=None, channel_read="", directives=""):
+              channel_unread=None, channel_read="", directives="",
+              provenance_line="synapt vTEST — running from /fixture (editable install)",
+              provenance_side_effect=None):
     """Drive cmd_hook('session-start') with a hook payload on stdin.
 
     Returns (stdout_text, popen_calls). Everything with a side effect outside
@@ -172,10 +174,16 @@ def _run_hook(monkeypatch, tmp_path, *, source="startup", context_lines=None, tr
             popen_calls.append(list(argv))
             self.kwargs = kwargs
 
+    provenance_kwargs = (
+        {"side_effect": provenance_side_effect} if provenance_side_effect is not None
+        else {"return_value": provenance_line}
+    )
+
     out = io.StringIO()
     with patch.object(cli.subprocess, "Popen", _FakePopen), \
          patch.object(cli, "project_transcript_dirs", return_value=transcript_dirs if transcript_dirs is not None else [tmp_path]), \
          patch("synapt.recall.server._check_version_stale", return_value=None), \
+         patch("synapt.recall.server._resolved_provenance_line", **provenance_kwargs), \
          patch("synapt.recall.journal.compact_journal", return_value=0), \
          patch.object(cli, "_dev_loop_activation_prompt", return_value=None), \
          patch("synapt.recall.reminders._reminders_path", return_value=tmp_path / "reminders.json"), \
@@ -613,6 +621,37 @@ class TestWakeOutputBudget:
         out, _ = _run_hook(monkeypatch, tmp_path)
         assert "60 reminders" in out.splitlines()[0]
         assert out.count("STICKY-REMINDER-") < 60
+
+
+class TestProvenanceBanner:
+    """The wake carries version+resolved-path disclosure into its
+    banner UNCONDITIONALLY, not only on a version mismatch -- a repointed
+    editable install can keep reporting the same version, so
+    the staleness check alone cannot see it."""
+
+    def test_provenance_line_reaches_the_wake_banner(self, monkeypatch, tmp_path):
+        out, _ = _run_hook(
+            monkeypatch, tmp_path,
+            provenance_line="synapt vTEST — running from /fixture/worktree (editable install)",
+        )
+        assert "synapt vTEST — running from /fixture/worktree (editable install)" in out
+
+    def test_a_provenance_lookup_failure_degrades_without_losing_the_rest_of_the_wake(
+        self, owned_recall_root, monkeypatch, tmp_path,
+    ):
+        """The lookup runs inside try/except in cmd_hook; a raise there must
+        not blank the whole session-start output the way an unguarded
+        exception elsewhere in this hook already once did (Ref #856)."""
+        jf = _journal_path()
+        jf.parent.mkdir(parents=True, exist_ok=True)
+        append_entry(JournalEntry(timestamp="2026-08-22T03:40:00Z", session_id="s", focus="f",
+                                  next_steps=["one small step"]), jf)
+        out, _ = _run_hook(
+            monkeypatch, tmp_path,
+            provenance_side_effect=RuntimeError("resolution blew up"),
+        )
+        assert "one small step" in out
+        assert "resolution blew up" not in out
 
 
 # ---------------------------------------------------------------------------
