@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[test,dashboard]"
+      - run: pip install -e ".[test,dashboard,anthropic,openai]"
       # A collection error in one file (e.g. a TDD tests-only spec ahead of its
       # implementation) otherwise makes pytest refuse to RUN any of the other
       # already-collected tests, zeroing out the whole matrix's signal rather

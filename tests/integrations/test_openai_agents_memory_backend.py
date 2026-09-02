@@ -7,6 +7,9 @@ import importlib
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("agents", reason="requires the optional openai-agents integration")
+
 from agents.memory.session import Session
 from agents.memory.session_settings import SessionSettings
 

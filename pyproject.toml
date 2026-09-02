@@ -25,10 +25,6 @@ classifiers = [
 ]
 dependencies = [
     "mcp[cli]==1.28.1",
-    "sentence-transformers>=2.0",
-    "mlx-lm>=0.10; sys_platform == 'darwin' and platform_machine == 'arm64'",
-    "anthropic>=0.70",
-    "openai-agents>=0.10",
 ]
 authors = [
     {name = "Layne Penney"},
@@ -38,7 +34,18 @@ authors = [
 Homepage = "https://synapt.dev"
 Repository = "https://github.com/synapt-dev/recall"
 
+# The MCP server is the base product and its closure stays mandatory above.
+# Local model backends and hosted-provider clients are opt-in runtime
+# capabilities: importing or running the server must not require their model
+# stacks to be present.
 [project.optional-dependencies]
+server = ["mcp[cli]==1.28.1"]
+full-runtime = [
+    "sentence-transformers>=2.0",
+    "mlx-lm>=0.10; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "anthropic>=0.70",
+    "openai-agents>=0.10",
+]
 anthropic = ["anthropic>=0.77.0"]
 openai = ["openai-agents>=0.10.0"]
 google-adk = ["google-adk>=1.0.0"]
@@ -59,6 +66,8 @@ x = ["tweepy>=4.14"]
 dashboard = ["fastapi>=0.100", "uvicorn[standard]>=0.20", "sse-starlette>=1.0", "markdown>=3.4", "nh3>=0.2.14"]
 code-index = ["tree-sitter>=0.23", "tree-sitter-language-pack>=0.7"]
 all = [
+    "sentence-transformers>=2.0",
+    "mlx-lm>=0.10; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "fastapi>=0.100",
     "uvicorn[standard]>=0.20",
     "sse-starlette>=1.0",
@@ -78,10 +87,37 @@ all = [
     "tree-sitter>=0.23",
     "tree-sitter-language-pack>=0.7",
 ]
+# `all` keeps the historical broad installation shape. `full` is the explicit
+# spelling for callers that want every runtime and integration capability.
+full = [
+    "sentence-transformers>=2.0",
+    "mlx-lm>=0.10; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "anthropic>=0.70",
+    "openai-agents>=0.10",
+    "anthropic>=0.77.0",
+    "openai-agents>=0.10.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.20",
+    "sse-starlette>=1.0",
+    "markdown>=3.4",
+    "nh3>=0.2.14",
+    "google-adk>=1.0.0",
+    "langchain-core>=0.2",
+    "crewai>=1.4.0",
+    "huggingface_hub>=0.20",
+    "onnxruntime>=1.16",
+    "optimum[onnxruntime]>=1.16",
+    "transformers>=4.30",
+    "peft>=0.7",
+    "synapt-extract>=0.6.0",
+    "tree-sitter>=0.23",
+    "tree-sitter-language-pack>=0.7",
+]
 dev = ["watchfiles>=0.20"]
 test = [
     "build>=1.0",
     "pytest>=7.0",
+    "tomli>=2.0; python_version < '3.11'",
     "numpy",
     "pytest-benchmark>=4.0",
     "fastapi>=0.100",
