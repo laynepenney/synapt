@@ -2862,7 +2862,11 @@ def recall_channel(
     log_store = None
     try:
         from synapt.recall.actions import get_action_registry
-        from synapt.recall.channel import _channels_dir, _db_path
+        from synapt.recall.channel import (
+            _channels_dir,
+            _db_path,
+            _orphaned_local_channel_store,
+        )
 
         registry = get_action_registry()
         state_store = _db_path().resolve()
@@ -2876,6 +2880,18 @@ def recall_channel(
         # the log was elsewhere. Named unconditionally, not only when they
         # diverge: a caller should never have to infer agreement from silence.
         log_store = _channels_dir().resolve()
+        orphan_dir = _orphaned_local_channel_store()
+        orphan_line = ""
+        if orphan_dir is not None:
+            # A leftover local channels dir can
+            # sit beside the live global one, still readable, with no
+            # signal it is not the store this call actually used. Named,
+            # never deleted -- a human decides what to do with it.
+            stale_files = ", ".join(str(p) for p in sorted(orphan_dir.glob("*.jsonl")))
+            orphan_line = (
+                f"Channel log store (orphaned legacy, not read/written by "
+                f"this call): {stale_files}\n"
+            )
         result = registry.dispatch(
             action,
             channel=channel,
@@ -2890,7 +2906,11 @@ def recall_channel(
             detail=detail,
             msg_type=msg_type,
         )
-        return f"Channel state store: {state_store}\nChannel log store: {log_store}\n{result}"
+        return (
+            f"Channel state store: {state_store}\n"
+            f"Channel log store: {log_store}\n"
+            f"{orphan_line}{result}"
+        )
     except Exception as exc:
         prefix = ""
         if state_store:

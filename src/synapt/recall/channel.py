@@ -32,7 +32,12 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from synapt.recall.core import project_data_dir, _worktree_name, _find_gripspace_root
+from synapt.recall.core import (
+    project_data_dir,
+    _worktree_name,
+    _find_gripspace_root,
+    _resolve_project_root_override,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -116,20 +121,24 @@ def _clear_message_hooks() -> None:
 def _read_manifest_url(project_dir: Path | None = None) -> str | None:
     """Read the manifest URL from gripspace.yml, or None if not in a gripspace.
 
-    Honors GRIPSPACE_ROOT the same way project_data_dir() already does
-    (core.py Priority 0b), consulted only when project_dir is None — an
-    explicitly-passed project_dir is a deliberate root that suppresses the
-    env override, same contract as project_data_dir. Without this, a call
-    from anywhere the walk-up can't reach the gripspace (a scratchpad, a
-    sibling worktree) silently misses this tier while project_data_dir's
-    Tier-3-backing resolver still finds it via the env var — two resolvers
-    disagreeing on the same root is recall#916 (`#dev` resolving to two
-    different files depending on caller cwd).
+    Honors the SAME env-var root override as project_data_dir() (Tier-3
+    local/state store), via the shared ``_resolve_project_root_override`` —
+    consulted only when project_dir is None, an explicitly-passed
+    project_dir being a deliberate root that suppresses every env override,
+    same contract as project_data_dir. One resolver decides the coordinate
+    for both stores now; before this fix, project_data_dir additionally
+    honored SYNAPT_RECALL_ROOT outright while
+    this function considered only GRIPSPACE_ROOT, so a caller who set
+    SYNAPT_RECALL_ROOT to redirect the local store got the log routed to
+    the real gripspace's Tier-2 global path instead — two different
+    gripspaces, not the by-design "log Tier-2, state Tier-3" split. The
+    GRIPSPACE_ROOT-only gap this originally closed is recall#916 (`#dev`
+    resolving to two different files depending on caller cwd).
     """
     if project_dir is None:
-        grip_env = os.environ.get("GRIPSPACE_ROOT")
-        if grip_env:
-            project_dir = Path(grip_env).expanduser().resolve()
+        override = _resolve_project_root_override(project_dir)
+        if override is not None:
+            project_dir = override
     root = _find_gripspace_root(project_dir or Path.cwd())
     if root is None:
         return None
@@ -257,6 +266,33 @@ def _channels_dir(project_dir: Path | None = None) -> Path:
         return global_dir
     # Tier 3: local fallback
     return _guard_store_path("resolve_channels_dir", _local_channels_dir(project_dir))
+
+
+def _orphaned_local_channel_store(project_dir: Path | None = None) -> Path | None:
+    """Return the legacy local channels dir if it looks orphaned, else None.
+
+    "Orphaned" means: this call's log resolves Tier-2 GLOBAL (so the local
+    Tier-3 directory is no longer the live log for this call), AND that
+    local directory already exists on disk with at least one channel
+    JSONL file in it -- the exact shape of a reported production symptom:
+    a gripspace-local ``dev.jsonl`` that "stayed behind looking live" after
+    the real log moved to the global store, its ``channels.db`` sitting
+    right beside it and still being written (the state db is Tier-3 local
+    by design), which is what made the leftover JSONL read as current to
+    a casual reader.
+
+    Detect and report ONLY -- never delete. Whether the leftover file
+    still matters (backup it, migrate it, or leave it) is a human's call,
+    not this function's.
+    """
+    if _global_channels_dir(project_dir) is None:
+        return None  # this call's log is Tier-3 local already; nothing orphaned
+    local_dir = _local_channels_dir(project_dir)
+    if not local_dir.is_dir():
+        return None
+    if any(local_dir.glob("*.jsonl")):
+        return local_dir
+    return None
 
 
 def _channel_to_filename(channel: str) -> str:

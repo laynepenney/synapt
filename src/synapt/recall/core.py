@@ -4809,6 +4809,45 @@ def _guard_data_root(operation: str, path: Path) -> Path:
     return path
 
 
+def _resolve_project_root_override(project_dir: Path | None = None) -> Path | None:
+    """Return the explicit env-var root override, or None to fall through
+    to a filesystem walk-up.
+
+    Shared by ``project_data_dir`` (Tier-3 local/state store) and
+    ``channel._read_manifest_url`` (Tier-2 global/log store) so an override
+    honored by one resolver is honored by both. Before this,
+    ``SYNAPT_RECALL_ROOT`` was consulted only here:
+    a caller who set it to redirect the local store (a reconstruction
+    scratch dir, an export ``--path``, a test isolation helper) got the log
+    store routed to the real gripspace's Tier-2 global path while the state
+    store correctly followed the override — two different gripspaces, not
+    the by-design "log Tier-2, state Tier-3" split.
+
+    Precedence, consulted only when *project_dir* is None (an explicitly-
+    passed project_dir is a deliberate root that suppresses every env
+    override, e.g. export/import ``--path``):
+      1. ``SYNAPT_RECALL_ROOT``
+      2. ``GRIPSPACE_ROOT``
+    Must exist: silently resolving under a mistyped root presents an empty
+    history as a real answer.
+    """
+    if project_dir is not None:
+        return None
+    for var in ("SYNAPT_RECALL_ROOT", "GRIPSPACE_ROOT"):
+        env_val = os.environ.get(var)
+        if not env_val:
+            continue
+        resolved = Path(env_val).expanduser().resolve()
+        if not resolved.is_dir():
+            raise ValueError(
+                f"{var} points at a directory that does not exist: "
+                f"{resolved}. Refusing to resolve under a mistyped root — "
+                f"unset the variable or create the workspace first."
+            )
+        return resolved
+    return None
+
+
 def project_data_dir(project_dir: Path | None = None) -> Path:
     """Return the root synapt recall data directory.
 
@@ -4837,39 +4876,11 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
       1. ``.synapse/recall/``  → ``.synapt/recall/``
       2. ``.synapse-recall/``  → ``.synapt/recall/``
     """
-    env_resolved: Path | None = None
-    if project_dir is None:
-        # Priority 0: SYNAPT_RECALL_ROOT — explicit store root, always wins.
-        env_root = os.environ.get("SYNAPT_RECALL_ROOT")
-        if env_root:
-            env_resolved = Path(env_root).expanduser().resolve()
-            if not env_resolved.is_dir():
-                raise ValueError(
-                    f"SYNAPT_RECALL_ROOT points at a directory that does not "
-                    f"exist: {env_resolved}. Refusing to mint a fresh store "
-                    f"under a mistyped root — unset the variable or create "
-                    f"the workspace first."
-                )
-        else:
-            # Priority 0b: GRIPSPACE_ROOT — the workspace root gr already
-            # computed via find_workspace_root() and exports on every spawn.
-            # It REPLACES the walk-up below, which cannot reach the workspace
-            # from an agent worktree that is a filesystem SIBLING of it: walking
-            # up from a sibling never arrives at the other one, so each agent
-            # silently minted its own store (tracked in a private issue). gr has the
-            # answer; recall reads it instead of guessing. Consulted only in this
-            # None-branch: an explicitly-passed project_dir is a deliberate root
-            # that suppresses the env override (cli.py cmd_export/cmd_import).
-            grip_env = os.environ.get("GRIPSPACE_ROOT")
-            if grip_env:
-                env_resolved = Path(grip_env).expanduser().resolve()
-                if not env_resolved.is_dir():
-                    raise ValueError(
-                        f"GRIPSPACE_ROOT points at a directory that does not "
-                        f"exist: {env_resolved}. Refusing to mint a fresh store "
-                        f"under a mistyped root — unset the variable or create "
-                        f"the workspace first."
-                    )
+    # Priority 0/0b (SYNAPT_RECALL_ROOT then GRIPSPACE_ROOT): shared with
+    # channel._read_manifest_url via _resolve_project_root_override so the
+    # override is honored identically by the local/state store and the
+    # global/log store — see that function's docstring for why.
+    env_resolved = _resolve_project_root_override(project_dir)
 
     if env_resolved is not None:
         # No early return: the override selects the ROOT and then flows
