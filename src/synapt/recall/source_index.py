@@ -19,6 +19,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import struct
 import threading
 import unicodedata
 import uuid
@@ -26,6 +27,9 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
+
+from synapt.recall.embeddings import EmbeddingProvider
+from synapt.recall.hybrid import weighted_rrf_merge
 
 
 SOURCE_INDEX_SUPPORTED = hasattr(os, "O_DIRECTORY")
@@ -36,6 +40,22 @@ run degrades to a clear refusal instead of an AttributeError deep in the
 walk."""
 
 _PARSER_VERSION = "markdown-v1"
+
+# Minimum cosine similarity for an embedding-only candidate (one with no
+# lexical/BM25 overlap) to be admitted into hybrid search results. Measured
+# 2026-09-02 against a real ~950-unit markdown corpus (all-MiniLM-L6-v2): ten
+# grep-verified-absent queries (nonsense tokens + real terms from a different
+# repo) scored a max cosine of 0.3876 against their nearest unit; floor is
+# that maximum plus a 0.03 margin. This is corpus- and model-dependent, not a
+# universal constant -- callers with a materially different corpus size or
+# embedding model should re-measure rather than trust this default. Full
+# measurement tracked privately, not linked here.
+DEFAULT_SOURCE_SIMILARITY_FLOOR = 0.4176
+
+# How many candidates each side (BM25, embedding) contributes to the merge
+# pool before truncating to the caller's requested limit. Wider than `limit`
+# so RRF has real ranking material to fuse from both sides.
+_HYBRID_CANDIDATE_POOL = 20
 _SUCCESS = "complete"
 _FAILURE_STATES = {
     "cancelled",
@@ -113,6 +133,13 @@ class SourceSearchResult:
     observed_at: str
     relative_path: str | None = None
     source_kind: str = "memory_file"
+    similarity: float | None = None
+    """Cosine similarity against the query, when the embedding path scored
+    this unit for this query (regardless of whether it passed the floor or
+    was surfaced via BM25 instead). ``None`` when hybrid search was not used,
+    or when this unit has no stored embedding (e.g. synced before the flag
+    was enabled). A caller sees the real number next to a BM25-only ``None``
+    and judges, rather than trusting an internal admit/reject decision alone."""
 
 
 @dataclass(frozen=True)
@@ -557,7 +584,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS source_units_fts USING fts5(
     structural_address,
     tokenize="porter unicode61 tokenchars '._+'"
 );
+CREATE TABLE IF NOT EXISTS source_units_embeddings (
+    unit_id TEXT PRIMARY KEY,
+    vector BLOB NOT NULL,
+    dim INTEGER NOT NULL,
+    model TEXT NOT NULL
+);
 """
+# No source_id column on source_units_embeddings: every embedding query must
+# join through source_units (and source_documents for lifecycle) to reach a
+# row at all, which makes it structurally impossible to query embeddings
+# without the same source_id/lifecycle scoping the FTS path already applies --
+# the same authorization discipline #918's cross-org isolation witness
+# (test_source_index_cross_org_isolation.py) already proved for search_source.
 
 
 def _ensure_schema(connection: sqlite3.Connection) -> None:
@@ -600,6 +639,23 @@ def _unit_id(document_id: str, unit: ParsedSourceUnit, unit_sha256: str) -> str:
     return hashlib.sha256(authority.encode()).hexdigest()
 
 
+def _pack_vector(values: list[float]) -> bytes:
+    return struct.pack(f"<{len(values)}f", *values)
+
+
+def _unpack_vector(blob: bytes, dim: int) -> list[float]:
+    return list(struct.unpack(f"<{dim}f", blob))
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def sync_source(
     admission: SourceAdmission,
     adapter: SourceAdapter,
@@ -608,8 +664,18 @@ def sync_source(
     *,
     limits: SourceLimits | None = None,
     parser: MarkdownParser = parse_markdown,
+    embed_provider: EmbeddingProvider | None = None,
 ) -> SourceScanReceipt:
-    """Scan and atomically publish one authorized source generation."""
+    """Scan and atomically publish one authorized source generation.
+
+    ``embed_provider`` is opt-in and defaults to ``None`` -- omitting it (the
+    default for every existing caller) produces byte-for-byte the same
+    behavior as before this parameter existed. When supplied, only the units
+    actually being (re)published this generation are embedded (the same
+    content-hash-scoped set that already skips unchanged documents), never
+    the whole corpus -- the embedding step rides the existing incrementality
+    rather than adding a second full-corpus pass.
+    """
 
     scan_id = f"scan_{uuid.uuid4().hex[:12]}"
     limits = limits or SourceLimits()
@@ -655,6 +721,27 @@ def sync_source(
     if not _authorized(admission, authorize):
         return SourceScanReceipt(scan_id, "unauthorized")
 
+    # Embedding runs outside any DB transaction/lock, same placement as
+    # parsing above -- a provider call (network or model inference) must
+    # never happen while holding the write lock. Only the units actually
+    # staged this generation are embedded (already skips reused/unchanged
+    # documents), so this rides the existing incrementality rather than
+    # adding a second full-corpus pass.
+    embeddings_by_unit_id: dict[str, list[float]] = {}
+    if embed_provider is not None and staged:
+        pending_ids: list[str] = []
+        pending_texts: list[str] = []
+        for relative_path, (document, units) in staged.items():
+            document_id = _document_id(admission.source_id, relative_path)
+            for unit in units:
+                unit_sha256 = hashlib.sha256(unit.content.encode()).hexdigest()
+                pending_ids.append(_unit_id(document_id, unit, unit_sha256))
+                pending_texts.append(unit.content)
+        if pending_texts:
+            embeddings_by_unit_id = dict(
+                zip(pending_ids, embed_provider.embed(pending_texts))
+            )
+
     connection = open_store()
     connection.row_factory = sqlite3.Row
     try:
@@ -687,6 +774,14 @@ def sync_source(
             for unit_id in unit_ids:
                 connection.execute(
                     "DELETE FROM source_units_fts WHERE unit_id = ?", (unit_id,)
+                )
+                # Always clean up, independent of whether embed_provider was
+                # passed THIS call -- a unit deleted/replaced while the flag
+                # happened to be off must not leave an orphaned embedding row
+                # keyed on a unit_id that source_units no longer considers
+                # current.
+                connection.execute(
+                    "DELETE FROM source_units_embeddings WHERE unit_id = ?", (unit_id,)
                 )
             connection.execute(
                 "UPDATE source_units SET lifecycle = 'deleted', generation = ? "
@@ -749,6 +844,13 @@ def sync_source(
                     "INSERT INTO source_units_fts(unit_id, content, structural_address) VALUES (?, ?, ?)",
                     (unit_id, unit.content, unit.structural_address),
                 )
+                vector = embeddings_by_unit_id.get(unit_id)
+                if vector is not None:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO source_units_embeddings "
+                        "(unit_id, vector, dim, model) VALUES (?, ?, ?, ?)",
+                        (unit_id, _pack_vector(vector), len(vector), type(embed_provider).__name__),
+                    )
                 units_published += 1
         connection.execute(
             "INSERT INTO source_state "
@@ -804,6 +906,20 @@ def _fts_query(query: str) -> str:
     return " ".join('"' + token.replace('"', '""') + '"' for token in tokens)
 
 
+def _row_to_result(
+    row: sqlite3.Row, disclose_path: bool, similarity: float | None = None
+) -> SourceSearchResult:
+    return SourceSearchResult(
+        content=row["content"],
+        structural_address=row["structural_address"],
+        lifecycle=row["lifecycle"],
+        revision_token=row["revision_token"],
+        observed_at=row["observed_at"],
+        relative_path=row["relative_path"] if disclose_path else None,
+        similarity=similarity,
+    )
+
+
 def search_source(
     admission: SourceAdmission,
     open_store: StoreOpener,
@@ -811,47 +927,132 @@ def search_source(
     query: str,
     *,
     limit: int = 5,
+    embed_provider: EmbeddingProvider | None = None,
+    similarity_floor: float = DEFAULT_SOURCE_SIMILARITY_FLOOR,
 ) -> list[SourceSearchResult]:
-    """Return bounded current lexical results after two authority checks."""
+    """Return bounded current results after two authority checks.
+
+    ``embed_provider`` is opt-in and defaults to ``None`` -- every existing
+    caller gets byte-for-byte the same lexical-only behavior as before this
+    parameter existed. When supplied, BM25 and embedding-cosine candidate
+    pools are fused via ``weighted_rrf_merge`` (the same fusion transcript
+    search already uses). An embedding-only candidate (no BM25 overlap) is
+    admitted only above ``similarity_floor``; a candidate found via BM25
+    is never excluded by the floor, matching it or not. Every result whose
+    unit has a stored embedding carries its cosine in ``similarity`` --
+    whether or not that score cleared the floor -- so a caller can see a
+    0.42 next to a 0.34 and judge, rather than trust an internal admit
+    decision alone.
+    """
 
     if limit < 1 or not _authorized(admission, authorize):
         return []
-    expression = _fts_query(query)
-    if not expression:
-        return []
+
+    if embed_provider is None:
+        expression = _fts_query(query)
+        if not expression:
+            return []
+        connection = open_store()
+        connection.row_factory = sqlite3.Row
+        try:
+            _ensure_schema(connection)
+            rows = connection.execute(
+                "SELECT u.content, u.structural_address, u.lifecycle, u.revision_token, "
+                "u.observed_at, d.relative_path "
+                "FROM source_units_fts f "
+                "JOIN source_units u ON u.unit_id = f.unit_id "
+                "JOIN source_documents d ON d.document_id = u.document_id "
+                "WHERE source_units_fts MATCH ? AND u.source_id = ? "
+                "AND u.lifecycle = 'current' AND d.lifecycle = 'current' "
+                "ORDER BY bm25(source_units_fts), u.unit_id LIMIT ?",
+                (expression, admission.source_id, limit),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            connection.close()
+        if not _authorized(admission, authorize):
+            return []
+        disclose_path = admission.path_disclosure == "relative"
+        return [_row_to_result(row, disclose_path) for row in rows]
+
+    # Hybrid path. Both queries below apply the identical source_id +
+    # lifecycle='current' scoping the lexical-only path already proved safe
+    # under a shared physical store (test_source_index_cross_org_isolation.py)
+    # -- the embeddings table has no source_id column of its own precisely so
+    # this join is the only way to reach a row.
     connection = open_store()
     connection.row_factory = sqlite3.Row
     try:
         _ensure_schema(connection)
-        rows = connection.execute(
-            "SELECT u.content, u.structural_address, u.lifecycle, u.revision_token, "
-            "u.observed_at, d.relative_path "
-            "FROM source_units_fts f "
-            "JOIN source_units u ON u.unit_id = f.unit_id "
+        expression = _fts_query(query)
+        bm25_rows: list[sqlite3.Row] = []
+        if expression:
+            try:
+                bm25_rows = connection.execute(
+                    "SELECT u.unit_id, u.content, u.structural_address, u.lifecycle, "
+                    "u.revision_token, u.observed_at, d.relative_path "
+                    "FROM source_units_fts f "
+                    "JOIN source_units u ON u.unit_id = f.unit_id "
+                    "JOIN source_documents d ON d.document_id = u.document_id "
+                    "WHERE source_units_fts MATCH ? AND u.source_id = ? "
+                    "AND u.lifecycle = 'current' AND d.lifecycle = 'current' "
+                    "ORDER BY bm25(source_units_fts), u.unit_id LIMIT ?",
+                    (expression, admission.source_id, _HYBRID_CANDIDATE_POOL),
+                ).fetchall()
+            except sqlite3.Error:
+                bm25_rows = []
+
+        embedding_rows = connection.execute(
+            "SELECT e.unit_id, e.vector, e.dim, u.content, u.structural_address, "
+            "u.lifecycle, u.revision_token, u.observed_at, d.relative_path "
+            "FROM source_units_embeddings e "
+            "JOIN source_units u ON u.unit_id = e.unit_id "
             "JOIN source_documents d ON d.document_id = u.document_id "
-            "WHERE source_units_fts MATCH ? AND u.source_id = ? "
-            "AND u.lifecycle = 'current' AND d.lifecycle = 'current' "
-            "ORDER BY bm25(source_units_fts), u.unit_id LIMIT ?",
-            (expression, admission.source_id, limit),
+            "WHERE u.source_id = ? AND u.lifecycle = 'current' AND d.lifecycle = 'current'",
+            (admission.source_id,),
         ).fetchall()
     except sqlite3.Error:
         return []
     finally:
         connection.close()
+
     if not _authorized(admission, authorize):
         return []
-    disclose_path = admission.path_disclosure == "relative"
-    return [
-        SourceSearchResult(
-            content=row["content"],
-            structural_address=row["structural_address"],
-            lifecycle=row["lifecycle"],
-            revision_token=row["revision_token"],
-            observed_at=row["observed_at"],
-            relative_path=row["relative_path"] if disclose_path else None,
+
+    row_by_unit_id: dict[str, sqlite3.Row] = {row["unit_id"]: row for row in bm25_rows}
+
+    query_vector = embed_provider.embed_single(query)
+    cosine_by_unit_id: dict[str, float] = {}
+    for row in embedding_rows:
+        vector = _unpack_vector(row["vector"], row["dim"])
+        cosine_by_unit_id[row["unit_id"]] = _cosine(query_vector, vector)
+        row_by_unit_id.setdefault(row["unit_id"], row)
+
+    bm25_ranked = [(row["unit_id"], 0.0) for row in bm25_rows]
+    emb_ranked = [
+        (unit_id, score)
+        for unit_id, score in sorted(
+            cosine_by_unit_id.items(), key=lambda item: item[1], reverse=True
         )
-        for row in rows
-    ]
+        if score >= similarity_floor
+    ][:_HYBRID_CANDIDATE_POOL]
+
+    if not bm25_ranked and not emb_ranked:
+        return []
+
+    merged = weighted_rrf_merge(bm25_ranked, emb_ranked)[:limit]
+
+    disclose_path = admission.path_disclosure == "relative"
+    results: list[SourceSearchResult] = []
+    for unit_id, _rrf_score in merged:
+        row = row_by_unit_id.get(unit_id)
+        if row is None:
+            continue
+        results.append(
+            _row_to_result(row, disclose_path, similarity=cosine_by_unit_id.get(unit_id))
+        )
+    return results
 
 
 @dataclass(frozen=True)
