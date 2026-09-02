@@ -847,6 +847,24 @@ def search_source(
     ]
 
 
+@dataclass(frozen=True)
+class IndexedSourceSearchProvider:
+    """Bridge one admitted source index into ordinary recall composition."""
+
+    admission: SourceAdmission
+    open_store: StoreOpener
+    authorize: AuthorizationCheck
+
+    def search(self, request: SourceSearchRequest) -> list[SourceSearchResult]:
+        return search_source(
+            self.admission,
+            self.open_store,
+            self.authorize,
+            request.query,
+            limit=request.limit,
+        )
+
+
 def render_source_results(results: Iterable[SourceSearchResult]) -> str:
     """Render authorized source results without internal IDs or raw hashes."""
 
