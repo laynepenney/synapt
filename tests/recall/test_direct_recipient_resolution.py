@@ -395,13 +395,12 @@ def test_two_gripspaces_converge_on_recipient_owned_state_and_history(
     """Anchor's send and Stromus's read/ack share one recipient-owned record.
 
     This test removes SYNAPT_SHARED_CHANNELS_DIR to test cross-org fallback.
-    The _isolated_direct_store autouse fixture now patches Path.home() in both
-    direct and registry modules, so isolation is preserved even when the env var
-    is removed.
+    The _isolated_direct_store autouse fixture patches Path.home() so isolation
+    is preserved even when the env var is removed.
     """
-    # The _isolated_direct_store fixture has already patched Path.home for both
-    # direct and registry modules. Removing the shared channels dir now triggers
-    # fallback to the patched home, not the real one.
+    # The _isolated_direct_store fixture has already patched Path.home.
+    # Removing the shared channels dir now triggers fallback to the patched home,
+    # not the real one.
     monkeypatch.delenv("SYNAPT_SHARED_CHANNELS_DIR", raising=False)
     anchor_space = tmp_path / "conversa-gripspace"
     stromus_space = tmp_path / "synapt-gripspace"
