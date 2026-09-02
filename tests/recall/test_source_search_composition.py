@@ -143,6 +143,12 @@ def test_indexed_markdown_flows_through_ordinary_recall_search(
             max_chunks=5,
             max_tokens=600,
         )
+        monkeypatch.setattr(server, "_get_index", lambda: _index(""))
+        absent_rendered = server.recall_search(
+            "violet turbine",
+            max_chunks=5,
+            max_tokens=600,
+        )
     finally:
         os.close(root_fd)
 
@@ -154,6 +160,9 @@ def test_indexed_markdown_flows_through_ordinary_recall_search(
     )
     assert "decision.md · Decision [1]" in rendered
     assert "amber lattice preserves the deployment boundary" in rendered.lower()
+    assert "No results found." in absent_rendered
+    assert "[source:" not in absent_rendered
+    assert "amber lattice" not in absent_rendered.lower()
 
 
 def test_registered_source_can_answer_when_transcript_index_is_missing(
