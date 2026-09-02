@@ -17,7 +17,9 @@ from synapt.recall.source_index import (
 )
 
 
-pytestmark = pytest.mark.skipif(os.name == "nt", reason="descriptor adapter fails closed on Windows")
+pytestmark = pytest.mark.skipif(
+    os.name == "nt", reason="descriptor adapter fails closed on Windows"
+)
 
 
 def _admission(root_fd: int, *, disclosure: str = "hidden") -> SourceAdmission:
@@ -41,7 +43,9 @@ def _opener(path: Path, calls: list[str] | None = None):
     return open_store
 
 
-def test_memory_file_flows_through_distinct_source_index_and_render(tmp_path: Path) -> None:
+def test_memory_file_flows_through_distinct_source_index_and_render(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "memory"
     root.mkdir()
     (root / "index.md").write_text(
@@ -82,7 +86,9 @@ def test_memory_file_flows_through_distinct_source_index_and_render(tmp_path: Pa
     assert "[source:memory_file · current · Decisions [1] · revision " in rendered
     assert str(root) not in rendered
     assert "document_sha256" not in rendered
-    assert compose_source_results("conversation result", results).startswith("conversation result\n\n[source:")
+    assert compose_source_results("conversation result", results).startswith(
+        "conversation result\n\n[source:"
+    )
 
     connection = sqlite3.connect(db_path)
     try:
@@ -101,7 +107,9 @@ def test_memory_file_flows_through_distinct_source_index_and_render(tmp_path: Pa
 def test_unchanged_second_scan_reuses_document_without_parsing(tmp_path: Path) -> None:
     root = tmp_path / "memory"
     root.mkdir()
-    (root / "rule.md").write_text("# Rule\n\nPrefer the narrow seam.\n", encoding="utf-8")
+    (root / "rule.md").write_text(
+        "# Rule\n\nPrefer the narrow seam.\n", encoding="utf-8"
+    )
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     parser_calls: list[bytes] = []
 
@@ -135,7 +143,9 @@ def test_unchanged_second_scan_reuses_document_without_parsing(tmp_path: Path) -
     assert second.units_published == 0
 
 
-def test_unauthorized_calls_open_nothing_and_return_no_corpus_metadata(tmp_path: Path) -> None:
+def test_unauthorized_calls_open_nothing_and_return_no_corpus_metadata(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "memory"
     root.mkdir()
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)

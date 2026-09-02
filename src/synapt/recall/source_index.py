@@ -19,12 +19,12 @@ import re
 import secrets
 import sqlite3
 import stat
+import threading
 import unicodedata
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import PurePath
 from typing import Protocol
 
 
@@ -61,7 +61,9 @@ class SourceAdmission:
 
     def __post_init__(self) -> None:
         if not self.source_id or not self.scope_capability or not self.root_handle_id:
-            raise ValueError("source admission requires opaque source, capability, and handle IDs")
+            raise ValueError(
+                "source admission requires opaque source, capability, and handle IDs"
+            )
         if self.admission_epoch < 0 or self.policy_epoch < 0:
             raise ValueError("source admission epochs must be non-negative")
         if self.path_disclosure not in {"hidden", "relative"}:
@@ -107,6 +109,20 @@ class SourceSearchResult:
 
 
 @dataclass(frozen=True)
+class SourceSearchRequest:
+    """Neutral query contract passed to already-authorized source providers."""
+
+    query: str
+    limit: int
+    after: str | None = None
+    before: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.limit < 1:
+            raise ValueError("source search limit must be positive")
+
+
+@dataclass(frozen=True)
 class SourceScanReceipt:
     scan_id: str
     state: str
@@ -124,9 +140,66 @@ class SourceAdapter(Protocol):
     ) -> Iterable[SourceDocument]: ...
 
 
+class SourceSearchProvider(Protocol):
+    """Return authorized, usefulness-gated results for one neutral request.
+
+    The provider owns authorization before any source, store, cache, metrics,
+    or candidate work.  Returning an empty iterable is a valid refusal or
+    genuine-absence result.
+    """
+
+    def search(self, request: SourceSearchRequest) -> Iterable[SourceSearchResult]: ...
+
+
 AuthorizationCheck = Callable[[SourceAdmission], bool]
 StoreOpener = Callable[[], sqlite3.Connection]
 MarkdownParser = Callable[[bytes], list[ParsedSourceUnit]]
+
+
+_source_search_providers: dict[str, SourceSearchProvider] = {}
+_source_search_provider_lock = threading.RLock()
+
+
+def register_source_search_provider(name: str, provider: SourceSearchProvider) -> None:
+    """Register one downstream source provider for normal recall composition."""
+
+    normalized = name.strip()
+    if not normalized or not callable(getattr(provider, "search", None)):
+        raise ValueError("source provider requires a name and search callable")
+    with _source_search_provider_lock:
+        existing = _source_search_providers.get(normalized)
+        if existing is not None and existing is not provider:
+            raise ValueError(f"source provider already registered: {normalized}")
+        _source_search_providers[normalized] = provider
+
+
+def _clear_source_search_providers() -> None:
+    """Reset the process-local provider registry for isolated tests."""
+
+    with _source_search_provider_lock:
+        _source_search_providers.clear()
+
+
+def search_registered_sources(request: SourceSearchRequest) -> list[SourceSearchResult]:
+    """Query a stable provider snapshot and fail closed on provider refusal."""
+
+    with _source_search_provider_lock:
+        providers = tuple(sorted(_source_search_providers.items()))
+    results: list[SourceSearchResult] = []
+    for _name, provider in providers:
+        try:
+            candidates = provider.search(request)
+            for candidate in candidates:
+                if not isinstance(candidate, SourceSearchResult):
+                    continue
+                results.append(candidate)
+                if len(results) >= request.limit:
+                    return results
+        except Exception:
+            # Provider errors may contain private source details.  Refuse this
+            # provider without surfacing or logging the exception text.
+            continue
+    return results
 
 
 class _ScanFailure(Exception):
@@ -476,7 +549,9 @@ def _document_id(source_id: str, relative_path: str) -> str:
 
 
 def _revision_token(revision_key: bytes, document_sha256: str) -> str:
-    return hmac.new(revision_key, document_sha256.encode(), hashlib.sha256).hexdigest()[:20]
+    return hmac.new(revision_key, document_sha256.encode(), hashlib.sha256).hexdigest()[
+        :20
+    ]
 
 
 def _unit_id(document_id: str, unit: ParsedSourceUnit, unit_sha256: str) -> str:
@@ -502,7 +577,9 @@ def sync_source(
     connection = open_store()
     try:
         _ensure_schema(connection)
-        generation, revision_key, current_documents = _snapshot_state(connection, admission)
+        generation, revision_key, current_documents = _snapshot_state(
+            connection, admission
+        )
     finally:
         connection.close()
 
@@ -567,7 +644,9 @@ def sync_source(
                 ).fetchall()
             ]
             for unit_id in unit_ids:
-                connection.execute("DELETE FROM source_units_fts WHERE unit_id = ?", (unit_id,))
+                connection.execute(
+                    "DELETE FROM source_units_fts WHERE unit_id = ?", (unit_id,)
+                )
             connection.execute(
                 "UPDATE source_units SET lifecycle = 'deleted', generation = ? "
                 "WHERE document_id = ? AND lifecycle = 'current'",
@@ -750,7 +829,9 @@ def render_source_results(results: Iterable[SourceSearchResult]) -> str:
     return "\n\n".join(blocks)
 
 
-def compose_source_results(base_result: str, source_results: Iterable[SourceSearchResult]) -> str:
+def compose_source_results(
+    base_result: str, source_results: Iterable[SourceSearchResult]
+) -> str:
     """Deterministically append source-unit results to an existing recall render."""
 
     source_render = render_source_results(source_results)

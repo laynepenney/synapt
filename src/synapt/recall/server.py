@@ -407,6 +407,30 @@ def recall_search(
     if min_score is not None:
         threshold_ratio = min_score
     max_tokens = _cap_tokens(max_tokens)
+    effective_max_chunks = top_k if top_k > 0 else max_chunks
+
+    source_result = ""
+    if max_tokens > 0 and effective_max_chunks > 0:
+        from synapt.recall.source_index import (
+            SourceSearchRequest,
+            render_source_results,
+            search_registered_sources,
+        )
+
+        source_results = search_registered_sources(
+            SourceSearchRequest(
+                query=query,
+                limit=effective_max_chunks,
+                after=after,
+                before=before,
+            )
+        )
+        if source_results:
+            source_budget = min(500, max_tokens // 3)
+            source_result = _tw(
+                render_source_results(source_results),
+                max(1, source_budget * 4),
+            )
     index = _get_index()
 
     # Search the live transcript for current-session context.
@@ -416,6 +440,7 @@ def recall_search(
     # context that postdates the requested time window.
     historical_filter = before is not None or after is not None
     from synapt.recall.live import search_live_transcript
+
     live_budget = min(500, max_tokens // 3)
     live_result = ""
     if live_budget > 0 and not before:
@@ -441,14 +466,19 @@ def recall_search(
 
     if index is None:
         if historical_filter:
+            if source_result:
+                return _with_query_freshness(source_result, freshness_line)
             index_dir = project_index_dir()
             return _with_query_freshness((
                 f"Historical search unavailable: no index found at {index_dir}. "
                 f"Run `synapt recall setup` first. "
                 f"Cannot satisfy date-filtered query without an index."
             ), freshness_line)
-        if live_result:
-            return _with_query_freshness(live_result, freshness_line)
+        if live_result or source_result:
+            return _with_query_freshness(
+                "\n\n".join(part for part in (live_result, source_result) if part),
+                freshness_line,
+            )
         index_dir = project_index_dir()
         return _with_query_freshness(
             f"No index found at {index_dir}. Run `synapt recall setup` first.",
@@ -460,8 +490,6 @@ def recall_search(
         # intent classification can override it. When the user explicitly
         # sets a value, pass it through as-is to honour their choice.
         effective_hl: float | None = None if half_life == 60.0 else half_life
-        # top_k overrides max_chunks for grep-style "give me N results"
-        effective_max_chunks = top_k if top_k > 0 else max_chunks
         # min_confidence filters knowledge nodes post-retrieval
         effective_min_confidence = min_confidence
         result = index.lookup(
@@ -485,6 +513,8 @@ def recall_search(
             parts.append(live_result)
         if result:
             parts.append(result)
+        if source_result:
+            parts.append(source_result)
 
         # Surface contradiction warnings from co-retrieval detection
         conflicts = getattr(index, "_last_conflicts", [])
