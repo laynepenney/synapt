@@ -197,6 +197,45 @@ def _invalidate_cache() -> None:
     _cached_has_embeddings = False
 
 
+def _index_missing_message(index_dir: Path, *, historical: bool = False) -> str:
+    """Message for a caller-visible "no index" state.
+
+    ``_get_index()`` (and the explicit file-existence checks a few callers
+    use instead) cannot distinguish a genuinely absent index from one that
+    is merely unreadable for a moment because another process holds the
+    build lock -- the index files can vanish from disk mid-write during a
+    concurrent ``recall_build``. Telling the caller to run setup in that
+    case is wrong: setup is not the remedy, waiting is. Check the lock
+    directly (cheap: one non-blocking flock attempt) so the sentence agrees
+    with what the Freshness trailer already reports as reason=build_lock.
+    """
+    from synapt.recall.cli import (
+        _acquire_build_lock,
+        _build_lock_busy_message,
+        _release_build_lock,
+    )
+
+    lock_fd = _acquire_build_lock(index_dir.parent, timeout=0)
+    if lock_fd is None:
+        holder = _build_lock_busy_message(index_dir.parent)
+        detail = (
+            "Cannot satisfy the date-filtered query while a build is in "
+            "progress; " if historical else ""
+        )
+        return (
+            f"Index build in progress ({holder}) at {index_dir}. {detail}"
+            "The index is not missing, it is locked -- retry the query in a moment."
+        )
+    _release_build_lock(lock_fd)
+    if historical:
+        return (
+            f"Historical search unavailable: no index found at {index_dir}. "
+            f"Run `synapt recall setup` first. "
+            f"Cannot satisfy date-filtered query without an index."
+        )
+    return f"No index found at {index_dir}. Run `synapt recall setup` first."
+
+
 def _query_freshness_line(index_dir: Path) -> str:
     """Run the bounded caller-tail preflight and return its stable label."""
     from synapt.recall.query_freshness import (
@@ -496,11 +535,10 @@ def recall_search(
             if source_result:
                 return _with_query_freshness(source_result, freshness_line)
             index_dir = project_index_dir()
-            return _with_query_freshness((
-                f"Historical search unavailable: no index found at {index_dir}. "
-                f"Run `synapt recall setup` first. "
-                f"Cannot satisfy date-filtered query without an index."
-            ), freshness_line)
+            return _with_query_freshness(
+                _index_missing_message(index_dir, historical=True),
+                freshness_line,
+            )
         if live_result or source_result:
             return _with_query_freshness(
                 "\n\n".join(part for part in (live_result, source_result) if part),
@@ -508,7 +546,7 @@ def recall_search(
             )
         index_dir = project_index_dir()
         return _with_query_freshness(
-            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            _index_missing_message(index_dir),
             freshness_line,
         )
 
@@ -619,7 +657,7 @@ def recall_quick(query: str) -> str:
     if index is None:
         index_dir = project_index_dir()
         return _with_query_freshness(
-            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            _index_missing_message(index_dir),
             freshness_line,
         )
 
@@ -807,7 +845,7 @@ def recall_resume(
         and not is_sharded(index_dir)
     ):
         return _with_query_freshness(
-            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            _index_missing_message(index_dir),
             freshness_line,
         )
 
