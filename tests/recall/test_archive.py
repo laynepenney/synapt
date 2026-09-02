@@ -270,6 +270,136 @@ def test_export_import_replace_roundtrip(tmp_path):
     assert reminders[0]["id"] == "rem-a"
 
 
+def test_export_import_replace_roundtrip_carries_compaction_summaries(tmp_path):
+    """compaction-summaries.json survives an export/import round trip.
+
+    Measured: the file existed in a store before export, was absent from the
+    archive's own manifest, and was absent after import -- present before,
+    silently dropped, gone after. _ROOT_EXPORT_FILES is what export
+    enumerates as root-level state; the file's absence there, not any
+    generic archive/extract logic, was the whole defect."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _seed_recall_project(
+        source,
+        session_id="sess-b",
+        chunk_id="sess-b:t0",
+        knowledge_id="know-b",
+        journal_focus="source focus",
+        channel_id="msg-b",
+        reminder_id="rem-b",
+    )
+    compaction_content = json.dumps({
+        "schema_version": 1,
+        "summaries": [
+            {
+                "runtime": "claude",
+                "session_id": "sess-b",
+                "timestamp": "2026-03-20T09:03:00+00:00",
+                "source_path": "/tmp/sess-b.jsonl",
+                "summary": "a compaction summary that must round-trip",
+                "status": "available",
+                "truncated": False,
+                "worktree": "source",
+            }
+        ],
+    })
+    (source / ".synapt" / "recall" / "compaction-summaries.json").write_text(compaction_content)
+
+    archive_path = tmp_path / "backup.synapt-archive"
+    export_recall_archive(source, archive_path)
+
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    import_recall_archive(dest, archive_path, mode="replace")
+
+    dest_path = dest / ".synapt" / "recall" / "compaction-summaries.json"
+    assert dest_path.exists(), "compaction-summaries.json must exist after import"
+    assert dest_path.read_text() == compaction_content, (
+        "compaction-summaries.json content must round-trip byte-identical"
+    )
+
+
+def test_import_merge_carries_compaction_summaries_when_absent_and_preserves_when_present(tmp_path):
+    """Merge-mode copy-if-absent semantics for compaction-summaries.json.
+
+    Mirrors the existing coverage for config.json/upload_manifest.json/
+    last_sync_time: merge import copies the archive's file only when the
+    destination doesn't already have one -- never a content merge of the
+    two summaries lists. Two cases in one test because they are the two
+    branches of the same `if src.is_file() and not dst.exists()` guard:
+    absent -> copied byte-identical; present -> left untouched."""
+    source = tmp_path / "source"
+    source.mkdir()
+    _seed_recall_project(
+        source,
+        session_id="sess-c",
+        chunk_id="sess-c:t0",
+        knowledge_id="know-c",
+        journal_focus="source focus",
+        channel_id="msg-c",
+        reminder_id="rem-c",
+    )
+    source_content = json.dumps({
+        "schema_version": 1,
+        "summaries": [
+            {
+                "runtime": "claude",
+                "session_id": "sess-c",
+                "timestamp": "2026-03-20T09:04:00+00:00",
+                "source_path": "/tmp/sess-c.jsonl",
+                "summary": "source-side compaction summary",
+                "status": "available",
+                "truncated": False,
+                "worktree": "source",
+            }
+        ],
+    })
+    (source / ".synapt" / "recall" / "compaction-summaries.json").write_text(source_content)
+
+    archive_path = tmp_path / "backup.synapt-archive"
+    export_recall_archive(source, archive_path)
+
+    # Case 1: destination has no compaction-summaries.json -- copied byte-identical.
+    dest_absent = tmp_path / "dest-absent"
+    dest_absent.mkdir()
+    import_recall_archive(dest_absent, archive_path, mode="merge")
+    absent_path = dest_absent / ".synapt" / "recall" / "compaction-summaries.json"
+    assert absent_path.exists(), "compaction-summaries.json must be copied when destination lacks one"
+    assert absent_path.read_text() == source_content, (
+        "copied compaction-summaries.json must be byte-identical to the archive's"
+    )
+
+    # Case 2: destination already has a compaction-summaries.json with different
+    # content -- merge import must leave it untouched (copy-if-absent, not a
+    # content merge).
+    dest_present = tmp_path / "dest-present"
+    dest_present.mkdir()
+    (dest_present / ".synapt" / "recall").mkdir(parents=True, exist_ok=True)
+    dest_content = json.dumps({
+        "schema_version": 1,
+        "summaries": [
+            {
+                "runtime": "claude",
+                "session_id": "sess-local",
+                "timestamp": "2026-03-20T09:05:00+00:00",
+                "source_path": "/tmp/sess-local.jsonl",
+                "summary": "destination-side compaction summary, must survive",
+                "status": "available",
+                "truncated": False,
+                "worktree": "dest-present",
+            }
+        ],
+    })
+    present_path = dest_present / ".synapt" / "recall" / "compaction-summaries.json"
+    present_path.write_text(dest_content)
+
+    import_recall_archive(dest_present, archive_path, mode="merge")
+    assert present_path.read_text() == dest_content, (
+        "merge import must not overwrite an existing compaction-summaries.json"
+    )
+
+
 def test_import_merge_unions_chunks_knowledge_journal_and_channels(tmp_path):
     """Merge import unions semantic recall state without dropping local data."""
     local = tmp_path / "local"
