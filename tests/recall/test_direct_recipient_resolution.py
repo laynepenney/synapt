@@ -33,6 +33,13 @@ def _isolated_direct_store(tmp_path, monkeypatch):
         json.dumps({"anchor": {"target": "conversa:anchor", "runtime": "codex"}}),
     )
     monkeypatch.setattr("synapt.recall.channel._agent_id", lambda: "apollo-001")
+    # Patch Path.home() for tests that remove SYNAPT_SHARED_CHANNELS_DIR.
+    # Both direct and registry import the same pathlib.Path class; one patch
+    # affects all references. This ensures Path.home() returns the test's
+    # isolated tmp_path, not the real home, for all code in the test file.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(exist_ok=True)
+    monkeypatch.setattr("synapt.recall.direct.Path.home", classmethod(lambda cls: fake_home))
 
 
 @pytest.fixture
@@ -386,11 +393,17 @@ def test_configured_file_traversal_rejects_before_a_send_can_touch_storage(
 def test_two_gripspaces_converge_on_recipient_owned_state_and_history(
     tmp_path, monkeypatch
 ):
-    """Anchor's send and Stromus's read/ack share one recipient-owned record."""
+    """Anchor's send and Stromus's read/ack share one recipient-owned record.
+
+    This test removes SYNAPT_SHARED_CHANNELS_DIR to test cross-org fallback.
+    The _isolated_direct_store autouse fixture now patches Path.home() in both
+    direct and registry modules, so isolation is preserved even when the env var
+    is removed.
+    """
+    # The _isolated_direct_store fixture has already patched Path.home for both
+    # direct and registry modules. Removing the shared channels dir now triggers
+    # fallback to the patched home, not the real one.
     monkeypatch.delenv("SYNAPT_SHARED_CHANNELS_DIR", raising=False)
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setattr("synapt.recall.direct.Path.home", classmethod(lambda cls: home))
     anchor_space = tmp_path / "conversa-gripspace"
     stromus_space = tmp_path / "synapt-gripspace"
     anchor_space.mkdir()
@@ -444,3 +457,82 @@ def test_two_gripspaces_converge_on_recipient_owned_state_and_history(
     )
     assert [item.message_id for item in anchor_history] == [message.message_id]
     assert [item.message_id for item in stromus_history] == [message.message_id]
+
+
+def test_parametrized_tests_do_not_escape_isolation_to_shared_store(
+    monkeypatch, tmp_path
+):
+    """Prevent test isolation escape from multiple parametrized test instances.
+
+    When test_two_gripspaces_converge_on_recipient_owned_state_and_history runs
+    multiple times (e.g., from parametrization), each instance should register
+    agents to its own isolated team.db, not to the shared ~/.synapt/orgs/<org>/team.db.
+
+    The _isolated_direct_store autouse fixture patches Path.home() in both
+    synapt.recall.direct and synapt.recall.registry modules so that:
+    1. _team_db_path() returns a path in the isolated fake_home
+    2. When SYNAPT_SHARED_CHANNELS_DIR is removed, fallback still uses fake_home
+    3. Multiple test instances all write to their own tmp_path, not the real home
+
+    This test verifies that isolation holds even when env vars are manipulated.
+    """
+    from synapt.recall.registry import register_agent, _team_db_path, _check_org_entitlement
+    import sqlite3
+
+    # The _isolated_direct_store fixture has already set up isolation with:
+    # - SYNAPT_DATA_DIR pointing to tmp_path
+    # - Path.home() patched to a fake_home inside tmp_path
+    # - But NOT SYNAPT_SHARED_CHANNELS_DIR (it may be removed)
+
+    # Simulate what test_two_gripspaces does: remove SYNAPT_SHARED_CHANNELS_DIR
+    monkeypatch.delenv("SYNAPT_SHARED_CHANNELS_DIR", raising=False)
+
+    # Now _team_db_path should still return a path inside fake_home,
+    # not the real ~/.synapt/orgs/<org>/team.db
+    team_db_path = _team_db_path("conversa")
+    print(f"\n_team_db_path('conversa'): {team_db_path}")
+
+    # Verify it's inside tmp_path (the isolated root), not /var/folders or /home
+    assert str(tmp_path) in str(team_db_path), (
+        f"ISOLATION ESCAPE: _team_db_path returned {team_db_path}, "
+        f"which is outside tmp_path {tmp_path}"
+    )
+
+    # Create the team.db in the isolated location (simulating gr spawn initialization)
+    team_db_path.parent.mkdir(parents=True, exist_ok=True)
+    from synapt.recall.registry import _ensure_schema
+
+    conn = sqlite3.connect(str(team_db_path))
+    conn.row_factory = sqlite3.Row
+    _ensure_schema(conn)
+    conn.close()
+
+    # Now register multiple agents in sequence (simulating parametrized test instances)
+    # Each should write to the same isolated team.db
+    agent_ids = []
+    for i in range(3):
+        agent_id = register_agent("conversa", f"TestAgent{i}")
+        agent_ids.append(agent_id)
+        print(f"Registered {agent_id}")
+
+    # Verify all registrations are in the isolated store
+    conn = sqlite3.connect(str(team_db_path))
+    rows = conn.execute(
+        "SELECT agent_id, display_name FROM org_agents WHERE org_id='conversa'"
+    ).fetchall()
+    conn.close()
+
+    assert len(rows) == 3, f"Expected 3 registrations in isolated store, got {len(rows)}"
+    for agent_id in agent_ids:
+        assert agent_id in [r[0] for r in rows], (
+            f"Agent {agent_id} not found in isolated store. "
+            f"Registrations: {[r[0] for r in rows]}"
+        )
+
+    # Verify the isolated store is indeed in tmp_path
+    assert team_db_path.exists(), f"Isolated team.db not found at {team_db_path}"
+    assert (
+        tmp_path in team_db_path.parents or team_db_path.parent == tmp_path
+    ), f"team_db_path {team_db_path} is not under tmp_path {tmp_path}"
+
+    print(f"✓ All registrations isolated to {team_db_path}")
