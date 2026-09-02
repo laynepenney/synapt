@@ -7,6 +7,9 @@ import re
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("anthropic", reason="requires the optional anthropic integration")
+
 from anthropic.lib.tools._beta_builtin_memory_tool import BetaAbstractMemoryTool
 from anthropic.types.beta import (
     BetaMemoryTool20250818CreateCommand,

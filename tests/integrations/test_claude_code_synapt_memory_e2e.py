@@ -7,6 +7,9 @@ import json
 from pathlib import Path
 
 import pytest
+
+pytest.importorskip("anthropic", reason="requires the optional anthropic integration")
+
 from anthropic.types.beta import (
     BetaMemoryTool20250818CreateCommand,
     BetaMemoryTool20250818StrReplaceCommand,
