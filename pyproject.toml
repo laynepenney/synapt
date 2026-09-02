@@ -153,6 +153,13 @@ x = "synapt.x.server"
 # a callable main() function. Example:
 # repair = "your_package.repair.cli:cli_main"
 
+[project.entry-points."synapt.annotators"]
+# A downstream layer may register a per-hit code-symbol annotator here for
+# recall_code (code_search.py). Each entry point must reference a callable
+# with signature (repo_root, path, line_start, line_end) -> list[dict].
+# Example:
+# code = "your_package.annotators:annotate_symbol"
+
 [tool.pytest.ini_options]
 addopts = "--benchmark-disable"
 
