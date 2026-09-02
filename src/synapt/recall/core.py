@@ -773,6 +773,8 @@ def parse_transcript(
     stop_offset: int | None = None,
     turn_index_start: int = 0,
     session_id_override: str | None = None,
+    max_line_bytes: int | None = None,
+    skipped_lines: list[dict] | None = None,
 ) -> list[TranscriptChunk]:
     """Parse a Claude Code transcript JSONL file into semantic chunks.
 
@@ -788,12 +790,26 @@ def parse_transcript(
         path: Path to a .jsonl transcript file.
         seen_uuids: Set of already-seen (session_id, uuid) pairs for dedup.
                     Mutated in-place to add new entries.
+        max_line_bytes: Per-line size ceiling. A JSONL line over this is
+                       skipped entirely -- never handed to json.loads(), so
+                       the giant string it would produce is never
+                       materialized. Whole-file ceilings do not catch this
+                       case: a file can be tiny while one line inside it is
+                       huge (a single giant tool_result), and that one line's
+                       json.loads + scrub_text passes alone were measured
+                       driving peak RSS to ~3.5-3.7x the LINE's own size.
+                       Defaults to SYNAPT_MAX_TRANSCRIPT_LINE_BYTES, or
+                       DEFAULT_MAX_LINE_BYTES when unset.
+        skipped_lines: If given, mutated in-place to append one
+                      {"session_id", "byte_offset", "size"} dict per skipped
+                      line -- mirrors seen_uuids' mutate-in-place contract.
 
     Returns:
         List of TranscriptChunk objects.
     """
     if seen_uuids is None:
         seen_uuids = set()
+    line_ceiling = max_line_bytes if max_line_bytes is not None else _max_line_bytes()[0]
 
     chunks: list[TranscriptChunk] = []
     session_id = session_id_override or path.stem  # UUID from filename
@@ -945,6 +961,19 @@ def parse_transcript(
             if stop_offset is not None and current_offset + line_bytes > stop_offset:
                 break
             current_offset += line_bytes
+            if line_ceiling is not None and line_bytes > line_ceiling:
+                # Never reaches json.loads(): the whole point is to avoid
+                # materializing the giant string at all, not just avoid
+                # storing it -- json.loads + scrub_text on a multi-hundred-MB
+                # line is what drives the RSS spike, and truncating the
+                # PARSED result after the fact does not prevent that spike.
+                if skipped_lines is not None:
+                    skipped_lines.append({
+                        "session_id": session_id,
+                        "byte_offset": line_start,
+                        "size": line_bytes,
+                    })
+                continue
             line = raw_line.strip()
             if not line:
                 continue
@@ -5182,15 +5211,49 @@ def parse_journal_entries(journal_path: Path) -> list[TranscriptChunk]:
 #: two data points, which is exactly why it is env-overridable.
 DEFAULT_MAX_TRANSCRIPT_FILE_BYTES = 2 * 1024 * 1024 * 1024
 
+#: A single JSONL LINE well over this is what a whole-file ceiling cannot
+#: see coming: the file can sit well under DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+#: while one line inside it is huge. Measured (synapt.dev, 2026-09-02): a
+#: single 400-600 MB line drives peak RSS to ~3.5-3.7x the LINE's own size
+#: (json.loads + scrub_text's 16 regex passes each transiently copy the
+#: string) -- far worse than normal content's ~0.44x. No real "legitimate
+#: giant single line" calibration point exists the way the 1.41 GB whole-file
+#: one did, so this is reasoned from the multiplier instead: even at the
+#: worst observed ~3.7x, 50 MB cannot push one line's RSS impact past
+#: ~185 MB, while sitting far above any ordinary turn's content.
+DEFAULT_MAX_LINE_BYTES = 50 * 1024 * 1024
 
-def _max_transcript_file_bytes() -> int:
-    override = os.environ.get("SYNAPT_MAX_TRANSCRIPT_FILE_BYTES")
-    if override:
-        try:
-            return int(override)
-        except ValueError:
-            pass
-    return DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+
+def _int_env_override(var_name: str, default: int) -> tuple[int, str | None]:
+    """Read an integer env override; never silently swallow a malformed one.
+
+    Returns (value, warning). A missing or empty var is not a malformed
+    override -- warning is None. A present-but-unparseable value falls back
+    to *default* AND returns a warning naming the bad string, so the caller
+    can surface it (build_index prints it and adds it to config_warnings)
+    rather than the override vanishing with no trace.
+    """
+    override = os.environ.get(var_name)
+    if not override:
+        return default, None
+    try:
+        return int(override), None
+    except ValueError:
+        return default, (
+            f"{var_name}={override!r} is not a valid integer; using default {default}"
+        )
+
+
+def _max_transcript_file_bytes() -> tuple[int, str | None]:
+    return _int_env_override(
+        "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES", DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+    )
+
+
+def _max_line_bytes() -> tuple[int, str | None]:
+    return _int_env_override(
+        "SYNAPT_MAX_TRANSCRIPT_LINE_BYTES", DEFAULT_MAX_LINE_BYTES
+    )
 
 
 def build_index(
@@ -5201,6 +5264,7 @@ def build_index(
     db: RecallDB | None = None,
     subchunk_min_text: int | None = None,
     max_file_bytes: int | None = None,
+    max_line_bytes: int | None = None,
 ) -> TranscriptIndex:
     """Build a TranscriptIndex from a directory of .jsonl transcript files.
 
@@ -5215,20 +5279,50 @@ def build_index(
                        up the rest of the build. Defaults to
                        SYNAPT_MAX_TRANSCRIPT_FILE_BYTES, or
                        DEFAULT_MAX_TRANSCRIPT_FILE_BYTES when unset.
+        max_line_bytes: Per-line size ceiling within a file that IS parsed.
+                       See parse_transcript's docstring for why a whole-file
+                       ceiling alone does not cover this case. Defaults to
+                       SYNAPT_MAX_TRANSCRIPT_LINE_BYTES, or
+                       DEFAULT_MAX_LINE_BYTES when unset.
 
     Returns:
-        TranscriptIndex over all parsed chunks. Carries a `.skipped_oversize`
-        attribute: a list of {"name", "dir", "size"} dicts for every file this
-        call skipped for size, always present (empty when nothing was
-        skipped) so a caller can rely on it without a hasattr check.
+        TranscriptIndex over all parsed chunks. Carries three attributes,
+        always present (empty when nothing was skipped/warned) so a caller
+        can rely on them without a hasattr check:
+        - `.skipped_oversize`: {"name", "dir", "size"} dicts, one per file
+          skipped for size.
+        - `.config_warnings`: one string per malformed env override this
+          call encountered (falls back to the safe default; a bad override
+          is visible, never a silent no-op).
+        - `.skipped_lines`: {"session_id", "byte_offset", "size"} dicts, one
+          per line skipped for size (see max_line_bytes above). Unlike
+          skipped_oversize, a line skip does not mean the file was skipped --
+          the file's other lines still parsed and are reflected in the
+          returned chunks.
     """
-    ceiling = max_file_bytes if max_file_bytes is not None else _max_transcript_file_bytes()
+    config_warnings: list[str] = []
+    if max_file_bytes is not None:
+        ceiling = max_file_bytes
+    else:
+        ceiling, warning = _max_transcript_file_bytes()
+        if warning:
+            config_warnings.append(warning)
+            print(f"[synapt] {warning}")
+    if max_line_bytes is not None:
+        line_ceiling = max_line_bytes
+    else:
+        line_ceiling, warning = _max_line_bytes()
+        if warning:
+            config_warnings.append(warning)
+            print(f"[synapt] {warning}")
 
     jsonl_files = sorted(source_dir.glob("*.jsonl"))
     if not jsonl_files:
         print(f"[synapt] No .jsonl files found in {source_dir}")
         empty = TranscriptIndex([])
         empty.skipped_oversize = []
+        empty.config_warnings = config_warnings
+        empty.skipped_lines = []
         return empty
 
     forced_subchunk = os.environ.get("SYNAPT_FORCE_SUBCHUNK_MIN_TEXT")
@@ -5272,6 +5366,7 @@ def build_index(
     skipped = 0
     parsed_files: list[Path] = []  # Track which files were actually parsed
     skipped_oversize: list[dict] = []
+    skipped_lines: list[dict] = []
 
     for filepath in jsonl_files:
         stamp = already_indexed.get((filepath.parent.name, filepath.name))
@@ -5309,7 +5404,9 @@ def build_index(
                 chunks = parse_codex_transcript(filepath, seen_uuids=seen_uuids)
             else:
                 chunks = parse_transcript(filepath, seen_uuids=seen_uuids,
-                                          subchunk_min_text=subchunk_min_text)
+                                          subchunk_min_text=subchunk_min_text,
+                                          max_line_bytes=line_ceiling,
+                                          skipped_lines=skipped_lines)
             all_chunks.extend(chunks)
             parsed_files.append(filepath)
             print(f"  {filepath.name}: {len(chunks)} turns")
@@ -5320,6 +5417,11 @@ def build_index(
         print(f"[synapt] Skipped {skipped} already-indexed files")
     if skipped_oversize:
         print(f"[synapt] Skipped {len(skipped_oversize)} oversize file(s) "
+              f"(not indexed, not searchable)")
+    if skipped_lines:
+        total_skipped_line_bytes = sum(s["size"] for s in skipped_lines)
+        print(f"[synapt] Skipped {len(skipped_lines)} oversize line(s) within "
+              f"otherwise-parsed files, {total_skipped_line_bytes:,} bytes "
               f"(not indexed, not searchable)")
     print(f"[synapt] Total: {len(all_chunks)} chunks from {len(jsonl_files) - skipped} files")
 
@@ -5349,7 +5451,8 @@ def build_index(
                             chunks = parse_codex_transcript(filepath, seen_uuids=seen_uuids_reparse)
                         else:
                             chunks = parse_transcript(filepath, seen_uuids=seen_uuids_reparse,
-                                                      subchunk_min_text=0)
+                                                      subchunk_min_text=0,
+                                                      max_line_bytes=line_ceiling)
                         all_chunks.extend(chunks)
                     except Exception:
                         pass
@@ -5357,4 +5460,6 @@ def build_index(
 
     result = TranscriptIndex(all_chunks, use_embeddings=use_embeddings, cache_dir=cache_dir, db=db)
     result.skipped_oversize = skipped_oversize
+    result.config_warnings = config_warnings
+    result.skipped_lines = skipped_lines
     return result

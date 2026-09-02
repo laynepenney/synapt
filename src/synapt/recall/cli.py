@@ -653,6 +653,8 @@ def _archive_and_build_locked(
         progress("parsing")
     logger.info("build: parsing transcripts from %d source(s)...", len(build_sources))
     skipped_oversize: list[dict] = []
+    skipped_lines: list[dict] = []
+    config_warnings: list[str] = []
     for build_source in build_sources:
         index = build_index(
             build_source,
@@ -662,6 +664,13 @@ def _archive_and_build_locked(
         )
         all_chunks.extend(index.chunks)
         skipped_oversize.extend(index.skipped_oversize)
+        skipped_lines.extend(index.skipped_lines)
+        # Same env override is resolved once per build_source; dedupe by text
+        # rather than plumbing it through as a single shared value, since
+        # each call already independently prints its own warning line.
+        for warning in index.config_warnings:
+            if warning not in config_warnings:
+                config_warnings.append(warning)
     logger.info("build: parsed %d chunks in %.1fs", len(all_chunks), _time.monotonic() - build_t0)
 
     # ChatGPT archive (separate source)
@@ -782,6 +791,13 @@ def _archive_and_build_locked(
                 f"{format_size(total_skipped_bytes)} not indexed -- see "
                 "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES"
             )
+        if skipped_lines:
+            total_skipped_line_bytes = sum(s["size"] for s in skipped_lines)
+            print(
+                f"  Skipped (oversize line): {len(skipped_lines)} line(s), "
+                f"{format_size(total_skipped_line_bytes)} not indexed -- see "
+                "SYNAPT_MAX_TRANSCRIPT_LINE_BYTES"
+            )
         return None
 
     # Dedup by chunk id
@@ -804,6 +820,8 @@ def _archive_and_build_locked(
         db=db,
     )
     final_index.skipped_oversize = skipped_oversize
+    final_index.config_warnings = config_warnings
+    final_index.skipped_lines = skipped_lines
     final_index.save(index_dir)
     logger.info("build: FTS5 save complete in %.1fs", _time.monotonic() - save_t0)
 
@@ -1012,6 +1030,12 @@ def _archive_and_build_locked(
     # indistinguishable from content that WAS successfully searched. Leaving
     # it out means the ceiling check re-runs (one cheap stat) and re-reports
     # it every build instead.
+    #
+    # A file with a SKIPPED LINE is not excluded the same way: its other
+    # lines DID parse successfully, so its stamp genuinely reflects what is
+    # in the index (minus the one line, which will be skipped again on the
+    # next build regardless of the stamp match). skipped_lines is threaded
+    # through as its own manifest key purely for visibility, not staleness.
     oversize_names = {(s["dir"], s["name"]) for s in skipped_oversize}
     source_files = []
     for build_source in build_sources:
@@ -1096,13 +1120,24 @@ def _archive_and_build_locked(
         compaction_indexed = False
         logger.warning("Compaction summary indexing failed: %s", exc)
 
-    manifest_payload = {"source_files": source_files, "skipped_oversize": skipped_oversize}
+    manifest_payload = {
+        "source_files": source_files,
+        "skipped_oversize": skipped_oversize,
+        "skipped_lines": skipped_lines,
+    }
     if skipped_oversize:
         total_skipped_bytes = sum(s["size"] for s in skipped_oversize)
         print(
             f"  Skipped (oversize): {len(skipped_oversize)} file(s), "
             f"{format_size(total_skipped_bytes)} not indexed -- see "
             "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES"
+        )
+    if skipped_lines:
+        total_skipped_line_bytes = sum(s["size"] for s in skipped_lines)
+        print(
+            f"  Skipped (oversize line): {len(skipped_lines)} line(s), "
+            f"{format_size(total_skipped_line_bytes)} not indexed -- see "
+            "SYNAPT_MAX_TRANSCRIPT_LINE_BYTES"
         )
     inputs_stable = (
         readonly_at_read.digest == readonly_before.digest

@@ -281,6 +281,19 @@ def _label_empty_result(result: str, index_dir: Path) -> str:
             f"\nSkipped (oversize, not searchable): {len(verdict.skipped_oversize)} "
             f"file(s) -- {skipped_desc}. Raise SYNAPT_MAX_TRANSCRIPT_FILE_BYTES to include."
         )
+    if verdict.skipped_lines:
+        # Same reasoning as skipped_oversize above, one level down: a
+        # skipped LINE was examined and rejected too, and stays true on the
+        # next build with the same ceiling -- it belongs in neither the
+        # stale nor the current branch above.
+        skipped_line_desc = "; ".join(
+            f"{s.get('session_id', '?')} ({s.get('size', 0):,} bytes)"
+            for s in verdict.skipped_lines
+        )
+        status += (
+            f"\nSkipped (oversize line, not searchable): {len(verdict.skipped_lines)} "
+            f"line(s) -- {skipped_line_desc}. Raise SYNAPT_MAX_TRANSCRIPT_LINE_BYTES to include."
+        )
     return f"{result}\n\nIndex root: {index_dir}\n{status}"
 
 
@@ -1092,6 +1105,12 @@ def _run_build_job(project: Path, receipt: dict, incremental: bool) -> None:
         # its skip on the receipt, not just a silent zero-chunk result.
         receipt["skipped_oversize"] = (
             final_index.skipped_oversize if final_index is not None else []
+        )
+        receipt["config_warnings"] = (
+            final_index.config_warnings if final_index is not None else []
+        )
+        receipt["skipped_lines"] = (
+            final_index.skipped_lines if final_index is not None else []
         )
     except BaseException as exc:
         receipt["state"] = "failed"
