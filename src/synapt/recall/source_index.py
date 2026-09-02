@@ -28,6 +28,13 @@ from datetime import datetime, timezone
 from typing import Protocol
 
 
+SOURCE_INDEX_SUPPORTED = hasattr(os, "O_DIRECTORY")
+"""Whether this platform can run DescriptorSourceAdapter's fd-based
+admission. False on Windows, where os.O_DIRECTORY does not exist -- the
+single source of truth production code and tests both check, so a Windows
+run degrades to a clear refusal instead of an AttributeError deep in the
+walk."""
+
 _PARSER_VERSION = "markdown-v1"
 _SUCCESS = "complete"
 _FAILURE_STATES = {
@@ -288,7 +295,7 @@ class DescriptorSourceAdapter:
     def enumerate(
         self, admission: SourceAdmission, limits: SourceLimits
     ) -> Iterable[SourceDocument]:
-        if os.name == "nt" or not hasattr(os, "O_NOFOLLOW"):
+        if not SOURCE_INDEX_SUPPORTED or not hasattr(os, "O_NOFOLLOW"):
             raise _ScanFailure("unsupported")
         try:
             root_before = os.fstat(admission.root_handle)
