@@ -2440,14 +2440,26 @@ class TestChannelSearch(unittest.TestCase):
         # "eval running on modal" matches both terms, should score higher
         self.assertEqual(results[0]["body"], "eval running on modal")
 
-    def test_search_skips_join_leave(self):
-        channel_join("dev", agent_name="bot")
+    def test_default_search_now_finds_join_leave_too(self):
+        """Renamed from test_search_skips_join_leave (recall#982 follow-on
+        finding, 2026-09-02): its own control was vacuous. `display` in a
+        join/leave body comes from ``display_name`` or ``_resolve_display_name``,
+        NEVER from ``agent_name`` -- so ``channel_join("dev", agent_name="bot")``
+        never actually put "bot" in the body, and the old assertion (0 hits)
+        passed for the wrong reason on every run, before and after this file's
+        two-``TestChannelSearch``-classes collection bug. Fixed here with
+        ``display_name="bot"`` so the body genuinely contains the needle, and
+        the expectation now matches Stromus's ruling: msg_type=None excludes
+        nothing, including join/leave."""
+        # channel_leave's own `display_name` parameter does not reach its
+        # message body (only `_agent_id` derivation) -- a separate, narrower
+        # defect noted but not fixed here (out of scope for recall#982);
+        # `reason` is the one leave-body override that actually works.
+        channel_join("dev", agent_name="bot", display_name="bot")
         channel_post("dev", "hello", agent_name="bot")
-        channel_leave("dev", agent_name="bot")
+        channel_leave("dev", agent_name="bot", reason="bot leaving now")
         results = channel_search("bot")
-        # Join/leave messages mention "bot" but should be skipped
-        # Only the "hello" message should NOT match "bot"
-        self.assertEqual(len(results), 0)
+        self.assertEqual({r["type"] for r in results}, {"join", "leave"})
 
     def test_search_includes_directives(self):
         channel_directive("dev", "check the deploy logs", to="s_target", agent_name="admin")
@@ -2467,8 +2479,16 @@ class TestChannelSearch(unittest.TestCase):
         self.assertEqual(results, [])
 
 
-class TestChannelSearch(unittest.TestCase):
-    """Tests for channel_search with type filtering (#147)."""
+class TestChannelSearchByType(unittest.TestCase):
+    """Tests for channel_search with type filtering (#147).
+
+    Renamed from a duplicate ``TestChannelSearch`` (recall#982 fix-adjacent
+    finding, 2026-09-02): two classes shared this name in this file, so the
+    second silently shadowed the first at module-load time and pytest never
+    collected the first class's 8 tests -- a name collision, not a skip or
+    an xfail, so nothing anywhere reported it. Verified before the rename:
+    `pytest --collect-only -k test_search_finds_matching_messages` collected
+    zero items."""
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
@@ -2503,6 +2523,80 @@ class TestChannelSearch(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertIn("type", results[0])
         self.assertEqual(results[0]["type"], "message")
+
+
+class TestChannelSearchDefaultCoversAllTypes(unittest.TestCase):
+    """recall#982: a string present verbatim in a real message was reported
+    absent. Measured cause: channel_search's own type filter silently
+    restricted an untyped search to type in ("message", "directive") only,
+    and _handle_search (the recall_channel(action="search") entry point)
+    never forwarded the caller's msg_type at all -- so no caller of the
+    documented tool could route around the restriction. A commit SHA posted
+    as a "pr"-type message (the majority of our actual #dev traffic --
+    GATE, PR, status, code, claim, and update posts are all non-message
+    types) was structurally unfindable, and the response read as a verified
+    negative rather than an unanswerable query.
+
+    Ruling (Stromus, 2026-09-02): msg_type=None means ALL types, no
+    exclusion. A caller who wants only chat passes msg_type="message".
+    BEHAVIOUR CHANGE: an untyped search used to silently exclude every
+    "pr"/"status"/"claim"/"code"/"update"-typed message (and join/leave);
+    it no longer does. Anyone who relied on the narrow default now sees
+    more results for the same query."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self._patcher = _patch_data_dir(self.tmpdir)
+        self._patcher.start()
+
+    def tearDown(self):
+        self._patcher.stop()
+
+    def test_default_search_finds_a_non_message_type_post(self):
+        channel_post("dev", "verdict bound to head cfe82908", agent_name="bot", msg_type="pr")
+        channel_post("dev", "unrelated chat", agent_name="bot")
+        results = channel_search("cfe82908")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["type"], "pr")
+
+    def test_explicit_message_type_still_excludes_other_types(self):
+        channel_post("dev", "verdict bound to head cfe82908", agent_name="bot", msg_type="pr")
+        results = channel_search("cfe82908", msg_type="message")
+        self.assertEqual(results, [])
+
+    def test_default_search_finds_every_real_type(self):
+        channel_post("dev", "shared_token_zz status line", agent_name="bot", msg_type="status")
+        channel_post("dev", "shared_token_zz claim line", agent_name="bot", msg_type="claim")
+        channel_post("dev", "shared_token_zz code line", agent_name="bot", msg_type="code")
+        channel_post("dev", "shared_token_zz update line", agent_name="bot", msg_type="update")
+        results = channel_search("shared_token_zz")
+        self.assertEqual({r["type"] for r in results}, {"status", "claim", "code", "update"})
+
+
+class TestActionSearchForwardsMsgType(unittest.TestCase):
+    """Pins the forwarded argument at the recall_channel(action="search")
+    boundary (actions.py:_handle_search) -- the half of recall#982 that a
+    channel_search-only test cannot see, since _handle_search silently
+    dropped the caller's msg_type kwarg before it ever reached
+    channel_search, regardless of what channel_search itself did."""
+
+    def test_msg_type_kwarg_reaches_channel_search(self):
+        from unittest.mock import patch as _patch
+        from synapt.recall.actions import _handle_search
+
+        with _patch("synapt.recall.channel.channel_search", return_value=[]) as mock_search:
+            _handle_search(message="cfe82908", msg_type="pr", name="bot")
+        mock_search.assert_called_once()
+        self.assertEqual(mock_search.call_args.kwargs.get("msg_type"), "pr")
+
+    def test_no_msg_type_forwards_none(self):
+        from unittest.mock import patch as _patch
+        from synapt.recall.actions import _handle_search
+
+        with _patch("synapt.recall.channel.channel_search", return_value=[]) as mock_search:
+            _handle_search(message="cfe82908", name="bot")
+        mock_search.assert_called_once()
+        self.assertIsNone(mock_search.call_args.kwargs.get("msg_type"))
 
 
 class TestCheckDirectives(unittest.TestCase):
