@@ -1747,10 +1747,15 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # helpers server.py already built and tested rather than duplicating
     # the logic -- refresh-current-session exceptions render as an
     # ERROR-state line; _with_query_freshness appends that line.
-    from synapt.recall.server import _query_freshness_line, _with_query_freshness
+    from synapt.recall.server import _query_freshness_line, _with_provenance, _with_query_freshness
 
     freshness_line = _query_freshness_line(index_dir)
-    print(_with_query_freshness(format_resume(view), freshness_line))
+    # Provenance: appended the same way the
+    # freshness line is -- a version number alone does not pin which code
+    # answered this resume; a repointed editable install can keep reporting
+    # the same declared version while the linked worktree underneath it
+    # changes out from under every running process.
+    print(_with_provenance(_with_query_freshness(format_resume(view), freshness_line)))
 
 
 def _attach_unclean_end(view, args):
@@ -3269,6 +3274,19 @@ def cmd_hook(args: argparse.Namespace) -> None:
                         f"WARNING: {stale_warning}\n"
                         "Call recall_reload to restart the MCP server with the latest code."
                     )
+            except Exception:
+                pass
+
+        # 0b. Provenance line, unconditional: a version match does not
+        # prove the same code ran -- an editable
+        # install's linked worktree can be silently repointed while the
+        # declared version stays put. This has to run every time, not only
+        # on a version mismatch, because the mismatch check can't see a
+        # repoint that happens to land on the same version.
+        with run.phase("provenance"):
+            try:
+                from synapt.recall.server import _resolved_provenance_line
+                banners.append(_resolved_provenance_line())
             except Exception:
                 pass
 
