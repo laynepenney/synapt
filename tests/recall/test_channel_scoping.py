@@ -38,6 +38,8 @@ from synapt.recall.channel import (
     _db_path,
     _append_message,
     _read_messages,
+    _read_manifest_url,
+    _global_channels_dir,
     channel_join,
     channel_post,
     channel_read,
@@ -59,12 +61,27 @@ try:
 except ImportError:
     SCOPING_AVAILABLE = False
 
-from synapt.recall.core import project_data_dir
+from synapt.recall.core import project_data_dir, _gripspace_cache
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _make_gripspace_with_manifest(
+    tmp_path: Path, url: str = "git@github.com:synapt-dev/synapt-gripspace.git"
+) -> Path:
+    """A gripspace root real enough for both root-detection and manifest
+    parsing: ``.gitgrip/griptrees.json`` marks the root (what
+    ``_find_gripspace_root`` looks for), ``.gitgrip/spaces/main/gripspace.yml``
+    carries the manifest URL (what ``_read_manifest_url`` parses)."""
+    grip = tmp_path / "workspace"
+    spaces_main = grip / ".gitgrip" / "spaces" / "main"
+    spaces_main.mkdir(parents=True)
+    (grip / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
+    (spaces_main / "gripspace.yml").write_text(f"version: 2\nmanifest:\n  url: {url}\nrepos: {{}}\n")
+    return grip
 
 
 def _create_team_db(db_path: Path, org_id: str = "synapt-dev") -> None:
@@ -578,6 +595,83 @@ class TestBackwardCompat(unittest.TestCase):
                 os.environ.pop("SYNAPT_SHARED_CHANNELS_DIR", None)
                 result = _channels_dir()
         self.assertEqual(result, self._local_dir / "channels")
+
+
+class TestManifestUrlHonorsGripspaceRoot:
+    """recall#916: two files both claim to be `#dev` depending on the caller's
+    cwd at the instant of the call. `_channels_dir()`'s Tier 3 fallback
+    (`project_data_dir`) already honors `GRIPSPACE_ROOT`; Tier 2's
+    `_read_manifest_url()` does not, so a call from anywhere that isn't
+    literally inside the gripspace tree (a scratchpad, a sibling worktree)
+    misses Tier 2 and lands in the shared local-fallback file instead of the
+    global store every other call reaches.
+    """
+
+    def setup_method(self):
+        _gripspace_cache.clear()
+
+    def test_channels_dir_diverges_by_cwd_before_the_fix(self, tmp_path, monkeypatch):
+        """The bug, pinned: called from INSIDE the gripspace, Tier 2 resolves
+        the global store; called from a SIBLING dir with `GRIPSPACE_ROOT` set
+        to the same gripspace, it does not — two different files for the same
+        `#dev`. Uses `_global_channels_dir()` (pure resolution, no mkdir) so
+        the assertion never touches the real filesystem and the test-isolation
+        guard on `_channels_dir()`'s write path never enters into it."""
+        grip = _make_gripspace_with_manifest(tmp_path)
+        sibling = tmp_path / "scratchpad"
+        sibling.mkdir()
+
+        monkeypatch.chdir(grip)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        from_inside = _global_channels_dir()
+
+        monkeypatch.chdir(sibling)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
+        from_sibling = _global_channels_dir()
+
+        assert from_inside == from_sibling, (
+            f"same gripspace resolved to two different channel stores: "
+            f"{from_inside} (inside) vs {from_sibling} (sibling + GRIPSPACE_ROOT)"
+        )
+        # And it should be the GLOBAL store, not either party silently
+        # collapsing to None (which is what forces `_channels_dir()`'s Tier 3
+        # local fallback and produces the observed two-files-for-one-channel).
+        assert from_inside == Path.home() / ".synapt" / "channels" / "synapt-dev" / "synapt-gripspace"
+
+    def test_manifest_url_without_gripspace_root_still_walks_up(self, tmp_path, monkeypatch):
+        """Control: with no GRIPSPACE_ROOT set, a sibling cwd genuinely cannot
+        see the gripspace (walk-up alone can't reach a filesystem sibling) —
+        proving the divergence above is caused by the missing env precedence,
+        not by some other confound in the fixture."""
+        grip = _make_gripspace_with_manifest(tmp_path)
+        sibling = tmp_path / "scratchpad"
+        sibling.mkdir()
+
+        monkeypatch.chdir(sibling)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert _read_manifest_url() is None
+
+    def test_manifest_url_honors_gripspace_root_from_sibling_cwd(self, tmp_path, monkeypatch):
+        """Unit-level pin on the fix itself: GRIPSPACE_ROOT lets
+        _read_manifest_url() find the manifest from a cwd it could never
+        walk up to."""
+        grip = _make_gripspace_with_manifest(tmp_path)
+        sibling = tmp_path / "scratchpad"
+        sibling.mkdir()
+
+        monkeypatch.chdir(sibling)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
+        assert _read_manifest_url() == "git@github.com:synapt-dev/synapt-gripspace.git"
+
+    def test_explicit_project_dir_suppresses_gripspace_root(self, tmp_path, monkeypatch):
+        """Parity with project_data_dir's contract: an explicitly-passed
+        project_dir is a deliberate root and suppresses the env override."""
+        grip = _make_gripspace_with_manifest(tmp_path)
+        deliberate = tmp_path / "deliberate-target"
+        deliberate.mkdir()
+
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
+        assert _read_manifest_url(deliberate) is None
 
 
 class TestOrgEntitlementCheck(unittest.TestCase):

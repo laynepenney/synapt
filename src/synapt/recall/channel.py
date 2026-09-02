@@ -114,7 +114,22 @@ def _clear_message_hooks() -> None:
 
 
 def _read_manifest_url(project_dir: Path | None = None) -> str | None:
-    """Read the manifest URL from gripspace.yml, or None if not in a gripspace."""
+    """Read the manifest URL from gripspace.yml, or None if not in a gripspace.
+
+    Honors GRIPSPACE_ROOT the same way project_data_dir() already does
+    (core.py Priority 0b), consulted only when project_dir is None — an
+    explicitly-passed project_dir is a deliberate root that suppresses the
+    env override, same contract as project_data_dir. Without this, a call
+    from anywhere the walk-up can't reach the gripspace (a scratchpad, a
+    sibling worktree) silently misses this tier while project_data_dir's
+    Tier-3-backing resolver still finds it via the env var — two resolvers
+    disagreeing on the same root is recall#916 (`#dev` resolving to two
+    different files depending on caller cwd).
+    """
+    if project_dir is None:
+        grip_env = os.environ.get("GRIPSPACE_ROOT")
+        if grip_env:
+            project_dir = Path(grip_env).expanduser().resolve()
     root = _find_gripspace_root(project_dir or Path.cwd())
     if root is None:
         return None
