@@ -1,0 +1,332 @@
+"""Cold no-caller resume refresh (durable-checkpoint follow-on).
+
+On a cold cross-runtime launch there is no caller transcript, so the caller-tail
+refresh has nothing to act on and the shared index can be months stale. This
+feature does an incremental refresh of the newest source before render, and
+labels what it refreshed. The load-bearing guarantees, each with a witness here:
+
+  * the read NEVER WAITS on a held build lock: a held lock (recall#1018 ghost
+    lock included) builds NOTHING and returns immediately (control). The
+    free-lock build is synchronous and delays the render by its own duration --
+    it never waits on ANOTHER holder, but is not free on the success path;
+  * it NEVER RAISES: every refresh failure (discovery, data-dir, lock acquire,
+    build, lock release) degrades to the stale render;
+  * the refresh builds into the SAME store the load reads, not a cwd-derived
+    secondary one (this change's R2 store split);
+  * a freshened render is legible as freshened: the label names the source and
+    the index cursor before -> after.
+"""
+
+from __future__ import annotations
+
+import os
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from synapt.recall import cli
+from synapt.recall.cli import ColdRefreshOutcome, cold_no_caller_refresh
+from synapt.recall.resume import ResumeView, ResumeTurn, format_resume
+
+
+def _patches(*, lock_fd, build_side_effect=None, ts_before="2026-06-01T00:00:00", ts_after="2026-09-01T00:00:00",
+             newest=Path("/w/.codex/sessions/2026/09/01/rollout-a.jsonl")):
+    """Patch the three seams cold_no_caller_refresh touches. build_calls records
+    whether the real build ran, so the ghost-lock control can assert it did not."""
+    build_calls = []
+
+    def fake_build(*a, **k):
+        build_calls.append((a, k))
+        if build_side_effect:
+            raise build_side_effect
+        return None
+
+    fresh = iter([mock.Mock(build_timestamp=ts_before), mock.Mock(build_timestamp=ts_after)])
+    cms = [
+        mock.patch.object(cli, "_newest_source_file", return_value=newest),
+        mock.patch.object(cli, "_acquire_build_lock", return_value=lock_fd),
+        mock.patch.object(cli, "_release_build_lock"),
+        mock.patch.object(cli, "_archive_and_build_locked", side_effect=fake_build),
+        # The STORE is derived from index_dir (the load target) and its data dir
+        # mocked to a pytest-owned path so no real store is touched (this change's R2
+        # store split); the cwd SOURCE is threaded separately.
+        mock.patch.object(cli, "project_data_dir", return_value=Path("/tmp/x")),
+        mock.patch("synapt.recall.freshness.check_index_freshness",
+                   side_effect=lambda *a, **k: next(fresh)),
+    ]
+    return cms, build_calls
+
+
+class TestColdNoCallerRefresh(unittest.TestCase):
+    def _run(self, cms):
+        for c in cms:
+            c.start()
+        self.addCleanup(mock.patch.stopall)
+        return cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+
+    def test_refreshed_advances_and_reports_cursor(self):
+        cms, build_calls = _patches(lock_fd=7)
+        out = self._run(cms)
+        self.assertTrue(out.refreshed)
+        self.assertEqual(out.reason, "refreshed")
+        self.assertEqual(out.source, "rollout-a.jsonl")
+        self.assertEqual(out.cursor_before, "2026-06-01T00:00:00")
+        self.assertEqual(out.cursor_after, "2026-09-01T00:00:00")
+        self.assertEqual(len(build_calls), 1)  # the build ran
+
+    def test_ghost_lock_control_builds_nothing_and_waits_for_nothing(self):
+        # recall#1018: lock held (possibly by a dead holder). The read must not
+        # build and must not wait. This is THE control.
+        cms, build_calls = _patches(lock_fd=None)
+        out = self._run(cms)
+        self.assertFalse(out.refreshed)
+        self.assertEqual(out.reason, "lock_held")
+        self.assertEqual(build_calls, [])  # nothing built under a held lock
+        self.assertEqual(out.cursor_before, out.cursor_after)  # index untouched
+
+    def test_up_to_date_when_build_ran_but_cursor_unchanged(self):
+        cms, build_calls = _patches(lock_fd=7, ts_before="2026-09-01T00:00:00",
+                                    ts_after="2026-09-01T00:00:00")
+        out = self._run(cms)
+        self.assertFalse(out.refreshed)
+        self.assertEqual(out.reason, "up_to_date")
+        self.assertEqual(len(build_calls), 1)
+
+    def test_no_source_skips_lock_and_build(self):
+        cms, build_calls = _patches(lock_fd=7, newest=None)
+        out = self._run(cms)
+        self.assertEqual(out.reason, "no_source")
+        self.assertFalse(out.refreshed)
+        self.assertEqual(build_calls, [])
+
+    def test_build_error_degrades_without_raising_and_releases_lock(self):
+        cms, build_calls = _patches(lock_fd=7, build_side_effect=RuntimeError("boom"))
+        with mock.patch.object(cli, "_release_build_lock") as rel:
+            for c in cms:
+                if getattr(c, "attribute", None) == "_release_build_lock":
+                    continue  # use our own release spy
+                c.start()
+            self.addCleanup(mock.patch.stopall)
+            out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+            self.assertEqual(out.reason, "error")
+            self.assertFalse(out.refreshed)
+            rel.assert_called_once()  # lock released even on build failure
+
+    def test_discovery_oserror_degrades_to_error_before_lock(self):
+        # this change's R2 (Atlas): source discovery walks the filesystem and can
+        # itself raise OSError (denied root, racing unlink). That is BEFORE the
+        # lock, so it must be caught into an error outcome, never escape — and
+        # the lock/build must not run.
+        with mock.patch.object(cli, "_newest_source_file", side_effect=OSError("denied")), \
+             mock.patch.object(cli, "_acquire_build_lock") as lock, \
+             mock.patch.object(cli, "_archive_and_build_locked") as build, \
+             mock.patch.object(cli, "project_data_dir", return_value=Path("/tmp/x")), \
+             mock.patch("synapt.recall.freshness.check_index_freshness",
+                        return_value=mock.Mock(build_timestamp="2026-06-01T00:00:00")):
+            out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+        self.assertEqual(out.reason, "error")
+        self.assertFalse(out.refreshed)
+        lock.assert_not_called()   # degraded BEFORE lock acquisition
+        build.assert_not_called()  # nothing built
+
+    def test_acquire_oserror_degrades_to_error_without_raising(self):
+        # this change's R2 (Atlas): resolving the data dir and acquiring the lock
+        # touch the filesystem (mkdir + os.open on the lock parent). A lock parent
+        # that is a regular file raises NotADirectoryError out of the REAL
+        # _acquire_build_lock (no mock). It sat outside the degradation boundary
+        # and escaped cmd_resume; it must degrade to an error outcome, never raise,
+        # and build nothing.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            notadir = Path(td) / "notadir"
+            notadir.write_text("i am a file, not a directory")
+            data_dir = notadir / "data"  # its parent is a file -> mkdir raises ENOTDIR
+            with mock.patch.object(cli, "_newest_source_file",
+                                   return_value=Path("/w/.codex/sessions/2026/09/01/rollout-a.jsonl")), \
+                 mock.patch.object(cli, "project_data_dir", return_value=data_dir), \
+                 mock.patch.object(cli, "_archive_and_build_locked") as build, \
+                 mock.patch("synapt.recall.freshness.check_index_freshness",
+                            return_value=mock.Mock(build_timestamp="2026-06-01T00:00:00")):
+                out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+        self.assertEqual(out.reason, "error")   # degraded, did not escape
+        self.assertFalse(out.refreshed)
+        self.assertEqual(out.source, "rollout-a.jsonl")  # got PAST discovery
+        build.assert_not_called()  # never reached the build
+
+    def test_release_oserror_does_not_override_a_successful_read(self):
+        # this change's R2 (Atlas): _release_build_lock runs in a finally and can
+        # raise OSError (a closed/invalid fd, an unlink on a vanished lock file).
+        # In a finally that would OVERRIDE the outcome: a release failure after a
+        # SUCCESSFUL build must still be a successful refresh, not an escaped
+        # exception. Swallow it; keep the read's outcome.
+        cms, build_calls = _patches(lock_fd=7)  # build succeeds, cursor advances
+        for c in cms:
+            if getattr(c, "attribute", None) == "_release_build_lock":
+                continue  # replace the no-op release with a raising one
+            c.start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.object(cli, "_release_build_lock", side_effect=OSError("bad fd")):
+            out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+        self.assertTrue(out.refreshed)          # success survived the release error
+        self.assertEqual(out.reason, "refreshed")
+        self.assertEqual(len(build_calls), 1)   # the build ran
+
+    def test_release_oserror_does_not_override_a_build_error(self):
+        # The other half of the finally-override hazard: when the build itself
+        # failed, a release OSError must not replace that build-error outcome with
+        # an escaped exception. reason stays "error", nothing raises.
+        cms, build_calls = _patches(lock_fd=7, build_side_effect=RuntimeError("boom"))
+        for c in cms:
+            if getattr(c, "attribute", None) == "_release_build_lock":
+                continue
+            c.start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.object(cli, "_release_build_lock", side_effect=OSError("bad fd")):
+            out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+        self.assertEqual(out.reason, "error")   # build error survived, did not escape
+        self.assertFalse(out.refreshed)
+        self.assertEqual(len(build_calls), 1)   # the build was attempted
+
+
+class TestColdRefreshStoreSplit(unittest.TestCase):
+    """this change's R2 (Atlas): resume LOADS the index from the GRIPSPACE_ROOT
+    store, but the refresh used to resolve data_dir/build from cwd. On a spawned
+    desk whose cwd is a filesystem SIBLING of GRIPSPACE_ROOT, that locked/built a
+    cwd-derived SECONDARY store and reloaded the untouched stale one, leaving the
+    durable-checkpoint fruit stale. The refresh must target the SAME store the load reads.
+
+    Real GRIPSPACE_ROOT env and a real build lock (only the heavy build is
+    spied), so the store paths are exercised and asserted ON DISK.
+    """
+
+    def test_refresh_targets_gripspace_root_store_source_stays_cwd(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            a = tmp / "canonical"      # GRIPSPACE_ROOT store (A) — what load reads
+            b = tmp / "agent-desk"     # cwd, a filesystem SIBLING of A (B)
+            (a / ".synapt" / "recall" / "index").mkdir(parents=True)
+            b.mkdir()
+            index_dir = a / ".synapt" / "recall" / "index"
+
+            captured: dict[str, Path | None] = {}
+
+            def spy_build(project_dir, source_dirs, **kw):
+                captured["store"] = Path(project_dir)
+                captured["source"] = kw.get("source_dir")
+                return None
+
+            with mock.patch.dict(os.environ, {"GRIPSPACE_ROOT": str(a)}, clear=False), \
+                 mock.patch.object(cli, "_newest_source_file",
+                                   return_value=b / ".codex" / "rollout-x.jsonl"), \
+                 mock.patch.object(cli, "_archive_and_build_locked", side_effect=spy_build), \
+                 mock.patch("synapt.recall.freshness.check_index_freshness",
+                            return_value=mock.Mock(build_timestamp="old")):
+                os.environ.pop("SYNAPT_RECALL_ROOT", None)
+                out = cold_no_caller_refresh(b, index_dir)  # real lock + real release
+
+            self.assertNotEqual(out.reason, "error")            # did not degrade/escape
+            # project_root/project_data_dir resolve() the path (macOS /var -> /private/var)
+            self.assertEqual(captured["store"], a.resolve())    # BUILD store == A (GRIPSPACE_ROOT)
+            self.assertEqual(captured["source"], b)             # SOURCE == cwd (B), threaded as-is
+            self.assertFalse((b / ".synapt").exists())          # no cwd-derived secondary store
+            self.assertTrue((a / ".synapt" / "recall").is_dir())  # the real lock touched A
+
+
+class TestNewestSourceProjectScope(unittest.TestCase):
+    """this change's R1 (Sentinel): the Codex sessions dir holds EVERY project's
+    rollouts. _newest_source_file must select only rollouts that belong to this
+    project — an unrelated newer rollout must not be picked (which would trigger a
+    build for a project that owns no sources). Real filesystem, real filter."""
+
+    def _rollout(self, codex_dir, name, cwd, mtime):
+        import json
+        import os
+        day = codex_dir / "2026" / "09" / "01"
+        day.mkdir(parents=True, exist_ok=True)
+        p = day / name
+        meta = {"type": "session_meta", "payload": {"cwd": str(cwd)}}
+        p.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def test_unrelated_newer_rollout_is_not_selected(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "myproject"
+            project.mkdir()
+            other = base / "otherproject"
+            other.mkdir()
+            codex = base / ".codex" / "sessions"
+            codex.mkdir(parents=True)
+            # An unrelated, NEWER rollout for a different project.
+            self._rollout(codex, "rollout-other.jsonl", other, mtime=2_000_000_000)
+            with mock.patch("synapt.recall.codex.discover_codex_sessions", return_value=codex):
+                got = cli._newest_source_file(project)
+            self.assertIsNone(got)  # project owns nothing; the unrelated file is out of scope
+
+    def test_owned_older_rollout_beats_unrelated_newer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "myproject"
+            project.mkdir()
+            other = base / "otherproject"
+            other.mkdir()
+            codex = base / ".codex" / "sessions"
+            codex.mkdir(parents=True)
+            self._rollout(codex, "rollout-other.jsonl", other, mtime=2_000_000_000)  # newer, unrelated
+            owned = self._rollout(codex, "rollout-mine.jsonl", project, mtime=1_000_000_000)  # older, owned
+            with mock.patch("synapt.recall.codex.discover_codex_sessions", return_value=codex):
+                got = cli._newest_source_file(project)
+            self.assertEqual(got, owned)  # owned wins despite being older; scope, not mtime alone
+
+    def test_unrelated_rollout_yields_no_source_no_lock_no_build(self):
+        # The full contract Sentinel named: an unrelated newer rollout must NOT
+        # drive cold_no_caller_refresh into a build. no_source, no lock, no build.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            project = base / "myproject"
+            project.mkdir()
+            other = base / "otherproject"
+            other.mkdir()
+            codex = base / ".codex" / "sessions"
+            codex.mkdir(parents=True)
+            self._rollout(codex, "rollout-other.jsonl", other, mtime=2_000_000_000)
+            with mock.patch("synapt.recall.codex.discover_codex_sessions", return_value=codex), \
+                 mock.patch.object(cli, "_acquire_build_lock") as lock, \
+                 mock.patch.object(cli, "_archive_and_build_locked") as build:
+                out = cold_no_caller_refresh(project, project / "index")
+        self.assertEqual(out.reason, "no_source")
+        self.assertFalse(out.refreshed)
+        lock.assert_not_called()   # never reached the lock
+        build.assert_not_called()  # never built for a project it does not own
+
+
+class TestRefreshLabelRender(unittest.TestCase):
+    def _view(self, refresh_label):
+        v = ResumeView(
+            session_id="0af31c22", selection_scope="store",
+            turns=[ResumeTurn(chunk_id="c0", turn_index=0, timestamp="2026-09-01T00:00:00Z",
+                              user_text="q", assistant_text="a", tools_used=[])],
+            total_turns=1,
+        )
+        v.refresh_label = refresh_label
+        return v
+
+    def test_label_names_source_and_cursor(self):
+        out = format_resume(self._view("source rollout-a.jsonl, index 2026-06-01 → 2026-09-01"))
+        self.assertIn("REFRESHED before render — source rollout-a.jsonl", out)
+        self.assertIn("2026-06-01 → 2026-09-01", out)
+
+    def test_no_label_when_not_refreshed(self):
+        out = format_resume(self._view(None))
+        self.assertNotIn("REFRESHED before render", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

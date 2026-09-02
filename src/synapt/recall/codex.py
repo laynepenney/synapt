@@ -190,14 +190,23 @@ def _has_buildable_transcripts(
 def archive_codex_transcripts(
     project_dir: Path,
     sessions_dir: Path | None = None,
+    store_dir: Path | None = None,
 ) -> list[Path]:
     """Copy project-relevant Codex transcripts into the project archive.
 
     Uses the same size-based semantics as Claude transcript archiving:
     unchanged files are skipped, grown files overwrite the archive copy,
     and shrunken sources do not replace larger archived copies.
+
+    *project_dir* is the SOURCE scope — it filters which Codex rollouts belong
+    to this project. *store_dir*, when given, is the STORE scope the archive is
+    written into; it defaults to *project_dir* so existing callers are
+    unchanged. The two differ only when a build must write into a store that is
+    resolved separately from the source (this change's R2 (Atlas): a cold no-caller
+    resume on a spawned desk archives cwd's rollouts INTO the GRIPSPACE_ROOT
+    store, never a cwd-derived secondary one).
     """
-    archive_dir = project_archive_dir(project_dir)
+    archive_dir = project_archive_dir(store_dir if store_dir is not None else project_dir)
     archive_dir.mkdir(parents=True, exist_ok=True)
 
     copied: list[Path] = []
