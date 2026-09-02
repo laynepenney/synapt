@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synapt"
-version = "0.23.0"
+version = "0.24.0"
 description = "Persistent conversational memory for AI coding assistants"
 readme = "README.md"
 license = "MIT"
@@ -146,12 +146,19 @@ x = "synapt.x.server"
 [project.entry-points."synapt.backends"]
 # Plugins register model backends here. Each entry point must reference
 # a module with a register(register_fn) callable. Example:
-# modal = "synapt_private.backends"
+# modal = "your_package.backends"
 
 [project.entry-points."synapt.commands"]
 # Plugins register CLI subcommands here. Each entry point must reference
 # a callable main() function. Example:
-# repair = "synapt_private.repair.cli:cli_main"
+# repair = "your_package.repair.cli:cli_main"
+
+[project.entry-points."synapt.annotators"]
+# A downstream layer may register a per-hit code-symbol annotator here for
+# recall_code (code_search.py). Each entry point must reference a callable
+# with signature (repo_root, path, line_start, line_end) -> list[dict].
+# Example:
+# code = "your_package.annotators:annotate_symbol"
 
 [tool.pytest.ini_options]
 addopts = "--benchmark-disable"

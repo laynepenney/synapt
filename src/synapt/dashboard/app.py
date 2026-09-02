@@ -1035,6 +1035,7 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
                 {"name": "apollo", "label": "APOLLO", "note": "builds. mends what breaks.", "tilt": 1.8, "authored": True},
                 {"name": "atlas", "label": "ATLAS", "note": "research. follows the spirals.", "tilt": -1.2, "authored": True},
                 {"name": "sentinel", "label": "SENTINEL", "note": "verifies everything. trust the lens.", "tilt": 2.6, "authored": True},
+                {"name": "fathom", "label": "FATHOM", "note": "first user. checks what's actually there.", "tilt": -0.6, "authored": True},
             ],
         },
     ]
@@ -1629,6 +1630,7 @@ def create_app(*, tmux_session: str | None = None) -> FastAPI:
     _CONSOLE_ACCENT = {
         "opus": "#9b7ff0",
         "apollo": "#ff8a5c", "atlas": "#57c7c1", "sentinel": "#5b8def",
+        "fathom": "#4ecb8f",
     }
 
     def _console_roster() -> list[dict]:

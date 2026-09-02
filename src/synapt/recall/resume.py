@@ -128,6 +128,12 @@ class ResumeView:
     # None means not applicable (fresh index with a caller, or no journal).
     durable_checkpoint: "JournalEntry | None" = None
     durable_lag: str | None = None
+    # Set by the CLI when a cold no-caller resume incrementally refreshed the
+    # newest source before rendering. Names the source and the index build
+    # timestamp before -> after, so a reader can tell a freshened tail from a
+    # stale one. None means no refresh happened (fresh index, a caller present,
+    # lock held, or nothing to refresh).
+    refresh_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1088,6 +1094,13 @@ def attach_durable_checkpoint(view: ResumeView, journal_path: Path | None) -> Re
     return view
 
 
+def _format_refresh_label(view: ResumeView) -> list[str]:
+    """Say what a cold no-caller resume refreshed, so freshened != stale is legible."""
+    if not view.refresh_label:
+        return []
+    return ["", f"REFRESHED before render — {view.refresh_label}"]
+
+
 def _format_durable_checkpoint(view: ResumeView) -> list[str]:
     entry = view.durable_checkpoint
     if entry is None:
@@ -1215,6 +1228,7 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
         )
 
     lines = [header]
+    lines.extend(_format_refresh_label(view))
     lines.extend(_format_freshness(view))
     lines.extend(_format_durable_checkpoint(view))
     lines.extend(_format_journal(view))
