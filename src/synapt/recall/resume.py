@@ -22,6 +22,7 @@ interpret runtime-specific event payloads.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 from datetime import datetime, timezone
@@ -575,7 +576,39 @@ def load_resume_index(directory: Path) -> TranscriptIndex | BoundedResumeIndex:
 
     if (directory / "recall.db").exists() or is_sharded(directory):
         return BoundedResumeIndex(ShardedRecallDB.open_readonly(directory))
-    return TranscriptIndex.load(directory, use_embeddings=False)
+
+    # Legacy JSONL migration is eager.  TranscriptIndex.load creates and saves
+    # a RecallDB, then returns an index whose in-memory chunks are complete but
+    # whose backend remains attached.  Resume only reads those chunks, so
+    # retaining that connection through a caller-owned TemporaryDirectory can
+    # prevent Windows from removing recall.db (and its WAL/SHM companions).
+    index = TranscriptIndex.load(directory, use_embeddings=False)
+    if not getattr(index, "_lazy_chunks", False):
+        db = getattr(index, "_db", None)
+        if db is not None:
+            index._db = None
+            # The migration connection enables WAL.  Checkpoint it while this
+            # loader still owns the only connection so the temporary legacy
+            # store does not retain -wal/-shm companions through teardown.
+            connection = getattr(db, "_conn", None)
+            checkpointed = False
+            if connection is not None:
+                try:
+                    result = connection.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    checkpointed = not result or result[0] == 0
+                except Exception:
+                    pass
+            # Closing this connection is the ownership boundary.  Do not hide
+            # a close failure and return a resume index that can still pin the
+            # caller's temporary store on Windows.
+            db.close()
+            if checkpointed:
+                for suffix in ("-wal", "-shm"):
+                    with contextlib.suppress(OSError):
+                        (directory / f"recall.db{suffix}").unlink()
+    return index
 
 
 # ---------------------------------------------------------------------------
