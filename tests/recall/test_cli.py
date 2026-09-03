@@ -483,6 +483,65 @@ def test_cmd_setup_no_transcripts_still_registers_mcp(tmp_path):
     assert skill_path.exists()
 
 
+def test_cmd_setup_registers_mcp_with_a_command_that_resolves_on_path(tmp_path):
+    """The `claude mcp add` call's registered command must be launchable.
+
+    `synapt init` used to register the MCP server as the single word
+    `synapt-server`, which has never existed as an installed executable (no
+    such console script is declared anywhere) -- a fresh user's Claude Code
+    session would try to launch it and fail to connect. The registered
+    command must be a name that actually resolves via shutil.which, or the
+    first word of a multi-word command that does.
+    """
+    project_dir = tmp_path / "freshproject"
+    project_dir.mkdir()
+
+    mock_run = MagicMock()
+    mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+
+    with patch.dict("os.environ", {"CODEX_HOME": str(tmp_path / ".codex")}), \
+         patch("synapt.recall.core.Path.home", return_value=tmp_path), \
+         patch("synapt.recall.core.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.subprocess.run", mock_run), \
+         patch("synapt.recall.cli.shutil.which", return_value="/usr/bin/claude"):
+        from synapt.recall.cli import cmd_setup
+        args = argparse.Namespace(
+            no_embeddings=True,
+            no_hook=False,
+            global_scope=False,
+            sync=None,
+        )
+        cmd_setup(args)
+
+    mcp_calls = [c for c in mock_run.call_args_list if "claude" in c[0][0]]
+    assert len(mcp_calls) == 1
+    call_args = mcp_calls[0][0][0]
+
+    # The registered command is everything after "-t" "stdio" "synapt" (the
+    # transport flag, then the server name Claude Code shows in its list).
+    add_idx = call_args.index("add")
+    stdio_idx = call_args.index("stdio", add_idx)
+    server_name_idx = stdio_idx + 1
+    registered_command = call_args[server_name_idx + 1:]
+
+    assert registered_command, "no command was registered at all"
+    import shutil as _shutil
+
+    first_word = registered_command[0]
+    assert _shutil.which(first_word) is not None, (
+        f"registered command {registered_command!r} does not resolve on PATH "
+        f"-- Claude Code would fail to launch this MCP server"
+    )
+
+    # Negative control: the OLD single-word command genuinely does not
+    # resolve -- this is the mechanism of the bug, not a hypothetical.
+    assert _shutil.which("synapt-server") is None, (
+        "control invalidated: synapt-server now resolves on PATH, "
+        "so this test no longer demonstrates the original defect"
+    )
+
+
 def test_cmd_setup_narrates_every_announced_step(tmp_path, capsys):
     """The banner announces total_steps=5 (hooks enabled); every step 1..5 must be narrated.
 
