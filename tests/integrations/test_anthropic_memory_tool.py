@@ -305,3 +305,66 @@ class TestImportability:
         d = tool.to_dict()
         assert d["type"] == "memory_20250818"
         assert d["name"] == "memory"
+
+
+class TestRecallBridgeLoadKnowledgeFilesRouting:
+    """load_knowledge_files hardcoded project_index_dir(project) / "recall.db"
+    with no is_sharded fallback: on a sharded store (only index.db present,
+    the file consolidation writes to since the routing fix) db_path.exists()
+    was always False, so this silently returned with the cache empty --
+    every existing knowledge node invisible to the memory-tool view command,
+    with no error. Real temp dirs and a real _RecallBridge, not the mocked
+    fixture the rest of this file uses -- the mock can't witness which path
+    RecallDB was constructed with resolving wrong."""
+
+    def test_seeds_the_cache_from_a_sharded_store(self, tmp_path):
+        from synapt.integrations.anthropic import _FileCache, _RecallBridge
+        from synapt.recall.knowledge import KnowledgeNode
+        from synapt.recall.storage import RecallDB
+
+        project = tmp_path / "proj"
+        index_dir = project / ".synapt" / "recall" / "index"
+        index_dir.mkdir(parents=True)
+        db = RecallDB(index_dir / "index.db")  # the sharded marker
+        db.save_knowledge_nodes([
+            KnowledgeNode.create(
+                content="the launch runbook lives in docs/runbook.md",
+                category="workflow",
+                source_sessions=["s0"],
+                node_id="n1",
+            ).to_dict(),
+        ])
+        db.close()
+        assert not (index_dir / "recall.db").exists()
+
+        bridge = _RecallBridge(project_root=project)
+        cache = _FileCache()
+        bridge.load_knowledge_files(cache)
+
+        assert any("runbook" in v for v in cache._files.values())
+
+    def test_seeds_the_cache_from_a_monolithic_store_control(self, tmp_path):
+        """Control: the untouched, no-index.db case is unaffected."""
+        from synapt.integrations.anthropic import _FileCache, _RecallBridge
+        from synapt.recall.knowledge import KnowledgeNode
+        from synapt.recall.storage import RecallDB
+
+        project = tmp_path / "proj"
+        index_dir = project / ".synapt" / "recall" / "index"
+        index_dir.mkdir(parents=True)
+        db = RecallDB(index_dir / "recall.db")  # no index.db at all
+        db.save_knowledge_nodes([
+            KnowledgeNode.create(
+                content="the launch runbook lives in docs/runbook.md",
+                category="workflow",
+                source_sessions=["s0"],
+                node_id="n1",
+            ).to_dict(),
+        ])
+        db.close()
+
+        bridge = _RecallBridge(project_root=project)
+        cache = _FileCache()
+        bridge.load_knowledge_files(cache)
+
+        assert any("runbook" in v for v in cache._files.values())

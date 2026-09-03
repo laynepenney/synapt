@@ -1381,11 +1381,16 @@ def cmd_search(args: argparse.Namespace) -> None:
     """Search the transcript index."""
     import time
     from synapt.recall.config import load_config
+    from synapt.recall.sharding import is_sharded
 
     profile = getattr(args, "profile", False)
 
     index_dir = _resolve_index_dir(args)
-    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         print("Run 'synapt build' or 'synapt setup' first.", file=sys.stderr)
         sys.exit(1)
@@ -1445,9 +1450,14 @@ _DEFAULT_BENCHMARK_QUERIES = [
 def cmd_benchmark(args: argparse.Namespace) -> None:
     """Run search pipeline benchmarks and report timing statistics."""
     import time
+    from synapt.recall.sharding import is_sharded
 
     index_dir = Path(args.index) if args.index else _resolve_index_dir(args)
-    if not (index_dir / "recall.db").exists() and not (index_dir / "chunks.jsonl").exists():
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "chunks.jsonl").exists()
+        and not is_sharded(index_dir)
+    ):
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         sys.exit(1)
 
@@ -1565,8 +1575,14 @@ def cmd_benchmark(args: argparse.Namespace) -> None:
 
 def cmd_stats(args: argparse.Namespace) -> None:
     """Show index statistics."""
+    from synapt.recall.sharding import is_sharded
+
     index_dir = _resolve_index_dir(args)
-    if not (index_dir / "recall.db").exists() and not (index_dir / "manifest.json").exists():
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "manifest.json").exists()
+        and not is_sharded(index_dir)
+    ):
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         sys.exit(1)
 
