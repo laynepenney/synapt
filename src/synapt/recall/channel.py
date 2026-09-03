@@ -1851,6 +1851,11 @@ def channel_post(
     result = f"[#{channel}] {display}: {message}{attachment_suffix}".rstrip()
     if pin:
         result += " (pinned)"
+    # A caller that wants to dispatch the author on this exact post (e.g. a
+    # verdict) needs the id back. _append_message() already generates one
+    # unconditionally; surface it rather than making every such caller
+    # re-derive it via _generate_msg_id or a follow-up read.
+    result += f" [id={msg.id}]"
     return result
 
 

@@ -1079,6 +1079,16 @@ class TestPostAndRead(unittest.TestCase):
         channel_file = data_dir / "channels" / "dev.jsonl"
         self.assertTrue(channel_file.exists())
 
+    def test_post_return_value_names_the_message_id(self):
+        # A caller that wants to dispatch the author on this exact post
+        # (e.g. a verdict) needs the id back -- _append_message already
+        # generates one unconditionally, it just was not surfaced.
+        result = channel_post("dev", "hello world", agent_name="agent-a")
+        msgs = _read_messages(_channels_dir() / "dev.jsonl")
+        msg = [m for m in msgs if m.type == "message"][-1]
+        self.assertTrue(msg.id)  # the id genuinely exists
+        self.assertIn(msg.id, result)  # and it is discoverable in the return value
+
     def test_post_copies_attachments_into_channel_store(self):
         src = Path(self.tmpdir) / "screenshot.png"
         src.write_text("fake-image")
