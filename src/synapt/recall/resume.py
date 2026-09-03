@@ -1258,7 +1258,26 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
         if turn.assistant_text:
             lines.append(f"  ASSISTANT: {_clip(turn.assistant_text, max_chars)}")
         elif not turn.is_continuation:
-            lines.append("  ASSISTANT: (no reply — the session ended here)")
+            # A tool-call-only turn (no text yet) followed by a continuation
+            # that carries the real answer is not "the session ended here" --
+            # the reply is one block below. But the immediate next turn being
+            # a continuation is not enough: a session that dies mid tool-loop
+            # produces a continuation segment that is ALSO just a tool call
+            # with no text, and nothing after it (the UNCLEAN END shape).
+            # Scan the whole run of consecutive continuation turns for one
+            # that actually carries assistant text before claiming a reply
+            # follows; otherwise nothing in the segment ever answered.
+            reply_found_ahead = False
+            look = position + 1
+            while look < len(view.turns) and view.turns[look].is_continuation:
+                if view.turns[look].assistant_text:
+                    reply_found_ahead = True
+                    break
+                look += 1
+            if reply_found_ahead:
+                lines.append("  ASSISTANT: (no text this turn — reply continues below)")
+            else:
+                lines.append("  ASSISTANT: (no reply — the session ended here)")
         if turn.tools_used:
             lines.append(f"  tools: {', '.join(turn.tools_used)}")
 
