@@ -51,6 +51,7 @@ _STARTUP_VERSION = getattr(_synapt_pkg, "__version__", "unknown")
 from synapt.recall.core import (
     TranscriptIndex,
     atomic_json_write,
+    describe_root_source,
     format_size,
     project_data_dir,
     project_index_dir,
@@ -2898,6 +2899,7 @@ def recall_channel(
     """
     state_store = None
     log_store = None
+    root_source = None
     try:
         from synapt.recall.actions import get_action_registry
         from synapt.recall.channel import (
@@ -2907,6 +2909,7 @@ def recall_channel(
         )
 
         registry = get_action_registry()
+        root_source = describe_root_source()
         state_store = _db_path().resolve()
         # _db_path is ALWAYS Tier-3 local by design (presence/cursors/pins/
         # mutes stay per-gripspace even when channels are shared); _channels_dir
@@ -2945,16 +2948,16 @@ def recall_channel(
             msg_type=msg_type,
         )
         return (
-            f"Channel state store: {state_store}\n"
-            f"Channel log store: {log_store}\n"
+            f"Channel state store: {state_store} (source: {root_source})\n"
+            f"Channel log store: {log_store} (source: {root_source})\n"
             f"{orphan_line}{result}"
         )
     except Exception as exc:
         prefix = ""
         if state_store:
-            prefix += f"Channel state store: {state_store}\n"
+            prefix += f"Channel state store: {state_store} (source: {root_source})\n"
         if log_store:
-            prefix += f"Channel log store: {log_store}\n"
+            prefix += f"Channel log store: {log_store} (source: {root_source})\n"
         return f"{prefix}Channel failed: {exc}"
 
 
@@ -3009,12 +3012,24 @@ def _resolved_provenance_line() -> str:
     ran (recall#952): under an editable install, the same reported version
     can execute different bytes minutes apart if the linked worktree is
     repointed, silently, with nothing else changed.
+
+    Also names the SOURCE of the resolved gripspace root (env var, a
+    persisted marker, or plain walk-up) -- recall#936, item 2's
+    marker-persistence follow-on: a reader should be able to see that a
+    marker, not a live env var, chose the coordinate this process is using.
     """
     try:
         location = str(Path(_synapt_pkg.__file__).resolve().parent)
     except Exception:
         location = "unknown"
-    return f"synapt v{_STARTUP_VERSION} — running from {location} ({_resolved_install_kind()} install)"
+    try:
+        root_source = describe_root_source()
+    except Exception:
+        root_source = "unknown"
+    return (
+        f"synapt v{_STARTUP_VERSION} — running from {location} "
+        f"({_resolved_install_kind()} install) — root: {root_source}"
+    )
 
 
 def _with_provenance(text: str) -> str:
