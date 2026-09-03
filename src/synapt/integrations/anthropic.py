@@ -165,12 +165,25 @@ class _RecallBridge:
         self._project_root = project_root
 
     def save(self, path: str, content: str) -> str:
+        from synapt.recall.knowledge import VALID_CATEGORIES
         from synapt.recall.server import recall_save
 
-        category = "memory"
+        virtual_dir = "memory"
         parts = PurePosixPath(path).parts
         if len(parts) >= 3 and parts[1] == "memories":
-            category = parts[2]
+            virtual_dir = parts[2]
+        # The virtual directory ("memory", "notes", "sessions", ...) is this
+        # bridge's own concept, not synapt's category taxonomy -- neither the
+        # default nor any real subdirectory name is in VALID_CATEGORIES.
+        # recall_save now refuses an unrecognized category (a sibling fix)
+        # rather than silently coercing it, so validate here and fall back
+        # exactly as the coercion always did: to "workflow", unconditionally,
+        # for any virtual_dir outside the enum. This changes nothing observable
+        # -- load_knowledge_files() below already reads the stored category
+        # back and defaults every node whose category isn't itself one of
+        # _VIRTUAL_DIRS to "knowledge" regardless of the original
+        # subdirectory, which "workflow" already was and remains.
+        category = virtual_dir if virtual_dir in VALID_CATEGORIES else "workflow"
 
         return recall_save(
             content=content,

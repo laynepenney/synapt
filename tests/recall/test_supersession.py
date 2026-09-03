@@ -2426,12 +2426,12 @@ class TestRecallSave:
              patch("synapt.recall.server._invalidate_cache"):
             first = recall_save(
                 content="LOCOMO score is 76%",
-                category="benchmark",
+                category="fact",
                 node_id="bench1",
             )
             second = recall_save(
                 content="LOCOMO score is 72.4% (audited)",
-                category="benchmark",
+                category="fact",
                 node_id="bench1",
             )
 

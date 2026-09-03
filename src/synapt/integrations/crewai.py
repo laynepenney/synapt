@@ -69,12 +69,22 @@ class SynaptStorage:
         return dot / norm if norm else 0.0
 
     def save(self, records: list[MemoryRecord]) -> None:
+        from synapt.recall.knowledge import VALID_CATEGORIES
+
         saved = {r.id: r for r in self._load()}
         for record in records:
             saved[record.id] = record
+            # A CrewAI record's own categories are that framework's
+            # vocabulary, not synapt's -- recall_save now refuses an
+            # unrecognized category (a sibling fix) rather than silently
+            # coercing it, so validate here and fall back exactly as the
+            # coercion always did, rather than letting an unmatched
+            # CrewAI category value fail the save outright.
+            crewai_category = record.categories[0] if record.categories else None
+            category = crewai_category if crewai_category in VALID_CATEGORIES else "workflow"
             _recall_save(
                 content=record.content,
-                category=record.categories[0] if record.categories else "workflow",
+                category=category,
                 confidence=record.importance,
                 tags=record.categories or None,
                 node_id=record.id,

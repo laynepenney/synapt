@@ -2455,8 +2455,14 @@ def recall_save(
         import hashlib
         from datetime import datetime, timezone
 
-        from synapt.recall.knowledge import KnowledgeNode, append_node
+        from synapt.recall.knowledge import VALID_CATEGORIES, KnowledgeNode, append_node
         from synapt.recall.storage import RecallDB
+
+        if not retract and category not in VALID_CATEGORIES:
+            return (
+                f"Error: unrecognized category {category!r}. "
+                f"Valid categories: {', '.join(sorted(VALID_CATEGORIES))}."
+            )
 
         project = Path.cwd().resolve()
         db = RecallDB(project_index_dir(project) / "recall.db")
@@ -2582,8 +2588,15 @@ def recall_sync_memory() -> str:
                 if body:
                     content += f"\n\n{body}"
 
-                # Map memory type to category
-                category = mem_type if mem_type in ("user", "feedback", "project", "reference") else "project"
+                # mem_type ("user"/"feedback"/"project"/"reference") is none of
+                # VALID_CATEGORIES -- recall_save's category check (this PR)
+                # would now refuse every one of these, where it previously
+                # always silently landed as "workflow" regardless of mem_type.
+                # The real distinction is already preserved via the
+                # f"type:{mem_type}" tag below; category is just "workflow",
+                # matching prior real-world behavior exactly rather than
+                # inventing a new mapping as part of this fix.
+                category = "workflow"
                 stable_id = hashlib.sha1(
                     str(md_file.resolve()).encode("utf-8")
                 ).hexdigest()[:12]
