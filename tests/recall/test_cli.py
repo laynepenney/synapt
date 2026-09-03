@@ -1104,6 +1104,72 @@ def test_channel_cli_post_without_name():
     assert args.name is None
 
 
+def test_channel_cli_post_with_type_flag():
+    """--type is a recognized flag on the channel post action."""
+    with (
+        patch.object(
+            sys,
+            "argv",
+            ["synapt", "channel", "post", "dev", "verdict text", "--type", "pr"],
+        ),
+        patch("synapt.recall.cli.cmd_channel") as mock,
+    ):
+        main()
+    args = mock.call_args[0][0]
+    assert args.action == "post"
+    assert args.type == "pr"
+
+
+def test_channel_cli_post_without_type_flag_defaults_to_none():
+    """No --type on post: args.type is None, so cmd_channel's own default (message) applies."""
+    with (
+        patch.object(sys, "argv", ["synapt", "channel", "post", "dev", "hello"]),
+        patch("synapt.recall.cli.cmd_channel") as mock,
+    ):
+        main()
+    args = mock.call_args[0][0]
+    assert args.type is None
+
+
+def test_channel_cli_post_type_wired_to_channel_post_msg_type():
+    """--type pr on post threads through to channel_post(msg_type="pr")."""
+    with (
+        patch.object(
+            sys,
+            "argv",
+            ["synapt", "channel", "post", "dev", "verdict text", "--type", "pr"],
+        ),
+        patch(
+            "synapt.recall.channel.channel_post",
+            return_value="[#dev] bot: verdict text [id=m_deadbeef]",
+        ) as mock_post,
+    ):
+        from synapt.recall.cli import main
+
+        main()
+    mock_post.assert_called_once()
+    assert mock_post.call_args[1].get("msg_type") == "pr"
+
+
+def test_channel_cli_post_without_type_flag_omits_msg_type_override():
+    """No --type: channel_post is called without a msg_type override (keeps its own default)."""
+    with (
+        patch.object(sys, "argv", ["synapt", "channel", "post", "dev", "hello"]),
+        patch(
+            "synapt.recall.channel.channel_post",
+            return_value="[#dev] bot: hello [id=m_cafebabe]",
+        ) as mock_post,
+    ):
+        from synapt.recall.cli import main
+
+        main()
+    mock_post.assert_called_once()
+    # Either omitted entirely or explicitly None -- either way, not forced to a
+    # non-default type when the operator never asked for one.
+    passed_type = mock_post.call_args[1].get("msg_type")
+    assert passed_type in (None, "message")
+
+
 # ---------------------------------------------------------------------------
 # migrate-channels CLI tests
 # ---------------------------------------------------------------------------

@@ -2455,7 +2455,14 @@ def cmd_channel(args: argparse.Namespace) -> None:
         if not args.message:
             print("Usage: synapt recall channel post <channel> \"message\"", file=sys.stderr)
             sys.exit(1)
-        print(channel_post(channel=channel, message=args.message, pin=args.pin))
+        post_kwargs: dict = {
+            "channel": channel,
+            "message": args.message,
+            "pin": args.pin,
+        }
+        if getattr(args, "type", None):
+            post_kwargs["msg_type"] = args.type
+        print(channel_post(**post_kwargs))
     elif action == "read":
         read_kwargs: dict = {"channel": channel, "limit": args.limit, "since": args.since}
         if getattr(args, "detail", None):
@@ -4171,6 +4178,9 @@ def make_parser() -> argparse.ArgumentParser:
                                 help="Only messages after this ISO timestamp (for 'read' action)")
     channel_parser.add_argument("--pin", action="store_true",
                                 help="Also pin the message (for 'post' action)")
+    channel_parser.add_argument("--type", default=None,
+                                help="Message type, e.g. pr/status/claim/code "
+                                     "(for 'post' action; default: message)")
     channel_parser.add_argument("--to", default=None,
                                 help="Target agent for 'directive' action")
     channel_parser.add_argument("--target", default=None,
