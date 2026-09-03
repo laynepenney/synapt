@@ -179,6 +179,34 @@ def _build_lock_busy_message(data_dir: Path, name: str = "build.lock") -> str:
     return f"held by {stamp}" if stamp else "holder unknown"
 
 
+def _build_lock_waiting_dir(data_dir: Path, name: str = "build.lock") -> Path:
+    """Directory holding one marker file per in-progress WAITER for *name*.
+
+    A directory of per-waiter markers (rather than one shared marker file)
+    means concurrent waiters never clobber each other's presence: each
+    creates and removes only its own entry, so the marker set stays correct
+    under any number of simultaneous waiters without its own locking.
+    """
+    return data_dir / f"{name}.waiting"
+
+
+def build_lock_has_waiter(data_dir: Path, name: str = "build.lock") -> bool:
+    """True if at least one caller is currently WAITING (non-zero timeout)
+    for *name*, per the marker directory ``_build_lock_waiting_dir`` writes.
+
+    This is a fairness HINT, not a guarantee: a crashed waiter can leave a
+    stale marker (costs a holder an unnecessary yield, never a correctness
+    problem), and a marker written after this check is invisible to it (the
+    same window every polling design has). Used by a lock holder that wants
+    to yield to a real waiter rather than immediately re-acquiring.
+    """
+    waiting_dir = _build_lock_waiting_dir(data_dir, name)
+    try:
+        return any(waiting_dir.iterdir())
+    except OSError:
+        return False
+
+
 def _acquire_build_lock(data_dir: Path, timeout: float = 60.0, name: str = "build.lock") -> "int | None":
     """Acquire an exclusive file lock for index builds (or, by *name*, for any
     other single-flight job such as ``catchup``).
@@ -187,34 +215,62 @@ def _acquire_build_lock(data_dir: Path, timeout: float = 60.0, name: str = "buil
     be acquired within *timeout* seconds (another holder is running). On
     success the holder stamps ``pid … since …`` into the file, so a waiter
     that gives up can say WHO it waited on rather than only that it waited.
+
+    When *timeout* is positive (a genuine wait, not a single-shot probe),
+    this call is visible to ``build_lock_has_waiter`` for its whole
+    duration, so a holder cycling the same lock between chunks of its own
+    work can detect a waiter and yield instead of winning every re-acquire
+    race by default (the gap between a release and the holder's own
+    re-acquire attempt is microseconds; a waiter polling every 0.5s almost
+    never lands inside it otherwise).
     """
     import errno
     import time
+    import uuid
     from synapt.recall._filelock import lock_exclusive_nb
 
     lock_path = data_dir / name
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
-    deadline = time.monotonic() + timeout
-    while True:
+
+    waiting_marker: Path | None = None
+    if timeout > 0:
+        waiting_dir = _build_lock_waiting_dir(data_dir, name)
         try:
-            lock_exclusive_nb(fd)
+            waiting_dir.mkdir(parents=True, exist_ok=True)
+            marker = waiting_dir / f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            marker.touch()
+            waiting_marker = marker
+        except OSError:
+            waiting_marker = None  # best-effort: a fairness hint, not a guarantee
+
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
             try:
-                os.ftruncate(fd, 0)
-                os.lseek(fd, 0, os.SEEK_SET)
-                os.write(fd, f"pid {os.getpid()} since {datetime.now().astimezone().isoformat(timespec='seconds')}\n".encode())
+                lock_exclusive_nb(fd)
+                try:
+                    os.ftruncate(fd, 0)
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.write(fd, f"pid {os.getpid()} since {datetime.now().astimezone().isoformat(timespec='seconds')}\n".encode())
+                except OSError:
+                    pass  # the stamp is a courtesy; the lock is the guarantee
+                return fd
+            except OSError as exc:
+                # Only retry on lock contention; other errors are fatal
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    os.close(fd)
+                    return None
+                if time.monotonic() >= deadline:
+                    os.close(fd)
+                    return None
+                time.sleep(0.5)
+    finally:
+        if waiting_marker is not None:
+            try:
+                waiting_marker.unlink(missing_ok=True)
             except OSError:
-                pass  # the stamp is a courtesy; the lock is the guarantee
-            return fd
-        except OSError as exc:
-            # Only retry on lock contention; other errors are fatal
-            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
-                os.close(fd)
-                return None
-            if time.monotonic() >= deadline:
-                os.close(fd)
-                return None
-            time.sleep(0.5)
+                pass
 
 
 def _release_build_lock(fd: int) -> None:
@@ -3875,7 +3931,8 @@ def cmd_catchup(args: argparse.Namespace) -> None:
     1. Archive + journal catch-up for every transcript dir (O(archive))
     2. Journal compaction
     3. ``build --incremental`` (O(index))
-    4. ``enrich --max-entries 1``
+    4. Oversize-transcript catchup (R3.1, data growth)
+    5. ``enrich --max-entries 1``
 
     Sequenced, not parallel: the old hook spawned build and enrich as two
     separate processes and ran the catch-up inline, so three things could
@@ -3884,6 +3941,13 @@ def cmd_catchup(args: argparse.Namespace) -> None:
     running (two sessions starting together) steps aside and says so on
     stderr, because two of these at once would double-journal and then
     queue on the build lock for a minute each.
+
+    Step 4 runs AFTER the build subprocess exits, never nested inside it:
+    ``index_oversize_source`` acquires ``build.lock`` itself (the default
+    lock name, distinct from this function's own ``catchup.lock``), and
+    that lock is only free once the build subprocess has released it by
+    exiting. Calling it from inside a build's own lock hold would deadlock;
+    calling it after the subprocess exits does not.
     """
     from synapt.recall.journal import compact_journal
 
@@ -3907,6 +3971,17 @@ def cmd_catchup(args: argparse.Namespace) -> None:
             [sys.executable, "-m", "synapt.recall.cli", "build", "--incremental"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        try:
+            from synapt.recall.query_freshness import (
+                catchup_oversize_transcripts,
+                format_query_freshness,
+            )
+
+            for result in catchup_oversize_transcripts(project, project_index_dir(project)):
+                print(f"[catchup] oversize: {format_query_freshness(result)}", file=sys.stderr)
+        except Exception as exc:
+            print(f"[catchup] oversize catchup step failed: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
         subprocess.run(
             [sys.executable, "-m", "synapt.recall.cli", "enrich", "--max-entries", "1"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
