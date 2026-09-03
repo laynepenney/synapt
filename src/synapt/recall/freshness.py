@@ -69,6 +69,22 @@ class IndexFreshness:
     scanned: str
     new_files: list[str] = field(default_factory=list)
     changed_files: list[str] = field(default_factory=list)
+    #: Files the last build EXAMINED and explicitly skipped for exceeding the
+    #: per-file byte ceiling, as {"name", "size"}. Distinct from
+    #: new_files: a new file has not been looked at yet and a rebuild would
+    #: fix it; a skipped_oversize file WAS looked at and will be skipped again
+    #: on the next build too, so labelling it "new" would be a false promise
+    #: that a rebuild resolves it.
+    skipped_oversize: list[dict] = field(default_factory=list)
+    #: Lines the last build EXAMINED and explicitly skipped for exceeding the
+    #: per-line byte ceiling, as {"session_id", "byte_offset", "size"}.
+    #: Unlike skipped_oversize, this does NOT mean the file itself was
+    #: skipped or excluded from source_files -- the file's other lines were
+    #: indexed normally, and its mtime/size in the manifest genuinely reflect
+    #: that. This is purely a visibility surface: the same line will be
+    #: skipped again on the next build with the same ceiling, so a caller
+    #: renders it distinctly rather than promising a plain rebuild helps.
+    skipped_lines: list[dict] = field(default_factory=list)
     remedy: str = REMEDY_COMMAND
 
 
@@ -140,8 +156,9 @@ def _archived_files(project_dir: Path, data_dir: Path | None = None) -> dict[str
 
 def _read_manifest(
     project_dir: Path, index_dir: Path | None = None
-) -> tuple[dict[str, tuple[float, int]], str] | None:
-    """``({name: (mtime, size)}, build_timestamp)``, or ``None`` if unreadable.
+) -> tuple[dict[str, tuple[float, int]], str, list[dict], list[dict]] | None:
+    """``({name: (mtime, size)}, build_timestamp, skipped_oversize,
+    skipped_lines)``, or ``None`` if unreadable.
 
     ``None`` is not "empty" — it means we could not compute an answer, and the
     caller must fail closed rather than report a clean index.
@@ -159,7 +176,7 @@ def _read_manifest(
         try:
             rows = dict(con.execute(
                 "SELECT key, value FROM metadata WHERE key IN "
-                "('source_files', 'build_timestamp')"
+                "('source_files', 'build_timestamp', 'skipped_oversize', 'skipped_lines')"
             ).fetchall())
         finally:
             con.close()
@@ -183,7 +200,22 @@ def _read_manifest(
     for e in entries:
         if isinstance(e, dict) and e.get("name"):
             known[e["name"]] = (e.get("mtime", 0), e.get("size", 0))
-    return known, rows.get("build_timestamp") or ""
+
+    try:
+        skipped_oversize = json.loads(rows.get("skipped_oversize") or "[]")
+    except (TypeError, ValueError):
+        skipped_oversize = []
+    if not isinstance(skipped_oversize, list):
+        skipped_oversize = []
+
+    try:
+        skipped_lines = json.loads(rows.get("skipped_lines") or "[]")
+    except (TypeError, ValueError):
+        skipped_lines = []
+    if not isinstance(skipped_lines, list):
+        skipped_lines = []
+
+    return known, rows.get("build_timestamp") or "", skipped_oversize, skipped_lines
 
 
 def check_index_freshness(
@@ -249,10 +281,19 @@ def check_index_freshness(
             scanned=scanned,
             new_files=sorted(_archived_files(project_dir, data_dir)),
         )
-    known, build_timestamp = manifest
+    known, build_timestamp, raw_skipped_oversize, raw_skipped_lines = manifest
+
+    # A skipped-oversize file was EXAMINED and will be skipped again on the
+    # next build too -- it must never render as "new" (implying a
+    # rebuild would fix it) or silently vanish as if it were current. Named
+    # here, once, so both legs below exclude it the same way.
+    skipped_names = {
+        s["name"] for s in raw_skipped_oversize
+        if isinstance(s, dict) and s.get("name")
+    }
 
     archived = _archived_files(project_dir, data_dir)
-    new = sorted(n for n in archived if n not in known)
+    new = sorted(n for n in archived if n not in known and n not in skipped_names)
     changed = sorted(n for n in archived if n in known and archived[n] != known[n])
 
     if deep:
@@ -263,6 +304,8 @@ def check_index_freshness(
         # what ``archive_codex_transcripts`` uses to decide whether to re-copy,
         # so this leg asks the same question the archiver answers.
         for live in _live_source_files(live_root):
+            if live.name in skipped_names:
+                continue
             try:
                 live_size = live.stat().st_size
             except OSError:
@@ -286,4 +329,12 @@ def check_index_freshness(
         scanned=scanned,
         new_files=new,
         changed_files=changed,
+        skipped_oversize=[
+            s for s in raw_skipped_oversize
+            if isinstance(s, dict) and s.get("name")
+        ],
+        skipped_lines=[
+            s for s in raw_skipped_lines
+            if isinstance(s, dict) and s.get("session_id")
+        ],
     )

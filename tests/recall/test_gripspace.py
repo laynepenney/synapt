@@ -1,6 +1,7 @@
 """Tests for GitGrip gripspace detection in recall path resolution."""
 
 import json
+import shutil
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -926,3 +927,211 @@ class TestGripspaceRootEnv:
         monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
         monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
         assert project_data_dir(deliberate) == deliberate / ".synapt" / "recall"
+
+
+def _make_named_gripspace(tmp_path: Path, name: str) -> Path:
+    """A second, independently self-resolvable gripspace (its own real
+    .gitgrip/griptrees.json), distinct from _make_gripspace's default -- for
+    tests that need TWO real gripspaces (the agent's own worktree and the
+    shared canonical root) rather than one gripspace plus an unmarked dir.
+    """
+    grip = tmp_path / name
+    (grip / ".gitgrip").mkdir(parents=True)
+    (grip / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
+    return grip
+
+
+class TestGripspaceRootMarkerPersistence:
+    """recall#936, narrowed: GRIPSPACE_ROOT binds an env-carrying process (the
+    MCP server, always gr-spawned) to a shared coordinate, but a bare CLI
+    invocation from a shell that never inherited that env var self-resolves
+    to its OWN worktree's gripspace instead -- correct in isolation, but a
+    real divergence when the two are different real, independently
+    self-resolvable gripspaces (not the unreachable-sibling shape
+    TestGripspaceRootEnv covers, where walk-up cannot even reach the target).
+
+    Fix direction: an env-bound call PERSISTS the resolved shared root to a
+    marker file inside the CALLER's own self-resolved gripspace
+    (.synapt/gripspace-root); a later env-less call in the same gripspace
+    reads that marker and converges on the same coordinate -- "computed once
+    and shared" rather than "bound explicitly at launch" (GRIPSPACE_ROOT
+    itself already covers the latter).
+    """
+
+    def setup_method(self):
+        _gripspace_cache.clear()
+
+    def test_env_bound_call_persists_a_marker_in_the_callers_own_gripspace(
+        self, tmp_path, monkeypatch
+    ):
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        assert project_data_dir() == shared_ws / ".synapt" / "recall"
+        marker = agent_ws / ".synapt" / "gripspace-root"
+        assert marker.is_file()
+        assert Path(marker.read_text().strip()) == shared_ws
+
+    def test_bare_cli_with_no_env_converges_via_the_persisted_marker(
+        self, tmp_path, monkeypatch
+    ):
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        # Earlier call, as the MCP server would make it: env-bound, persists
+        # the marker as a side effect.
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        project_data_dir()
+        _gripspace_cache.clear()
+        # Later call, as a bare `synapt` CLI invocation would make it: same
+        # cwd, same gripspace, but NO env var in this shell.
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert project_data_dir() == shared_ws / ".synapt" / "recall"
+
+    def test_no_marker_and_no_env_falls_back_to_self_resolution_unchanged(
+        self, tmp_path, monkeypatch
+    ):
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        # No env-bound call has ever run here, so no marker exists -- must
+        # behave exactly as before the fix: self-resolve to the agent's own
+        # gripspace, and never invent a marker file out of nothing.
+        assert project_data_dir() == agent_ws / ".synapt" / "recall"
+        assert not (agent_ws / ".synapt" / "gripspace-root").exists()
+
+    def test_marker_pointing_at_a_no_longer_gripspace_is_ignored_not_followed(
+        self, tmp_path, monkeypatch
+    ):
+        """A moved coordinator tree or a deleted gripspace must not redirect
+        a worktree forever. The marker is a CACHED coordinate, not a live
+        pointer -- if its recorded target no longer carries its own
+        gripspace marker (.gitgrip/.grip), it is stale and must be ignored,
+        falling through to self-resolution exactly as if no marker existed.
+        """
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        project_data_dir()  # persists the marker pointing at shared_ws
+        _gripspace_cache.clear()
+
+        # The coordinator tree is gone: its gripspace marker is removed
+        # (the directory itself may or may not still exist -- either way it
+        # is no longer a gripspace).
+        shutil.rmtree(shared_ws / ".gitgrip")
+
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert project_data_dir() == agent_ws / ".synapt" / "recall"
+
+    def test_marker_pointing_at_a_deleted_directory_is_ignored_not_followed(
+        self, tmp_path, monkeypatch
+    ):
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        project_data_dir()
+        _gripspace_cache.clear()
+
+        shutil.rmtree(shared_ws)
+
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert project_data_dir() == agent_ws / ".synapt" / "recall"
+
+    def test_valid_marker_still_used_when_target_still_a_real_gripspace(
+        self, tmp_path, monkeypatch
+    ):
+        """Control for the two staleness tests above: an unmutated marker
+        must still be followed. Without this, a mutation that always
+        ignores the marker would pass the staleness tests trivially."""
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        project_data_dir()
+        _gripspace_cache.clear()
+
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert project_data_dir() == shared_ws / ".synapt" / "recall"
+
+
+class TestGripspaceRootSourceDisclosure:
+    """One word naming which of env:GRIPSPACE_ROOT / env:SYNAPT_RECALL_ROOT /
+    marker:<path> / walk-up chose the coordinate -- so a reader of the
+    existing store-disclosure lines can see that a marker (rather than a
+    live env var) picked the root, per the same visibility discipline as
+    the orphaned-store line and the provenance line.
+    """
+
+    def setup_method(self):
+        _gripspace_cache.clear()
+
+    def test_source_is_gripspace_root_env_when_set(self, tmp_path, monkeypatch):
+        from synapt.recall.core import describe_root_source
+
+        shared_ws = _make_named_gripspace(tmp_path, "shared")
+        monkeypatch.chdir(shared_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        assert describe_root_source() == "env:GRIPSPACE_ROOT"
+
+    def test_source_is_synapt_recall_root_env_when_set(self, tmp_path, monkeypatch):
+        from synapt.recall.core import describe_root_source
+
+        store = tmp_path / "store"
+        store.mkdir()
+        monkeypatch.setenv("SYNAPT_RECALL_ROOT", str(store))
+        assert describe_root_source() == "env:SYNAPT_RECALL_ROOT"
+
+    def test_source_is_marker_path_when_converging_via_a_persisted_marker(
+        self, tmp_path, monkeypatch
+    ):
+        from synapt.recall.core import describe_root_source
+
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        project_data_dir()
+        _gripspace_cache.clear()
+
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert describe_root_source() == f"marker:{shared_ws}"
+
+    def test_source_is_walk_up_with_no_env_and_no_marker(self, tmp_path, monkeypatch):
+        from synapt.recall.core import describe_root_source
+
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert describe_root_source() == "walk-up"
+
+    def test_source_names_the_ignored_stale_marker(self, tmp_path, monkeypatch):
+        """A stale marker is not silently indistinguishable from no marker
+        at all -- the source string names what was ignored and why."""
+        from synapt.recall.core import describe_root_source
+
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        project_data_dir()
+        _gripspace_cache.clear()
+        shutil.rmtree(shared_ws / ".gitgrip")
+
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        source = describe_root_source()
+        assert source.startswith("walk-up")
+        assert str(shared_ws) in source
+        assert "stale" in source.lower()

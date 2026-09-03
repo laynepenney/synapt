@@ -269,10 +269,22 @@ def _newest_source_file(project_dir: Path) -> Path | None:
     from synapt.recall.codex import discover_codex_sessions, list_codex_transcripts
 
     # Roots that are project-scoped by construction; rglob stays in scope.
+    #
+    # project_dir here is cmd_resume's implicit Path.cwd() fallback (resume
+    # has no --project flag), never a deliberate override. project_transcript_dirs
+    # is pure filesystem/cwd discovery -- it never touches project_data_dir --
+    # so it correctly keeps project_dir. But all_worktree_archive_dirs and
+    # project_archive_dir resolve the STORE root via project_data_dir, which
+    # treats ANY passed project_dir as a deliberate root that suppresses
+    # SYNAPT_RECALL_ROOT/GRIPSPACE_ROOT (see that function's docstring). An
+    # implicit cwd is not a deliberate override, so threading it through here
+    # silently defeated a caller's env-based store isolation (recall#967) --
+    # pass None so the store stays ambient, matching how project_data_dir's
+    # OTHER callers in this same chain already resolve it.
     roots: list[Path] = []
     roots.extend(project_transcript_dirs(project_dir))
-    roots.extend(all_worktree_archive_dirs(project_dir))
-    archive = project_archive_dir(project_dir)
+    roots.extend(all_worktree_archive_dirs(None))
+    archive = project_archive_dir(None)
     if archive.exists():
         roots.append(archive)
 
@@ -652,6 +664,9 @@ def _archive_and_build_locked(
     if progress:
         progress("parsing")
     logger.info("build: parsing transcripts from %d source(s)...", len(build_sources))
+    skipped_oversize: list[dict] = []
+    skipped_lines: list[dict] = []
+    config_warnings: list[str] = []
     for build_source in build_sources:
         index = build_index(
             build_source,
@@ -660,6 +675,14 @@ def _archive_and_build_locked(
             subchunk_min_text=_subchunk_min,
         )
         all_chunks.extend(index.chunks)
+        skipped_oversize.extend(index.skipped_oversize)
+        skipped_lines.extend(index.skipped_lines)
+        # Same env override is resolved once per build_source; dedupe by text
+        # rather than plumbing it through as a single shared value, since
+        # each call already independently prints its own warning line.
+        for warning in index.config_warnings:
+            if warning not in config_warnings:
+                config_warnings.append(warning)
     logger.info("build: parsed %d chunks in %.1fs", len(all_chunks), _time.monotonic() - build_t0)
 
     # ChatGPT archive (separate source)
@@ -766,6 +789,27 @@ def _archive_and_build_locked(
                 all_chunks.extend(journal_chunks)
 
     if not all_chunks:
+        # A store whose ONLY source content is an oversize-skipped file (no
+        # other transcripts, journal entries or channel messages) never
+        # reaches the manifest write below -- still print the skip here so
+        # it is visible in this build's own output, even though it will not
+        # persist into the freshness banner until a build with other content
+        # runs. Narrow edge case; the manifest/freshness path above handles
+        # the realistic one (a pathological file alongside real content).
+        if skipped_oversize:
+            total_skipped_bytes = sum(s["size"] for s in skipped_oversize)
+            print(
+                f"  Skipped (oversize): {len(skipped_oversize)} file(s), "
+                f"{format_size(total_skipped_bytes)} not indexed -- see "
+                "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES"
+            )
+        if skipped_lines:
+            total_skipped_line_bytes = sum(s["size"] for s in skipped_lines)
+            print(
+                f"  Skipped (oversize line): {len(skipped_lines)} line(s), "
+                f"{format_size(total_skipped_line_bytes)} not indexed -- see "
+                "SYNAPT_MAX_TRANSCRIPT_LINE_BYTES"
+            )
         return None
 
     # Dedup by chunk id
@@ -787,6 +831,9 @@ def _archive_and_build_locked(
         cache_dir=index_dir,
         db=db,
     )
+    final_index.skipped_oversize = skipped_oversize
+    final_index.config_warnings = config_warnings
+    final_index.skipped_lines = skipped_lines
     final_index.save(index_dir)
     logger.info("build: FTS5 save complete in %.1fs", _time.monotonic() - save_t0)
 
@@ -984,9 +1031,29 @@ def _archive_and_build_locked(
             logger.debug("Cross-session linking failed: %s", exc)
 
     # Store source file info in DB metadata
+    #
+    # Oversize-skipped files are EXCLUDED from source_files
+    # deliberately: this list is what the next incremental build's
+    # already_indexed stamp-match reads (core.py build_index), and a stamp
+    # match there means "unchanged since a successful parse" -- true for
+    # every entry here except an oversize file, which was never parsed at
+    # all. Including it would make it match its own stamp on the very next
+    # build and vanish into the ordinary "already indexed" skip path forever,
+    # indistinguishable from content that WAS successfully searched. Leaving
+    # it out means the ceiling check re-runs (one cheap stat) and re-reports
+    # it every build instead.
+    #
+    # A file with a SKIPPED LINE is not excluded the same way: its other
+    # lines DID parse successfully, so its stamp genuinely reflects what is
+    # in the index (minus the one line, which will be skipped again on the
+    # next build regardless of the stamp match). skipped_lines is threaded
+    # through as its own manifest key purely for visibility, not staleness.
+    oversize_names = {(s["dir"], s["name"]) for s in skipped_oversize}
     source_files = []
     for build_source in build_sources:
         for fp in sorted(build_source.glob("*.jsonl")):
+            if (build_source.name, fp.name) in oversize_names:
+                continue
             st = fp.stat()
             source_files.append({
                 "name": fp.name,
@@ -1065,7 +1132,25 @@ def _archive_and_build_locked(
         compaction_indexed = False
         logger.warning("Compaction summary indexing failed: %s", exc)
 
-    manifest_payload = {"source_files": source_files}
+    manifest_payload = {
+        "source_files": source_files,
+        "skipped_oversize": skipped_oversize,
+        "skipped_lines": skipped_lines,
+    }
+    if skipped_oversize:
+        total_skipped_bytes = sum(s["size"] for s in skipped_oversize)
+        print(
+            f"  Skipped (oversize): {len(skipped_oversize)} file(s), "
+            f"{format_size(total_skipped_bytes)} not indexed -- see "
+            "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES"
+        )
+    if skipped_lines:
+        total_skipped_line_bytes = sum(s["size"] for s in skipped_lines)
+        print(
+            f"  Skipped (oversize line): {len(skipped_lines)} line(s), "
+            f"{format_size(total_skipped_line_bytes)} not indexed -- see "
+            "SYNAPT_MAX_TRANSCRIPT_LINE_BYTES"
+        )
     inputs_stable = (
         readonly_at_read.digest == readonly_before.digest
         and compute_input_signature(
@@ -1674,10 +1759,15 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # helpers server.py already built and tested rather than duplicating
     # the logic -- refresh-current-session exceptions render as an
     # ERROR-state line; _with_query_freshness appends that line.
-    from synapt.recall.server import _query_freshness_line, _with_query_freshness
+    from synapt.recall.server import _query_freshness_line, _with_provenance, _with_query_freshness
 
     freshness_line = _query_freshness_line(index_dir)
-    print(_with_query_freshness(format_resume(view), freshness_line))
+    # Provenance: appended the same way the
+    # freshness line is -- a version number alone does not pin which code
+    # answered this resume; a repointed editable install can keep reporting
+    # the same declared version while the linked worktree underneath it
+    # changes out from under every running process.
+    print(_with_provenance(_with_query_freshness(format_resume(view), freshness_line)))
 
 
 def _attach_unclean_end(view, args):
@@ -2365,7 +2455,14 @@ def cmd_channel(args: argparse.Namespace) -> None:
         if not args.message:
             print("Usage: synapt recall channel post <channel> \"message\"", file=sys.stderr)
             sys.exit(1)
-        print(channel_post(channel=channel, message=args.message, pin=args.pin))
+        post_kwargs: dict = {
+            "channel": channel,
+            "message": args.message,
+            "pin": args.pin,
+        }
+        if getattr(args, "type", None):
+            post_kwargs["msg_type"] = args.type
+        print(channel_post(**post_kwargs))
     elif action == "read":
         read_kwargs: dict = {"channel": channel, "limit": args.limit, "since": args.since}
         if getattr(args, "detail", None):
@@ -3199,6 +3296,19 @@ def cmd_hook(args: argparse.Namespace) -> None:
             except Exception:
                 pass
 
+        # 0b. Provenance line, unconditional: a version match does not
+        # prove the same code ran -- an editable
+        # install's linked worktree can be silently repointed while the
+        # declared version stays put. This has to run every time, not only
+        # on a version mismatch, because the mismatch check can't see a
+        # repoint that happens to land on the same version.
+        with run.phase("provenance"):
+            try:
+                from synapt.recall.server import _resolved_provenance_line
+                banners.append(_resolved_provenance_line())
+            except Exception:
+                pass
+
         # 1. ONE detached process for everything unbounded: archive, journal
         #    catch-up, journal compaction, incremental build, one enrich.
         #    Sequenced inside `catchup` under its own lock so they cannot
@@ -3467,12 +3577,12 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
     if not shutil.which("claude"):
         print("  Warning: 'claude' CLI not found in PATH. Skipping MCP registration.", file=sys.stderr)
-        print("  Register manually: claude mcp add -s user -t stdio synapt synapt-server", file=sys.stderr)
+        print("  Register manually: claude mcp add -s user -t stdio synapt synapt server", file=sys.stderr)
     else:
         try:
             result = subprocess.run(
                 ["claude", "mcp", "add", "-s", scope, "-t", "stdio",
-                 "synapt", "synapt-server"],
+                 "synapt", "synapt", "server"],
                 capture_output=True, text=True, timeout=15,
             )
             if result.returncode == 0:
@@ -3512,9 +3622,12 @@ def cmd_setup(args: argparse.Namespace) -> None:
     print()
 
     # --- 5. Ensure .gitignore ---
+    print(f"[setup] Step {step}/{total_steps}: Ensuring .gitignore ...")
+    step += 1
     _ensure_gitignore(project)
+    print()
 
-    # --- 5. Push to HF if sync configured ---
+    # --- 6. Push to HF if sync configured ---
     if sync_repo:
         from synapt.recall.archive import upload_to_hf
         print("[setup] Pushing to HF ...")
@@ -4065,6 +4178,9 @@ def make_parser() -> argparse.ArgumentParser:
                                 help="Only messages after this ISO timestamp (for 'read' action)")
     channel_parser.add_argument("--pin", action="store_true",
                                 help="Also pin the message (for 'post' action)")
+    channel_parser.add_argument("--type", default=None,
+                                help="Message type, e.g. pr/status/claim/code "
+                                     "(for 'post' action; default: message)")
     channel_parser.add_argument("--to", default=None,
                                 help="Target agent for 'directive' action")
     channel_parser.add_argument("--target", default=None,

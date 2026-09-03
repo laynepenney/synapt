@@ -51,6 +51,7 @@ _STARTUP_VERSION = getattr(_synapt_pkg, "__version__", "unknown")
 from synapt.recall.core import (
     TranscriptIndex,
     atomic_json_write,
+    describe_root_source,
     format_size,
     project_data_dir,
     project_index_dir,
@@ -197,6 +198,45 @@ def _invalidate_cache() -> None:
     _cached_has_embeddings = False
 
 
+def _index_missing_message(index_dir: Path, *, historical: bool = False) -> str:
+    """Message for a caller-visible "no index" state.
+
+    ``_get_index()`` (and the explicit file-existence checks a few callers
+    use instead) cannot distinguish a genuinely absent index from one that
+    is merely unreadable for a moment because another process holds the
+    build lock -- the index files can vanish from disk mid-write during a
+    concurrent ``recall_build``. Telling the caller to run setup in that
+    case is wrong: setup is not the remedy, waiting is. Check the lock
+    directly (cheap: one non-blocking flock attempt) so the sentence agrees
+    with what the Freshness trailer already reports as reason=build_lock.
+    """
+    from synapt.recall.cli import (
+        _acquire_build_lock,
+        _build_lock_busy_message,
+        _release_build_lock,
+    )
+
+    lock_fd = _acquire_build_lock(index_dir.parent, timeout=0)
+    if lock_fd is None:
+        holder = _build_lock_busy_message(index_dir.parent)
+        detail = (
+            "Cannot satisfy the date-filtered query while a build is in "
+            "progress; " if historical else ""
+        )
+        return (
+            f"Index build in progress ({holder}) at {index_dir}. {detail}"
+            "The index is not missing, it is locked -- retry the query in a moment."
+        )
+    _release_build_lock(lock_fd)
+    if historical:
+        return (
+            f"Historical search unavailable: no index found at {index_dir}. "
+            f"Run `synapt recall setup` first. "
+            f"Cannot satisfy date-filtered query without an index."
+        )
+    return f"No index found at {index_dir}. Run `synapt recall setup` first."
+
+
 def _query_freshness_line(index_dir: Path) -> str:
     """Run the bounded caller-tail preflight and return its stable label."""
     from synapt.recall.query_freshness import (
@@ -267,6 +307,32 @@ def _label_empty_result(result: str, index_dir: Path) -> str:
             f"Index freshness: CURRENT. Built "
             f"{verdict.build_timestamp or 'at an unrecorded time'}, "
             f"checked: {verdict.scanned}."
+        )
+    if verdict.skipped_oversize:
+        # Deliberately printed regardless of stale/current above: a
+        # skipped-oversize file was examined and rejected, not merely
+        # unindexed, so it belongs in neither branch above and must not be
+        # silent just because everything ELSE is current.
+        skipped_desc = "; ".join(
+            f"{s.get('name', '?')} ({s.get('size', 0):,} bytes)"
+            for s in verdict.skipped_oversize
+        )
+        status += (
+            f"\nSkipped (oversize, not searchable): {len(verdict.skipped_oversize)} "
+            f"file(s) -- {skipped_desc}. Raise SYNAPT_MAX_TRANSCRIPT_FILE_BYTES to include."
+        )
+    if verdict.skipped_lines:
+        # Same reasoning as skipped_oversize above, one level down: a
+        # skipped LINE was examined and rejected too, and stays true on the
+        # next build with the same ceiling -- it belongs in neither the
+        # stale nor the current branch above.
+        skipped_line_desc = "; ".join(
+            f"{s.get('session_id', '?')} ({s.get('size', 0):,} bytes)"
+            for s in verdict.skipped_lines
+        )
+        status += (
+            f"\nSkipped (oversize line, not searchable): {len(verdict.skipped_lines)} "
+            f"line(s) -- {skipped_line_desc}. Raise SYNAPT_MAX_TRANSCRIPT_LINE_BYTES to include."
         )
     return f"{result}\n\nIndex root: {index_dir}\n{status}"
 
@@ -470,11 +536,10 @@ def recall_search(
             if source_result:
                 return _with_query_freshness(source_result, freshness_line)
             index_dir = project_index_dir()
-            return _with_query_freshness((
-                f"Historical search unavailable: no index found at {index_dir}. "
-                f"Run `synapt recall setup` first. "
-                f"Cannot satisfy date-filtered query without an index."
-            ), freshness_line)
+            return _with_query_freshness(
+                _index_missing_message(index_dir, historical=True),
+                freshness_line,
+            )
         if live_result or source_result:
             return _with_query_freshness(
                 "\n\n".join(part for part in (live_result, source_result) if part),
@@ -482,7 +547,7 @@ def recall_search(
             )
         index_dir = project_index_dir()
         return _with_query_freshness(
-            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            _index_missing_message(index_dir),
             freshness_line,
         )
 
@@ -593,7 +658,7 @@ def recall_quick(query: str) -> str:
     if index is None:
         index_dir = project_index_dir()
         return _with_query_freshness(
-            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            _index_missing_message(index_dir),
             freshness_line,
         )
 
@@ -781,7 +846,7 @@ def recall_resume(
         and not is_sharded(index_dir)
     ):
         return _with_query_freshness(
-            f"No index found at {index_dir}. Run `synapt recall setup` first.",
+            _index_missing_message(index_dir),
             freshness_line,
         )
 
@@ -1074,6 +1139,18 @@ def _run_build_job(project: Path, receipt: dict, incremental: bool) -> None:
         else:
             receipt["stats"] = {"chunk_count": 0, "session_count": 0}
             receipt["result"] = "no transcripts found"
+        # Visible even on the "no transcripts found" branch: a
+        # store whose only source content is one oversize file still needs
+        # its skip on the receipt, not just a silent zero-chunk result.
+        receipt["skipped_oversize"] = (
+            final_index.skipped_oversize if final_index is not None else []
+        )
+        receipt["config_warnings"] = (
+            final_index.config_warnings if final_index is not None else []
+        )
+        receipt["skipped_lines"] = (
+            final_index.skipped_lines if final_index is not None else []
+        )
     except BaseException as exc:
         receipt["state"] = "failed"
         receipt["phase"] = "failed"
@@ -2821,12 +2898,41 @@ def recall_channel(
         intent: Declare intent to create something (message = description of planned work).
     """
     state_store = None
+    log_store = None
+    root_source = None
     try:
         from synapt.recall.actions import get_action_registry
-        from synapt.recall.channel import _db_path
+        from synapt.recall.channel import (
+            _channels_dir,
+            _db_path,
+            _orphaned_local_channel_store,
+        )
 
         registry = get_action_registry()
+        root_source = describe_root_source()
         state_store = _db_path().resolve()
+        # _db_path is ALWAYS Tier-3 local by design (presence/cursors/pins/
+        # mutes stay per-gripspace even when channels are shared); _channels_dir
+        # can resolve to the Tier-2 GLOBAL store. So the JSONL log this call
+        # actually reads/writes can live in a different directory than the
+        # state store just named above -- naming only the state store let a
+        # gripspace-local dev.jsonl "look live" after the real log moved to
+        # the global path, since nothing in the output ever said
+        # the log was elsewhere. Named unconditionally, not only when they
+        # diverge: a caller should never have to infer agreement from silence.
+        log_store = _channels_dir().resolve()
+        orphan_dir = _orphaned_local_channel_store()
+        orphan_line = ""
+        if orphan_dir is not None:
+            # A leftover local channels dir can
+            # sit beside the live global one, still readable, with no
+            # signal it is not the store this call actually used. Named,
+            # never deleted -- a human decides what to do with it.
+            stale_files = ", ".join(str(p) for p in sorted(orphan_dir.glob("*.jsonl")))
+            orphan_line = (
+                f"Channel log store (orphaned legacy, not read/written by "
+                f"this call): {stale_files}\n"
+            )
         result = registry.dispatch(
             action,
             channel=channel,
@@ -2841,9 +2947,17 @@ def recall_channel(
             detail=detail,
             msg_type=msg_type,
         )
-        return f"Channel state store: {state_store}\n{result}"
+        return (
+            f"Channel state store: {state_store} (source: {root_source})\n"
+            f"Channel log store: {log_store} (source: {root_source})\n"
+            f"{orphan_line}{result}"
+        )
     except Exception as exc:
-        prefix = f"Channel state store: {state_store}\n" if state_store else ""
+        prefix = ""
+        if state_store:
+            prefix += f"Channel state store: {state_store} (source: {root_source})\n"
+        if log_store:
+            prefix += f"Channel log store: {log_store} (source: {root_source})\n"
         return f"{prefix}Channel failed: {exc}"
 
 
@@ -2868,6 +2982,61 @@ def _check_version_stale() -> str:
     except Exception:
         pass
     return ""
+
+
+def _resolved_install_kind() -> str:
+    """"editable", "non-editable", or "unknown" for the running synapt install.
+
+    A declared version string does not pin which code ran: an editable
+    install's dist-info version can stay unchanged while the linked
+    worktree underneath it is repointed -- the incident this whole
+    disclosure line exists to make visible without hand diagnosis.
+    PEP 660's ``direct_url.json`` is the one place this is
+    recorded, under ``dir_info.editable``; a normal (non-editable) install
+    either has no ``direct_url.json`` or has one without that key.
+    """
+    try:
+        from importlib.metadata import distribution
+        raw = distribution("synapt").read_text("direct_url.json")
+        if raw is None:
+            return "non-editable"
+        data = json.loads(raw)
+        return "editable" if data.get("dir_info", {}).get("editable") else "non-editable"
+    except Exception:
+        return "unknown"
+
+
+def _resolved_provenance_line() -> str:
+    """One line naming the version AND the resolved import location this
+    process is actually running -- version alone does not pin which code
+    ran (recall#952): under an editable install, the same reported version
+    can execute different bytes minutes apart if the linked worktree is
+    repointed, silently, with nothing else changed.
+
+    Also names the SOURCE of the resolved gripspace root (env var, a
+    persisted marker, or plain walk-up) -- recall#936, item 2's
+    marker-persistence follow-on: a reader should be able to see that a
+    marker, not a live env var, chose the coordinate this process is using.
+    """
+    try:
+        location = str(Path(_synapt_pkg.__file__).resolve().parent)
+    except Exception:
+        location = "unknown"
+    try:
+        root_source = describe_root_source()
+    except Exception:
+        root_source = "unknown"
+    return (
+        f"synapt v{_STARTUP_VERSION} — running from {location} "
+        f"({_resolved_install_kind()} install) — root: {root_source}"
+    )
+
+
+def _with_provenance(text: str) -> str:
+    """Append the resolved-provenance line to a CLI result, same composition
+    shape as ``_with_query_freshness`` -- the caller's text is never mutated
+    beyond adding this one trailing line."""
+    return f"{text}\n\nProvenance: {_resolved_provenance_line()}"
 
 
 def _check_channel_activity() -> str:
@@ -3011,11 +3180,87 @@ def recall_reload() -> str:
     return "Reloading..."  # pragma: no cover
 
 
+def _build_validating_fastmcp_class():
+    """Build the ``ValidatingFastMCP`` class on first use.
+
+    ``mcp.server.fastmcp`` pulls in a heavy transitive chain (starlette,
+    pydantic-settings, sse-starlette, ...) that most importers of this
+    module never need -- e.g. the ``recall grep-intercept`` hook imports
+    this module for unrelated tool functions on every Bash/Grep tool call,
+    and measured 200-300ms slower per invocation (enough to blow its
+    published 500ms budget every time) when that import moved to module
+    load time. Building the class lazily, on first access of the
+    ``ValidatingFastMCP`` module attribute (see ``__getattr__`` below),
+    keeps that cost paid only by callers who actually construct a server.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    class ValidatingFastMCP(FastMCP):
+        """A FastMCP server that rejects an unrecognized tool-call argument
+        instead of silently dropping it.
+
+        A tool function never sees a mismatched argument name: FastMCP
+        builds a per-tool Pydantic model from the function's signature and
+        validates the raw call arguments against that model before the
+        function is ever invoked. That model's default is to silently drop
+        an unrecognized field, so a caller who misnames a field --
+        ``accomplishments`` instead of ``recall_journal``'s real ``done``
+        -- gets it discarded before dispatch; the tool then reports success
+        with the content simply missing.
+
+        This checks the raw arguments against each tool's own published
+        schema (``list_tools()`` / ``Tool.inputSchema``, both part of the
+        MCP wire protocol) before delegating to the real dispatch, so it
+        needs no access to any FastMCP-internal class -- only the public
+        ``call_tool`` method it is overriding and the public ``list_tools``
+        it calls. Applies to every tool constructed as part of this server,
+        not one hand-picked function: closed by construction, not by a
+        per-tool wrapper.
+
+        NOTE: this only takes effect if a ``ValidatingFastMCP`` instance is
+        what gets *constructed* -- ``FastMCP.__init__`` binds
+        ``self.call_tool`` as the wire handler during ``_setup_handlers()``,
+        so patching a plain ``FastMCP`` instance's ``.call_tool`` attribute
+        afterward (e.g. inside ``register_tools()``, which receives an
+        already-built instance) has no effect; the handler reference was
+        already captured at construction time.
+        """
+
+        async def call_tool(self, name: str, arguments: dict) -> object:
+            tools = await self.list_tools()
+            tool = next((t for t in tools if t.name == name), None)
+            if tool is not None and tool.inputSchema:
+                allowed = set(tool.inputSchema.get("properties", {}).keys())
+                unknown = set(arguments) - allowed
+                if unknown:
+                    raise ToolError(
+                        f"Unknown argument(s) for {name}: {sorted(unknown)}. "
+                        f"Accepted: {sorted(allowed)}"
+                    )
+            return await super().call_tool(name, arguments)
+
+    return ValidatingFastMCP
+
+
+def __getattr__(name: str):
+    """PEP 562 lazy module attribute -- see ``_build_validating_fastmcp_class``
+    for why ``ValidatingFastMCP`` isn't just defined at module level."""
+    if name == "ValidatingFastMCP":
+        cls = _build_validating_fastmcp_class()
+        globals()["ValidatingFastMCP"] = cls
+        return cls
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def register_tools(mcp) -> None:
     """Register recall tools on the given FastMCP server instance.
 
     This allows the unified synapt server to compose recall tools alongside
-    repair and watch tools on a single MCP server.
+    repair and watch tools on a single MCP server. Rejecting an unrecognized
+    argument is a property of the SERVER instance (see ``ValidatingFastMCP``
+    above), not of this registration step -- the caller must construct a
+    ``ValidatingFastMCP`` for that protection to take effect.
     """
     mcp.tool()(_with_directive_check(recall_search))
     mcp.tool()(_with_directive_check(recall_quick))
@@ -3046,9 +3291,7 @@ def register_tools(mcp) -> None:
 
 def main():
     """Entry point for standalone synapt-recall-server."""
-    from mcp.server.fastmcp import FastMCP
-
-    server = FastMCP(
+    server = _build_validating_fastmcp_class()(
         "synapt-recall",
         instructions=MCP_INSTRUCTIONS,
     )

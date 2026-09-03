@@ -773,6 +773,8 @@ def parse_transcript(
     stop_offset: int | None = None,
     turn_index_start: int = 0,
     session_id_override: str | None = None,
+    max_line_bytes: int | None = None,
+    skipped_lines: list[dict] | None = None,
 ) -> list[TranscriptChunk]:
     """Parse a Claude Code transcript JSONL file into semantic chunks.
 
@@ -788,12 +790,26 @@ def parse_transcript(
         path: Path to a .jsonl transcript file.
         seen_uuids: Set of already-seen (session_id, uuid) pairs for dedup.
                     Mutated in-place to add new entries.
+        max_line_bytes: Per-line size ceiling. A JSONL line over this is
+                       skipped entirely -- never handed to json.loads(), so
+                       the giant string it would produce is never
+                       materialized. Whole-file ceilings do not catch this
+                       case: a file can be tiny while one line inside it is
+                       huge (a single giant tool_result), and that one line's
+                       json.loads + scrub_text passes alone were measured
+                       driving peak RSS to ~3.5-3.7x the LINE's own size.
+                       Defaults to SYNAPT_MAX_TRANSCRIPT_LINE_BYTES, or
+                       DEFAULT_MAX_LINE_BYTES when unset.
+        skipped_lines: If given, mutated in-place to append one
+                      {"session_id", "byte_offset", "size"} dict per skipped
+                      line -- mirrors seen_uuids' mutate-in-place contract.
 
     Returns:
         List of TranscriptChunk objects.
     """
     if seen_uuids is None:
         seen_uuids = set()
+    line_ceiling = max_line_bytes if max_line_bytes is not None else _max_line_bytes()[0]
 
     chunks: list[TranscriptChunk] = []
     session_id = session_id_override or path.stem  # UUID from filename
@@ -945,6 +961,19 @@ def parse_transcript(
             if stop_offset is not None and current_offset + line_bytes > stop_offset:
                 break
             current_offset += line_bytes
+            if line_ceiling is not None and line_bytes > line_ceiling:
+                # Never reaches json.loads(): the whole point is to avoid
+                # materializing the giant string at all, not just avoid
+                # storing it -- json.loads + scrub_text on a multi-hundred-MB
+                # line is what drives the RSS spike, and truncating the
+                # PARSED result after the fact does not prevent that spike.
+                if skipped_lines is not None:
+                    skipped_lines.append({
+                        "session_id": session_id,
+                        "byte_offset": line_start,
+                        "size": line_bytes,
+                    })
+                continue
             line = raw_line.strip()
             if not line:
                 continue
@@ -4780,6 +4809,169 @@ def _guard_data_root(operation: str, path: Path) -> Path:
     return path
 
 
+_GRIPSPACE_ROOT_MARKER_RELPATH = Path(".synapt") / "gripspace-root"
+
+
+def _persist_shared_gripspace_root(resolved: Path) -> None:
+    """Record *resolved* as the shared coordinate for the CALLER's own
+    gripspace, so a later call with no env var in its shell (a bare CLI
+    invocation) can converge on the same root an env-bound call (the MCP
+    server, always gr-spawned) used.
+
+    Best-effort: this is a side effect of a resolution that already
+    succeeded via the env var, so a write failure (read-only fs, permission)
+    must not turn a working env-bound call into a failure.
+
+    Routed through ``_guard_data_root`` before touching disk, exactly like
+    ``project_data_dir``'s own write target: a test-isolated caller whose
+    cwd happens to walk up into a REAL gripspace (rather than a tmp_path
+    fixture) must not have this side effect plant a real file, the same
+    contract project_data_dir already enforces for its own store root.
+    """
+    self_root = _find_gripspace_root(Path.cwd())
+    if self_root is None or self_root == resolved:
+        return
+    marker = self_root / _GRIPSPACE_ROOT_MARKER_RELPATH
+    _guard_data_root("gripspace_root_marker", marker)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{resolved}\n")
+    except OSError:
+        pass
+
+
+def _is_gripspace_root_marker_dir(path: Path) -> bool:
+    """True when *path* itself (not a walk-up) carries a gripspace marker.
+
+    Checked directly against the recorded path, not via ``_find_gripspace_root``
+    (which would walk further up and could find a DIFFERENT, unrelated
+    gripspace above a moved/renamed target -- that would silently swap
+    which coordinate the marker names rather than correctly reporting the
+    recorded one as gone).
+    """
+    return (path / ".gitgrip").is_dir() or (path / ".grip").is_dir()
+
+
+def _read_shared_gripspace_root_marker() -> tuple[Path | None, Path | None]:
+    """Read a marker an earlier env-bound call persisted in the CALLER's own
+    gripspace, so an env-less call (bare CLI) converges without requiring
+    the env var in its own shell.
+
+    Returns ``(resolved, stale_target)``: *resolved* is the marker's target
+    when it still names a real gripspace, else None; *stale_target* is the
+    recorded path when a marker existed but no longer names one (a moved
+    coordinator tree or a deleted gripspace must not redirect a worktree
+    forever), else None. No marker at all yields ``(None, None)`` -- staleness
+    is reported only when a marker existed and was found untrustworthy, never
+    invented for the "no marker ever written" case.
+    """
+    self_root = _find_gripspace_root(Path.cwd())
+    if self_root is None:
+        return None, None
+    marker = self_root / _GRIPSPACE_ROOT_MARKER_RELPATH
+    if not marker.is_file():
+        return None, None
+    try:
+        recorded = Path(marker.read_text().strip())
+    except OSError:
+        return None, None
+    if recorded.is_dir() and _is_gripspace_root_marker_dir(recorded):
+        return recorded, None
+    return None, recorded
+
+
+def _resolve_root_and_source(project_dir: Path | None = None) -> tuple[Path | None, str]:
+    """Return ``(path, source)`` -- the resolved override root (or None to
+    fall through to a filesystem walk-up) and a short label naming what
+    chose it: ``env:SYNAPT_RECALL_ROOT``, ``env:GRIPSPACE_ROOT``,
+    ``marker:<path>``, or ``walk-up`` (optionally naming an ignored stale
+    marker). One shared implementation so ``_resolve_project_root_override``
+    (the resolution machinery) and ``describe_root_source`` (disclosure)
+    cannot drift into disagreeing about which source actually applied.
+
+    Shared by ``project_data_dir`` (Tier-3 local/state store) and
+    ``channel._read_manifest_url`` (Tier-2 global/log store) so an override
+    honored by one resolver is honored by both. Before this,
+    ``SYNAPT_RECALL_ROOT`` was consulted only here:
+    a caller who set it to redirect the local store (a reconstruction
+    scratch dir, an export ``--path``, a test isolation helper) got the log
+    store routed to the real gripspace's Tier-2 global path while the state
+    store correctly followed the override — two different gripspaces, not
+    the by-design "log Tier-2, state Tier-3" split.
+
+    Precedence, consulted only when *project_dir* is None (an explicitly-
+    passed project_dir is a deliberate root that suppresses every env
+    override, e.g. export/import ``--path``):
+      1. ``SYNAPT_RECALL_ROOT``
+      2. ``GRIPSPACE_ROOT``
+      3. a marker an earlier call under 1 or 2 persisted in this gripspace
+         (recall#936: a bare CLI invocation carries neither env var, but
+         should still converge on the coordinate an MCP server call already
+         established for this same gripspace) -- ignored, not followed, if
+         its recorded target no longer names a real gripspace (a moved
+         coordinator tree or a deleted gripspace must not redirect a
+         worktree forever)
+    Must exist: silently resolving under a mistyped root presents an empty
+    history as a real answer.
+    """
+    if project_dir is not None:
+        return None, "walk-up"
+    for var in ("SYNAPT_RECALL_ROOT", "GRIPSPACE_ROOT"):
+        env_val = os.environ.get(var)
+        if not env_val:
+            continue
+        resolved = Path(env_val).expanduser().resolve()
+        if not resolved.is_dir():
+            raise ValueError(
+                f"{var} points at a directory that does not exist: "
+                f"{resolved}. Refusing to resolve under a mistyped root — "
+                f"unset the variable or create the workspace first."
+            )
+        if var == "GRIPSPACE_ROOT":
+            # SYNAPT_RECALL_ROOT is a deliberate, narrow escape hatch (test
+            # isolation, reconstruction scratch dirs, export/import --path)
+            # and must have no side effects beyond its own resolution -- it
+            # is not the "bound at launch" mechanism recall#936 narrowed to,
+            # and persisting a marker for it broke exactly the test pattern
+            # SYNAPT_RECALL_ROOT exists for: caller cwd stays a real
+            # checkout while the store itself is redirected. Only
+            # GRIPSPACE_ROOT (gr spawn's uniform per-agent binding) gets
+            # persisted for a later env-less call to converge on.
+            _persist_shared_gripspace_root(resolved)
+        return resolved, f"env:{var}"
+    marker_root, stale_target = _read_shared_gripspace_root_marker()
+    if marker_root is not None:
+        return marker_root, f"marker:{marker_root}"
+    if stale_target is not None:
+        return None, f"walk-up (stale marker ignored: {stale_target})"
+    return None, "walk-up"
+
+
+def _resolve_project_root_override(project_dir: Path | None = None) -> Path | None:
+    """Return the explicit env-var root override, or a previously-persisted
+    shared-root marker, or None to fall through to a filesystem walk-up.
+
+    See ``_resolve_root_and_source`` for the full precedence and rationale;
+    this is the thin wrapper used by ``project_data_dir`` and
+    ``channel._read_manifest_url``, which need only the path.
+    """
+    return _resolve_root_and_source(project_dir)[0]
+
+
+def describe_root_source(project_dir: Path | None = None) -> str:
+    """One-word-ish label naming what chose the resolved gripspace root:
+    ``env:GRIPSPACE_ROOT``, ``env:SYNAPT_RECALL_ROOT``, ``marker:<path>``,
+    or ``walk-up`` (naming an ignored stale marker when one was found).
+
+    Disclosure-only: a reader of the existing store-resolution lines
+    (channel state/log store, the startup provenance line) should be able
+    to see that a marker -- rather than a live env var -- picked the
+    coordinate, per the same visibility discipline as the orphaned-store
+    line (recall#936, item 2, follow-on).
+    """
+    return _resolve_root_and_source(project_dir)[1]
+
+
 def project_data_dir(project_dir: Path | None = None) -> Path:
     """Return the root synapt recall data directory.
 
@@ -4808,39 +5000,11 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
       1. ``.synapse/recall/``  → ``.synapt/recall/``
       2. ``.synapse-recall/``  → ``.synapt/recall/``
     """
-    env_resolved: Path | None = None
-    if project_dir is None:
-        # Priority 0: SYNAPT_RECALL_ROOT — explicit store root, always wins.
-        env_root = os.environ.get("SYNAPT_RECALL_ROOT")
-        if env_root:
-            env_resolved = Path(env_root).expanduser().resolve()
-            if not env_resolved.is_dir():
-                raise ValueError(
-                    f"SYNAPT_RECALL_ROOT points at a directory that does not "
-                    f"exist: {env_resolved}. Refusing to mint a fresh store "
-                    f"under a mistyped root — unset the variable or create "
-                    f"the workspace first."
-                )
-        else:
-            # Priority 0b: GRIPSPACE_ROOT — the workspace root gr already
-            # computed via find_workspace_root() and exports on every spawn.
-            # It REPLACES the walk-up below, which cannot reach the workspace
-            # from an agent worktree that is a filesystem SIBLING of it: walking
-            # up from a sibling never arrives at the other one, so each agent
-            # silently minted its own store (tracked in a private issue). gr has the
-            # answer; recall reads it instead of guessing. Consulted only in this
-            # None-branch: an explicitly-passed project_dir is a deliberate root
-            # that suppresses the env override (cli.py cmd_export/cmd_import).
-            grip_env = os.environ.get("GRIPSPACE_ROOT")
-            if grip_env:
-                env_resolved = Path(grip_env).expanduser().resolve()
-                if not env_resolved.is_dir():
-                    raise ValueError(
-                        f"GRIPSPACE_ROOT points at a directory that does not "
-                        f"exist: {env_resolved}. Refusing to mint a fresh store "
-                        f"under a mistyped root — unset the variable or create "
-                        f"the workspace first."
-                    )
+    # Priority 0/0b (SYNAPT_RECALL_ROOT then GRIPSPACE_ROOT): shared with
+    # channel._read_manifest_url via _resolve_project_root_override so the
+    # override is honored identically by the local/state store and the
+    # global/log store — see that function's docstring for why.
+    env_resolved = _resolve_project_root_override(project_dir)
 
     if env_resolved is not None:
         # No early return: the override selects the ROOT and then flows
@@ -5170,6 +5334,63 @@ def parse_journal_entries(journal_path: Path) -> list[TranscriptChunk]:
 # Multi-file index builder
 # ---------------------------------------------------------------------------
 
+#: One pathological transcript must not be able to hold a store's only index
+#: build indefinitely -- a 3.5 GB transcript in one project directory froze a
+#: store's index for 20+ minutes with no visible cause. Measured throughput
+#: is linear, ~10 MB/s (synapt.dev, 2026-09-02) -- the cost of parsing a file
+#: this size is bounded, not runaway -- but a real, currently-active,
+#: NON-pathological session was independently found at 1.41 GB, so the
+#: ceiling must sit clearly above legitimate large sessions, not just above
+#: "normal-looking" ones. 2 GiB is ~30% above that observed legitimate file
+#: and ~40% below the flagged 3.5 GB pathological one -- a judgment call from
+#: two data points, which is exactly why it is env-overridable.
+DEFAULT_MAX_TRANSCRIPT_FILE_BYTES = 2 * 1024 * 1024 * 1024
+
+#: A single JSONL LINE well over this is what a whole-file ceiling cannot
+#: see coming: the file can sit well under DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+#: while one line inside it is huge. Measured (synapt.dev, 2026-09-02): a
+#: single 400-600 MB line drives peak RSS to ~3.5-3.7x the LINE's own size
+#: (json.loads + scrub_text's 16 regex passes each transiently copy the
+#: string) -- far worse than normal content's ~0.44x. No real "legitimate
+#: giant single line" calibration point exists the way the 1.41 GB whole-file
+#: one did, so this is reasoned from the multiplier instead: even at the
+#: worst observed ~3.7x, 50 MB cannot push one line's RSS impact past
+#: ~185 MB, while sitting far above any ordinary turn's content.
+DEFAULT_MAX_LINE_BYTES = 50 * 1024 * 1024
+
+
+def _int_env_override(var_name: str, default: int) -> tuple[int, str | None]:
+    """Read an integer env override; never silently swallow a malformed one.
+
+    Returns (value, warning). A missing or empty var is not a malformed
+    override -- warning is None. A present-but-unparseable value falls back
+    to *default* AND returns a warning naming the bad string, so the caller
+    can surface it (build_index prints it and adds it to config_warnings)
+    rather than the override vanishing with no trace.
+    """
+    override = os.environ.get(var_name)
+    if not override:
+        return default, None
+    try:
+        return int(override), None
+    except ValueError:
+        return default, (
+            f"{var_name}={override!r} is not a valid integer; using default {default}"
+        )
+
+
+def _max_transcript_file_bytes() -> tuple[int, str | None]:
+    return _int_env_override(
+        "SYNAPT_MAX_TRANSCRIPT_FILE_BYTES", DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+    )
+
+
+def _max_line_bytes() -> tuple[int, str | None]:
+    return _int_env_override(
+        "SYNAPT_MAX_TRANSCRIPT_LINE_BYTES", DEFAULT_MAX_LINE_BYTES
+    )
+
+
 def build_index(
     source_dir: Path,
     use_embeddings: bool = False,
@@ -5177,6 +5398,8 @@ def build_index(
     incremental_manifest: dict | None = None,
     db: RecallDB | None = None,
     subchunk_min_text: int | None = None,
+    max_file_bytes: int | None = None,
+    max_line_bytes: int | None = None,
 ) -> TranscriptIndex:
     """Build a TranscriptIndex from a directory of .jsonl transcript files.
 
@@ -5186,14 +5409,56 @@ def build_index(
         cache_dir: Directory for caching embeddings.
         incremental_manifest: If provided, skip files already indexed
                              (by checking source_files in manifest).
+        max_file_bytes: Per-file size ceiling. A file over this is skipped,
+                       not parsed, so one pathological transcript cannot hold
+                       up the rest of the build. Defaults to
+                       SYNAPT_MAX_TRANSCRIPT_FILE_BYTES, or
+                       DEFAULT_MAX_TRANSCRIPT_FILE_BYTES when unset.
+        max_line_bytes: Per-line size ceiling within a file that IS parsed.
+                       See parse_transcript's docstring for why a whole-file
+                       ceiling alone does not cover this case. Defaults to
+                       SYNAPT_MAX_TRANSCRIPT_LINE_BYTES, or
+                       DEFAULT_MAX_LINE_BYTES when unset.
 
     Returns:
-        TranscriptIndex over all parsed chunks.
+        TranscriptIndex over all parsed chunks. Carries three attributes,
+        always present (empty when nothing was skipped/warned) so a caller
+        can rely on them without a hasattr check:
+        - `.skipped_oversize`: {"name", "dir", "size"} dicts, one per file
+          skipped for size.
+        - `.config_warnings`: one string per malformed env override this
+          call encountered (falls back to the safe default; a bad override
+          is visible, never a silent no-op).
+        - `.skipped_lines`: {"session_id", "byte_offset", "size"} dicts, one
+          per line skipped for size (see max_line_bytes above). Unlike
+          skipped_oversize, a line skip does not mean the file was skipped --
+          the file's other lines still parsed and are reflected in the
+          returned chunks.
     """
+    config_warnings: list[str] = []
+    if max_file_bytes is not None:
+        ceiling = max_file_bytes
+    else:
+        ceiling, warning = _max_transcript_file_bytes()
+        if warning:
+            config_warnings.append(warning)
+            print(f"[synapt] {warning}")
+    if max_line_bytes is not None:
+        line_ceiling = max_line_bytes
+    else:
+        line_ceiling, warning = _max_line_bytes()
+        if warning:
+            config_warnings.append(warning)
+            print(f"[synapt] {warning}")
+
     jsonl_files = sorted(source_dir.glob("*.jsonl"))
     if not jsonl_files:
         print(f"[synapt] No .jsonl files found in {source_dir}")
-        return TranscriptIndex([])
+        empty = TranscriptIndex([])
+        empty.skipped_oversize = []
+        empty.config_warnings = config_warnings
+        empty.skipped_lines = []
+        return empty
 
     forced_subchunk = os.environ.get("SYNAPT_FORCE_SUBCHUNK_MIN_TEXT")
     if subchunk_min_text is None and forced_subchunk:
@@ -5235,6 +5500,8 @@ def build_index(
     seen_uuids: set[str] = set()
     skipped = 0
     parsed_files: list[Path] = []  # Track which files were actually parsed
+    skipped_oversize: list[dict] = []
+    skipped_lines: list[dict] = []
 
     for filepath in jsonl_files:
         stamp = already_indexed.get((filepath.parent.name, filepath.name))
@@ -5246,12 +5513,35 @@ def build_index(
             if stat.st_mtime == stored_mtime and stat.st_size == stored_size:
                 skipped += 1
                 continue
+        else:
+            stat = filepath.stat()
+        # An oversize file is NEVER recorded into `already_indexed`'s source --
+        # that list is built by the caller (cli.py) unconditionally globbing
+        # the archive, deliberately excluding whatever this call reports here
+        # (see skipped_oversize). So this check re-runs, cheaply (one stat,
+        # already paid above), on every build: the file is re-reported every
+        # time rather than silently absorbed into "already indexed" forever,
+        # which would look identical to a file that WAS successfully parsed.
+        if stat.st_size > ceiling:
+            skipped_oversize.append({
+                "name": filepath.name,
+                "dir": filepath.parent.name,
+                "size": stat.st_size,
+            })
+            print(
+                f"  {filepath.name}: SKIPPED (oversize, {stat.st_size:,} bytes > "
+                f"ceiling {ceiling:,} bytes; override with "
+                f"SYNAPT_MAX_TRANSCRIPT_FILE_BYTES)"
+            )
+            continue
         try:
             if is_codex_transcript(filepath):
                 chunks = parse_codex_transcript(filepath, seen_uuids=seen_uuids)
             else:
                 chunks = parse_transcript(filepath, seen_uuids=seen_uuids,
-                                          subchunk_min_text=subchunk_min_text)
+                                          subchunk_min_text=subchunk_min_text,
+                                          max_line_bytes=line_ceiling,
+                                          skipped_lines=skipped_lines)
             all_chunks.extend(chunks)
             parsed_files.append(filepath)
             print(f"  {filepath.name}: {len(chunks)} turns")
@@ -5260,6 +5550,14 @@ def build_index(
 
     if skipped:
         print(f"[synapt] Skipped {skipped} already-indexed files")
+    if skipped_oversize:
+        print(f"[synapt] Skipped {len(skipped_oversize)} oversize file(s) "
+              f"(not indexed, not searchable)")
+    if skipped_lines:
+        total_skipped_line_bytes = sum(s["size"] for s in skipped_lines)
+        print(f"[synapt] Skipped {len(skipped_lines)} oversize line(s) within "
+              f"otherwise-parsed files, {total_skipped_line_bytes:,} bytes "
+              f"(not indexed, not searchable)")
     print(f"[synapt] Total: {len(all_chunks)} chunks from {len(jsonl_files) - skipped} files")
 
     # Auto-detect content profile and re-parse if sub-chunking should differ.
@@ -5288,10 +5586,15 @@ def build_index(
                             chunks = parse_codex_transcript(filepath, seen_uuids=seen_uuids_reparse)
                         else:
                             chunks = parse_transcript(filepath, seen_uuids=seen_uuids_reparse,
-                                                      subchunk_min_text=0)
+                                                      subchunk_min_text=0,
+                                                      max_line_bytes=line_ceiling)
                         all_chunks.extend(chunks)
                     except Exception:
                         pass
                 print(f"[synapt] Re-parsed: {len(all_chunks)} chunks (sub-chunking disabled)")
 
-    return TranscriptIndex(all_chunks, use_embeddings=use_embeddings, cache_dir=cache_dir, db=db)
+    result = TranscriptIndex(all_chunks, use_embeddings=use_embeddings, cache_dir=cache_dir, db=db)
+    result.skipped_oversize = skipped_oversize
+    result.config_warnings = config_warnings
+    result.skipped_lines = skipped_lines
+    return result

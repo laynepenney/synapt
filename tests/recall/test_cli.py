@@ -483,6 +483,98 @@ def test_cmd_setup_no_transcripts_still_registers_mcp(tmp_path):
     assert skill_path.exists()
 
 
+def test_cmd_setup_registers_mcp_with_a_command_that_resolves_on_path(tmp_path):
+    """The `claude mcp add` call's registered command must be launchable.
+
+    `synapt init` used to register the MCP server as the single word
+    `synapt-server`, which has never existed as an installed executable (no
+    such console script is declared anywhere) -- a fresh user's Claude Code
+    session would try to launch it and fail to connect. The registered
+    command must be a name that actually resolves via shutil.which, or the
+    first word of a multi-word command that does.
+    """
+    project_dir = tmp_path / "freshproject"
+    project_dir.mkdir()
+
+    mock_run = MagicMock()
+    mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+
+    with patch.dict("os.environ", {"CODEX_HOME": str(tmp_path / ".codex")}), \
+         patch("synapt.recall.core.Path.home", return_value=tmp_path), \
+         patch("synapt.recall.core.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.subprocess.run", mock_run), \
+         patch("synapt.recall.cli.shutil.which", return_value="/usr/bin/claude"):
+        from synapt.recall.cli import cmd_setup
+        args = argparse.Namespace(
+            no_embeddings=True,
+            no_hook=False,
+            global_scope=False,
+            sync=None,
+        )
+        cmd_setup(args)
+
+    mcp_calls = [c for c in mock_run.call_args_list if "claude" in c[0][0]]
+    assert len(mcp_calls) == 1
+    call_args = mcp_calls[0][0][0]
+
+    # The registered command is everything after "-t" "stdio" "synapt" (the
+    # transport flag, then the server name Claude Code shows in its list).
+    add_idx = call_args.index("add")
+    stdio_idx = call_args.index("stdio", add_idx)
+    server_name_idx = stdio_idx + 1
+    registered_command = call_args[server_name_idx + 1:]
+
+    assert registered_command, "no command was registered at all"
+    import shutil as _shutil
+
+    first_word = registered_command[0]
+    assert _shutil.which(first_word) is not None, (
+        f"registered command {registered_command!r} does not resolve on PATH "
+        f"-- Claude Code would fail to launch this MCP server"
+    )
+
+    # Negative control: the OLD single-word command genuinely does not
+    # resolve -- this is the mechanism of the bug, not a hypothetical.
+    assert _shutil.which("synapt-server") is None, (
+        "control invalidated: synapt-server now resolves on PATH, "
+        "so this test no longer demonstrates the original defect"
+    )
+
+
+def test_cmd_setup_narrates_every_announced_step(tmp_path, capsys):
+    """The banner announces total_steps=5 (hooks enabled); every step 1..5 must be narrated.
+
+    The .gitignore step ran silently -- the banner said 5 steps, only 4
+    ever printed "[setup] Step N/5: ...", so a user counting along saw
+    the completion summary appear right after "4/5" with no "5/5" anywhere.
+    """
+    project_dir = tmp_path / "freshproject"
+    project_dir.mkdir()
+
+    mock_run = MagicMock()
+    mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+
+    with patch.dict("os.environ", {"CODEX_HOME": str(tmp_path / ".codex")}), \
+         patch("synapt.recall.core.Path.home", return_value=tmp_path), \
+         patch("synapt.recall.core.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.subprocess.run", mock_run), \
+         patch("synapt.recall.cli.shutil.which", return_value="/usr/bin/claude"):
+        from synapt.recall.cli import cmd_setup
+        args = argparse.Namespace(
+            no_embeddings=True,
+            no_hook=False,
+            global_scope=False,
+            sync=None,
+        )
+        cmd_setup(args)
+
+    out = capsys.readouterr().out
+    for n in range(1, 6):
+        assert f"Step {n}/5:" in out, f"missing narration for step {n}/5 in setup output"
+
+
 def test_ensure_gitignore_creates_file(tmp_path):
     """_ensure_gitignore creates .gitignore with .synapt/ entry if missing."""
     _ensure_gitignore(tmp_path)
@@ -1069,6 +1161,72 @@ def test_channel_cli_post_without_name():
     assert args.action == "post"
     assert args.message == "hello"
     assert args.name is None
+
+
+def test_channel_cli_post_with_type_flag():
+    """--type is a recognized flag on the channel post action."""
+    with (
+        patch.object(
+            sys,
+            "argv",
+            ["synapt", "channel", "post", "dev", "verdict text", "--type", "pr"],
+        ),
+        patch("synapt.recall.cli.cmd_channel") as mock,
+    ):
+        main()
+    args = mock.call_args[0][0]
+    assert args.action == "post"
+    assert args.type == "pr"
+
+
+def test_channel_cli_post_without_type_flag_defaults_to_none():
+    """No --type on post: args.type is None, so cmd_channel's own default (message) applies."""
+    with (
+        patch.object(sys, "argv", ["synapt", "channel", "post", "dev", "hello"]),
+        patch("synapt.recall.cli.cmd_channel") as mock,
+    ):
+        main()
+    args = mock.call_args[0][0]
+    assert args.type is None
+
+
+def test_channel_cli_post_type_wired_to_channel_post_msg_type():
+    """--type pr on post threads through to channel_post(msg_type="pr")."""
+    with (
+        patch.object(
+            sys,
+            "argv",
+            ["synapt", "channel", "post", "dev", "verdict text", "--type", "pr"],
+        ),
+        patch(
+            "synapt.recall.channel.channel_post",
+            return_value="[#dev] bot: verdict text [id=m_deadbeef]",
+        ) as mock_post,
+    ):
+        from synapt.recall.cli import main
+
+        main()
+    mock_post.assert_called_once()
+    assert mock_post.call_args[1].get("msg_type") == "pr"
+
+
+def test_channel_cli_post_without_type_flag_omits_msg_type_override():
+    """No --type: channel_post is called without a msg_type override (keeps its own default)."""
+    with (
+        patch.object(sys, "argv", ["synapt", "channel", "post", "dev", "hello"]),
+        patch(
+            "synapt.recall.channel.channel_post",
+            return_value="[#dev] bot: hello [id=m_cafebabe]",
+        ) as mock_post,
+    ):
+        from synapt.recall.cli import main
+
+        main()
+    mock_post.assert_called_once()
+    # Either omitted entirely or explicitly None -- either way, not forced to a
+    # non-default type when the operator never asked for one.
+    passed_type = mock_post.call_args[1].get("msg_type")
+    assert passed_type in (None, "message")
 
 
 # ---------------------------------------------------------------------------

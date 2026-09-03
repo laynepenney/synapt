@@ -1293,6 +1293,235 @@ def test_build_index_skips_unchanged_files():
         )
 
 
+def test_build_index_skips_oversize_file_and_reports_it():
+    """One pathological transcript must not hold up the rest of a build, and
+    the skip must be visible rather than silently dropped.
+
+    Before this: no per-file size cap existed anywhere in the builder, so a
+    single runaway transcript in a source directory would be handed straight
+    to parse_transcript() with no way to opt out short of never building that
+    store again.
+    """
+    from synapt.recall.core import build_index
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        normal = tmpdir / "normal-session.jsonl"
+        write_jsonl(normal, [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        ])
+
+        oversize = tmpdir / "oversize-session.jsonl"
+        write_jsonl(oversize, [
+            user_text_entry("this one is too big", uuid="u2", ts="2026-03-01T11:00:00Z"),
+            assistant_entry(text="ok", uuid="a2", ts="2026-03-01T11:00:30Z"),
+        ])
+        oversize_size = oversize.stat().st_size
+        ceiling = oversize_size - 1  # strictly below the oversize file's size
+
+        index = build_index(tmpdir, max_file_bytes=ceiling)
+
+        # The build completes and the NORMAL file is still parsed — one
+        # pathological file must not take the rest of the build down with it.
+        assert len(index.chunks) == 1, (
+            f"Expected the normal file's 1 chunk despite the oversize sibling, "
+            f"got {len(index.chunks)}"
+        )
+        assert index.chunks[0].session_id == "normal-session"
+
+        # The skip is REPORTED, not silent: visible on the returned index
+        # with the file's real size, distinct from the ordinary
+        # already-indexed skip path (which would make it look identical to a
+        # file that WAS successfully searched).
+        assert hasattr(index, "skipped_oversize"), (
+            "build_index() must expose which files it skipped for size, "
+            "not just drop them"
+        )
+        assert len(index.skipped_oversize) == 1
+        skipped = index.skipped_oversize[0]
+        assert skipped["name"] == "oversize-session.jsonl"
+        assert skipped["size"] == oversize_size
+
+
+def test_build_index_default_ceiling_does_not_affect_normal_files():
+    """The default ceiling must not touch any realistically-sized transcript."""
+    from synapt.recall.core import build_index
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        transcript = tmpdir / "normal-session.jsonl"
+        write_jsonl(transcript, [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        ])
+
+        index = build_index(tmpdir)  # no explicit ceiling — production default
+
+        assert len(index.chunks) == 1
+        assert index.skipped_oversize == []
+
+
+def test_parse_transcript_skips_oversize_line_and_reports_it():
+    """One pathological JSONL LINE inside an otherwise-small file must not be
+    parsed at all -- a whole-file byte ceiling cannot see this coming, since
+    the file stays small while one line inside it is huge. Measured: a real
+    giant single line drives peak RSS to ~3.5-3.7x the file's own size, far
+    worse than normal content's ~0.44x."""
+    from synapt.recall.core import parse_transcript
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        transcript = Path(tmpdir) / "session.jsonl"
+        huge_content = "x" * 5000
+        write_jsonl(transcript, [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+            user_tool_result_entry(content=huge_content, uuid="tr1", ts="2026-03-01T10:01:00Z"),
+            user_text_entry("after", uuid="u2", ts="2026-03-01T10:02:00Z"),
+            assistant_entry(text="ok", uuid="a2", ts="2026-03-01T10:02:30Z"),
+        ])
+
+        skipped_lines: list[dict] = []
+        chunks = parse_transcript(
+            transcript, max_line_bytes=1000, skipped_lines=skipped_lines,
+        )
+
+        assert len(skipped_lines) == 1, "the oversize line must be reported, not silently dropped"
+        assert skipped_lines[0]["size"] > 1000
+
+        # The huge blob never entered any chunk field -- skipped, not merely
+        # truncated after the fact (which would still show a 3000-char prefix).
+        joined = " ".join(
+            (c.user_text or "") + (c.assistant_text or "") + (c.tool_content or "")
+            for c in chunks
+        )
+        assert "x" * 500 not in joined
+
+        # The surrounding ordinary turns still parsed -- one pathological
+        # line does not take the rest of the file down with it.
+        assert any(c.user_text == "hello" for c in chunks)
+        assert any(c.user_text == "after" for c in chunks)
+
+
+def test_parse_transcript_default_line_ceiling_does_not_affect_normal_lines():
+    """The default line ceiling must not touch any realistically-sized turn."""
+    from synapt.recall.core import parse_transcript
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        transcript = Path(tmpdir) / "session.jsonl"
+        write_jsonl(transcript, [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        ])
+
+        skipped_lines: list[dict] = []
+        chunks = parse_transcript(transcript, skipped_lines=skipped_lines)  # no explicit ceiling
+
+        assert len(chunks) == 1
+        assert skipped_lines == []
+
+
+def test_max_transcript_file_bytes_malformed_env_warns_and_falls_back(monkeypatch):
+    """A bad SYNAPT_MAX_TRANSCRIPT_FILE_BYTES must not silently become the
+    default with no trace -- the build still needs a working ceiling, but the
+    operator needs to know their override was ignored."""
+    from synapt.recall.core import _max_transcript_file_bytes, DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+
+    monkeypatch.setenv("SYNAPT_MAX_TRANSCRIPT_FILE_BYTES", "not-a-number")
+    value, warning = _max_transcript_file_bytes()
+
+    assert value == DEFAULT_MAX_TRANSCRIPT_FILE_BYTES
+    assert warning is not None
+    assert "not-a-number" in warning
+
+
+def test_max_transcript_file_bytes_valid_env_no_warning(monkeypatch):
+    from synapt.recall.core import _max_transcript_file_bytes
+
+    monkeypatch.setenv("SYNAPT_MAX_TRANSCRIPT_FILE_BYTES", "12345")
+    value, warning = _max_transcript_file_bytes()
+
+    assert value == 12345
+    assert warning is None
+
+
+def test_max_line_bytes_malformed_env_warns_and_falls_back(monkeypatch):
+    from synapt.recall.core import _max_line_bytes, DEFAULT_MAX_LINE_BYTES
+
+    monkeypatch.setenv("SYNAPT_MAX_TRANSCRIPT_LINE_BYTES", "garbage")
+    value, warning = _max_line_bytes()
+
+    assert value == DEFAULT_MAX_LINE_BYTES
+    assert warning is not None
+    assert "garbage" in warning
+
+
+def test_build_index_surfaces_malformed_ceiling_env_as_config_warning(monkeypatch):
+    """The malformed-override warning must reach the build's returned index,
+    not just stdout -- the same visibility contract as skipped_oversize."""
+    from synapt.recall.core import build_index
+
+    monkeypatch.setenv("SYNAPT_MAX_TRANSCRIPT_FILE_BYTES", "not-a-number")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        write_jsonl(tmpdir / "session.jsonl", [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        ])
+
+        index = build_index(tmpdir)
+
+        assert hasattr(index, "config_warnings")
+        assert any("not-a-number" in w for w in index.config_warnings)
+
+
+def test_build_index_surfaces_skipped_lines_on_the_returned_index():
+    """A line-level skip must reach the returned index, not just a print
+    statement -- the earlier version of this fix built
+    skipped_lines as a local that only ever reached stdout, so an in-process
+    caller (the MCP build path) could never see it. Same always-present
+    contract as skipped_oversize/config_warnings: empty when nothing was
+    skipped, so a caller never needs a hasattr check."""
+    from synapt.recall.core import build_index
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        transcript = tmpdir / "session.jsonl"
+        huge_content = "x" * 5000
+        write_jsonl(transcript, [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+            user_tool_result_entry(content=huge_content, uuid="tr1", ts="2026-03-01T10:01:00Z"),
+        ])
+
+        index = build_index(tmpdir, max_line_bytes=1000)
+
+        assert hasattr(index, "skipped_lines")
+        assert len(index.skipped_lines) == 1
+        assert index.skipped_lines[0]["size"] > 1000
+        assert index.skipped_lines[0]["session_id"] == "session"
+
+        # The file's other lines still parsed -- a line skip is not a file skip.
+        assert any(c.user_text == "hello" for c in index.chunks)
+
+
+def test_build_index_default_skipped_lines_is_empty_when_nothing_skipped():
+    from synapt.recall.core import build_index
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        write_jsonl(tmpdir / "session.jsonl", [
+            user_text_entry("hello", uuid="u1", ts="2026-03-01T10:00:00Z"),
+            assistant_entry(text="hi", uuid="a1", ts="2026-03-01T10:00:30Z"),
+        ])
+
+        index = build_index(tmpdir)
+
+        assert index.skipped_lines == []
+
+
 # ---------------------------------------------------------------------------
 # Tests: _summarize_tool_result
 # ---------------------------------------------------------------------------

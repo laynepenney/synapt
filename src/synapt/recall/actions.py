@@ -225,7 +225,7 @@ def _handle_search(**kwargs: Any) -> str:
     message = kwargs.get("message")
     if not message:
         return "Error: query is required for 'search' action."
-    results = channel_search(message, agent_id=kwargs.get("name"))
+    results = channel_search(message, msg_type=kwargs.get("msg_type"), agent_id=kwargs.get("name"))
     if not results:
         return "No matching channel messages."
     lines = ["## Channel search results"]

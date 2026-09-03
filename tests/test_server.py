@@ -38,6 +38,35 @@ class TestServerDevMode(unittest.TestCase):
                 main()
                 self.assertNotIn("--dev", captured_argv)
 
+    def test_serve_prints_provenance_to_stderr_before_running(self):
+        """`synapt server` must disclose which code it is
+        running, not just its declared version -- stdout is the MCP
+        protocol channel, so this has to land on stderr,
+        matching the --dev logger's own comment two lines above this."""
+        import io
+
+        order: list[str] = []
+        fake_mcp = unittest.mock.Mock()
+        fake_mcp.run.side_effect = lambda: order.append("run")
+
+        err = io.StringIO()
+        with patch("synapt.recall.server.ValidatingFastMCP", return_value=fake_mcp), \
+             patch("synapt.plugins.register_plugins", return_value=[]), \
+             patch("synapt.recall.server.register_tools"), \
+             patch(
+                 "synapt.recall.server._resolved_provenance_line",
+                 return_value="synapt vTEST — running from /fixture (editable install)",
+             ), \
+             patch.object(sys, "stderr", err):
+            from synapt.server import _serve
+            _serve()
+
+        printed = err.getvalue()
+        self.assertIn(
+            "synapt vTEST — running from /fixture (editable install)", printed,
+        )
+        fake_mcp.run.assert_called_once()
+
     def test_find_watch_paths(self):
         """_find_watch_paths returns at least the synapt package directory."""
         from synapt.server import _find_watch_paths

@@ -45,12 +45,23 @@ logger = logging.getLogger("synapt.server")
 
 def _serve():
     """Start the MCP server (no reload)."""
-    from mcp.server.fastmcp import FastMCP
-
     from synapt.plugins import register_plugins
-    from synapt.recall.server import MCP_INSTRUCTIONS, register_tools as recall_register
+    from synapt.recall.server import (
+        MCP_INSTRUCTIONS,
+        ValidatingFastMCP,
+        _resolved_provenance_line,
+        register_tools as recall_register,
+    )
 
-    mcp = FastMCP(
+    # Provenance disclosure: stdout is the MCP
+    # protocol channel, so this goes to stderr, same as the --dev logger
+    # above. A version match alone does not prove the same code is running
+    # -- an editable install's linked worktree can be repointed while the
+    # declared version stays put, which is exactly how four live agent
+    # servers ran unmerged code with nothing anywhere saying so.
+    print(f"[synapt] {_resolved_provenance_line()}", file=sys.stderr)
+
+    mcp = ValidatingFastMCP(
         "synapt",
         instructions=MCP_INSTRUCTIONS,
     )

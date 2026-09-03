@@ -554,3 +554,118 @@ def test_primitive_imports_nothing_from_premium_or_the_memory_layer():
             f"code_index must not import {name!r} — the primitive stays free of "
             "the memory layer so the join can live above it"
         )
+
+
+# --------------------------------------------------------------------------
+# Parser stack absent — a defect on the released 0.24.0, tracked privately.
+#
+# tree-sitter-language-pack is optional (the ``code-index`` extra; a plain
+# ``pip install synapt`` does not carry it). Before this fix, a missing stack
+# made _get_parser() return None once per file, and index_repo() turned each
+# None into its own generic "<path>: could not be parsed" — indistinguishable
+# from N real per-file parse failures, with nothing anywhere naming the actual
+# cause. This suite had zero coverage of that path (the `except ImportError`
+# branch in _get_parser carried a "pragma: no cover" saying so) before now.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _reset_parser_stack_cache():
+    from synapt.recall import code_index
+
+    code_index._PARSER_STACK_AVAILABLE = None
+    yield
+    code_index._PARSER_STACK_AVAILABLE = None
+
+
+def test_missing_parser_stack_reports_one_clear_error_not_one_per_file(
+    repo: Path, db: Path, monkeypatch, _reset_parser_stack_cache
+):
+    """The bug, pinned: simulate tree-sitter-language-pack being absent (a
+    fresh install without the ``code-index`` extra) via ``sys.modules``, and
+    assert ONE clear, named signal for the whole run — not five generic
+    "could not be parsed" lines, one per fixture file."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "tree_sitter_language_pack", None)
+
+    stats = index_repo(repo, db, repo="demo")
+
+    assert stats.parser_stack_missing is True
+    assert stats.symbols == 0
+    assert stats.imports == 0
+    assert len(stats.errors) == 1, stats.errors
+    assert "tree-sitter-language-pack" in stats.errors[0]
+    assert "code-index" in stats.errors[0]
+
+
+def test_parser_stack_present_leaves_the_flag_false_and_reports_no_errors(
+    repo: Path, db: Path
+):
+    """Control: with the stack genuinely available (this test environment,
+    same as ``pip install synapt[code-index]``), the new flag stays False and
+    no aggregate error is added — the flag tracks absence, not a blanket
+    always-on signal."""
+    stats = index_repo(repo, db, repo="demo")
+
+    assert stats.parser_stack_missing is False
+    assert stats.errors == []
+    assert stats.symbols > 0
+
+
+def test_missing_parser_stack_does_not_poison_the_index_for_a_later_run(
+    repo: Path, db: Path, _reset_parser_stack_cache
+):
+    """Regression witness for the review finding on this fix: a run with the
+    parser stack missing must not write a code_files row per file at all.
+    Before this correction, it did — with the file's REAL content_hash and
+    empty symbols/imports, counted as indexed — so a LATER run with the stack
+    installed saw an unchanged content_hash for every file and silently
+    skipped them all as already-current, forever, until the file's own
+    content changed. Two runs against the SAME db, same unchanged files on
+    disk: stack missing, then stack present, must actually index for real on
+    the second run.
+    """
+    import sys
+
+    from synapt.recall import code_index
+
+    had_key = "tree_sitter_language_pack" in sys.modules
+    prior_value = sys.modules.get("tree_sitter_language_pack")
+    try:
+        # Run 1: stack missing.
+        sys.modules["tree_sitter_language_pack"] = None
+        code_index._PARSER_STACK_AVAILABLE = None
+
+        stats1 = index_repo(repo, db, repo="demo")
+        assert stats1.parser_stack_missing is True
+        assert stats1.symbols == 0
+        assert stats1.files_indexed == 0, (
+            "a file the parser stack can't process must not be counted as "
+            "indexed — that count is what a caller trusts as 'it worked'"
+        )
+        assert stats1.files_skipped == 0, (
+            "not-yet-parsed is a different claim than unchanged-since-last-run"
+        )
+
+        # Run 2: stack present again (real module, no longer blocked), same
+        # db, same unchanged files on disk.
+        if had_key:
+            sys.modules["tree_sitter_language_pack"] = prior_value
+        else:
+            del sys.modules["tree_sitter_language_pack"]
+        code_index._PARSER_STACK_AVAILABLE = None
+
+        stats2 = index_repo(repo, db, repo="demo")
+        assert stats2.parser_stack_missing is False
+        assert stats2.errors == []
+        assert stats2.symbols > 0, (
+            "run 2 must actually index the files run 1 couldn't parse — a "
+            "poisoned content_hash from run 1 would read them as unchanged "
+            "and skip them silently, forever"
+        )
+    finally:
+        if had_key:
+            sys.modules["tree_sitter_language_pack"] = prior_value
+        else:
+            sys.modules.pop("tree_sitter_language_pack", None)

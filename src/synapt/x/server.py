@@ -424,9 +424,9 @@ def register_tools(mcp: Any) -> None:
 
 def main():
     """Entry point for standalone synapt-x-server."""
-    from mcp.server.fastmcp import FastMCP
+    from synapt.recall.server import ValidatingFastMCP
 
-    server = FastMCP("synapt-x", instructions=MCP_INSTRUCTIONS)
+    server = ValidatingFastMCP("synapt-x", instructions=MCP_INSTRUCTIONS)
     register_tools(server)
     server.run()
 
