@@ -45,11 +45,10 @@ logger = logging.getLogger("synapt.server")
 
 def _serve():
     """Start the MCP server (no reload)."""
-    from mcp.server.fastmcp import FastMCP
-
     from synapt.plugins import register_plugins
     from synapt.recall.server import (
         MCP_INSTRUCTIONS,
+        ValidatingFastMCP,
         _resolved_provenance_line,
         register_tools as recall_register,
     )
@@ -62,7 +61,7 @@ def _serve():
     # servers ran unmerged code with nothing anywhere saying so.
     print(f"[synapt] {_resolved_provenance_line()}", file=sys.stderr)
 
-    mcp = FastMCP(
+    mcp = ValidatingFastMCP(
         "synapt",
         instructions=MCP_INSTRUCTIONS,
     )

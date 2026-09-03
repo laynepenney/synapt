@@ -50,7 +50,7 @@ class TestServerDevMode(unittest.TestCase):
         fake_mcp.run.side_effect = lambda: order.append("run")
 
         err = io.StringIO()
-        with patch("mcp.server.fastmcp.FastMCP", return_value=fake_mcp), \
+        with patch("synapt.recall.server.ValidatingFastMCP", return_value=fake_mcp), \
              patch("synapt.plugins.register_plugins", return_value=[]), \
              patch("synapt.recall.server.register_tools"), \
              patch(
