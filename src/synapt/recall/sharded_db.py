@@ -601,13 +601,12 @@ class ShardedRecallDB:
         correctness gap, but it goes stale after a rebuild through this
         system until a follow-up lands.
         """
-        if not self._data_dbs:
+        index_dir = self._index._path.parent
+        if not is_sharded(index_dir):
             self._index.save_chunks(chunks)
             return
 
         from synapt.recall.generations import rebuild_and_publish
-
-        index_dir = self._index._path.parent
 
         for db in self._data_dbs:
             try:
@@ -881,5 +880,11 @@ class ShardedRecallDB:
 
     @property
     def is_monolithic(self) -> bool:
-        """True if using a single recall.db (no shards)."""
-        return not self._data_dbs
+        """True if using a single recall.db (no shards).
+
+        Reflects the on-disk layout (``is_sharded(index_dir)``), not merely
+        whether this instance currently holds any shard connections -- a
+        genuinely sharded store (``index.db`` present) with zero shards
+        yet created is still sharded, not monolithic.
+        """
+        return not is_sharded(self._index._path.parent)
