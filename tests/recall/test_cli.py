@@ -483,6 +483,39 @@ def test_cmd_setup_no_transcripts_still_registers_mcp(tmp_path):
     assert skill_path.exists()
 
 
+def test_cmd_setup_narrates_every_announced_step(tmp_path, capsys):
+    """The banner announces total_steps=5 (hooks enabled); every step 1..5 must be narrated.
+
+    The .gitignore step ran silently -- the banner said 5 steps, only 4
+    ever printed "[setup] Step N/5: ...", so a user counting along saw
+    the completion summary appear right after "4/5" with no "5/5" anywhere.
+    """
+    project_dir = tmp_path / "freshproject"
+    project_dir.mkdir()
+
+    mock_run = MagicMock()
+    mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+
+    with patch.dict("os.environ", {"CODEX_HOME": str(tmp_path / ".codex")}), \
+         patch("synapt.recall.core.Path.home", return_value=tmp_path), \
+         patch("synapt.recall.core.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.Path.cwd", return_value=project_dir), \
+         patch("synapt.recall.cli.subprocess.run", mock_run), \
+         patch("synapt.recall.cli.shutil.which", return_value="/usr/bin/claude"):
+        from synapt.recall.cli import cmd_setup
+        args = argparse.Namespace(
+            no_embeddings=True,
+            no_hook=False,
+            global_scope=False,
+            sync=None,
+        )
+        cmd_setup(args)
+
+    out = capsys.readouterr().out
+    for n in range(1, 6):
+        assert f"Step {n}/5:" in out, f"missing narration for step {n}/5 in setup output"
+
+
 def test_ensure_gitignore_creates_file(tmp_path):
     """_ensure_gitignore creates .gitignore with .synapt/ entry if missing."""
     _ensure_gitignore(tmp_path)
