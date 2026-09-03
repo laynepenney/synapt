@@ -3577,12 +3577,12 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
     if not shutil.which("claude"):
         print("  Warning: 'claude' CLI not found in PATH. Skipping MCP registration.", file=sys.stderr)
-        print("  Register manually: claude mcp add -s user -t stdio synapt synapt-server", file=sys.stderr)
+        print("  Register manually: claude mcp add -s user -t stdio synapt synapt server", file=sys.stderr)
     else:
         try:
             result = subprocess.run(
                 ["claude", "mcp", "add", "-s", scope, "-t", "stdio",
-                 "synapt", "synapt-server"],
+                 "synapt", "synapt", "server"],
                 capture_output=True, text=True, timeout=15,
             )
             if result.returncode == 0:
