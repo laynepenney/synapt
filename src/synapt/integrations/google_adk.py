@@ -206,9 +206,14 @@ if BaseMemoryService is not None:
                 from synapt.recall.server import recall_save
 
                 content_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+                # "conversation" is not one of synapt's VALID_CATEGORIES --
+                # recall_save now refuses an unrecognized category (a sibling
+                # fix) rather than silently coercing it, so this always used
+                # "workflow" under the hood anyway. Pass it explicitly rather
+                # than a value that would now be refused.
                 recall_save(
                     content=text,
-                    category="conversation",
+                    category="workflow",
                     confidence=0.8,
                     tags=[
                         "google-adk",
