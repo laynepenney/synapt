@@ -3180,11 +3180,87 @@ def recall_reload() -> str:
     return "Reloading..."  # pragma: no cover
 
 
+def _build_validating_fastmcp_class():
+    """Build the ``ValidatingFastMCP`` class on first use.
+
+    ``mcp.server.fastmcp`` pulls in a heavy transitive chain (starlette,
+    pydantic-settings, sse-starlette, ...) that most importers of this
+    module never need -- e.g. the ``recall grep-intercept`` hook imports
+    this module for unrelated tool functions on every Bash/Grep tool call,
+    and measured 200-300ms slower per invocation (enough to blow its
+    published 500ms budget every time) when that import moved to module
+    load time. Building the class lazily, on first access of the
+    ``ValidatingFastMCP`` module attribute (see ``__getattr__`` below),
+    keeps that cost paid only by callers who actually construct a server.
+    """
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    class ValidatingFastMCP(FastMCP):
+        """A FastMCP server that rejects an unrecognized tool-call argument
+        instead of silently dropping it.
+
+        A tool function never sees a mismatched argument name: FastMCP
+        builds a per-tool Pydantic model from the function's signature and
+        validates the raw call arguments against that model before the
+        function is ever invoked. That model's default is to silently drop
+        an unrecognized field, so a caller who misnames a field --
+        ``accomplishments`` instead of ``recall_journal``'s real ``done``
+        -- gets it discarded before dispatch; the tool then reports success
+        with the content simply missing.
+
+        This checks the raw arguments against each tool's own published
+        schema (``list_tools()`` / ``Tool.inputSchema``, both part of the
+        MCP wire protocol) before delegating to the real dispatch, so it
+        needs no access to any FastMCP-internal class -- only the public
+        ``call_tool`` method it is overriding and the public ``list_tools``
+        it calls. Applies to every tool constructed as part of this server,
+        not one hand-picked function: closed by construction, not by a
+        per-tool wrapper.
+
+        NOTE: this only takes effect if a ``ValidatingFastMCP`` instance is
+        what gets *constructed* -- ``FastMCP.__init__`` binds
+        ``self.call_tool`` as the wire handler during ``_setup_handlers()``,
+        so patching a plain ``FastMCP`` instance's ``.call_tool`` attribute
+        afterward (e.g. inside ``register_tools()``, which receives an
+        already-built instance) has no effect; the handler reference was
+        already captured at construction time.
+        """
+
+        async def call_tool(self, name: str, arguments: dict) -> object:
+            tools = await self.list_tools()
+            tool = next((t for t in tools if t.name == name), None)
+            if tool is not None and tool.inputSchema:
+                allowed = set(tool.inputSchema.get("properties", {}).keys())
+                unknown = set(arguments) - allowed
+                if unknown:
+                    raise ToolError(
+                        f"Unknown argument(s) for {name}: {sorted(unknown)}. "
+                        f"Accepted: {sorted(allowed)}"
+                    )
+            return await super().call_tool(name, arguments)
+
+    return ValidatingFastMCP
+
+
+def __getattr__(name: str):
+    """PEP 562 lazy module attribute -- see ``_build_validating_fastmcp_class``
+    for why ``ValidatingFastMCP`` isn't just defined at module level."""
+    if name == "ValidatingFastMCP":
+        cls = _build_validating_fastmcp_class()
+        globals()["ValidatingFastMCP"] = cls
+        return cls
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def register_tools(mcp) -> None:
     """Register recall tools on the given FastMCP server instance.
 
     This allows the unified synapt server to compose recall tools alongside
-    repair and watch tools on a single MCP server.
+    repair and watch tools on a single MCP server. Rejecting an unrecognized
+    argument is a property of the SERVER instance (see ``ValidatingFastMCP``
+    above), not of this registration step -- the caller must construct a
+    ``ValidatingFastMCP`` for that protection to take effect.
     """
     mcp.tool()(_with_directive_check(recall_search))
     mcp.tool()(_with_directive_check(recall_quick))
@@ -3215,9 +3291,7 @@ def register_tools(mcp) -> None:
 
 def main():
     """Entry point for standalone synapt-recall-server."""
-    from mcp.server.fastmcp import FastMCP
-
-    server = FastMCP(
+    server = _build_validating_fastmcp_class()(
         "synapt-recall",
         instructions=MCP_INSTRUCTIONS,
     )
