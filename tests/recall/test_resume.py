@@ -1268,6 +1268,53 @@ class TestContinuationSegments(unittest.TestCase):
         text = format_resume(build_resume_view(index, limit=10, journal_path=None))
         self.assertIn("continues the previous question", text)
 
+    def test_no_reply_label_is_not_used_when_a_continuation_carries_the_real_answer(self):
+        """A tool-call-only anchor turn (no text yet) followed by a
+        continuation with the real answer read as "the session ended here"
+        immediately before that answer -- reproduced live in the OSS stranger
+        dogfood (2026-09-03) with a one-shot session whose first turn called
+        Bash and whose second turn (flagged is_continuation) carried the reply.
+        The label is gated only on the CURRENT turn's own is_continuation flag;
+        it never checks whether the NEXT turn continues it with real content.
+        """
+        index = _index([
+            _chunk(SESSION_A, 0, "what license is this under?", "", tools_used=["Bash"]),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "MIT License."),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertNotIn("session ended here", text)
+        self.assertIn("reply continues below", text)
+        self.assertIn("MIT License.", text)
+
+    def test_no_reply_label_still_fires_when_nothing_follows(self):
+        """Control: a genuinely final turn with no reply and no continuation
+        after it must still show the no-reply label -- the fix narrows the
+        condition, it must not remove it."""
+        index = _index([
+            _chunk(SESSION_A, 0, "what license is this under?", "", tools_used=["Bash"]),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn("session ended here", text)
+
+    def test_no_reply_label_fires_when_the_continuation_ALSO_has_no_text(self):
+        """R2 finding (Stromus, 2026-09-03): the previous fix looked only at
+        whether the NEXT turn is a continuation, not whether that continuation
+        (or any later one in the same segment) actually carries a reply. A
+        session that dies mid tool-loop -- an anchor tool call, then a
+        continuation segment that is ALSO just a tool call with no text, then
+        nothing further (the UNCLEAN END shape) -- has an immediate-next
+        continuation but no reply anywhere in the segment. Claiming "reply
+        continues below" here is worse than the original bug: it points the
+        reader at a reply that does not exist.
+        """
+        index = _index([
+            _chunk(SESSION_A, 0, "what license is this under?", "", tools_used=["Bash"]),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "", tools_used=["Bash"]),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn("session ended here", text)
+        self.assertNotIn("reply continues below", text)
+
     def test_window_opening_mid_reply_is_anchored_to_its_question(self):
         """The defect this fixes was invisible to constructed tests and obvious in the fruit.
 
