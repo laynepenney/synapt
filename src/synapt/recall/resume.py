@@ -1212,19 +1212,30 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
             f"({stamp}, {newest.size} bytes) is newer and unindexed | " + header
         )
     if view.caller_partial:
+        # the reader's cold read of "CALLER SOURCE PARTIAL" was a
+        # data-integrity alarm ("did the index build fail, is my transcript
+        # missing"). The condition itself is benign and expected (the index
+        # build finished a moment before the live file's last write) -- the
+        # wording should say that plainly instead of alarming on it.
         gap = view.caller_partial
         header = (
-            f"⚠ CALLER SOURCE PARTIAL: {gap.source.session_id[:8]} "
-            f"indexed through {gap.indexed_latest}, live through {gap.live_latest} | "
-            "run `synapt recall build --no-embeddings` to refresh | " + header
+            f"Note: session {gap.source.session_id[:8]} is not fully indexed yet -- "
+            f"indexed through {gap.indexed_latest}, live through {gap.live_latest}; "
+            "run `synapt recall build --no-embeddings` to catch up | " + header
         )
     if view.unclean_end:
+        # "UNCLEAN END" / "no SessionEnd checkpoint" read as an
+        # accusation about the session. The detection is correct but the
+        # code cannot tell a genuine crash from a one-shot session that
+        # never runs a shutdown hook -- so the wording names both
+        # possibilities rather than asserting either.
         found = view.unclean_end
         header = (
-            f"⚠ UNCLEAN END: last activity {found.last_activity}, "
-            + (f"{_gap_phrase(found.gap_seconds)} after the last journal that could be its own, "
-               if found.gap_seconds is not None else "no journal of its own covers it, ")
-            + "no SessionEnd checkpoint for this session | " + header
+            f"Note: this session ended without a shutdown checkpoint "
+            f"(last activity {found.last_activity}); "
+            + (f"its last journal is {_gap_phrase(found.gap_seconds)} old, "
+               if found.gap_seconds is not None else "no journal covers it, ")
+            + "which is expected for a one-shot run or an interrupted session | " + header
         )
 
     lines = [header]
