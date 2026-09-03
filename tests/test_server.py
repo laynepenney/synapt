@@ -103,6 +103,34 @@ class TestServerDevMode(unittest.TestCase):
         )
         fake_mcp.run.assert_called_once()
 
+    def test_serve_syncs_claude_memory_source_between_register_and_run(self):
+        """R3 "Memory Everywhere" first fruit: the eager-at-startup sync must
+        run on the UNIFIED server (`synapt server`, what the fleet and every
+        real MCP-registered user actually run) -- not only on the standalone
+        recall/server.py:main() entrypoint, which _serve() does not call."""
+        order: list[str] = []
+        fake_mcp = unittest.mock.Mock()
+        fake_mcp.run.side_effect = lambda: order.append("run")
+
+        with patch("synapt.recall.server.ValidatingFastMCP", return_value=fake_mcp), \
+             patch("synapt.plugins.register_plugins", return_value=[]), \
+             patch(
+                 "synapt.recall.server.register_tools",
+                 side_effect=lambda _mcp: order.append("register"),
+             ), \
+             patch(
+                 "synapt.recall.server._sync_claude_memory_source_on_startup",
+                 side_effect=lambda: order.append("sync"),
+             ) as mock_sync:
+            from synapt.server import _serve
+            _serve()
+
+        mock_sync.assert_called_once()
+        # Must run after tools are registered (a source registered before
+        # recall's own registry setup would be undefined) and before the
+        # server blocks on mcp.run().
+        self.assertEqual(order, ["register", "sync", "run"])
+
     def test_find_watch_paths(self):
         """_find_watch_paths returns at least the synapt package directory."""
         from synapt.server import _find_watch_paths

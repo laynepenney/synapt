@@ -3289,6 +3289,39 @@ def register_tools(mcp) -> None:
     mcp.tool()(recall_reload)
 
 
+def _sync_claude_memory_source_on_startup() -> None:
+    """Eager sync of this agent's own Claude Code memory directory into a
+    recall source, once, at process startup (R3 "Memory Everywhere" first
+    fruit). Silent no-op when no gripspace or no ``memory/`` directory
+    resolves -- most processes running this server have neither, and that
+    is not an error. When a sync DOES run, its receipt is logged once so a
+    slow scan is visible rather than felt; nothing here ever blocks or
+    fails server startup.
+
+    Deliberately NOT called from ``register_tools()``: several tests call
+    ``register_tools(mcp)`` directly against a real FastMCP instance, and
+    those must not trigger a real disk scan of whatever memory directory
+    happens to exist on the machine running the suite.
+    """
+    import sys
+
+    try:
+        from synapt.recall.claude_memory_source import admit_and_index_claude_memory
+
+        started = time.monotonic()
+        receipt = admit_and_index_claude_memory()
+        if receipt is not None:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            print(
+                f"[claude_memory] {receipt.state}: "
+                f"{receipt.documents_seen or 0} file(s), "
+                f"generation {receipt.generation}, {elapsed_ms}ms",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass  # best-effort startup indexing; never block server start
+
+
 def main():
     """Entry point for standalone synapt-recall-server."""
     server = _build_validating_fastmcp_class()(
@@ -3296,6 +3329,7 @@ def main():
         instructions=MCP_INSTRUCTIONS,
     )
     register_tools(server)
+    _sync_claude_memory_source_on_startup()
     server.run()
 
 
