@@ -50,6 +50,7 @@ def _serve():
         MCP_INSTRUCTIONS,
         ValidatingFastMCP,
         _resolved_provenance_line,
+        _sync_claude_memory_source_on_startup,
         register_tools as recall_register,
     )
 
@@ -68,6 +69,13 @@ def _serve():
 
     # Core: always available
     recall_register(mcp)
+
+    # R3 "Memory Everywhere" first fruit: eager sync of this agent's own
+    # Claude Code memory directory into a recall source, on the server the
+    # fleet and every real MCP-registered user actually run. The standalone
+    # recall/server.py:main() entrypoint calls this too, but is not what
+    # `synapt server` starts -- this is. Best-effort: never raises.
+    _sync_claude_memory_source_on_startup()
 
     # Plugins: discovered via entry points, gracefully degraded
     registered = register_plugins(mcp)
