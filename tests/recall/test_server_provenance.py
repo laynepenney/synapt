@@ -83,6 +83,14 @@ def test_resolved_provenance_line_degrades_to_unknown_location_on_file_error():
     assert "unknown" in line
 
 
+def test_resolved_provenance_line_names_the_root_source():
+    with patch.object(server, "_STARTUP_VERSION", "9.9.9"), \
+         patch.object(server, "_resolved_install_kind", return_value="editable"), \
+         patch.object(server, "describe_root_source", return_value="marker:/some/shared/root"):
+        line = server._resolved_provenance_line()
+    assert "marker:/some/shared/root" in line
+
+
 def test_with_provenance_appends_without_mutating_original_text():
     with patch.object(server, "_resolved_provenance_line", return_value="synapt vX — running from /nowhere (unknown install)"):
         result = server._with_provenance("original body text")

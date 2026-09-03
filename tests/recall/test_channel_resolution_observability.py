@@ -87,8 +87,10 @@ class TestChannelResolutionObservability(unittest.TestCase):
                     result = recall_channel(action=action)
                     self.assertEqual(
                         result,
-                        f"Channel state store: {resolved_state_db}\n"
-                        f"Channel log store: {resolved_log_dir}\npayload",
+                        f"Channel state store: {resolved_state_db} "
+                        f"(source: env:SYNAPT_RECALL_ROOT)\n"
+                        f"Channel log store: {resolved_log_dir} "
+                        f"(source: env:SYNAPT_RECALL_ROOT)\npayload",
                     )
 
         self.assertEqual(dispatch.call_count, len(actions))
@@ -110,8 +112,10 @@ class TestChannelResolutionObservability(unittest.TestCase):
 
         self.assertEqual(
             result,
-            f"Channel state store: {resolved_state_db}\n"
-            f"Channel log store: {resolved_log_dir}\nChannel failed: boom",
+            f"Channel state store: {resolved_state_db} "
+            f"(source: env:SYNAPT_RECALL_ROOT)\n"
+            f"Channel log store: {resolved_log_dir} "
+            f"(source: env:SYNAPT_RECALL_ROOT)\nChannel failed: boom",
         )
 
     def test_store_resolution_failure_reports_the_original_error(self) -> None:
@@ -510,6 +514,48 @@ class TestOrphanedLocalChannelStoreIsReported(unittest.TestCase):
             "a local dir with no channel JSONL was reported as an "
             "orphaned leftover -- there was never a log there to go "
             "stale, only the state db that belongs there by design",
+        )
+
+
+class TestDisclosureLinesNameTheRootSource(unittest.TestCase):
+    """recall#936, item 2's marker-persistence follow-on: the existing
+    store-disclosure lines name WHICH store resolved, but not WHAT chose
+    the coordinate. A marker converging a bare CLI call onto an env-bound
+    call's root is invisible unless the disclosure line also says so.
+    """
+
+    def setUp(self) -> None:
+        self._store = owned_store()
+        self._previous_agent_id = os.environ.get("SYNAPT_AGENT_ID")
+        os.environ["SYNAPT_AGENT_ID"] = "sentinel-witness"
+
+        from synapt.recall.actions import reset_action_registry
+
+        reset_action_registry()
+
+    def tearDown(self) -> None:
+        from synapt.recall.actions import reset_action_registry
+
+        reset_action_registry()
+        if self._previous_agent_id is None:
+            os.environ.pop("SYNAPT_AGENT_ID", None)
+        else:
+            os.environ["SYNAPT_AGENT_ID"] = self._previous_agent_id
+        self._store.restore()
+
+    def test_channel_state_store_line_names_the_env_source(self) -> None:
+        from synapt.recall.server import recall_channel
+
+        # owned_store() sets SYNAPT_RECALL_ROOT, so both stores resolve
+        # via that override deterministically.
+        result = recall_channel(action="who")
+        lines = result.splitlines()
+        state_line = next(l for l in lines if l.startswith("Channel state store:"))
+        self.assertIn(
+            "env:SYNAPT_RECALL_ROOT",
+            state_line,
+            "the state-store disclosure line must name the source that "
+            "chose its root, not only the root itself",
         )
 
 

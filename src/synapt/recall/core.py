@@ -4809,9 +4809,85 @@ def _guard_data_root(operation: str, path: Path) -> Path:
     return path
 
 
-def _resolve_project_root_override(project_dir: Path | None = None) -> Path | None:
-    """Return the explicit env-var root override, or None to fall through
-    to a filesystem walk-up.
+_GRIPSPACE_ROOT_MARKER_RELPATH = Path(".synapt") / "gripspace-root"
+
+
+def _persist_shared_gripspace_root(resolved: Path) -> None:
+    """Record *resolved* as the shared coordinate for the CALLER's own
+    gripspace, so a later call with no env var in its shell (a bare CLI
+    invocation) can converge on the same root an env-bound call (the MCP
+    server, always gr-spawned) used.
+
+    Best-effort: this is a side effect of a resolution that already
+    succeeded via the env var, so a write failure (read-only fs, permission)
+    must not turn a working env-bound call into a failure.
+
+    Routed through ``_guard_data_root`` before touching disk, exactly like
+    ``project_data_dir``'s own write target: a test-isolated caller whose
+    cwd happens to walk up into a REAL gripspace (rather than a tmp_path
+    fixture) must not have this side effect plant a real file, the same
+    contract project_data_dir already enforces for its own store root.
+    """
+    self_root = _find_gripspace_root(Path.cwd())
+    if self_root is None or self_root == resolved:
+        return
+    marker = self_root / _GRIPSPACE_ROOT_MARKER_RELPATH
+    _guard_data_root("gripspace_root_marker", marker)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{resolved}\n")
+    except OSError:
+        pass
+
+
+def _is_gripspace_root_marker_dir(path: Path) -> bool:
+    """True when *path* itself (not a walk-up) carries a gripspace marker.
+
+    Checked directly against the recorded path, not via ``_find_gripspace_root``
+    (which would walk further up and could find a DIFFERENT, unrelated
+    gripspace above a moved/renamed target -- that would silently swap
+    which coordinate the marker names rather than correctly reporting the
+    recorded one as gone).
+    """
+    return (path / ".gitgrip").is_dir() or (path / ".grip").is_dir()
+
+
+def _read_shared_gripspace_root_marker() -> tuple[Path | None, Path | None]:
+    """Read a marker an earlier env-bound call persisted in the CALLER's own
+    gripspace, so an env-less call (bare CLI) converges without requiring
+    the env var in its own shell.
+
+    Returns ``(resolved, stale_target)``: *resolved* is the marker's target
+    when it still names a real gripspace, else None; *stale_target* is the
+    recorded path when a marker existed but no longer names one (a moved
+    coordinator tree or a deleted gripspace must not redirect a worktree
+    forever), else None. No marker at all yields ``(None, None)`` -- staleness
+    is reported only when a marker existed and was found untrustworthy, never
+    invented for the "no marker ever written" case.
+    """
+    self_root = _find_gripspace_root(Path.cwd())
+    if self_root is None:
+        return None, None
+    marker = self_root / _GRIPSPACE_ROOT_MARKER_RELPATH
+    if not marker.is_file():
+        return None, None
+    try:
+        recorded = Path(marker.read_text().strip())
+    except OSError:
+        return None, None
+    if recorded.is_dir() and _is_gripspace_root_marker_dir(recorded):
+        return recorded, None
+    return None, recorded
+
+
+def _resolve_root_and_source(project_dir: Path | None = None) -> tuple[Path | None, str]:
+    """Return ``(path, source)`` -- the resolved override root (or None to
+    fall through to a filesystem walk-up) and a short label naming what
+    chose it: ``env:SYNAPT_RECALL_ROOT``, ``env:GRIPSPACE_ROOT``,
+    ``marker:<path>``, or ``walk-up`` (optionally naming an ignored stale
+    marker). One shared implementation so ``_resolve_project_root_override``
+    (the resolution machinery) and ``describe_root_source`` (disclosure)
+    cannot drift into disagreeing about which source actually applied.
 
     Shared by ``project_data_dir`` (Tier-3 local/state store) and
     ``channel._read_manifest_url`` (Tier-2 global/log store) so an override
@@ -4828,11 +4904,18 @@ def _resolve_project_root_override(project_dir: Path | None = None) -> Path | No
     override, e.g. export/import ``--path``):
       1. ``SYNAPT_RECALL_ROOT``
       2. ``GRIPSPACE_ROOT``
+      3. a marker an earlier call under 1 or 2 persisted in this gripspace
+         (recall#936: a bare CLI invocation carries neither env var, but
+         should still converge on the coordinate an MCP server call already
+         established for this same gripspace) -- ignored, not followed, if
+         its recorded target no longer names a real gripspace (a moved
+         coordinator tree or a deleted gripspace must not redirect a
+         worktree forever)
     Must exist: silently resolving under a mistyped root presents an empty
     history as a real answer.
     """
     if project_dir is not None:
-        return None
+        return None, "walk-up"
     for var in ("SYNAPT_RECALL_ROOT", "GRIPSPACE_ROOT"):
         env_val = os.environ.get(var)
         if not env_val:
@@ -4844,8 +4927,49 @@ def _resolve_project_root_override(project_dir: Path | None = None) -> Path | No
                 f"{resolved}. Refusing to resolve under a mistyped root — "
                 f"unset the variable or create the workspace first."
             )
-        return resolved
-    return None
+        if var == "GRIPSPACE_ROOT":
+            # SYNAPT_RECALL_ROOT is a deliberate, narrow escape hatch (test
+            # isolation, reconstruction scratch dirs, export/import --path)
+            # and must have no side effects beyond its own resolution -- it
+            # is not the "bound at launch" mechanism recall#936 narrowed to,
+            # and persisting a marker for it broke exactly the test pattern
+            # SYNAPT_RECALL_ROOT exists for: caller cwd stays a real
+            # checkout while the store itself is redirected. Only
+            # GRIPSPACE_ROOT (gr spawn's uniform per-agent binding) gets
+            # persisted for a later env-less call to converge on.
+            _persist_shared_gripspace_root(resolved)
+        return resolved, f"env:{var}"
+    marker_root, stale_target = _read_shared_gripspace_root_marker()
+    if marker_root is not None:
+        return marker_root, f"marker:{marker_root}"
+    if stale_target is not None:
+        return None, f"walk-up (stale marker ignored: {stale_target})"
+    return None, "walk-up"
+
+
+def _resolve_project_root_override(project_dir: Path | None = None) -> Path | None:
+    """Return the explicit env-var root override, or a previously-persisted
+    shared-root marker, or None to fall through to a filesystem walk-up.
+
+    See ``_resolve_root_and_source`` for the full precedence and rationale;
+    this is the thin wrapper used by ``project_data_dir`` and
+    ``channel._read_manifest_url``, which need only the path.
+    """
+    return _resolve_root_and_source(project_dir)[0]
+
+
+def describe_root_source(project_dir: Path | None = None) -> str:
+    """One-word-ish label naming what chose the resolved gripspace root:
+    ``env:GRIPSPACE_ROOT``, ``env:SYNAPT_RECALL_ROOT``, ``marker:<path>``,
+    or ``walk-up`` (naming an ignored stale marker when one was found).
+
+    Disclosure-only: a reader of the existing store-resolution lines
+    (channel state/log store, the startup provenance line) should be able
+    to see that a marker -- rather than a live env var -- picked the
+    coordinate, per the same visibility discipline as the orphaned-store
+    line (recall#936, item 2, follow-on).
+    """
+    return _resolve_root_and_source(project_dir)[1]
 
 
 def project_data_dir(project_dir: Path | None = None) -> Path:
