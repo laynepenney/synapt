@@ -3603,9 +3603,12 @@ def cmd_setup(args: argparse.Namespace) -> None:
     print()
 
     # --- 5. Ensure .gitignore ---
+    print(f"[setup] Step {step}/{total_steps}: Ensuring .gitignore ...")
+    step += 1
     _ensure_gitignore(project)
+    print()
 
-    # --- 5. Push to HF if sync configured ---
+    # --- 6. Push to HF if sync configured ---
     if sync_repo:
         from synapt.recall.archive import upload_to_hf
         print("[setup] Pushing to HF ...")
