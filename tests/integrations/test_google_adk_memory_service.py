@@ -313,6 +313,78 @@ class TestSaveToRecallTags:
         assert kwargs["user_id"] == "user1"
 
 
+class TestSearchScopedRecallRouting:
+    """_search_scoped_recall opened RecallDB(project_index_dir() / "recall.db")
+    unconditionally -- no is_sharded check at all. On a sharded store (only
+    index.db present, the file consolidation writes to since the routing
+    fix), RecallDB(<nonexistent recall.db>) silently CREATES a fresh empty
+    file rather than raising, so a search found zero results with no error,
+    indistinguishable from "no memories exist" -- the false-negative class
+    this whole PR family exists to close. Real temp dirs and a real
+    RecallDB, not mocks: a mocked RecallDB can't witness which path it was
+    constructed with resolving wrong.
+
+    Calls the private ``_search_scoped_recall`` directly (a plain sync
+    method) rather than the public async ``search_memory`` -- every
+    ``@pytest.mark.asyncio`` test in this file silently does not execute in
+    this environment (``pytest-asyncio`` is absent from every extras group
+    in pyproject.toml; filed separately, out of scope for this fix) as async
+    def, and would need that dependency fixed first to prove anything."""
+
+    def test_finds_a_node_on_a_sharded_store(self, service, tmp_path):
+        from synapt.recall.knowledge import KnowledgeNode
+        from synapt.recall.storage import RecallDB
+
+        index_dir = tmp_path / "index"
+        index_dir.mkdir(parents=True)
+        db = RecallDB(index_dir / "index.db")  # the sharded marker
+        db.save_knowledge_nodes([
+            KnowledgeNode.create(
+                content="the launch runbook lives in docs/runbook.md",
+                category="workflow",
+                source_sessions=["s0"],
+                tags=["google-adk", "app:myapp", "user:user1", "author:recall"],
+                node_id="n1",
+            ).to_dict(),
+        ])
+        db.close()
+        assert not (index_dir / "recall.db").exists()
+
+        with patch("synapt.integrations.google_adk.project_index_dir", return_value=index_dir):
+            entries = service._search_scoped_recall(
+                app_name="myapp", user_id="user1", query="runbook",
+            )
+
+        assert len(entries) == 1
+        assert "runbook" in entries[0].content.parts[0].text
+
+    def test_finds_a_node_on_a_monolithic_store_control(self, service, tmp_path):
+        """Control: the untouched, no-index.db case is unaffected."""
+        from synapt.recall.knowledge import KnowledgeNode
+        from synapt.recall.storage import RecallDB
+
+        index_dir = tmp_path / "index"
+        index_dir.mkdir(parents=True)
+        db = RecallDB(index_dir / "recall.db")  # no index.db at all
+        db.save_knowledge_nodes([
+            KnowledgeNode.create(
+                content="the launch runbook lives in docs/runbook.md",
+                category="workflow",
+                source_sessions=["s0"],
+                tags=["google-adk", "app:myapp", "user:user1", "author:recall"],
+                node_id="n1",
+            ).to_dict(),
+        ])
+        db.close()
+
+        with patch("synapt.integrations.google_adk.project_index_dir", return_value=index_dir):
+            entries = service._search_scoped_recall(
+                app_name="myapp", user_id="user1", query="runbook",
+            )
+
+        assert len(entries) == 1
+
+
 class TestImportability:
 
     def test_importable(self):

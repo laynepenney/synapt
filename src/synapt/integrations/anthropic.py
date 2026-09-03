@@ -214,16 +214,21 @@ class _RecallBridge:
         """Seed the cache with existing recall knowledge nodes."""
         try:
             from synapt.recall.core import project_index_dir
+            from synapt.recall.sharding import live_store_path
             from synapt.recall.storage import RecallDB
             from pathlib import Path
 
             project = self._project_root.resolve() if self._project_root else Path.cwd().resolve()
-            db_path = project_index_dir(project) / "recall.db"
+            db_path = live_store_path(project_index_dir(project))
             if not db_path.exists():
                 return
             db = RecallDB(db_path)
             try:
-                nodes = db.list_knowledge_nodes(limit=200)
+                # load_knowledge_nodes has no limit= parameter -- slice after,
+                # not before (the method existed as list_knowledge_nodes(limit=200),
+                # which RecallDB has never defined; silently swallowed by the
+                # except below, so this seeded nothing on any store, ever).
+                nodes = db.load_knowledge_nodes()[:200]
                 for node in nodes:
                     if node.get("status") == "retracted":
                         continue

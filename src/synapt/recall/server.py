@@ -1391,10 +1391,16 @@ def recall_stats() -> str:
 
     Returns chunk count, session count, date range, and index size.
     """
+    from synapt.recall.sharding import is_sharded
+
     index_dir = project_index_dir()
 
-    # Check for recall.db or legacy manifest.json
-    if not (index_dir / "recall.db").exists() and not (index_dir / "manifest.json").exists():
+    # Check for recall.db, legacy manifest.json, or the sharded layout
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "manifest.json").exists()
+        and not is_sharded(index_dir)
+    ):
         return f"No index found at {index_dir}. Run `synapt recall setup` first."
 
     index = _get_index()

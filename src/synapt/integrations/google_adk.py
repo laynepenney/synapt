@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Optional
 
 from synapt.recall.core import project_index_dir
+from synapt.recall.sharding import live_store_path
 from synapt.recall.storage import RecallDB
 
 try:
@@ -239,7 +240,7 @@ if BaseMemoryService is not None:
 
             app_tag = f"app:{app_name}"
             user_tag = f"user:{user_id}"
-            db = RecallDB(project_index_dir() / "recall.db")
+            db = RecallDB(live_store_path(project_index_dir()))
             try:
                 nodes = db.load_knowledge_nodes(status="active")
             finally:

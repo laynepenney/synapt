@@ -107,6 +107,48 @@ def _archive_dir(project: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _write_sharded_index(
+    index_dir: Path,
+    source_files: list[dict],
+    build_ts: str = "2026-08-06T00:00:00",
+    skipped_oversize: list[dict] | None = None,
+    skipped_lines: list[dict] | None = None,
+) -> None:
+    """Same metadata as ``_write_index``, but into ``index.db`` -- the sharded
+    layout's live store -- with no ``recall.db`` at all, the shape a store
+    gets once it is sharded and consolidation has written since."""
+    index_dir.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(index_dir / "index.db")
+    con.execute("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('source_files', ?)",
+                (json.dumps(source_files),))
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('build_timestamp', ?)", (build_ts,))
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('skipped_oversize', ?)",
+                (json.dumps(skipped_oversize or []),))
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('skipped_lines', ?)",
+                (json.dumps(skipped_lines or []),))
+    con.commit()
+    con.close()
+
+
+def test_matching_archive_and_manifest_is_fresh_on_a_sharded_store(store):
+    """_read_manifest hardcoded recall.db with no is_sharded fallback: on a
+    sharded store (index.db, the file consolidation actually writes to since
+    the routing fix) this always returned None -- "could not compute an
+    answer" -- and check_index_freshness fails closed on None, so every
+    sharded store reported stale regardless of the real state."""
+    f = _archive_file(_archive_dir(store), "a.jsonl", "one")
+    _write_sharded_index(_index_dir(store), [_entry(f)])
+
+    result = check_index_freshness(store)
+
+    assert isinstance(result, IndexFreshness)
+    assert result.stale is False
+    assert result.new_files == []
+    assert result.changed_files == []
+    assert not (_index_dir(store) / "recall.db").exists()
+
+
 def test_matching_archive_and_manifest_is_fresh(store):
     f = _archive_file(_archive_dir(store), "a.jsonl", "one")
     _write_index(_index_dir(store), [_entry(f)])

@@ -167,8 +167,9 @@ def _read_manifest(
     import sqlite3
 
     from synapt.recall.core import project_index_dir
+    from synapt.recall.sharding import live_store_path
 
-    db = (index_dir or project_index_dir(project_dir)) / "recall.db"
+    db = live_store_path(index_dir or project_index_dir(project_dir))
     if not db.is_file():
         return None
     try:
