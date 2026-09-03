@@ -83,6 +83,21 @@ def is_sharded(index_dir: Path) -> bool:
     return (index_dir / "index.db").exists()
 
 
+def live_store_path(index_dir: Path) -> Path:
+    """The single file a caller should open for knowledge/metadata reads
+    and writes: ``index.db`` when the on-disk layout is sharded, else the
+    monolithic ``recall.db``.
+
+    ``ShardedRecallDB.open``/``open_readonly`` already branch on
+    ``is_sharded()`` for chunk data; this is the same decision for the
+    handful of callers (consolidation, enrichment, knowledge caching)
+    that construct their own path to ``index_dir / "recall.db"`` directly.
+    Several did so unconditionally, which resolves to a file the primary
+    path never reads once ``index.db`` exists.
+    """
+    return index_dir / "index.db" if is_sharded(index_dir) else index_dir / "recall.db"
+
+
 # ---------------------------------------------------------------------------
 # Shard metadata schema (lives in index.db)
 # ---------------------------------------------------------------------------

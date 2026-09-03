@@ -2094,9 +2094,10 @@ def format_contradictions_for_session_start(limit: int = 5) -> str:
     reads as a number rather than as a wall of text that the ~2KB startup
     preview truncates anyway (Ref #856).
     """
+    from synapt.recall.sharding import live_store_path
     from synapt.recall.storage import RecallDB
 
-    db_path = project_index_dir() / "recall.db"
+    db_path = live_store_path(project_index_dir())
     if not db_path.exists():
         return ""
 
@@ -2456,6 +2457,7 @@ def recall_save(
         from datetime import datetime, timezone
 
         from synapt.recall.knowledge import VALID_CATEGORIES, KnowledgeNode, append_node
+        from synapt.recall.sharding import live_store_path
         from synapt.recall.storage import RecallDB
 
         if not retract and category not in VALID_CATEGORIES:
@@ -2465,7 +2467,7 @@ def recall_save(
             )
 
         project = Path.cwd().resolve()
-        db = RecallDB(project_index_dir(project) / "recall.db")
+        db = RecallDB(live_store_path(project_index_dir(project)))
         try:
             # --- Retract path ---
             if retract:
