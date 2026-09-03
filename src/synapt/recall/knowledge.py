@@ -376,7 +376,8 @@ def dedup_knowledge_nodes(
         # Try loading cached embeddings from SQLite
         from synapt.recall.core import project_index_dir
         from synapt.recall.storage import RecallDB
-        db_path = project_index_dir(project_dir) / "recall.db"
+        from synapt.recall.sharding import live_store_path
+        db_path = live_store_path(project_index_dir(project_dir))
         try:
             db = RecallDB(db_path)
             emb_map = db.get_knowledge_embeddings_by_id()
