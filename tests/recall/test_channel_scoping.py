@@ -674,6 +674,76 @@ class TestManifestUrlHonorsGripspaceRoot:
         assert _read_manifest_url(deliberate) is None
 
 
+def _make_standalone_clone_gripspace_with_manifest(
+    tmp_path: Path,
+    name: str = "standalone-space",
+    url: str = "git@github.com:synapt-dev/synapt-gripspace.git",
+) -> Path:
+    """A lean/standalone-clone gripspace (``new-agent-gripspace.sh`` shape):
+    no ``griptree.json``, no ``griptrees.json``, no ``.grip`` -- only
+    ``.gitgrip/spaces/main/gripspace.yml``, which carries BOTH the root
+    marker ``_find_gripspace_root``'s fourth signal looks for AND the
+    manifest URL ``_read_manifest_url`` parses. Distinct from
+    ``_make_gripspace_with_manifest`` above, which writes ``griptrees.json``
+    (the first-class-gripspace shape) and therefore never exercises this
+    code path."""
+    grip = tmp_path / name
+    spaces_main = grip / ".gitgrip" / "spaces" / "main"
+    spaces_main.mkdir(parents=True)
+    (spaces_main / "gripspace.yml").write_text(f"version: 2\nmanifest:\n  url: {url}\nrepos: {{}}\n")
+    return grip
+
+
+class TestStandaloneCloneChannelsDirResolution:
+    """A lean-cloned agent gripspace carries none of
+    griptree.json/griptrees.json/.grip -- only
+    .gitgrip/spaces/main/gripspace.yml. _find_gripspace_root's fourth
+    signal (74f873c) and _read_manifest_url's GRIPSPACE_ROOT precedence
+    (3aa5b83) each have direct unit coverage elsewhere in this file, but
+    both existing suites build their fixture with _make_gripspace_with_manifest,
+    which writes griptrees.json -- the FIRST-CLASS gripspace shape, not the
+    standalone-clone shape a filed symptom was actually measured against.
+    Nothing exercises the two fixes TOGETHER, through the full
+    _channels_dir() resolution chain, for the exact fixture shape the
+    symptom was measured on. Pinning that combination here rather than
+    assuming composition."""
+
+    def setup_method(self):
+        _gripspace_cache.clear()
+
+    def test_resolves_to_global_from_directly_inside(self, tmp_path, monkeypatch):
+        grip = _make_standalone_clone_gripspace_with_manifest(tmp_path)
+        monkeypatch.chdir(grip)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert _global_channels_dir() == (
+            Path.home() / ".synapt" / "channels" / "synapt-dev" / "synapt-gripspace"
+        )
+
+    def test_resolves_to_global_from_nested_subdir(self, tmp_path, monkeypatch):
+        grip = _make_standalone_clone_gripspace_with_manifest(tmp_path)
+        nested = grip / "synapt"
+        nested.mkdir()
+        monkeypatch.chdir(nested)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert _global_channels_dir() == (
+            Path.home() / ".synapt" / "channels" / "synapt-dev" / "synapt-gripspace"
+        )
+
+    def test_resolves_to_global_via_gripspace_root_from_sibling(self, tmp_path, monkeypatch):
+        """The filed topology: caller cwd is outside the lean clone
+        entirely (a raw CLI invocation from a scratchpad, or a process
+        whose cwd never lands inside the clone's own tree), and
+        GRIPSPACE_ROOT is the only signal pointing back at it."""
+        grip = _make_standalone_clone_gripspace_with_manifest(tmp_path)
+        sibling = tmp_path / "scratchpad"
+        sibling.mkdir()
+        monkeypatch.chdir(sibling)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(grip))
+        assert _global_channels_dir() == (
+            Path.home() / ".synapt" / "channels" / "synapt-dev" / "synapt-gripspace"
+        )
+
+
 class TestOrgEntitlementCheck(unittest.TestCase):
     """Tests for register_agent() entitlement gate (recall#530)."""
 
