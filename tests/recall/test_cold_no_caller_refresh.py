@@ -28,6 +28,8 @@ from synapt.recall import cli
 from synapt.recall.cli import ColdRefreshOutcome, cold_no_caller_refresh
 from synapt.recall.resume import ResumeView, ResumeTurn, format_resume
 
+from _isolation_helpers import owned_store
+
 
 def _patches(*, lock_fd, build_side_effect=None, ts_before="2026-06-01T00:00:00", ts_after="2026-09-01T00:00:00",
              newest=Path("/w/.codex/sessions/2026/09/01/rollout-a.jsonl")):
@@ -239,7 +241,21 @@ class TestNewestSourceProjectScope(unittest.TestCase):
     """this change's R1 (Sentinel): the Codex sessions dir holds EVERY project's
     rollouts. _newest_source_file must select only rollouts that belong to this
     project — an unrelated newer rollout must not be picked (which would trigger a
-    build for a project that owns no sources). Real filesystem, real filter."""
+    build for a project that owns no sources). Real filesystem, real filter.
+
+    Ref #967: _newest_source_file now resolves the archive/store roots it
+    scans (all_worktree_archive_dirs, project_archive_dir) with an ambient
+    project_dir=None rather than the tmp `project` fixture dir these tests
+    pass to cli._newest_source_file, so without an owned store this class
+    escaped into whichever real gripspace the test process happened to run
+    from -- exactly the isolation break this ref is about, one level up.
+    """
+
+    def setUp(self):
+        self._store = owned_store()
+
+    def tearDown(self):
+        self._store.restore()
 
     def _rollout(self, codex_dir, name, cwd, mtime):
         import json
@@ -305,6 +321,103 @@ class TestNewestSourceProjectScope(unittest.TestCase):
         self.assertFalse(out.refreshed)
         lock.assert_not_called()   # never reached the lock
         build.assert_not_called()  # never built for a project it does not own
+
+
+class TestNewestSourceRespectsEnvStoreOverride(unittest.TestCase):
+    """Ref #967, the actual mechanism: _newest_source_file's archive/store
+    lookups (all_worktree_archive_dirs, project_archive_dir) used to thread
+    the passed project_dir straight into project_data_dir, which treats ANY
+    passed project_dir as a deliberate override that suppresses
+    SYNAPT_RECALL_ROOT -- so an implicit cwd (cmd_resume's fallback, resume
+    has no --project flag) silently defeated a caller's env-based store
+    isolation. Real filesystem, real env var, no mocking of project_data_dir
+    itself: the archive must be found under the ENV-designated store even
+    though a different directory is passed as project_dir.
+    """
+
+    def test_archived_source_under_env_store_is_found_despite_different_project_dir(
+        self,
+    ):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = base / "env-designated-store"
+            store.mkdir()
+            cwd_project = base / "agent-desk"  # sibling of `store`, NOT inside it
+            cwd_project.mkdir()
+
+            # An archived transcript under the store's worktree layout --
+            # exactly where all_worktree_archive_dirs/project_archive_dir look
+            # once project_data_dir resolves the ENV-designated root.
+            archive_dir = (
+                store / ".synapt" / "recall" / "worktrees" / "main" / "transcripts"
+            )
+            archive_dir.mkdir(parents=True)
+            source = archive_dir / "rollout-archived.jsonl"
+            source.write_text("{}\n", encoding="utf-8")
+
+            with (
+                mock.patch.dict(
+                    os.environ, {"SYNAPT_RECALL_ROOT": str(store)}, clear=False
+                ),
+                mock.patch(
+                    "synapt.recall.codex.discover_codex_sessions", return_value=None
+                ),
+            ):
+                os.environ.pop("GRIPSPACE_ROOT", None)
+                got = cli._newest_source_file(cwd_project)
+
+            # found under the ENV store, not silently dropped
+            self.assertEqual(got, source.resolve())
+
+    def test_without_the_env_var_the_same_layout_is_not_found(self):
+        # Negative control: identical fixture, no SYNAPT_RECALL_ROOT set and
+        # cwd_project itself owns no .synapt structure -- proves the positive
+        # case above is actually locating the archive via the env var, not
+        # via some other path that happens to reach it regardless.
+        #
+        # With no env var, project_data_dir(None) falls through to a
+        # Path.cwd()-based walk-up -- so the process cwd must itself be
+        # chdir'd into a tmp-owned, marker-free directory here, or this
+        # negative control would walk up into whatever real gripspace the
+        # test happened to run from (the store-isolation guard would then
+        # legitimately refuse it as an escape, same as any other implicit
+        # resolution reaching a real store).
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            store = base / "env-designated-store"
+            store.mkdir()
+            cwd_project = base / "agent-desk"
+            cwd_project.mkdir()
+
+            archive_dir = (
+                store / ".synapt" / "recall" / "worktrees" / "main" / "transcripts"
+            )
+            archive_dir.mkdir(parents=True)
+            (archive_dir / "rollout-archived.jsonl").write_text(
+                "{}\n", encoding="utf-8"
+            )
+
+            original_cwd = Path.cwd()
+            os.chdir(cwd_project)
+            try:
+                with (
+                    mock.patch.dict(os.environ, {}, clear=False),
+                    mock.patch(
+                        "synapt.recall.codex.discover_codex_sessions",
+                        return_value=None,
+                    ),
+                ):
+                    os.environ.pop("SYNAPT_RECALL_ROOT", None)
+                    os.environ.pop("GRIPSPACE_ROOT", None)
+                    got = cli._newest_source_file(cwd_project)
+            finally:
+                os.chdir(original_cwd)
+
+            self.assertIsNone(got)  # store never named; nothing to find
 
 
 class TestRefreshLabelRender(unittest.TestCase):

@@ -269,10 +269,22 @@ def _newest_source_file(project_dir: Path) -> Path | None:
     from synapt.recall.codex import discover_codex_sessions, list_codex_transcripts
 
     # Roots that are project-scoped by construction; rglob stays in scope.
+    #
+    # project_dir here is cmd_resume's implicit Path.cwd() fallback (resume
+    # has no --project flag), never a deliberate override. project_transcript_dirs
+    # is pure filesystem/cwd discovery -- it never touches project_data_dir --
+    # so it correctly keeps project_dir. But all_worktree_archive_dirs and
+    # project_archive_dir resolve the STORE root via project_data_dir, which
+    # treats ANY passed project_dir as a deliberate root that suppresses
+    # SYNAPT_RECALL_ROOT/GRIPSPACE_ROOT (see that function's docstring). An
+    # implicit cwd is not a deliberate override, so threading it through here
+    # silently defeated a caller's env-based store isolation (recall#967) --
+    # pass None so the store stays ambient, matching how project_data_dir's
+    # OTHER callers in this same chain already resolve it.
     roots: list[Path] = []
     roots.extend(project_transcript_dirs(project_dir))
-    roots.extend(all_worktree_archive_dirs(project_dir))
-    archive = project_archive_dir(project_dir)
+    roots.extend(all_worktree_archive_dirs(None))
+    archive = project_archive_dir(None)
     if archive.exists():
         roots.append(archive)
 
