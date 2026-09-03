@@ -25,6 +25,42 @@ class TestServerDevMode(unittest.TestCase):
                 main()
                 mock_dev.assert_called_once()
 
+    def test_main_with_help_flag_prints_help_and_does_not_serve(self):
+        """`synapt server --help` must print usage, not start the server.
+
+        The top-level help text (`synapt --help`) promises "Run 'synapt
+        <command> --help' for details on each command" -- until now
+        `server` was the one subcommand that broke that promise by
+        silently starting the MCP server on stdio instead of printing
+        anything."""
+        import io
+
+        out = io.StringIO()
+        with patch("synapt.server._serve") as mock_serve, \
+             patch("synapt.server._dev_serve") as mock_dev, \
+             patch.object(sys, "argv", ["synapt server", "--help"]), \
+             patch.object(sys, "stdout", out):
+            from synapt.server import main
+            main()
+        mock_serve.assert_not_called()
+        mock_dev.assert_not_called()
+        self.assertIn("server", out.getvalue().lower())
+
+    def test_main_with_h_flag_prints_help_and_does_not_serve(self):
+        """-h is the short form and must behave identically to --help."""
+        import io
+
+        out = io.StringIO()
+        with patch("synapt.server._serve") as mock_serve, \
+             patch("synapt.server._dev_serve") as mock_dev, \
+             patch.object(sys, "argv", ["synapt server", "-h"]), \
+             patch.object(sys, "stdout", out):
+            from synapt.server import main
+            main()
+        mock_serve.assert_not_called()
+        mock_dev.assert_not_called()
+        self.assertIn("server", out.getvalue().lower())
+
     def test_dev_flag_removed_from_argv(self):
         """--dev flag should be removed from sys.argv."""
         captured_argv = []

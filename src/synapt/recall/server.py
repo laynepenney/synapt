@@ -18,7 +18,7 @@ Provides recall tools via the Model Context Protocol, including:
   - recall_consolidate: Extract durable knowledge from journal entries
   - recall_contradict: Manage pending knowledge contradictions
 
-Can run standalone (synapt-server) or be composed into the
+Can run standalone (synapt-recall-server) or be composed into the
 unified synapt server via register_tools(mcp).
 """
 

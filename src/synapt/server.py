@@ -302,11 +302,32 @@ def _dev_serve():
                 child.kill()
 
 
+def _print_help():
+    print(
+        "\n".join(
+            [
+                "synapt server -- start the unified MCP server",
+                "",
+                "Usage:",
+                "  synapt server          normal mode",
+                "  synapt server --dev    auto-reload on source changes",
+                "",
+                "Add to Claude Code (.mcp.json):",
+                '  {"mcpServers": {"synapt": {"type": "stdio", '
+                '"command": "synapt", "args": ["server"]}}}',
+            ]
+        )
+    )
+
+
 def main():
     """Entry point for the unified synapt MCP server.
 
     Supports --dev flag for auto-reload during development.
     """
+    if "-h" in sys.argv or "--help" in sys.argv:
+        _print_help()
+        return
     if "--dev" in sys.argv:
         sys.argv.remove("--dev")
         _dev_serve()
