@@ -122,5 +122,89 @@ class TestTimestampMetadataRouting(unittest.TestCase):
         self.assertFalse((index_dir / "recall.db").exists())
 
 
+class TestServerCallSiteRouting(unittest.TestCase):
+    """Two more unconverted recall.db call sites in server.py,
+    found during review of this PR's original 8-site fix. format_contradictions_
+    for_session_start is the urgent one -- this PR's own write-side change
+    (routing contradiction-queuing to index.db) makes it a live regression:
+    before this PR, its recall.db read agreed with the recall.db write, so
+    contradictions surfaced despite both sides being on the wrong file; after
+    this PR, the write moves and the read doesn't, so new contradictions on a
+    sharded store go invisible at every session start. recall_save is the
+    same bug class (RecallDB opened directly on recall.db, no is_sharded()
+    check at all), not urgent, but the same helper applies."""
+
+    def test_format_contradictions_for_session_start_sees_a_sharded_store_contradiction(self):
+        from synapt.recall import server as server_mod
+        from unittest.mock import patch
+
+        index_dir = _sharded_dir()
+        db = RecallDB(index_dir / "index.db")
+        old_node = KnowledgeNode.create(
+            content="old fact", category="configuration",
+            source_sessions=["s0"], node_id="old-1",
+        )
+        db.save_knowledge_nodes([old_node.to_dict()])
+        db.add_pending_contradiction(
+            old_node_id="old-1", new_content="new conflicting fact",
+            category="configuration", reason="test",
+        )
+        db.close()
+
+        with patch.object(server_mod, "project_index_dir", return_value=index_dir):
+            output = server_mod.format_contradictions_for_session_start()
+
+        self.assertIn("Pending contradictions (1)", output)
+        self.assertIn("new conflicting fact", output)
+        self.assertFalse((index_dir / "recall.db").exists())
+
+    def test_format_contradictions_for_session_start_monolithic_control(self):
+        """Control: unaffected case, no index.db, must still read recall.db."""
+        from synapt.recall import server as server_mod
+        from unittest.mock import patch
+
+        index_dir = _monolithic_dir()
+        db = RecallDB(index_dir / "recall.db")
+        old_node = KnowledgeNode.create(
+            content="old fact", category="configuration",
+            source_sessions=["s0"], node_id="old-1",
+        )
+        db.save_knowledge_nodes([old_node.to_dict()])
+        db.add_pending_contradiction(
+            old_node_id="old-1", new_content="new conflicting fact",
+            category="configuration", reason="test",
+        )
+        db.close()
+
+        with patch.object(server_mod, "project_index_dir", return_value=index_dir):
+            output = server_mod.format_contradictions_for_session_start()
+
+        self.assertIn("Pending contradictions (1)", output)
+        self.assertIn("new conflicting fact", output)
+
+    def test_recall_save_writes_into_index_db_on_a_sharded_store(self):
+        from synapt.recall import server as server_mod
+        from unittest.mock import patch
+        import os
+
+        index_dir = _sharded_dir()
+        project_dir = index_dir.parent
+        cwd_before = os.getcwd()
+        os.chdir(project_dir)
+        try:
+            with patch.object(server_mod, "project_index_dir", return_value=index_dir):
+                result = server_mod.recall_save(content="a durable fact", category="workflow")
+        finally:
+            os.chdir(cwd_before)
+
+        self.assertNotIn("Error", result)
+        db = RecallDB.open_readonly(index_dir / "index.db")
+        nodes = db.load_knowledge_nodes(status=None)
+        db.close()
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0]["content"], "a durable fact")
+        self.assertFalse((index_dir / "recall.db").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
