@@ -357,7 +357,7 @@ class TestSessionSelection(unittest.TestCase):
 
         first = format_resume(view).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn(SESSION_A[:8], first)
         self.assertIn("2026-08-01T10:00:00Z", first)
         self.assertIn("2026-08-05T12:00:00Z", first)
@@ -379,7 +379,7 @@ class TestSessionSelection(unittest.TestCase):
             )
         ).splitlines()[0]
 
-        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+        self.assertNotIn("is not fully indexed yet", first)
 
     def test_mixed_iso_offsets_compare_by_instant_not_spelling(self):
         index = _index([
@@ -410,7 +410,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+        self.assertNotIn("is not fully indexed yet", first)
 
     def test_partial_warning_preserves_mixed_offset_spellings(self):
         indexed = "2026-08-01T12:00:00+01:00"
@@ -436,7 +436,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn(f"indexed through {indexed}", first)
         self.assertIn(f"live through {live}", first)
 
@@ -462,7 +462,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn("indexed through no searchable transcript endpoint", first)
         self.assertIn("live through 2026-08-01T11:00:00Z", first)
 
@@ -495,7 +495,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn("indexed through 2026-08-01T10:00:00Z", first)
 
     def test_foreign_live_extent_is_not_a_caller_partial_warning(self):
@@ -515,7 +515,7 @@ class TestSessionSelection(unittest.TestCase):
             )
         ).splitlines()[0]
 
-        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+        self.assertNotIn("is not fully indexed yet", first)
 
     def test_latest_event_timestamp_reads_backward_over_large_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2181,18 +2181,40 @@ class TestUncleanEnd(unittest.TestCase):
         self.assertEqual(found.session_id, SESSION_B)
 
     def test_format_resume_names_an_unclean_end_in_the_header(self):
+        """The banner text was renamed from the ALL-CAPS
+        "UNCLEAN END" / "no SessionEnd checkpoint" jargon to a plain sentence
+        that names both possible causes (a one-shot run or a real
+        interruption) without asserting which one it is -- the code cannot
+        tell the two apart, so the wording must not pretend it can."""
         index = _index([_chunk(SESSION_A, 0, "last question", "")])
         view = build_resume_view(index, session_id=SESSION_A, journal_path=None)
-        self.assertNotIn("UNCLEAN END", format_resume(view))
+        self.assertNotIn("without a shutdown checkpoint", format_resume(view))
         view.unclean_end = UncleanEnd(
             session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
             last_activity=self.LAST, last_authored_journal="2026-08-31T04:54:00Z",
             gap_seconds=25927.0, checkpoint_session=None,
         )
         text = format_resume(view)
-        self.assertIn("UNCLEAN END", text.splitlines()[0])
+        self.assertIn("without a shutdown checkpoint", text.splitlines()[0])
+        self.assertIn(self.LAST, text.splitlines()[0])
         self.assertIn("7h12m", text.splitlines()[0])
-        self.assertIn("no SessionEnd checkpoint", text.splitlines()[0])
+        self.assertIn("one-shot run or an interrupted session", text.splitlines()[0])
+
+    def test_unclean_end_wording_names_no_journal_at_all_when_there_is_none(self):
+        """Control for the second UncleanEnd sub-case: when there
+        is no authored journal at all (gap_seconds is None), the wording must
+        say so plainly instead of reporting a bogus gap duration."""
+        index = _index([_chunk(SESSION_A, 0, "last question", "")])
+        view = build_resume_view(index, session_id=SESSION_A, journal_path=None)
+        view.unclean_end = UncleanEnd(
+            session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
+            last_activity=self.LAST, last_authored_journal=None,
+            gap_seconds=None, checkpoint_session=None,
+        )
+        first = format_resume(view).splitlines()[0]
+        self.assertIn("without a shutdown checkpoint", first)
+        self.assertIn("no journal covers it", first)
+        self.assertNotIn("its last journal is", first)
 
     def test_the_foreign_journal_wording_says_later_only_when_it_is(self):
         from synapt.recall.resume import format_unclean_end
