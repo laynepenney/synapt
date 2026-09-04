@@ -27,6 +27,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Optional
 
 from synapt.recall.core import project_index_dir
+from synapt.recall.sharding import live_store_path
 from synapt.recall.storage import RecallDB
 
 try:
@@ -206,9 +207,14 @@ if BaseMemoryService is not None:
                 from synapt.recall.server import recall_save
 
                 content_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
+                # "conversation" is not one of synapt's VALID_CATEGORIES --
+                # recall_save now refuses an unrecognized category (a sibling
+                # fix) rather than silently coercing it, so this always used
+                # "workflow" under the hood anyway. Pass it explicitly rather
+                # than a value that would now be refused.
                 recall_save(
                     content=text,
-                    category="conversation",
+                    category="workflow",
                     confidence=0.8,
                     tags=[
                         "google-adk",
@@ -234,7 +240,7 @@ if BaseMemoryService is not None:
 
             app_tag = f"app:{app_name}"
             user_tag = f"user:{user_id}"
-            db = RecallDB(project_index_dir() / "recall.db")
+            db = RecallDB(live_store_path(project_index_dir()))
             try:
                 nodes = db.load_knowledge_nodes(status="active")
             finally:

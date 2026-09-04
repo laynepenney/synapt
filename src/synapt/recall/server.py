@@ -18,7 +18,7 @@ Provides recall tools via the Model Context Protocol, including:
   - recall_consolidate: Extract durable knowledge from journal entries
   - recall_contradict: Manage pending knowledge contradictions
 
-Can run standalone (synapt-server) or be composed into the
+Can run standalone (synapt-recall-server) or be composed into the
 unified synapt server via register_tools(mcp).
 """
 
@@ -1391,10 +1391,16 @@ def recall_stats() -> str:
 
     Returns chunk count, session count, date range, and index size.
     """
+    from synapt.recall.sharding import is_sharded
+
     index_dir = project_index_dir()
 
-    # Check for recall.db or legacy manifest.json
-    if not (index_dir / "recall.db").exists() and not (index_dir / "manifest.json").exists():
+    # Check for recall.db, legacy manifest.json, or the sharded layout
+    if (
+        not (index_dir / "recall.db").exists()
+        and not (index_dir / "manifest.json").exists()
+        and not is_sharded(index_dir)
+    ):
         return f"No index found at {index_dir}. Run `synapt recall setup` first."
 
     index = _get_index()
@@ -2094,9 +2100,10 @@ def format_contradictions_for_session_start(limit: int = 5) -> str:
     reads as a number rather than as a wall of text that the ~2KB startup
     preview truncates anyway (Ref #856).
     """
+    from synapt.recall.sharding import live_store_path
     from synapt.recall.storage import RecallDB
 
-    db_path = project_index_dir() / "recall.db"
+    db_path = live_store_path(project_index_dir())
     if not db_path.exists():
         return ""
 
@@ -2455,11 +2462,18 @@ def recall_save(
         import hashlib
         from datetime import datetime, timezone
 
-        from synapt.recall.knowledge import KnowledgeNode, append_node
+        from synapt.recall.knowledge import VALID_CATEGORIES, KnowledgeNode, append_node
+        from synapt.recall.sharding import live_store_path
         from synapt.recall.storage import RecallDB
 
+        if not retract and category not in VALID_CATEGORIES:
+            return (
+                f"Error: unrecognized category {category!r}. "
+                f"Valid categories: {', '.join(sorted(VALID_CATEGORIES))}."
+            )
+
         project = Path.cwd().resolve()
-        db = RecallDB(project_index_dir(project) / "recall.db")
+        db = RecallDB(live_store_path(project_index_dir(project)))
         try:
             # --- Retract path ---
             if retract:
@@ -2582,8 +2596,15 @@ def recall_sync_memory() -> str:
                 if body:
                     content += f"\n\n{body}"
 
-                # Map memory type to category
-                category = mem_type if mem_type in ("user", "feedback", "project", "reference") else "project"
+                # mem_type ("user"/"feedback"/"project"/"reference") is none of
+                # VALID_CATEGORIES -- recall_save's category check (this PR)
+                # would now refuse every one of these, where it previously
+                # always silently landed as "workflow" regardless of mem_type.
+                # The real distinction is already preserved via the
+                # f"type:{mem_type}" tag below; category is just "workflow",
+                # matching prior real-world behavior exactly rather than
+                # inventing a new mapping as part of this fix.
+                category = "workflow"
                 stable_id = hashlib.sha1(
                     str(md_file.resolve()).encode("utf-8")
                 ).hexdigest()[:12]
@@ -3289,6 +3310,39 @@ def register_tools(mcp) -> None:
     mcp.tool()(recall_reload)
 
 
+def _sync_claude_memory_source_on_startup() -> None:
+    """Eager sync of this agent's own Claude Code memory directory into a
+    recall source, once, at process startup (R3 "Memory Everywhere" first
+    fruit). Silent no-op when no gripspace or no ``memory/`` directory
+    resolves -- most processes running this server have neither, and that
+    is not an error. When a sync DOES run, its receipt is logged once so a
+    slow scan is visible rather than felt; nothing here ever blocks or
+    fails server startup.
+
+    Deliberately NOT called from ``register_tools()``: several tests call
+    ``register_tools(mcp)`` directly against a real FastMCP instance, and
+    those must not trigger a real disk scan of whatever memory directory
+    happens to exist on the machine running the suite.
+    """
+    import sys
+
+    try:
+        from synapt.recall.claude_memory_source import admit_and_index_claude_memory
+
+        started = time.monotonic()
+        receipt = admit_and_index_claude_memory()
+        if receipt is not None:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            print(
+                f"[claude_memory] {receipt.state}: "
+                f"{receipt.documents_seen or 0} file(s), "
+                f"generation {receipt.generation}, {elapsed_ms}ms",
+                file=sys.stderr,
+            )
+    except Exception:
+        pass  # best-effort startup indexing; never block server start
+
+
 def main():
     """Entry point for standalone synapt-recall-server."""
     server = _build_validating_fastmcp_class()(
@@ -3296,6 +3350,7 @@ def main():
         instructions=MCP_INSTRUCTIONS,
     )
     register_tools(server)
+    _sync_claude_memory_source_on_startup()
     server.run()
 
 

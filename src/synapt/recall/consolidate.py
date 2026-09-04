@@ -4209,7 +4209,8 @@ def consolidate(
             from synapt.recall.content_profile import detect_content_profile
             idx_dir = project_index_dir(project_dir)
             from synapt.recall.storage import RecallDB
-            db_path = idx_dir / "recall.db"
+            from synapt.recall.sharding import live_store_path
+            db_path = live_store_path(idx_dir)
             if db_path.exists():
                 _db = RecallDB(db_path)
                 from synapt.recall.core import parse_transcript
@@ -4279,7 +4280,8 @@ def consolidate(
     # Open DB for queuing contradictions (Phase 8b)
     db = None
     index_dir = project_index_dir(project_dir)
-    db_path = index_dir / "recall.db"
+    from synapt.recall.sharding import live_store_path
+    db_path = live_store_path(index_dir)
     if db_path.exists():
         try:
             from synapt.recall.storage import RecallDB
@@ -4581,8 +4583,9 @@ def extract_collections(
 
 def _get_last_consolidation_ts(project_dir: Path) -> str:
     """Read last consolidation timestamp from metadata."""
+    from synapt.recall.sharding import live_store_path
     index_dir = project_index_dir(project_dir)
-    db_path = index_dir / "recall.db"
+    db_path = live_store_path(index_dir)
     if not db_path.exists():
         return ""
     try:
@@ -4597,8 +4600,9 @@ def _get_last_consolidation_ts(project_dir: Path) -> str:
 
 def _set_last_consolidation_ts(project_dir: Path) -> None:
     """Write current timestamp as last consolidation timestamp."""
+    from synapt.recall.sharding import live_store_path
     index_dir = project_index_dir(project_dir)
-    db_path = index_dir / "recall.db"
+    db_path = live_store_path(index_dir)
     if not db_path.exists():
         return
     try:
@@ -4615,8 +4619,9 @@ def _set_last_consolidation_ts(project_dir: Path) -> None:
 
 def _sync_knowledge_to_db(project_dir: Path, kn_path: Path) -> None:
     """Sync knowledge.jsonl nodes into SQLite for FTS search."""
+    from synapt.recall.sharding import live_store_path
     index_dir = project_index_dir(project_dir)
-    db_path = index_dir / "recall.db"
+    db_path = live_store_path(index_dir)
     if not db_path.exists():
         return
     try:
@@ -4650,8 +4655,9 @@ def _load_chunks_for_resolve(
     if not kn_path.exists():
         return None
 
+    from synapt.recall.sharding import live_store_path
     index_dir = project_index_dir(project_dir)
-    db_path = index_dir / "recall.db"
+    db_path = live_store_path(index_dir)
     if not db_path.exists():
         return None
 

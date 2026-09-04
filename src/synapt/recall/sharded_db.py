@@ -114,10 +114,19 @@ class ShardedRecallDB:
           - If ``index.db`` exists → sharded (index + data shards)
           - If ``recall.db`` exists → monolithic (single DB wraps both)
           - Otherwise → creates new monolithic ``recall.db``
+
+        In sharded mode, data shards are read from the CURRENT generation
+        (``generations.current_generation_dir``) if one has ever been
+        published -- a full rebuild via ``save_chunks`` publishes a new
+        generation atomically, so a reader here always sees either a
+        complete prior generation or a complete new one, never a partial
+        rebuild in progress. An index never rebuilt since this system
+        landed has no CURRENT yet; falls back to the flat legacy layout
+        (shards directly under ``index_dir``) unchanged.
         """
         if is_sharded(index_dir):
             index_db = RecallDB(index_dir / "index.db")
-            data_dbs = [RecallDB(p) for p in list_shards(index_dir)]
+            data_dbs = [RecallDB(p) for p in list_shards(cls._data_shard_dir(index_dir))]
             return cls(index_db, data_dbs)
 
         # Monolithic: single recall.db serves as both index and data
@@ -126,17 +135,33 @@ class ShardedRecallDB:
 
     @classmethod
     def open_readonly(cls, index_dir: Path) -> ShardedRecallDB:
-        """Open an existing layout without DDL, migrations, or write access."""
+        """Open an existing layout without DDL, migrations, or write access.
+
+        Follows CURRENT the same way ``open`` does -- see its docstring.
+        """
         if is_sharded(index_dir):
             index_db = RecallDB.open_readonly(index_dir / "index.db")
             try:
-                data_dbs = [RecallDB.open_readonly(p) for p in list_shards(index_dir)]
+                data_dbs = [
+                    RecallDB.open_readonly(p)
+                    for p in list_shards(cls._data_shard_dir(index_dir))
+                ]
             except Exception:
                 index_db.close()
                 raise
             return cls(index_db, data_dbs)
 
         return cls(RecallDB.open_readonly(index_dir / "recall.db"), [])
+
+    @staticmethod
+    def _data_shard_dir(index_dir: Path) -> Path:
+        """Where to glob for data_*.db: the CURRENT generation if one has
+        been published, else index_dir itself (the pre-generation flat
+        layout, unaffected until the first rebuild through save_chunks)."""
+        from synapt.recall.generations import current_generation_dir
+
+        gen_dir = current_generation_dir(index_dir)
+        return gen_dir if gen_dir is not None else index_dir
 
     # -- Delegated methods (index DB) --------------------------------------
 
@@ -545,27 +570,44 @@ class ShardedRecallDB:
         """Save chunks to the appropriate database.
 
         In monolithic mode, delegates directly to the single DB.
-        In sharded mode, closes all existing shards, deletes the old
-        shard files, and re-distributes chunks across fresh shards
-        using SHARD_CHUNK_THRESHOLD. This prevents the unbounded shard
-        accumulation bug where every rebuild created a new full-copy
-        shard (#sharding-bug-sprint-13).
+
+        In sharded mode, this used to close every shard connection,
+        delete every shard file, then rebuild from scratch with no
+        atomicity spanning those steps -- a reader in the window between
+        delete and rebuild could see a missing or partial shard set.
+        Now it builds a complete, self-contained generation of fresh
+        shards under ``generations/<name>/`` and publishes it with one
+        atomic pointer swap (``generations.rebuild_and_publish``): a
+        reader via ``open``/``open_readonly`` always sees either the
+        prior complete generation or the new complete one, never a
+        rebuild in progress. This still prevents the unbounded shard
+        accumulation bug the delete-and-rebuild approach was written to
+        fix (#sharding-bug-sprint-13) -- SHARD_CHUNK_THRESHOLD-based
+        redistribution is unchanged, just now happening in a fresh
+        directory instead of in place.
+
+        Every successful publish also garbage-collects every generation
+        except the new CURRENT and the one it superseded
+        (``generations.gc_old_generations``), so a rebuild every session
+        start does not accumulate one full-size generation per rebuild
+        forever. Steady state after GC is measured at ~2.98x one
+        generation's size (2 kept generations + the flat legacy mirror);
+        see the PR body for the measured multiple and the follow-up
+        under consideration to cut it further.
+
+        Known gap (disclosed, not yet done): shard_metadata bookkeeping
+        is not wired to this path yet -- nothing reads it to resolve
+        which shards to open, so this is cosmetic staleness, not a
+        correctness gap, but it goes stale after a rebuild through this
+        system until a follow-up lands.
         """
-        if not self._data_dbs:
+        index_dir = self._index._path.parent
+        if not is_sharded(index_dir):
             self._index.save_chunks(chunks)
             return
 
-        from synapt.recall.sharding import (
-            SHARD_CHUNK_THRESHOLD,
-            SHARD_METADATA_SQL,
-            _update_shard_metadata,
-            list_shards,
-            shard_name_for_index,
-        )
+        from synapt.recall.generations import rebuild_and_publish
 
-        index_dir = self._index._path.parent
-
-        # Step 1: Close all existing data shard connections
         for db in self._data_dbs:
             try:
                 db.close()
@@ -573,52 +615,13 @@ class ShardedRecallDB:
                 pass
         self._data_dbs = []
 
-        # Step 2: Delete all old shard files (including WAL/SHM journals)
-        for old_shard in list_shards(index_dir):
-            for suffix in ("", "-wal", "-shm"):
-                p = old_shard.parent / (old_shard.name + suffix)
-                try:
-                    p.unlink(missing_ok=True)
-                except OSError:
-                    logger.warning("Failed to delete %s", p)
+        rebuild_and_publish(index_dir, chunks)
 
-        # Step 3: Clear stale shard_metadata in index.db
-        try:
-            self._index._conn.execute("DELETE FROM shard_metadata")
-            self._index._conn.commit()
-        except Exception:
-            logger.warning("Failed to clear shard_metadata", exc_info=True)
+        self._data_dbs = [
+            RecallDB(p) for p in list_shards(self._data_shard_dir(index_dir))
+        ]
 
-        # Step 4: Sort chunks by timestamp for time-range sharding
-        sorted_chunks = sorted(chunks, key=lambda c: c.timestamp or "")
-
-        # Step 5: Distribute chunks across fresh shards
-        shard_idx = 1
-        for offset in range(0, len(sorted_chunks), SHARD_CHUNK_THRESHOLD):
-            batch = sorted_chunks[offset:offset + SHARD_CHUNK_THRESHOLD]
-            shard_path = index_dir / shard_name_for_index(shard_idx)
-            shard_db = RecallDB(shard_path)
-            shard_db.save_chunks(batch)
-            self._data_dbs.append(shard_db)
-
-            # Record shard metadata
-            min_ts = batch[0].timestamp if batch else ""
-            max_ts = batch[-1].timestamp if batch else ""
-            is_last = offset + SHARD_CHUNK_THRESHOLD >= len(sorted_chunks)
-            try:
-                self._index._conn.execute(SHARD_METADATA_SQL)
-                _update_shard_metadata(
-                    self._index._conn, shard_path, len(batch),
-                    min_ts or "", max_ts or "",
-                    is_active=is_last,
-                )
-                self._index._conn.commit()
-            except Exception:
-                logger.warning("Failed to update shard metadata for %s",
-                               shard_path.name, exc_info=True)
-            shard_idx += 1
-
-        logger.info("save_chunks: distributed %d chunks across %d shard(s)",
+        logger.info("save_chunks: published a new generation with %d chunks across %d shard(s)",
                      len(chunks), len(self._data_dbs))
 
     def retire_absorbed_query_tails(self) -> None:
@@ -877,5 +880,11 @@ class ShardedRecallDB:
 
     @property
     def is_monolithic(self) -> bool:
-        """True if using a single recall.db (no shards)."""
-        return not self._data_dbs
+        """True if using a single recall.db (no shards).
+
+        Reflects the on-disk layout (``is_sharded(index_dir)``), not merely
+        whether this instance currently holds any shard connections -- a
+        genuinely sharded store (``index.db`` present) with zero shards
+        yet created is still sharded, not monolithic.
+        """
+        return not is_sharded(self._index._path.parent)

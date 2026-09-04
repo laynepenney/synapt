@@ -85,6 +85,7 @@ class SourceAdmission:
     exclusion_policy_hash: str = ""
     parser_profile: str = _PARSER_VERSION
     path_disclosure: str = "hidden"
+    source_kind: str = "memory_file"
 
     def __post_init__(self) -> None:
         if not self.source_id or not self.scope_capability or not self.root_handle_id:
@@ -942,7 +943,10 @@ def _fts_query(query: str) -> str:
 
 
 def _row_to_result(
-    row: sqlite3.Row, disclose_path: bool, similarity: float | None = None
+    row: sqlite3.Row,
+    disclose_path: bool,
+    similarity: float | None = None,
+    source_kind: str = "memory_file",
 ) -> SourceSearchResult:
     return SourceSearchResult(
         content=row["content"],
@@ -951,6 +955,7 @@ def _row_to_result(
         revision_token=row["revision_token"],
         observed_at=row["observed_at"],
         relative_path=row["relative_path"] if disclose_path else None,
+        source_kind=source_kind,
         similarity=similarity,
     )
 
@@ -1009,7 +1014,10 @@ def search_source(
         if not _authorized(admission, authorize):
             return []
         disclose_path = admission.path_disclosure == "relative"
-        return [_row_to_result(row, disclose_path) for row in rows]
+        return [
+            _row_to_result(row, disclose_path, source_kind=admission.source_kind)
+            for row in rows
+        ]
 
     # Hybrid path. Both queries below apply the identical source_id +
     # lifecycle='current' scoping the lexical-only path already proved safe
@@ -1085,7 +1093,12 @@ def search_source(
         if row is None:
             continue
         results.append(
-            _row_to_result(row, disclose_path, similarity=cosine_by_unit_id.get(unit_id))
+            _row_to_result(
+                row,
+                disclose_path,
+                similarity=cosine_by_unit_id.get(unit_id),
+                source_kind=admission.source_kind,
+            )
         )
     return results
 

@@ -156,6 +156,18 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         self.assertEqual(db.chunk_count(), 2)
         db.close()
 
+    def test_is_monolithic_is_false_for_a_sharded_store_with_zero_shards(self):
+        """index.db present with no data shard file yet -- the shape
+        split_monolithic_db leaves behind when splitting an empty
+        recall.db -- is a genuinely sharded layout, not monolithic. Prior
+        code inferred monolithic-ness from ``not self._data_dbs``, which
+        an empty (but sharded) store also satisfies."""
+        RecallDB(self.index_dir / "index.db").close()
+        db = ShardedRecallDB.open(self.index_dir)
+        self.assertEqual(db.shard_count, 0)  # setup check: genuinely zero shards
+        self.assertFalse(db.is_monolithic)
+        db.close()
+
     def test_bounded_session_reads_merge_across_shards(self):
         RecallDB(self.index_dir / "index.db").close()
         first = RecallDB(self.index_dir / "data_001.db")
@@ -474,6 +486,52 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         db.save_chunks([])
         db.close()
 
+    def test_save_chunks_routes_through_rebuild_when_a_sharded_store_has_zero_shards(self):
+        """A genuinely sharded store (index.db present) with NO existing
+        shard file at all -- the shape ``split_monolithic_db`` leaves behind
+        when splitting an empty ``recall.db`` -- must still route through
+        the atomic generation rebuild, not silently fall through to the
+        monolithic branch because ``self._data_dbs`` happens to be empty.
+        Reproduced against the prior code: seeding only ``index.db`` left
+        ``save_chunks()`` writing chunks into ``index.db`` itself and never
+        publishing a generation, self-perpetuating on every later call
+        since data never lands in a shard."""
+        RecallDB(self.index_dir / "index.db").close()
+        db = ShardedRecallDB.open(self.index_dir)
+        self.assertEqual(db.shard_count, 0)  # setup check: genuinely zero shards
+        chunk = TranscriptChunk(
+            id="test:t0", session_id="s1", timestamp="2025-04-15T10:00:00Z",
+            turn_index=0, user_text="hello", assistant_text="hi",
+        )
+        db.save_chunks([chunk])
+        from synapt.recall.generations import read_current_generation
+        self.assertIsNotNone(
+            read_current_generation(self.index_dir),
+            "save_chunks on a zero-shard sharded store must publish a "
+            "generation, not silently write into index.db",
+        )
+        db.close()
+
+    def test_save_chunks_still_uses_monolithic_branch_for_a_true_monolithic_store(self):
+        """Control: a genuinely monolithic store (no index.db at all) must
+        still take the monolithic branch -- the fix narrows what counts as
+        'sharded' to the on-disk layout, it must not treat every store as
+        sharded."""
+        db = ShardedRecallDB.open(self.index_dir)  # no index.db -> monolithic
+        self.assertTrue(db.is_monolithic)
+        chunk = TranscriptChunk(
+            id="test:t0", session_id="s1", timestamp="2025-04-15T10:00:00Z",
+            turn_index=0, user_text="hello", assistant_text="hi",
+        )
+        db.save_chunks([chunk])
+        self.assertEqual(db.chunk_count(), 1)
+        from synapt.recall.generations import generations_root
+        self.assertFalse(
+            generations_root(self.index_dir).exists(),
+            "a monolithic store must never grow a generations/ directory",
+        )
+        db.close()
+
     def test_chunk_count_spans_all_shards(self):
         db = self._create_two_shard_layout()
         self.assertEqual(db.chunk_count(), 2)
@@ -556,8 +614,10 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         db.close()
 
     def test_save_chunks_reshards_properly(self):
-        """save_chunks deletes old shards and redistributes across fresh ones."""
+        """save_chunks publishes a fresh generation and redistributes into it;
+        the prior generation's chunks are no longer visible through open()."""
         from synapt.recall.core import TranscriptChunk
+        from synapt.recall.generations import current_generation_dir
         RecallDB(self.index_dir / "index.db").close()
         RecallDB(self.index_dir / "data_001.db").close()
         RecallDB(self.index_dir / "data_002.db").close()
@@ -578,12 +638,13 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         )
         db.save_chunks([new_chunk])
 
-        # Old shard files should be deleted; 1 chunk = 1 fresh shard
+        # The rebuild publishes a fresh generation; 1 chunk = 1 fresh shard
+        # inside it, and CURRENT now names that generation (not the old
+        # flat pre-generation layout the seeded old_chunk lived in).
         self.assertEqual(db.shard_count, 1)
-        self.assertFalse(
-            (self.index_dir / "data_002.db").exists(),
-            "Old shard file should be deleted",
-        )
+        gen_dir = current_generation_dir(self.index_dir)
+        self.assertIsNotNone(gen_dir, "save_chunks must publish a generation")
+        self.assertTrue(gen_dir.is_dir())
 
         # Active shard should have the new chunk
         self.assertEqual(db.chunk_count(), 1)
@@ -596,8 +657,22 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         db.close()
 
     def test_save_chunks_no_unbounded_shard_growth(self):
-        """Repeated rebuilds must not accumulate shard files (the sprint-13 bug)."""
+        """A single rebuild call must not accumulate duplicate/stale shard
+        files WITHIN the generation it publishes (the sprint-13 bug: a
+        rebuild used to create one new full-copy shard per call, in place,
+        without ever removing the previous one). Repeating the rebuild must
+        keep landing on exactly the right shard count each time.
+
+        Cross-generation accumulation (old, superseded generations staying
+        on disk once a new one publishes) is a different, disclosed, and
+        still-open concern -- generation garbage collection is explicit
+        follow-up scope, not yet wired to this path. This test's contract
+        is narrower and still fully meaningful under the new generation
+        system: it is the CURRENT generation, after any number of rebuilds,
+        that must never show duplication.
+        """
         from synapt.recall.core import TranscriptChunk
+        from synapt.recall.generations import current_generation_dir
         from synapt.recall.sharding import list_shards
 
         RecallDB(self.index_dir / "index.db").close()
@@ -617,11 +692,13 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         for rebuild in range(3):
             db.save_chunks(chunks)
 
-        shard_files = list_shards(self.index_dir)
+        current_gen = current_generation_dir(self.index_dir)
+        self.assertIsNotNone(current_gen)
+        shard_files = list_shards(current_gen)
         self.assertEqual(
             len(shard_files), 1,
-            f"Expected 1 shard after rebuilds, got {len(shard_files)}: "
-            f"{[p.name for p in shard_files]}",
+            f"Expected 1 shard in the current generation after rebuilds, "
+            f"got {len(shard_files)}: {[p.name for p in shard_files]}",
         )
         self.assertEqual(db.chunk_count(), 5)
         db.close()
@@ -629,6 +706,7 @@ class TestShardedRecallDBSharded(unittest.TestCase):
     def test_save_chunks_splits_at_threshold(self):
         """Chunks exceeding threshold are split across multiple shards."""
         from synapt.recall.core import TranscriptChunk
+        from synapt.recall.generations import current_generation_dir
         from synapt.recall.sharding import list_shards
         import synapt.recall.sharding as _sharding_mod
 
@@ -657,7 +735,9 @@ class TestShardedRecallDBSharded(unittest.TestCase):
         self.assertEqual(db.shard_count, 3)
         self.assertEqual(db.chunk_count(), 25)
 
-        shard_files = list_shards(self.index_dir)
+        current_gen = current_generation_dir(self.index_dir)
+        self.assertIsNotNone(current_gen)
+        shard_files = list_shards(current_gen)
         self.assertEqual(len(shard_files), 3)
         db.close()
 

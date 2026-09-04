@@ -11,6 +11,7 @@ from synapt.recall.sharding import (
     list_shards,
     next_shard_index,
     is_sharded,
+    live_store_path,
     estimate_split,
     split_monolithic_db,
     SHARD_CHUNK_THRESHOLD,
@@ -78,6 +79,37 @@ class TestIsSharded(unittest.TestCase):
         (d / "index.db").touch()
         (d / "data_001.db").touch()
         self.assertTrue(is_sharded(d))
+
+
+class TestLiveStorePath(unittest.TestCase):
+    """Several callers (consolidate.py, knowledge.py, enrich.py)
+    constructed ``index_dir / "recall.db"`` unconditionally, resolving to a
+    file the primary ShardedRecallDB path never reads once index.db exists.
+    live_store_path() is the one helper both cases should route through."""
+
+    def test_monolithic_resolves_to_recall_db(self):
+        tmpdir = tempfile.mkdtemp()
+        d = Path(tmpdir)
+        (d / "recall.db").touch()
+        self.assertEqual(live_store_path(d), d / "recall.db")
+
+    def test_sharded_resolves_to_index_db_even_when_recall_db_also_exists(self):
+        """The exact production shape: a sharded store that ALSO still has
+        a stale recall.db left over from an earlier migration. The live
+        file must be index.db, not whichever file happens to exist."""
+        tmpdir = tempfile.mkdtemp()
+        d = Path(tmpdir)
+        (d / "index.db").touch()
+        (d / "recall.db").touch()
+        self.assertEqual(live_store_path(d), d / "index.db")
+
+    def test_neither_file_exists_yet_resolves_to_recall_db(self):
+        """A brand-new project: is_sharded() is False (no index.db), so a
+        fresh monolithic recall.db is where the first write should go —
+        matches ShardedRecallDB.open()'s own "otherwise" branch."""
+        tmpdir = tempfile.mkdtemp()
+        d = Path(tmpdir)
+        self.assertEqual(live_store_path(d), d / "recall.db")
 
 
 class TestEstimateSplit(unittest.TestCase):

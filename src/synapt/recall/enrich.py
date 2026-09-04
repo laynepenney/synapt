@@ -936,7 +936,8 @@ def _set_last_enrichment_ts(project_dir: Path) -> None:
         from datetime import datetime, timezone
         from synapt.recall.core import project_index_dir
         from synapt.recall.storage import RecallDB
-        db_path = project_index_dir(project_dir) / "recall.db"
+        from synapt.recall.sharding import live_store_path
+        db_path = live_store_path(project_index_dir(project_dir))
         if not db_path.exists():
             return
         db = RecallDB(db_path)

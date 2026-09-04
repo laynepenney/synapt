@@ -25,6 +25,42 @@ class TestServerDevMode(unittest.TestCase):
                 main()
                 mock_dev.assert_called_once()
 
+    def test_main_with_help_flag_prints_help_and_does_not_serve(self):
+        """`synapt server --help` must print usage, not start the server.
+
+        The top-level help text (`synapt --help`) promises "Run 'synapt
+        <command> --help' for details on each command" -- until now
+        `server` was the one subcommand that broke that promise by
+        silently starting the MCP server on stdio instead of printing
+        anything."""
+        import io
+
+        out = io.StringIO()
+        with patch("synapt.server._serve") as mock_serve, \
+             patch("synapt.server._dev_serve") as mock_dev, \
+             patch.object(sys, "argv", ["synapt server", "--help"]), \
+             patch.object(sys, "stdout", out):
+            from synapt.server import main
+            main()
+        mock_serve.assert_not_called()
+        mock_dev.assert_not_called()
+        self.assertIn("server", out.getvalue().lower())
+
+    def test_main_with_h_flag_prints_help_and_does_not_serve(self):
+        """-h is the short form and must behave identically to --help."""
+        import io
+
+        out = io.StringIO()
+        with patch("synapt.server._serve") as mock_serve, \
+             patch("synapt.server._dev_serve") as mock_dev, \
+             patch.object(sys, "argv", ["synapt server", "-h"]), \
+             patch.object(sys, "stdout", out):
+            from synapt.server import main
+            main()
+        mock_serve.assert_not_called()
+        mock_dev.assert_not_called()
+        self.assertIn("server", out.getvalue().lower())
+
     def test_dev_flag_removed_from_argv(self):
         """--dev flag should be removed from sys.argv."""
         captured_argv = []
@@ -66,6 +102,34 @@ class TestServerDevMode(unittest.TestCase):
             "synapt vTEST — running from /fixture (editable install)", printed,
         )
         fake_mcp.run.assert_called_once()
+
+    def test_serve_syncs_claude_memory_source_between_register_and_run(self):
+        """R3 "Memory Everywhere" first fruit: the eager-at-startup sync must
+        run on the UNIFIED server (`synapt server`, what the fleet and every
+        real MCP-registered user actually run) -- not only on the standalone
+        recall/server.py:main() entrypoint, which _serve() does not call."""
+        order: list[str] = []
+        fake_mcp = unittest.mock.Mock()
+        fake_mcp.run.side_effect = lambda: order.append("run")
+
+        with patch("synapt.recall.server.ValidatingFastMCP", return_value=fake_mcp), \
+             patch("synapt.plugins.register_plugins", return_value=[]), \
+             patch(
+                 "synapt.recall.server.register_tools",
+                 side_effect=lambda _mcp: order.append("register"),
+             ), \
+             patch(
+                 "synapt.recall.server._sync_claude_memory_source_on_startup",
+                 side_effect=lambda: order.append("sync"),
+             ) as mock_sync:
+            from synapt.server import _serve
+            _serve()
+
+        mock_sync.assert_called_once()
+        # Must run after tools are registered (a source registered before
+        # recall's own registry setup would be undefined) and before the
+        # server blocks on mcp.run().
+        self.assertEqual(order, ["register", "sync", "run"])
 
     def test_find_watch_paths(self):
         """_find_watch_paths returns at least the synapt package directory."""

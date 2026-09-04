@@ -165,12 +165,25 @@ class _RecallBridge:
         self._project_root = project_root
 
     def save(self, path: str, content: str) -> str:
+        from synapt.recall.knowledge import VALID_CATEGORIES
         from synapt.recall.server import recall_save
 
-        category = "memory"
+        virtual_dir = "memory"
         parts = PurePosixPath(path).parts
         if len(parts) >= 3 and parts[1] == "memories":
-            category = parts[2]
+            virtual_dir = parts[2]
+        # The virtual directory ("memory", "notes", "sessions", ...) is this
+        # bridge's own concept, not synapt's category taxonomy -- neither the
+        # default nor any real subdirectory name is in VALID_CATEGORIES.
+        # recall_save now refuses an unrecognized category (a sibling fix)
+        # rather than silently coercing it, so validate here and fall back
+        # exactly as the coercion always did: to "workflow", unconditionally,
+        # for any virtual_dir outside the enum. This changes nothing observable
+        # -- load_knowledge_files() below already reads the stored category
+        # back and defaults every node whose category isn't itself one of
+        # _VIRTUAL_DIRS to "knowledge" regardless of the original
+        # subdirectory, which "workflow" already was and remains.
+        category = virtual_dir if virtual_dir in VALID_CATEGORIES else "workflow"
 
         return recall_save(
             content=content,
@@ -201,16 +214,21 @@ class _RecallBridge:
         """Seed the cache with existing recall knowledge nodes."""
         try:
             from synapt.recall.core import project_index_dir
+            from synapt.recall.sharding import live_store_path
             from synapt.recall.storage import RecallDB
             from pathlib import Path
 
             project = self._project_root.resolve() if self._project_root else Path.cwd().resolve()
-            db_path = project_index_dir(project) / "recall.db"
+            db_path = live_store_path(project_index_dir(project))
             if not db_path.exists():
                 return
             db = RecallDB(db_path)
             try:
-                nodes = db.list_knowledge_nodes(limit=200)
+                # load_knowledge_nodes has no limit= parameter -- slice after,
+                # not before (the method existed as list_knowledge_nodes(limit=200),
+                # which RecallDB has never defined; silently swallowed by the
+                # except below, so this seeded nothing on any store, ever).
+                nodes = db.load_knowledge_nodes()[:200]
                 for node in nodes:
                     if node.get("status") == "retracted":
                         continue

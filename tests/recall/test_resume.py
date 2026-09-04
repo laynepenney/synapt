@@ -357,7 +357,7 @@ class TestSessionSelection(unittest.TestCase):
 
         first = format_resume(view).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn(SESSION_A[:8], first)
         self.assertIn("2026-08-01T10:00:00Z", first)
         self.assertIn("2026-08-05T12:00:00Z", first)
@@ -379,7 +379,7 @@ class TestSessionSelection(unittest.TestCase):
             )
         ).splitlines()[0]
 
-        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+        self.assertNotIn("is not fully indexed yet", first)
 
     def test_mixed_iso_offsets_compare_by_instant_not_spelling(self):
         index = _index([
@@ -410,7 +410,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+        self.assertNotIn("is not fully indexed yet", first)
 
     def test_partial_warning_preserves_mixed_offset_spellings(self):
         indexed = "2026-08-01T12:00:00+01:00"
@@ -436,7 +436,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn(f"indexed through {indexed}", first)
         self.assertIn(f"live through {live}", first)
 
@@ -462,7 +462,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn("indexed through no searchable transcript endpoint", first)
         self.assertIn("live through 2026-08-01T11:00:00Z", first)
 
@@ -495,7 +495,7 @@ class TestSessionSelection(unittest.TestCase):
             build_resume_view(index, caller_sources=[source], journal_path=None)
         ).splitlines()[0]
 
-        self.assertIn("CALLER SOURCE PARTIAL", first)
+        self.assertIn("is not fully indexed yet", first)
         self.assertIn("indexed through 2026-08-01T10:00:00Z", first)
 
     def test_foreign_live_extent_is_not_a_caller_partial_warning(self):
@@ -515,7 +515,7 @@ class TestSessionSelection(unittest.TestCase):
             )
         ).splitlines()[0]
 
-        self.assertNotIn("CALLER SOURCE PARTIAL", first)
+        self.assertNotIn("is not fully indexed yet", first)
 
     def test_latest_event_timestamp_reads_backward_over_large_tail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1267,6 +1267,53 @@ class TestContinuationSegments(unittest.TestCase):
         ])
         text = format_resume(build_resume_view(index, limit=10, journal_path=None))
         self.assertIn("continues the previous question", text)
+
+    def test_no_reply_label_is_not_used_when_a_continuation_carries_the_real_answer(self):
+        """A tool-call-only anchor turn (no text yet) followed by a
+        continuation with the real answer read as "the session ended here"
+        immediately before that answer -- reproduced live in the OSS stranger
+        dogfood (2026-09-03) with a one-shot session whose first turn called
+        Bash and whose second turn (flagged is_continuation) carried the reply.
+        The label is gated only on the CURRENT turn's own is_continuation flag;
+        it never checks whether the NEXT turn continues it with real content.
+        """
+        index = _index([
+            _chunk(SESSION_A, 0, "what license is this under?", "", tools_used=["Bash"]),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "MIT License."),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertNotIn("session ended here", text)
+        self.assertIn("reply continues below", text)
+        self.assertIn("MIT License.", text)
+
+    def test_no_reply_label_still_fires_when_nothing_follows(self):
+        """Control: a genuinely final turn with no reply and no continuation
+        after it must still show the no-reply label -- the fix narrows the
+        condition, it must not remove it."""
+        index = _index([
+            _chunk(SESSION_A, 0, "what license is this under?", "", tools_used=["Bash"]),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn("session ended here", text)
+
+    def test_no_reply_label_fires_when_the_continuation_ALSO_has_no_text(self):
+        """R2 finding (Stromus, 2026-09-03): the previous fix looked only at
+        whether the NEXT turn is a continuation, not whether that continuation
+        (or any later one in the same segment) actually carries a reply. A
+        session that dies mid tool-loop -- an anchor tool call, then a
+        continuation segment that is ALSO just a tool call with no text, then
+        nothing further (the UNCLEAN END shape) -- has an immediate-next
+        continuation but no reply anywhere in the segment. Claiming "reply
+        continues below" here is worse than the original bug: it points the
+        reader at a reply that does not exist.
+        """
+        index = _index([
+            _chunk(SESSION_A, 0, "what license is this under?", "", tools_used=["Bash"]),
+            _chunk(SESSION_A, 1, self.CONTEXT_PREFIX, "", tools_used=["Bash"]),
+        ])
+        text = format_resume(build_resume_view(index, limit=10, journal_path=None))
+        self.assertIn("session ended here", text)
+        self.assertNotIn("reply continues below", text)
 
     def test_window_opening_mid_reply_is_anchored_to_its_question(self):
         """The defect this fixes was invisible to constructed tests and obvious in the fruit.
@@ -2134,18 +2181,40 @@ class TestUncleanEnd(unittest.TestCase):
         self.assertEqual(found.session_id, SESSION_B)
 
     def test_format_resume_names_an_unclean_end_in_the_header(self):
+        """The banner text was renamed from the ALL-CAPS
+        "UNCLEAN END" / "no SessionEnd checkpoint" jargon to a plain sentence
+        that names both possible causes (a one-shot run or a real
+        interruption) without asserting which one it is -- the code cannot
+        tell the two apart, so the wording must not pretend it can."""
         index = _index([_chunk(SESSION_A, 0, "last question", "")])
         view = build_resume_view(index, session_id=SESSION_A, journal_path=None)
-        self.assertNotIn("UNCLEAN END", format_resume(view))
+        self.assertNotIn("without a shutdown checkpoint", format_resume(view))
         view.unclean_end = UncleanEnd(
             session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
             last_activity=self.LAST, last_authored_journal="2026-08-31T04:54:00Z",
             gap_seconds=25927.0, checkpoint_session=None,
         )
         text = format_resume(view)
-        self.assertIn("UNCLEAN END", text.splitlines()[0])
+        self.assertIn("without a shutdown checkpoint", text.splitlines()[0])
+        self.assertIn(self.LAST, text.splitlines()[0])
         self.assertIn("7h12m", text.splitlines()[0])
-        self.assertIn("no SessionEnd checkpoint", text.splitlines()[0])
+        self.assertIn("one-shot run or an interrupted session", text.splitlines()[0])
+
+    def test_unclean_end_wording_names_no_journal_at_all_when_there_is_none(self):
+        """Control for the second UncleanEnd sub-case: when there
+        is no authored journal at all (gap_seconds is None), the wording must
+        say so plainly instead of reporting a bogus gap duration."""
+        index = _index([_chunk(SESSION_A, 0, "last question", "")])
+        view = build_resume_view(index, session_id=SESSION_A, journal_path=None)
+        view.unclean_end = UncleanEnd(
+            session_id=SESSION_A, transcript_path=Path("/t/a.jsonl"),
+            last_activity=self.LAST, last_authored_journal=None,
+            gap_seconds=None, checkpoint_session=None,
+        )
+        first = format_resume(view).splitlines()[0]
+        self.assertIn("without a shutdown checkpoint", first)
+        self.assertIn("no journal covers it", first)
+        self.assertNotIn("its last journal is", first)
 
     def test_the_foreign_journal_wording_says_later_only_when_it_is(self):
         from synapt.recall.resume import format_unclean_end
