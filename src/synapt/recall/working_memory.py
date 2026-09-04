@@ -99,13 +99,26 @@ class WorkingMemory:
         return [slot for _, slot in scored[:max_results]]
 
     def boost_multiplier(self, item_id: str) -> float:
-        """Return the working-memory multiplier for an item."""
+        """Return the working-memory multiplier for an item.
+
+        access_count is incremented on every record() call, and record()
+        fires whenever an item is merely returned in a result set -- not
+        when the caller actually reads, cites, or otherwise uses it. A
+        single pull is therefore not evidence of use, only of having been
+        surfaced once; boosting it back into the next query's ranking on
+        that basis alone is what let a stale, single-pull row outrank a
+        genuinely on-topic result that had never come up before. Requiring
+        a second pull before any boost applies is the cheapest available
+        proxy for "this kept mattering" rather than "this was shown once."
+        """
         slot = self._slots.get(item_id)
         if slot is None:
             return 1.0
         if slot.access_count >= 3:
             return 2.0
-        return 1.5
+        if slot.access_count >= 2:
+            return 1.5
+        return 1.0
 
     def boost_score(self, base_score: float, item_id: str) -> float:
         """Apply working memory boost to a search result score."""
