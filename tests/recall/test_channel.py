@@ -2709,7 +2709,15 @@ class TestCheckDirectives(unittest.TestCase):
 
     def test_mention_stored_in_db(self):
         """@mentions are stored in the mentions table."""
-        channel_join("dev", agent_name="s_sender")
+        # Explicit display_name: with none given, channel_join falls through
+        # to _resolve_display_name(), which reads SYNAPT_AGENT_NAME before
+        # ever looking at the (isolated) presence table. On a desk where that
+        # env var equals "opus" or "apollo" -- this fleet's own agent names --
+        # the sender's own row picks up that value as its display_name, and
+        # the mention parser's identity_map then resolves "@opus"/"@apollo"
+        # to the sender instead of falling back to the literal name this test
+        # means to exercise.
+        channel_join("dev", agent_name="s_sender", display_name="sender")
         channel_post("dev", "hey @apollo and @opus check this", agent_name="s_sender")
         conn = _open_db()
         rows = conn.execute("SELECT mentioned FROM mentions ORDER BY mentioned").fetchall()
