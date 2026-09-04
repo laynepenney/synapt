@@ -69,9 +69,20 @@ class TestWorkingMemory:
         wm = WorkingMemory()
         assert wm.boost_score(5.0, "unknown") == 5.0
 
-    def test_boost_score_in_memory(self):
-        """Items in working memory get 1.5x boost."""
+    def test_boost_score_single_pull_not_boosted(self):
+        """A single pull is not evidence of use. record() fires on mere
+        emission, so one prior pull must not earn a boost -- only being
+        returned repeatedly does."""
         wm = WorkingMemory()
+        wm.record("chunk", "s1:t0", "something")
+
+        assert wm.boost_score(4.0, "s1:t0") == 4.0  # unboosted after 1 pull
+
+    def test_boost_score_second_pull_is_1_5x(self):
+        """Control: an item genuinely pulled more than once still boosts --
+        this fix narrows *when* a boost applies, it does not remove boosting."""
+        wm = WorkingMemory()
+        wm.record("chunk", "s1:t0", "something")
         wm.record("chunk", "s1:t0", "something")
 
         assert wm.boost_score(4.0, "s1:t0") == 6.0  # 4.0 * 1.5
@@ -127,11 +138,30 @@ def _chunk(id: str, user: str = "", assistant: str = "") -> TranscriptChunk:
 
 
 class TestWorkingMemoryResultFormatting:
-    def test_format_results_tags_working_memory_boost(self):
+    def test_format_results_does_not_tag_single_pull_as_boosted(self):
+        """Reproduction: record() fires on mere emission, so a
+        single prior pull of sess-1:t1 (never revisited, never acted on)
+        must not carry a working-memory boost tag into the next query's
+        results -- being surfaced once is not evidence it was used."""
         idx = TranscriptIndex([
             _chunk("sess-1:t0", user="Show the strongest result", assistant="Top unboosted result."),
             _chunk("sess-1:t1", user="What drink do I prefer?", assistant="You prefer tea."),
         ])
+        idx._working_memory.record("chunk", "sess-1:t1", "You prefer tea.")
+
+        result = idx._format_results([(0, 10.0), (1, 7.0)], max_tokens=2000)
+
+        assert "boosted: working-memory" not in result
+
+    def test_format_results_tags_working_memory_boost_after_second_pull(self):
+        """Control: a row genuinely pulled a second time still gets boosted
+        and labeled -- the fix narrows the threshold, it does not remove
+        boosting for items that keep recurring."""
+        idx = TranscriptIndex([
+            _chunk("sess-1:t0", user="Show the strongest result", assistant="Top unboosted result."),
+            _chunk("sess-1:t1", user="What drink do I prefer?", assistant="You prefer tea."),
+        ])
+        idx._working_memory.record("chunk", "sess-1:t1", "You prefer tea.")
         idx._working_memory.record("chunk", "sess-1:t1", "You prefer tea.")
 
         result = idx._format_results([(0, 10.0), (1, 7.0)], max_tokens=2000)
