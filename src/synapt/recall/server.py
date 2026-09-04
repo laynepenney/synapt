@@ -3175,14 +3175,26 @@ def _with_directive_check(fn):
     return wrapper
 
 
+# The pending deferred-exec timer from the most recent recall_reload() call,
+# exposed at module level so a test (or a second reload call) can cancel it
+# rather than let it fire against an unpatched/unexpected os.execv later.
+_pending_reload_timer: "threading.Timer | None" = None
+
+
 def recall_reload() -> str:
     """Restart the MCP server to pick up code changes after pip install.
 
-    Replaces the current process with a fresh one via os.execv().
-    The MCP client (Claude Code) will reconnect automatically.
+    Replaces the current process with a fresh one via os.execv(), a short
+    moment after this call returns so its own response reaches the caller
+    first. Claude Code does NOT auto-reconnect a stdio MCP child whose
+    process is replaced: from an interactive session, run /mcp to
+    reconnect after this completes.
     """
     import os
     import sys
+    import threading
+
+    global _pending_reload_timer
 
     stale = _check_version_stale()
     log = logging.getLogger("synapt.recall")
@@ -3194,11 +3206,35 @@ def recall_reload() -> str:
     # Flush any pending DB writes
     _invalidate_cache()
 
-    # Replace this process with a fresh one
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+    def _delayed_execv() -> None:
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    # os.execv never returns — this is just for type checkers
-    return "Reloading..."  # pragma: no cover
+    # Defer the process replacement (measured with a minimal stdio client
+    # against the real server): calling os.execv() inline here, before
+    # returning, preempted this call's own response — a minimal stdio client
+    # timed out waiting for a reply to THIS call, then got an "Invalid
+    # request parameters" rejection on its next call, because the fresh
+    # process's MCP session was never initialized by that connection and
+    # nothing re-initializes it. The stdio pipe itself survives the execv;
+    # the MCP session handshake does not, and no client-side auto-reconnect
+    # exists to redo it.
+    #
+    # The timer is a daemon thread and exposed at module level (rather than
+    # fired inline in a way a caller cannot observe or cancel) because a
+    # caller — the real server or a test — must be able to prevent this
+    # scheduled execv from firing after it is no longer wanted; a stray
+    # timer firing unpatched os.execv() after a test's mock context has
+    # closed replaces the TEST RUNNER's own process, not a fixture.
+    timer = threading.Timer(0.2, _delayed_execv)
+    timer.daemon = True
+    _pending_reload_timer = timer
+    timer.start()
+
+    return (
+        "Reloading in ~0.2s. This connection will end when the process is "
+        "replaced. Claude Code does not auto-reconnect a stdio MCP child: "
+        "from an interactive session, run /mcp to reconnect."
+    )
 
 
 def _build_validating_fastmcp_class():
