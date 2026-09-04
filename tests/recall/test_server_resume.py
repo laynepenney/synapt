@@ -123,7 +123,16 @@ def test_recall_resume_reports_missing_index(monkeypatch, tmp_path):
     from synapt.recall import server
 
     monkeypatch.setattr(server, "project_index_dir", lambda: tmp_path)
-    out = server.recall_resume()
+    # _query_freshness_line reaches into Path.home()-based caller-transcript
+    # discovery (unrelated to project_index_dir) and, when it finds a real
+    # transcript, creates and populates recall.db at whatever index_dir it is
+    # given -- including this tmp_path -- as a side effect. On a desk with a
+    # real caller transcript that defeats the "index missing" check below
+    # before it ever runs, and the resume path that follows resolves the
+    # journal via an unmocked Path.cwd(), escaping to the real store. Bypass
+    # freshness entirely, same pattern as the sibling empty-index test.
+    with patch.object(server, "_query_freshness_line", return_value="Freshness: NOT_BOUND"):
+        out = server.recall_resume()
     assert out.startswith("No index found at")
     assert "synapt recall setup" in out
 
