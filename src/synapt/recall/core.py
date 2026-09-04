@@ -2541,25 +2541,16 @@ class TranscriptIndex:
         token_count = 0
         access_items: list[dict] = []
 
-        # Knowledge nodes first
-        for node in (knowledge_results or []):
-            block = self._format_knowledge_block(node)
-            block_tokens = len(block) // 4
-            if token_count + block_tokens > max_tokens and len(lines) > 1:
-                break
-            lines.append(block)
-            token_count += block_tokens
-            item_id = node.get("id", "")
-            access_items.append({
-                "item_type": "knowledge",
-                "item_id": item_id,
-                "score": node.get("score", 0.0),
-            })
-            wm.record("knowledge", item_id, node.get("content", ""))
-
         # Re-rank cluster hits by durability: durable clusters are more
         # valuable in concise mode (high-level context). Ephemeral clusters
-        # (debugging narration, navigation) get score discounts.
+        # (debugging narration, navigation) get score discounts. Computed
+        # BEFORE the knowledge loop so a token reservation can be made for
+        # it below — knowledge rows carry a static confidence*specificity*
+        # knowledge_boost multiplier clusters never get, so without a floor
+        # a handful of off-topic-but-boosted knowledge rows can consume the
+        # entire budget before cluster_hits is even considered (reproduced
+        # live: off-topic knowledge rows scoring 27-44 ran ahead of clusters
+        # on-topic for the query, scoring ~12.65).
         _durability_mult = {"durable": 1.0, "mixed": 0.8, "ephemeral": 0.5}
         ranked_hits = []
         for cluster_id, score in cluster_hits:
@@ -2570,6 +2561,42 @@ class TranscriptIndex:
             mult = _durability_mult.get(dur, 0.7)  # unclassified = 0.7
             ranked_hits.append((cluster_id, score * mult, info))
         ranked_hits.sort(key=lambda x: x[1], reverse=True)
+
+        # Reserve budget for at least the top MIN_CLUSTER_SURVIVORS cluster
+        # hits so an off-topic knowledge row can never fully displace them —
+        # a floor on cluster survival, not a floor on knowledge eligibility,
+        # since knowledge and cluster scores are not on a comparable scale
+        # (knowledge_boost alone can 2x a score; nothing on the cluster side
+        # corresponds to it). When there are no cluster hits to reserve for
+        # (e.g. the query only matches knowledge), the reservation is zero
+        # and knowledge rows behave exactly as before.
+        MIN_CLUSTER_SURVIVORS = 2
+        reserved_tokens = 0
+        for cluster_id, score, info in ranked_hits[:MIN_CLUSTER_SURVIVORS]:
+            reserved_tokens += len(self._format_cluster_block(cluster_id, info, query=query)) // 4
+        knowledge_ceiling = max(0, max_tokens - reserved_tokens)
+
+        # Knowledge nodes first, but never past the reserved cluster floor.
+        # The "show at least one item even if it's oversized" leniency only
+        # applies when there is nothing else to fall back on (no cluster
+        # hits) -- otherwise a single oversized knowledge block would still
+        # consume the whole budget on its first iteration and defeat the
+        # reservation above before it ever gets a chance to matter.
+        for node in (knowledge_results or []):
+            block = self._format_knowledge_block(node)
+            block_tokens = len(block) // 4
+            allow_oversized_first = len(lines) == 1 and not ranked_hits
+            if token_count + block_tokens > knowledge_ceiling and not allow_oversized_first:
+                break
+            lines.append(block)
+            token_count += block_tokens
+            item_id = node.get("id", "")
+            access_items.append({
+                "item_type": "knowledge",
+                "item_id": item_id,
+                "score": node.get("score", 0.0),
+            })
+            wm.record("knowledge", item_id, node.get("content", ""))
 
         # Cluster summaries — pass query for snippet extraction
         for cluster_id, score, info in ranked_hits:
