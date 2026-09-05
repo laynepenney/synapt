@@ -1267,6 +1267,101 @@ def test_materialize_all_chunks_batch_hydrates_instead_of_one_query_per_chunk(
     index._db.close()
 
 
+def test_materialize_all_chunks_updates_session_list_in_constant_time_per_chunk(
+    tmp_path, monkeypatch
+):
+    """recall#435 follow-on: the batch-hydration fix (above) still updated
+    session_chunks via `for pos, existing in enumerate(session_chunks): if
+    existing.id == loaded.id`, a linear scan run ONCE PER HYDRATED CHUNK --
+    O(session_length) per chunk, O(session_length^2) total for one large
+    session. Measured as the new dominant frame (22.3s tottime) once the DB
+    N+1 from the batch fix was resolved.
+
+    Wall-clock timing assertions are flaky under system load (see
+    test_oversize_catchup's own 2s-deadline flake, diagnosed the same day
+    this test was written) -- so this counts id-COMPARISONS directly via a
+    string subclass, rather than asserting a time bound. A single 400-chunk
+    session: O(n) touches on the order of n comparisons; the un-fixed
+    O(n^2) scan touches up to n^2/2 = 80,000. The bound below (1,500) is
+    comfortably above n for a linear fix and comfortably below n^2/2 for
+    the un-fixed scan, so it discriminates cleanly either way."""
+    from unittest.mock import Mock
+
+    from synapt.recall.storage import RecallDB
+
+    class CountingStr(str):
+        """A str whose __eq__ increments a shared counter -- lets the test
+        count exactly how many id-comparisons _materialize_all_chunks makes
+        without depending on wall-clock time."""
+
+        def __eq__(self, other):
+            CountingStr.comparisons += 1
+            return str.__eq__(self, other)
+
+        def __hash__(self):
+            return str.__hash__(self)
+
+        comparisons = 0
+
+    n = 400
+    chunks = [
+        TranscriptChunk(
+            id=f"big:{i}",
+            session_id="big-session",
+            timestamp=f"2026-03-01T{(i // 60) % 24:02d}:{i % 60:02d}:00Z",
+            turn_index=i,
+            user_text=f"turn {i} question",
+            assistant_text=f"turn {i} answer",
+        )
+        for i in range(n)
+    ]
+
+    directory = tmp_path / "index"
+    db = RecallDB(directory / "recall.db")
+    try:
+        db.save_chunks(chunks)
+    finally:
+        db.close()
+
+    index = TranscriptIndex.load(directory, use_embeddings=False)
+
+    # Relabel every stub chunk's id with the counting subclass AFTER load, so
+    # the counter measures only _materialize_all_chunks's own comparisons,
+    # not construction/loading overhead. The DB-loaded replacement chunks
+    # need the SAME treatment: a chunk loaded from load_chunks_by_rowids has
+    # a plain str id (built fresh from the DB row), so once it replaces a
+    # stub in session_chunks, a naive relabel-only-the-stubs approach stops
+    # seeing comparisons at that position after its first replacement --
+    # undercounting a real scan that still runs. Wrap the batch loader's
+    # return value to relabel loaded chunks' ids too, so every comparison
+    # for the life of the call is visible to the counter.
+    real_batch_load = index._db.load_chunks_by_rowids
+
+    def counting_batch_load(rowids):
+        result = real_batch_load(rowids)
+        for chunk in result.values():
+            chunk.id = CountingStr(chunk.id)
+        return result
+
+    batch = Mock(wraps=counting_batch_load)
+    monkeypatch.setattr(index._db, "load_chunks_by_rowids", batch)
+
+    for c in index.chunks:
+        c.id = CountingStr(c.id)
+    CountingStr.comparisons = 0
+
+    materialized = index._materialize_all_chunks()
+
+    assert len(materialized) == n
+    assert all(c.user_text for c in materialized)
+    assert CountingStr.comparisons < 1500, (
+        f"{CountingStr.comparisons} id-comparisons for {n} chunks in one "
+        f"session -- looks like an O(session_length) scan per hydrated "
+        f"chunk, not the O(1) position lookup this test guards"
+    )
+    index._db.close()
+
+
 # ---------------------------------------------------------------------------
 # Tests: build_index incremental change detection
 # ---------------------------------------------------------------------------
