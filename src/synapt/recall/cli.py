@@ -170,8 +170,16 @@ def _refuse_if_index_disagrees_with_source(
         "Error: index and source disagree on which workspace they belong to.",
         file=sys.stderr,
     )
-    print(f"  source (cwd):     {source_dir}  ->  workspace {source_root}", file=sys.stderr)
-    print(f"  index (ambient):  {index_dir}  ->  workspace {index_root}", file=sys.stderr)
+    # Resolved for printing, not just for the comparison above: source_root and
+    # index_root are already resolved (project_data_dir / _index_gripspace_root
+    # both call .resolve() internally), but the raw source_dir/index_dir
+    # arguments are not -- on Windows, an unresolved path can render in the
+    # short 8.3 form (RUNNER~1) while its resolved sibling renders long
+    # (runneradmin), so printing them unresolved beside their resolved roots
+    # made the two lines of the SAME error message use two different spellings
+    # of the same directory.
+    print(f"  source (cwd):     {source_dir.resolve()}  ->  workspace {source_root}", file=sys.stderr)
+    print(f"  index (ambient):  {index_dir.resolve()}  ->  workspace {index_root}", file=sys.stderr)
     print(
         "This usually means GRIPSPACE_ROOT or SYNAPT_RECALL_ROOT is set to a "
         "different workspace than your current directory. Fix the environment "

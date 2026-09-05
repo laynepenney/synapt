@@ -496,6 +496,55 @@ class TestResumeRefusesIndexSourceGripspaceMismatch(unittest.TestCase):
             self.assertIn("no index found", captured.getvalue())
             self.assertNotIn("disagree on which workspace", captured.getvalue())
 
+    def test_message_names_both_paths_in_their_resolved_form(self):
+        # A portable witness for the Windows short/long-name incident: on a
+        # windows-latest CI runner, an UNRESOLVED path can render in the short
+        # 8.3 form (e.g. RUNNER~1) while its RESOLVED sibling renders long
+        # (runneradmin) -- source_root/index_root are already resolved
+        # (project_data_dir / _index_gripspace_root each call .resolve()
+        # internally), so printing the raw source_dir/index_dir arguments
+        # beside them made the SAME error message spell the SAME directory two
+        # different ways on the SAME line, and a test asserting the raw
+        # (unresolved) string was a substring failed deterministically on
+        # every windows-latest job. A symlink reproduces the identical
+        # SHAPE cross-platform: the raw path string differs from its
+        # os-canonical form, on every OS this suite runs on.
+        import io
+
+        with self._tmp_symlink_world() as (index_dir, source_link):
+            captured = io.StringIO()
+            args = self._cmd_resume_args()
+            with mock.patch("sys.stderr", captured):
+                with self.assertRaises(SystemExit) as ctx:
+                    cli._refuse_if_index_disagrees_with_source(args, index_dir, source_link)
+
+            self.assertEqual(ctx.exception.code, 1)
+            message = captured.getvalue()
+            self.assertIn(f"source (cwd):     {source_link.resolve()}", message)
+            self.assertIn(f"index (ambient):  {index_dir.resolve()}", message)
+
+    def _tmp_symlink_world(self):
+        import contextlib
+        import tempfile
+
+        @contextlib.contextmanager
+        def _make():
+            with tempfile.TemporaryDirectory() as td:
+                tmp = Path(td)
+                real_index_root = tmp / "real-index-root"
+                index_link = tmp / "index-alias"
+                index_link.symlink_to(real_index_root, target_is_directory=True)
+                self._build_real_loadable_index(real_index_root / ".synapt" / "recall" / "index")
+
+                real_source_target = tmp / "real-source-target"
+                real_source_target.mkdir()
+                source_link = tmp / "source-alias"
+                source_link.symlink_to(real_source_target, target_is_directory=True)
+
+                yield index_link / ".synapt" / "recall" / "index", source_link
+
+        return _make()
+
 
 class TestNewestSourceProjectScope(unittest.TestCase):
     """this change's R1 (Sentinel): the Codex sessions dir holds EVERY project's
