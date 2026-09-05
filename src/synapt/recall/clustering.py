@@ -719,10 +719,18 @@ def recluster_stale_chunks(
     def _drain_command(remaining: int) -> str:
         if remaining <= 0:
             return ""
+        # Ceil division is a LOWER BOUND on runs needed, not a prediction:
+        # it assumes every chunk in every future batch actually clusters,
+        # which cluster_chunks()'s own MIN_CLUSTER_SIZE filtering does not
+        # guarantee (measured on the real store: 71 of 2000 selected chunks,
+        # 3.6%, actually formed a saved cluster in one run -- the rest stay
+        # stale and get reselected). "At least" is the honest word; a flat
+        # "N more runs" would overpromise convergence this function cannot
+        # itself guarantee.
         runs = -(-remaining // batch_size)  # ceil division
         return (
             f"synapt maintain --recluster --recluster-batch {batch_size} "
-            f"(run {runs} more time{'s' if runs != 1 else ''} to drain the backlog)"
+            f"(at least {runs} more run{'s' if runs != 1 else ''} to drain the backlog)"
         )
 
     if total_stale > refuse_above:

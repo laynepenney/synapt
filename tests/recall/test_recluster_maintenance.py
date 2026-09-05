@@ -194,6 +194,61 @@ def test_recluster_refuses_above_ceiling_and_names_the_drain_command(tmp_path):
         db.close()
 
 
+def test_recluster_ceiling_boundary_exact_value_proceeds_one_over_refuses(tmp_path):
+    """Pins the '>' in the refuse_above comparison: a mutant weakening it to
+    '>=' would refuse at the exact ceiling too, and every other test in this
+    file uses stale counts far from any ceiling, so nothing else catches
+    that one-token change."""
+    from synapt.recall.clustering import recluster_stale_chunks
+
+    project = _build_store_with_stale_chunks(tmp_path, turns=8)
+    db = _open_db(project)
+    try:
+        # Exactly AT the ceiling: must proceed (docstring says "above", not
+        # "at or above"). batch_size=100 so the whole set clusters in one go.
+        receipt_at = recluster_stale_chunks(db, batch_size=100, refuse_above=8)
+        assert receipt_at["refused"] is False, (
+            "total_stale == refuse_above must proceed, not refuse"
+        )
+    finally:
+        db.close()
+
+    second = tmp_path / "second"
+    second.mkdir()
+    project2 = _build_store_with_stale_chunks(second, turns=8)
+    db2 = _open_db(project2)
+    try:
+        # ONE past the ceiling: must refuse.
+        receipt_over = recluster_stale_chunks(db2, batch_size=100, refuse_above=7)
+        assert receipt_over["refused"] is True, (
+            "total_stale == refuse_above + 1 must refuse"
+        )
+    finally:
+        db2.close()
+
+
+def test_recluster_drain_command_names_the_actual_computed_run_count(tmp_path):
+    """Pins the ceil-division arithmetic itself: a mutant hardcoding
+    runs=1 would pass every other test in this file, because every other
+    scenario here happens to need exactly one more run."""
+    from synapt.recall.clustering import recluster_stale_chunks
+
+    # 12 chunks, same prefix/topic so they cluster together as one group
+    # (already established by the turns=8 e2e above) -- batch_size=5 leaves
+    # a deterministic remainder whose drain count is NOT 1.
+    project = _build_store_with_stale_chunks(tmp_path, turns=12)
+    db = _open_db(project)
+    try:
+        receipt = recluster_stale_chunks(db, batch_size=5)
+
+        assert receipt["still_stale"] == 7, receipt
+        # ceil(7 / 5) == 2 -- if this were hardcoded to 1, this assertion
+        # is the only thing in the file that would catch it.
+        assert "at least 2 more runs" in receipt["drain_command"], receipt
+    finally:
+        db.close()
+
+
 def test_recluster_processes_oldest_batch_first_and_reports_backlog(tmp_path):
     from synapt.recall.clustering import recluster_stale_chunks, stale_transcript_chunk_ids
 
