@@ -960,6 +960,13 @@ class TestCodexCwdCacheWiredIntoCommands(unittest.TestCase):
     reach the Codex scan actually arm it. Same "predicate exists but nothing
     consumes it" shape as TestTheBuildPreCheckReadsTheCodexArm above, one
     call site over.
+
+    Apollo's non-blocking R1 note on the follow-on (#dev m_7b6fb908): the
+    arming spy covered only 2 of the 6 wired commands (build, hook
+    precompact) — rescrub and setup, both genuinely wired in production,
+    have no witness and their arming call can be silently removed without
+    any test noticing. Parametrized over all six here; each invocation is
+    named so a subTest failure names the command, not just "one of six."
     """
 
     def setUp(self):
@@ -971,7 +978,7 @@ class TestCodexCwdCacheWiredIntoCommands(unittest.TestCase):
         os.chdir(self._orig_cwd)
         self._store.restore()
 
-    def test_cmd_build_arms_the_cache_at_the_projects_index_dir(self):
+    def _invoke_cmd_build(self, project: Path):
         import argparse
         from synapt.recall import cli
 
@@ -981,15 +988,35 @@ class TestCodexCwdCacheWiredIntoCommands(unittest.TestCase):
         )
         fake_index = mock.Mock()
         fake_index.stats.return_value = {"chunk_count": 1, "session_count": 1}
-        expected_index_dir = cli.project_index_dir(Path.cwd().resolve())
         with mock.patch.object(cli, "project_transcript_dirs", return_value=["dummy"]), \
              mock.patch.object(cli, "_check_legacy_index", return_value=None), \
-             mock.patch.object(cli, "_archive_and_build", return_value=fake_index), \
-             mock.patch("synapt.recall.codex.configure_cwd_cache") as spy:
+             mock.patch.object(cli, "_archive_and_build", return_value=fake_index):
             cli.cmd_build(args)
-        spy.assert_called_once_with(expected_index_dir)
 
-    def test_cmd_hook_precompact_arms_the_cache_at_the_projects_index_dir(self):
+    def _invoke_cmd_rebuild(self, project: Path):
+        from synapt.recall import cli
+
+        fake_index = mock.Mock()
+        fake_index.stats.return_value = {"chunk_count": 1, "session_count": 1}
+        with mock.patch.object(cli, "project_transcript_dirs", return_value=["dummy"]), \
+             mock.patch.object(cli, "_archive_and_build", return_value=fake_index):
+            cli.cmd_rebuild(mock.Mock(spec=[]))
+
+    def _invoke_cmd_rescrub(self, project: Path):
+        import argparse
+        from synapt.recall import cli
+
+        archive_dir = cli.project_archive_dir(project)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        (archive_dir / "dummy.jsonl").write_text('{"role": "user", "content": "hi"}\n')
+
+        args = argparse.Namespace(no_rebuild=False, no_embeddings=True)
+        fake_index = mock.Mock()
+        fake_index.stats.return_value = {"chunk_count": 1, "session_count": 1}
+        with mock.patch.object(cli, "_archive_and_build", return_value=fake_index):
+            cli.cmd_rescrub(args)
+
+    def _invoke_cmd_hook_precompact(self, project: Path):
         import argparse
         import io
         import sys
@@ -1000,8 +1027,50 @@ class TestCodexCwdCacheWiredIntoCommands(unittest.TestCase):
              mock.patch.object(cli, "_archive_and_build", return_value=None), \
              mock.patch.object(cli, "_sync_after_rebuild"), \
              mock.patch.object(cli, "_precompact_journal_write"), \
-             mock.patch("synapt.recall.channel.channel_heartbeat"), \
-             mock.patch("synapt.recall.codex.configure_cwd_cache") as spy:
-            expected_index_dir = cli.project_index_dir(Path.cwd().resolve())
+             mock.patch("synapt.recall.channel.channel_heartbeat"):
             cli.cmd_hook(argparse.Namespace(event="precompact"))
-        spy.assert_called_once_with(expected_index_dir)
+
+    def _invoke_cmd_setup(self, project: Path):
+        import argparse
+        from synapt.recall import cli
+
+        args = argparse.Namespace(
+            sync=None, no_hook=True, no_embeddings=True, global_scope=False,
+        )
+        with mock.patch.object(cli, "_check_legacy_index", return_value=None), \
+             mock.patch("synapt.recall.codex.discover_codex_sessions", return_value=None), \
+             mock.patch.object(cli.shutil, "which", return_value=None), \
+             mock.patch.object(cli, "_install_codex_skill", return_value=None):
+            cli.cmd_setup(args)
+
+    def _invoke_cmd_resume(self, project: Path):
+        import argparse
+        from synapt.recall import cli
+
+        index_dir = cli.project_index_dir(project)
+        index_dir.mkdir(parents=True, exist_ok=True)
+        (index_dir / "recall.db").touch()
+        args = argparse.Namespace(index=str(index_dir), project=project, session=None, turns=None)
+        with mock.patch("synapt.recall.resume.caller_transcripts", return_value=[]), \
+             mock.patch("synapt.recall.resume.load_resume_index", side_effect=SystemExit(0)):
+            with self.assertRaises(SystemExit):
+                cli.cmd_resume(args)
+
+    def test_all_six_wired_commands_arm_the_cache_at_the_projects_index_dir(self):
+        from synapt.recall import cli
+
+        project = Path.cwd().resolve()
+        expected_index_dir = cli.project_index_dir(project)
+        invocations = {
+            "build": self._invoke_cmd_build,
+            "rebuild": self._invoke_cmd_rebuild,
+            "rescrub": self._invoke_cmd_rescrub,
+            "hook precompact": self._invoke_cmd_hook_precompact,
+            "setup": self._invoke_cmd_setup,
+            "resume": self._invoke_cmd_resume,
+        }
+        for name, invoke in invocations.items():
+            with self.subTest(command=name):
+                with mock.patch("synapt.recall.codex.configure_cwd_cache") as spy:
+                    invoke(project)
+                spy.assert_called_once_with(expected_index_dir)
