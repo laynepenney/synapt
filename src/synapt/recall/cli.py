@@ -72,6 +72,7 @@ from synapt.recall.core import (
     project_transcript_dir,
     project_transcript_dirs,
     all_worktree_archive_dirs,
+    _gripspace_has_registered_repo,
     _is_real_user_message,
     _extract_user_text,
     _extract_assistant_content,
@@ -103,6 +104,82 @@ def _resolve_index_dir(args: argparse.Namespace) -> Path:
     if getattr(args, "out", None):
         return Path(args.out).expanduser()
     return project_index_dir()
+
+
+def _index_gripspace_root(index_dir: Path) -> Path | None:
+    """The workspace root implied by *index_dir*'s own canonical layout
+    (``<root>/.synapt/recall/index``). None if index_dir is not that shape --
+    a ``--index`` pointed at something else cannot be safely mapped back to a
+    root (same reasoning ``cold_no_caller_refresh`` already applies before it
+    will touch build.lock: its ``"custom_store"`` outcome)."""
+    resolved = index_dir.resolve()
+    parent = resolved.parent
+    if resolved.name == "index" and parent.name == "recall" and parent.parent.name == ".synapt":
+        return parent.parent.parent
+    return None
+
+
+def _refuse_if_index_disagrees_with_source(
+    args: argparse.Namespace, index_dir: Path, source_dir: Path
+) -> None:
+    """recall#1123: an ambient index_dir (no explicit ``--index``) resolved
+    via ``GRIPSPACE_ROOT``/``SYNAPT_RECALL_ROOT`` can point at a DIFFERENT
+    workspace than source_dir (cwd). Left unchecked, a caller that goes on
+    to rebuild (resume's cold no-caller path is the one that does) takes
+    THAT workspace's real build.lock and rebuilds ITS index using THIS
+    cwd's content: a cross-workspace index corruption, not merely a wrong
+    read.
+
+    v3 (Stromus's R2 on v2, m_4422aa09): a bare root-vs-root COMPARISON
+    refuses a shape that is legitimate BY DESIGN -- every real agent desk on
+    this host is a filesystem SIBLING of the team's shared GRIPSPACE_ROOT,
+    so ``source_root != index_root`` is true for every correctly-spawned
+    desk, not just for a poisoned one. The fix is a DISCRIMINATOR, not a
+    comparison: refuse only when source_dir's OWN gripspace is not itself
+    POPULATED (no registered repo), reusing recall#1124's
+    ``_gripspace_has_registered_repo`` -- the same signal that already
+    distinguishes a real ``gr spawn``/``gr repo add`` worktree from a
+    hand-built scratch dir for the marker-persistence half of this same
+    incident. A populated source proves this cwd was deliberately set up as
+    a desk; an unpopulated one is indistinguishable from the scratch dir a
+    stray env var poisoned in the original incident.
+
+    KNOWN LIMITATION, filed privately rather than detailed here: a
+    populated gripspace belonging to a DIFFERENT TEAM than the one
+    GRIPSPACE_ROOT names is not caught by this check -- "populated" only
+    proves SOME repo is registered, not that it is the SAME team's. Closing
+    that gap needs a registry signal this function does not have.
+
+    Refuses before anything can touch build.lock, printing both paths and
+    the fix. Skipped when ``--index`` was passed explicitly -- an explicit
+    override is a deliberate choice (``project_data_dir`` suppresses the
+    same env override the same way when project_dir is passed explicitly),
+    and it is also the fix this refusal points the caller at.
+    """
+    if getattr(args, "index", None):
+        return
+    index_root = _index_gripspace_root(index_dir)
+    if index_root is None:
+        return
+    source_root = project_data_dir(source_dir).parent.parent
+    if index_root.resolve() == source_root.resolve():
+        return
+    if _gripspace_has_registered_repo(source_root):
+        return
+    print(
+        "Error: index and source disagree on which workspace they belong to.",
+        file=sys.stderr,
+    )
+    print(f"  source (cwd):     {source_dir}  ->  workspace {source_root}", file=sys.stderr)
+    print(f"  index (ambient):  {index_dir}  ->  workspace {index_root}", file=sys.stderr)
+    print(
+        "This usually means GRIPSPACE_ROOT or SYNAPT_RECALL_ROOT is set to a "
+        "different workspace than your current directory. Fix the environment "
+        "variable, or pass --index explicitly if you really mean to target "
+        "that store.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def _check_legacy_index() -> Path | None:
@@ -446,6 +523,13 @@ def cold_no_caller_refresh(project_dir: Path, index_dir: Path) -> ColdRefreshOut
         # recall#1018). Build nothing, wait for nothing; the caller renders the
         # durable-checkpoint block and only that.
         return ColdRefreshOutcome(True, False, source.name, before, before, "lock_held")
+    # recall#1123 hardening: name both paths on every cold rebuild, even the
+    # (only) case that reaches here today -- store and source already agree.
+    # cmd_resume's own refusal only guards ITS ambient resolution; a future
+    # caller of cold_no_caller_refresh that skips that guard, or a bug that
+    # narrows the guard's scope, still leaves a legible trail of which store
+    # was rebuilt from which source, rather than silence either way.
+    print(f"[resume] refreshing store {store_root} from source {project_dir}", file=sys.stderr)
     try:
         _archive_and_build_locked(
             store_root, None, use_embeddings=False, incremental=True, chatgpt_archive=None,
@@ -1314,7 +1398,12 @@ def _configure_codex_cwd_cache(index_dir: Path) -> None:
 def cmd_build(args: argparse.Namespace) -> None:
     """Build a transcript index from local files, HuggingFace, or ChatGPT."""
     project = Path.cwd().resolve()
-    _configure_codex_cwd_cache(project_index_dir(project))
+    index_dir = project_index_dir(project)
+    # recall#1123 hardening: index_dir is derived FROM project here, so this
+    # can only fire if a future change gives cmd_build its own ambient
+    # index resolution -- an invariant assertion, not a live guard today.
+    _refuse_if_index_disagrees_with_source(args, index_dir, project)
+    _configure_codex_cwd_cache(index_dir)
     use_emb = not args.no_embeddings
 
     # Re-scrub archives if requested
@@ -1715,10 +1804,12 @@ def cmd_sessions(args: argparse.Namespace) -> None:
 def cmd_resume(args: argparse.Namespace) -> None:
     """Print the tail of a session so a fresh session can pick up where it stopped.
 
-    Three outcomes are kept distinguishable because they have different fixes:
-    no index at all (exit 1 — build one), an index with no sessions (exit 0 —
-    nothing to resume), and a session id that does not resolve (exit 1 — the
-    request was wrong). Collapsing them would send the reader down the wrong path.
+    Four outcomes are kept distinguishable because they have different fixes:
+    index and source disagree on which workspace they belong to (exit 1 —
+    fix the environment or pass --index), no index at all (exit 1 — build
+    one), an index with no sessions (exit 0 — nothing to resume), and a
+    session id that does not resolve (exit 1 — the request was wrong).
+    Collapsing them would send the reader down the wrong path.
     """
     from synapt.recall.journal import _journal_path
     from synapt.recall.resume import (
@@ -1731,6 +1822,9 @@ def cmd_resume(args: argparse.Namespace) -> None:
     from synapt.recall.sharding import is_sharded
 
     index_dir = _resolve_index_dir(args)
+    project = getattr(args, "project", None) or Path.cwd()
+    _refuse_if_index_disagrees_with_source(args, index_dir, project)
+
     if (
         not (index_dir / "recall.db").exists()
         and not (index_dir / "chunks.jsonl").exists()
@@ -1748,7 +1842,6 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # unchanged.
     _configure_codex_cwd_cache(index_dir)
 
-    project = getattr(args, "project", None) or Path.cwd()
     caller_sources = caller_transcripts(project)
 
     # Cold no-caller refresh (durable-checkpoint follow-on): on a cold cross-runtime
@@ -3483,7 +3576,13 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # Rebuild with sync
         project = Path.cwd().resolve()
         if project_transcript_dirs(project):
-            _configure_codex_cwd_cache(project_index_dir(project))
+            precompact_index_dir = project_index_dir(project)
+            # recall#1123 hardening: same invariant assertion as cmd_build --
+            # index_dir is derived FROM project here, so a live refusal would
+            # mean a future change gave this branch its own ambient index
+            # resolution.
+            _refuse_if_index_disagrees_with_source(args, precompact_index_dir, project)
+            _configure_codex_cwd_cache(precompact_index_dir)
             final_index = _archive_and_build(project, use_embeddings=False, incremental=True)
             if final_index:
                 stats = final_index.stats()
