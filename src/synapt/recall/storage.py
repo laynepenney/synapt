@@ -2411,6 +2411,53 @@ class RecallDB:
         cur.execute("INSERT INTO clusters_fts(clusters_fts) VALUES ('rebuild')")
         self._conn.commit()
 
+    def append_clusters(
+        self,
+        clusters: list[dict],
+        chunk_memberships: list[tuple[str, str, str]],
+    ) -> None:
+        """Insert NEW clusters/memberships without touching existing ones.
+
+        recall#435 follow-on (the recluster maintenance op): ``save_clusters``
+        above is a full-corpus REPLACE -- it deletes every ``cluster_type =
+        'topic'`` row before inserting, which is correct for a full build but
+        would erase every already-clustered chunk if used to add a small
+        incremental batch of newly-stale chunks. This is the additive
+        counterpart: plain inserts, ``OR IGNORE`` so a rerun over the same
+        (already-applied) batch is a no-op rather than a duplicate-key error.
+        """
+        cur = self._conn.cursor()
+        for c in clusters:
+            cur.execute(
+                "INSERT OR IGNORE INTO clusters "
+                "(cluster_id, topic, search_text, cluster_type, session_ids, branch, "
+                " date_start, date_end, chunk_count, status, tags, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    c["cluster_id"],
+                    c["topic"],
+                    c.get("search_text", ""),
+                    c.get("cluster_type", "topic"),
+                    json.dumps(c.get("session_ids", [])),
+                    c.get("branch"),
+                    c.get("date_start"),
+                    c.get("date_end"),
+                    c.get("chunk_count", 0),
+                    c.get("status", "active"),
+                    json.dumps(c.get("tags", [])),
+                    c["created_at"],
+                    c["updated_at"],
+                ),
+            )
+        for cluster_id, chunk_id, added_at in chunk_memberships:
+            cur.execute(
+                "INSERT OR IGNORE INTO cluster_chunks "
+                "(cluster_id, chunk_id, added_at) VALUES (?, ?, ?)",
+                (cluster_id, chunk_id, added_at),
+            )
+        cur.execute("INSERT INTO clusters_fts(clusters_fts) VALUES ('rebuild')")
+        self._conn.commit()
+
     def load_clusters(self, status: str = "active") -> list[dict]:
         """Load clusters filtered by status."""
         rows = self._conn.execute(

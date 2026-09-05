@@ -208,6 +208,9 @@ class ShardedRecallDB:
     def save_clusters(self, clusters: list[dict], memberships: list[tuple]) -> None:
         self._index.save_clusters(clusters, memberships)
 
+    def append_clusters(self, clusters: list[dict], memberships: list[tuple]) -> None:
+        self._index.append_clusters(clusters, memberships)
+
     def save_cluster_summary(self, cluster_id: str, summary: str, **kwargs) -> None:
         self._index.save_cluster_summary(cluster_id, summary, **kwargs)
 
