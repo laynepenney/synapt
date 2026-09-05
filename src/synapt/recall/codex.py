@@ -107,17 +107,31 @@ def flush_cwd_cache() -> None:
     (a stat() failure already refuses to serve a stale entry on read — see
     _session_cwd — so this is a cleanup at write time, not a correctness fix
     at read time).
+
+    Written atomically (temp file in the same directory, then os.replace):
+    build, rebuild, rescrub, hook, setup, and resume can all flush this same
+    cache file, so a crash or a second concurrent flush mid-write must never
+    leave a half-written, unparseable cache file for the next reader —
+    configure_cwd_cache already degrades a corrupt file to an empty cache,
+    but a corrupt file discards every entry it held, not just the ones that
+    changed. os.replace is atomic on both POSIX and Windows.
     """
     global _cwd_cache_dirty
     if _cwd_cache_index_dir is None or not _cwd_cache_dirty or _cwd_cache is None:
         return
     for key in [k for k in _cwd_cache if not Path(k).exists()]:
         del _cwd_cache[key]
+    cache_path = _cwd_cache_index_dir / _CWD_CACHE_FILENAME
+    tmp_path = cache_path.with_name(f"{cache_path.name}.tmp-{os.getpid()}")
     try:
-        (_cwd_cache_index_dir / _CWD_CACHE_FILENAME).write_text(json.dumps(_cwd_cache))
+        tmp_path.write_text(json.dumps(_cwd_cache))
+        os.replace(tmp_path, cache_path)
         _cwd_cache_dirty = False
     except OSError:
-        pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _project_roots(project_dir: Path | None = None) -> list[Path]:

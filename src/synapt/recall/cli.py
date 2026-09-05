@@ -1292,9 +1292,29 @@ def cmd_split(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _configure_codex_cwd_cache(index_dir: Path) -> None:
+    """Arm the process-wide Codex session-cwd cache (recall#1125) for
+    *index_dir* and guarantee it flushes at exit.
+
+    Shared by every command whose call graph can reach
+    ``list_codex_transcripts``/``caller_transcripts`` — a top-level command
+    that reads Codex sessions without arming this cache pays the unscoped
+    machine-wide scan cost the cache exists to avoid every single call,
+    exactly as resume did before recall#1125's first fix. ``atexit`` covers
+    early ``sys.exit`` paths the same way it does in ``cmd_resume``.
+    """
+    import atexit
+
+    from synapt.recall.codex import configure_cwd_cache, flush_cwd_cache
+
+    configure_cwd_cache(index_dir)
+    atexit.register(flush_cwd_cache)
+
+
 def cmd_build(args: argparse.Namespace) -> None:
     """Build a transcript index from local files, HuggingFace, or ChatGPT."""
     project = Path.cwd().resolve()
+    _configure_codex_cwd_cache(project_index_dir(project))
     use_emb = not args.no_embeddings
 
     # Re-scrub archives if requested
@@ -1700,9 +1720,6 @@ def cmd_resume(args: argparse.Namespace) -> None:
     nothing to resume), and a session id that does not resolve (exit 1 — the
     request was wrong). Collapsing them would send the reader down the wrong path.
     """
-    import atexit
-
-    from synapt.recall.codex import configure_cwd_cache, flush_cwd_cache
     from synapt.recall.journal import _journal_path
     from synapt.recall.resume import (
         ResumeError,
@@ -1728,10 +1745,8 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # freshness check and the cold-path archive) shares one process-wide
     # cache keyed off this index_dir, so a resume that opens a Codex rollout
     # file once does not reopen it on the next call as long as it is
-    # unchanged. atexit guarantees the flush runs on every exit path in this
-    # function, including the early sys.exit(1) paths below.
-    configure_cwd_cache(index_dir)
-    atexit.register(flush_cwd_cache)
+    # unchanged.
+    _configure_codex_cwd_cache(index_dir)
 
     project = getattr(args, "project", None) or Path.cwd()
     caller_sources = caller_transcripts(project)
@@ -1932,6 +1947,8 @@ def cmd_rebuild(args: argparse.Namespace) -> None:
     if not project_transcript_dirs(project):
         return
 
+    _configure_codex_cwd_cache(project_index_dir(project))
+
     final_index = _archive_and_build(
         project,
         use_embeddings=False,
@@ -1990,6 +2007,7 @@ def cmd_rescrub(args: argparse.Namespace) -> None:
     print(f"[rescrub] Scrubbed {total} archived transcript(s)")
 
     if not args.no_rebuild:
+        _configure_codex_cwd_cache(project_index_dir(project))
         print("[rescrub] Rebuilding index from scrubbed transcripts ...")
         use_emb = not getattr(args, "no_embeddings", False)
         final_index = _archive_and_build(
@@ -3465,6 +3483,7 @@ def cmd_hook(args: argparse.Namespace) -> None:
         # Rebuild with sync
         project = Path.cwd().resolve()
         if project_transcript_dirs(project):
+            _configure_codex_cwd_cache(project_index_dir(project))
             final_index = _archive_and_build(project, use_embeddings=False, incremental=True)
             if final_index:
                 stats = final_index.stats()
@@ -3559,6 +3578,7 @@ def cmd_setup(args: argparse.Namespace) -> None:
     )
 
     project = Path.cwd().resolve()
+    _configure_codex_cwd_cache(project_index_dir(project))
     print(f"[setup] Project: {project}")
     print()
 
