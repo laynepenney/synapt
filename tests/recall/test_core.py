@@ -1204,6 +1204,69 @@ def test_list_sessions_batch_hydrates_candidate_sessions(tmp_path, monkeypatch):
     index._db.close()
 
 
+def test_materialize_all_chunks_batch_hydrates_instead_of_one_query_per_chunk(
+    tmp_path, monkeypatch
+):
+    """recall#435: _materialize_all_chunks looped _get_chunk(i) one at a time,
+    issuing one single-row DB query per chunk (335,524 calls / 40.1s cumtime
+    measured against a 167,762-chunk store, the dominant frame in `stats`'s
+    cold-start cost). load_chunks_by_rowids already exists and is already used
+    by list_sessions (test above) -- this wires the same batch path into
+    _materialize_all_chunks instead of inventing new plumbing."""
+    from unittest.mock import Mock
+
+    from synapt.recall.storage import RecallDB
+
+    directory = tmp_path / "index"
+    db = RecallDB(directory / "recall.db")
+    try:
+        db.save_chunks(make_test_chunks())
+    finally:
+        db.close()
+
+    index = TranscriptIndex.load(directory, use_embeddings=False)
+    batch = Mock(wraps=index._db.load_chunks_by_rowids)
+    monkeypatch.setattr(index._db, "load_chunks_by_rowids", batch)
+    monkeypatch.setattr(
+        index,
+        "_get_chunk",
+        lambda _idx: (_ for _ in ()).throw(
+            AssertionError("materialize_all_chunks hydrated one chunk at a time")
+        ),
+    )
+
+    chunks = index._materialize_all_chunks()
+
+    assert len(chunks) == len(make_test_chunks())
+    assert all(c.user_text or c.assistant_text or c.tool_content for c in chunks)
+    batch.assert_called_once()
+
+    # A batch-loaded chunk must refresh the SAME two side-indexes the old
+    # per-chunk _get_chunk path refreshed: index.sessions (the per-session
+    # chunk list search_and other paths read) and _turn_lookup (turn-indexed
+    # access). Refreshing only self.chunks and leaving these pointing at the
+    # pre-hydration stub is silent -- nothing in the assertions above would
+    # catch it, since len()/user_text/batch-call-count are all unaffected by
+    # a side-index left stale. Identity (`is`), not equality: a stub and its
+    # hydrated replacement can compare equal on shared fields while being
+    # two different objects, so only `is` proves the refresh actually ran.
+    for idx, chunk in enumerate(chunks):
+        session_chunks = index.sessions[chunk.session_id]
+        matching = [c for c in session_chunks if c.id == chunk.id]
+        assert len(matching) == 1
+        assert matching[0] is chunk, (
+            f"index.sessions[{chunk.session_id!r}] still holds the pre-hydration "
+            f"chunk for {chunk.id!r}, not the batch-loaded one"
+        )
+        if chunk.turn_index >= 0:
+            assert index._turn_lookup[(chunk.session_id, chunk.turn_index)] is chunk, (
+                f"_turn_lookup[{(chunk.session_id, chunk.turn_index)!r}] still holds "
+                f"the pre-hydration chunk, not the batch-loaded one"
+            )
+
+    index._db.close()
+
+
 # ---------------------------------------------------------------------------
 # Tests: build_index incremental change detection
 # ---------------------------------------------------------------------------

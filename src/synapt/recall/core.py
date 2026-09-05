@@ -1441,11 +1441,41 @@ class TranscriptIndex:
         return loaded
 
     def _materialize_all_chunks(self) -> list[TranscriptChunk]:
-        """Force hydration of all chunks when a full-scan path needs raw text."""
-        if not self._lazy_chunks:
+        """Force hydration of all chunks when a full-scan path needs raw text.
+
+        recall#435: this used to call _get_chunk(i) once per chunk, issuing one
+        single-row DB query per chunk (the dominant cost of a cold `stats` run
+        against a large store -- 335,524 calls / 40.1s cumtime measured against
+        167,762 chunks). load_chunks_by_rowids already exists and is already
+        used the same way by list_sessions's own batch-hydration path; this
+        collects every rowid that still needs hydrating and loads them in one
+        batched call (SQLite-variable-limit-chunked inside load_chunks_by_rowids
+        itself) instead of N individual round-trips.
+        """
+        if not self._lazy_chunks or self._db is None:
             return self.chunks
-        for i in range(len(self.chunks)):
-            self._get_chunk(i)
+        to_load: dict[int, int] = {}
+        for i, chunk in enumerate(self.chunks):
+            if chunk.user_text or chunk.assistant_text or chunk.tool_content or chunk.transcript_path:
+                continue
+            rowid = self._idx_to_rowid.get(i)
+            if rowid is not None:
+                to_load[rowid] = i
+        if not to_load:
+            return self.chunks
+        loaded_by_rowid = self._db.load_chunks_by_rowids(list(to_load.keys()))
+        for rowid, idx in to_load.items():
+            loaded = loaded_by_rowid.get(rowid)
+            if loaded is None:
+                continue
+            self.chunks[idx] = loaded
+            session_chunks = self.sessions.get(loaded.session_id, [])
+            for pos, existing in enumerate(session_chunks):
+                if existing.id == loaded.id:
+                    session_chunks[pos] = loaded
+                    break
+            if loaded.turn_index >= 0:
+                self._turn_lookup[(loaded.session_id, loaded.turn_index)] = loaded
         return self.chunks
 
     def _ensure_embeddings_loaded(self) -> None:
