@@ -856,6 +856,29 @@ class TestCarryForwardAgingAndBound(unittest.TestCase):
         self.assertEqual(merged, [])
         self.assertEqual(report.retired_by_done, 1)
 
+    def test_done_retires_a_double_bulleted_write_echo(self):
+        """recall#984 v2 (Stromus R2, #dev, 2026-09-05): a done item can
+        ALREADY carry a leading "- " in storage (auto-extraction or a
+        copy-paste that included one), and the tool's own read-back renderers
+        (format_entry_full, format_for_session_start) add ANOTHER "- " on top
+        for display -- the write-echo shape is "- - <step>". A single strip
+        (v1's fix) removes only the outer bullet and leaves one behind, so
+        this shape still failed to retire in Stromus's real-carried-step
+        probe (0 retired, 2 carried) even though plain text, one bullet, and
+        stamped text all correctly retired 1. Bullets must strip repeatedly,
+        not once."""
+        from synapt.recall.journal import merge_carried_forward_with_report
+        prev = self._entry(
+            "2026-08-20T09:00:00+00:00",
+            ["work out why the index rebuild stalls on cold start [carried since 2026-08-10]"],
+        )
+        double_bulleted_line = (
+            "- - work out why the index rebuild stalls on cold start [carried since 2026-08-10]"
+        )
+        merged, report = merge_carried_forward_with_report([], [double_bulleted_line], prev)
+        self.assertEqual(merged, [])
+        self.assertEqual(report.retired_by_done, 1)
+
     def test_near_miss_does_not_retire(self):
         """The issue's explicit ask: rewording must NOT retire; only exact text does."""
         from synapt.recall.journal import merge_carried_forward_with_report
