@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 crewai_memory = pytest.importorskip("crewai.memory")
@@ -8,6 +10,22 @@ crewai_types = pytest.importorskip("crewai.memory.types")
 CrewAIMemory = crewai_memory.Memory
 MemoryMatch = crewai_types.MemoryMatch
 MemoryRecord = crewai_types.MemoryRecord
+
+# crewai's Memory defaults BOTH its vector embedder and its remember()/recall()
+# classification path to a real LLM call (crewai>=1.4.0's unified_memory.py
+# unconditionally builds an LLM instance inside _encode_batch, regardless of
+# whether categories/importance are passed explicitly to remember(), and
+# recall()'s default depth="deep" needs the LLM too for its RecallFlow) -- so
+# there is no public kwarg path to make this suite hermetic without wiring a
+# fake LLM into a test meant to exercise our real adapter logic. Skip cleanly
+# rather than fail loudly when no provider credential is configured, matching
+# the pattern used for the MLX-guarded tests elsewhere in this suite.
+pytestmark = pytest.mark.skipif(
+    not (os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")),
+    reason="crewai's Memory needs a real LLM + embedder credential "
+    "(OPENAI_API_KEY or ANTHROPIC_API_KEY) for its default remember()/recall() "
+    "path; no credential is configured here.",
+)
 
 
 def _adapter_cls():
