@@ -217,6 +217,31 @@ class ShardedRecallDB:
     def get_recluster_attempted_ids(self) -> set[str]:
         return self._index.get_recluster_attempted_ids()
 
+    def save_cluster_token_signature(
+        self, cluster_id: str, tokens: list[str], updated_at: str,
+    ) -> None:
+        self._index.save_cluster_token_signature(cluster_id, tokens, updated_at)
+
+    def load_cluster_token_signatures(self) -> dict[str, set[str]]:
+        return self._index.load_cluster_token_signatures()
+
+    def active_topic_clusters_missing_signature(self) -> list[str]:
+        return self._index.active_topic_clusters_missing_signature()
+
+    def load_cluster_member_chunk_ids(self, cluster_ids: list[str]) -> dict[str, list[str]]:
+        return self._index.load_cluster_member_chunk_ids(cluster_ids)
+
+    def load_cluster_topics(self, cluster_ids: list[str]) -> dict[str, str]:
+        return self._index.load_cluster_topics(cluster_ids)
+
+    def merge_chunks_into_cluster(
+        self, cluster_id: str, chunk_ids: list[str], appended_text: str, added_at: str,
+        run_id: str | None = None,
+    ) -> None:
+        self._index.merge_chunks_into_cluster(
+            cluster_id, chunk_ids, appended_text, added_at, run_id=run_id,
+        )
+
     def save_cluster_summary(self, cluster_id: str, summary: str, **kwargs) -> None:
         self._index.save_cluster_summary(cluster_id, summary, **kwargs)
 

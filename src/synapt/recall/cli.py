@@ -4115,7 +4115,10 @@ def cmd_maintain(args: argparse.Namespace) -> None:
         recluster_receipt = None
         if getattr(args, "recluster", False):
             batch_size = args.recluster_batch or clustering.DEFAULT_RECLUSTER_BATCH
-            recluster_receipt = clustering.recluster_stale_chunks(db, batch_size=batch_size)
+            recluster_receipt = clustering.recluster_stale_chunks(
+                db, batch_size=batch_size,
+                merge_into_existing=getattr(args, "recluster_merge", False),
+            )
     finally:
         db.close()
 
@@ -4133,7 +4136,8 @@ def cmd_maintain(args: argparse.Namespace) -> None:
             print(
                 f"  Recluster: {r['batches_run']} batch(es), "
                 f"{r['fresh_in_batch']} fresh + {r['fallback_in_batch']} fallback "
-                f"in the batch, {r['chunks_clustered']} chunk(s) clustered this run, "
+                f"in the batch, {r['chunks_clustered']} chunk(s) clustered this run "
+                f"({r.get('merged_into_existing', 0)} merged into existing clusters), "
                 f"{r['still_stale']} still stale"
                 + (f". {r['drain_command']}" if r["drain_command"] else ".")
             )
@@ -4511,6 +4515,13 @@ def make_parser() -> argparse.ArgumentParser:
         help="Stale chunks to cluster this run (default: "
              "clustering.DEFAULT_RECLUSTER_BATCH). Bounded on purpose -- this "
              "is what keeps --recluster from repeating recall#435's OOM.",
+    )
+    maintain_parser.add_argument(
+        "--recluster-merge", action="store_true",
+        help="With --recluster, let a stale chunk join an EXISTING cluster "
+             "(Jaccard-matched against cluster search_text, cheap) before "
+             "self-batch clustering runs, instead of only ever forming new "
+             "clusters from same-batch matches. Default off.",
     )
 
     migrate_parser = subparsers.add_parser(

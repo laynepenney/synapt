@@ -65,12 +65,107 @@ MIN_CLUSTER_SIZE = 2      # Singleton clusters are not useful
 MAX_CLUSTER_SIZE = 20     # Split threshold (future)
 MIN_TOKENS = 3            # Chunks with fewer tokens are noise
 
+# A stale-chunk-to-existing-cluster match compares against a
+# bounded, persisted per-cluster signature (top N tokens by within-cluster
+# document frequency), not the full member set. Starting values, subject to
+# revision after a hand-read of real matches -- not tuned from a synthetic
+# target.
+TOP_SIGNATURE_TOKENS = 64        # signature size cap
+CONTAINMENT_THRESHOLD = 0.20     # fraction of the signature that must be present
+MIN_SHARED_SIGNATURE_TOKENS = 8  # absolute floor: ratio alone lets a tiny
+                                  # signature "match" on a handful of coincidental tokens
 
-def _chunk_tokens(chunk: TranscriptChunk) -> set[str]:
-    """Extract distinctive tokens from a chunk's text content."""
-    text = f"{chunk.user_text} {chunk.assistant_text}"
+# Harness-injected wrapper blocks, verified with matching
+# open/close counts on a real 2000-chunk stale batch (skill 162/162,
+# command-message 111/111, local-command-stdout 9/9). These are structural
+# artifacts of HOW a message reached the transcript, not conversational
+# content, and the SAME block repeats verbatim across many otherwise-
+# unrelated turns (measured: 477 of 2000 stale chunks in that batch carried
+# a <skill> block alone). Stripped unconditionally, before any statistical
+# guard -- exact and cheap beats probabilistic where the shape is known.
+# ``task-notification`` is NOT here: it never closes in this corpus (0/35
+# on the same batch), evidently truncated upstream before the closing tag
+# -- left to the per-batch data-derived guard in recluster_stale_chunks,
+# which does not need a clean tag pair to work.
+_HARNESS_PREAMBLE_TAGS = ("skill", "command-message", "local-command-stdout")
+_HARNESS_PREAMBLE_RE = _re.compile(
+    r"<(" + "|".join(_HARNESS_PREAMBLE_TAGS) + r")>.*?</\1>", _re.DOTALL,
+)
+
+
+def _strip_harness_preamble(text: str) -> str:
+    """Remove KNOWN harness-injected wrapper blocks before tokenizing."""
+    return _HARNESS_PREAMBLE_RE.sub(" ", text)
+
+
+# recall's OWN synthetic restatement, not the harness's. core.py
+# gives every sub-chunk PAST THE FIRST of a long assistant reply this string
+# as its ENTIRE user_text (see core.py's chunk-splitting loop and resume.py's
+# _is_continuation, which checks the same literal prefix): a truncated echo
+# of the ONE user turn that started the exchange. Two sub-chunks of the same
+# exchange therefore share this exact string verbatim, which inflates their
+# apparent similarity for reasons that have nothing to do with what either
+# chunk actually SAYS -- measured store-wide: 102,669 of 169,053 chunks carry
+# it, and one traced merge (found via hand-read) matched almost entirely on
+# a shared echo, not shared substance. Since it is the WHOLE field rather
+# than a span inside a larger blob (unlike the tags above), the fix is to
+# drop the field entirely when it starts with this marker, not to regex out
+# a substring -- the echoed text itself can contain stray punctuation
+# (it's an arbitrary 100-char slice of real user text) that would break a
+# span-based end-of-block match.
+_CONTEXT_ECHO_PREFIX = "(context: User previously asked:"
+
+
+def _has_letter(token: str) -> bool:
+    """True if ``token`` carries at least one alphabetic character.
+
+    Hand-read finding: a "User selected: <path>\\nN\\u2192<code>" editor
+    line-selection echo puts bare decimal line numbers into the token
+    stream (``_tokenize`` keeps digit-only strings as-is), and two entirely
+    unrelated files that both happen to have a selection starting around
+    the same line number then share dozens of "distinctive" tokens that are
+    really just consecutive integers -- coincidence, not topic overlap.
+    Measured: one real cluster signature was 64/64 bare numbers, no
+    topical content at all, and would contentedly match any other
+    numbered-code excerpt in a similar line range. There is no dash or
+    arrow token to special-case: ``_tokenize``'s charset (``[a-zA-Z0-9_.]``)
+    already treats ``-`` and ``\\u2192`` as separators, so "100-200" and
+    "100\\u2192200" both arrive as plain per-number tokens already, not one
+    joined token -- the general rule (a content token has at least one
+    letter) is what actually needs to hold, not a shape-specific strip.
+    """
+    return any(c.isalpha() for c in token)
+
+
+def _chunk_tokens(
+    chunk: TranscriptChunk, extra_stopwords: frozenset[str] = frozenset(),
+) -> set[str]:
+    """Extract distinctive tokens from a chunk's text content.
+
+    Drops recall's own synthetic context-echo user_text FIRST (see
+    ``_CONTEXT_ECHO_PREFIX`` -- it is not the turn's content, so a
+    comparison that can see it compares the echo, not the chunk), then
+    strips known harness preamble blocks (structural, unconditional, see
+    ``_HARNESS_PREAMBLE_TAGS``), then applies ``extra_stopwords`` -- a
+    DATA-DERIVED, per-caller stoplist (see ``compute_boilerplate_stoplist``)
+    for whatever boilerplate the two structural strips above do not have
+    an exact shape for -- and finally drops any token with no letters at
+    all (see ``_has_letter``): a run of digits can be pervasive between two
+    otherwise-unrelated chunks by pure coincidence in a way an English or
+    code word essentially cannot. Default empty: every existing caller is
+    unaffected until it opts in.
+    """
+    user_text = (
+        "" if chunk.user_text.lstrip().startswith(_CONTEXT_ECHO_PREFIX)
+        else chunk.user_text
+    )
+    text = _strip_harness_preamble(f"{user_text} {chunk.assistant_text}")
     tokens = _tokenize(text)
-    return {t for t in tokens if t not in _STOP_TOKENS and len(t) > 2}
+    return {
+        t for t in tokens
+        if t not in _STOP_TOKENS and t not in extra_stopwords and len(t) > 2
+        and _has_letter(t)
+    }
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -80,6 +175,132 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     intersection = len(a & b)
     union = len(a | b)
     return intersection / union if union > 0 else 0.0
+
+
+def _cluster_signature_tokens(
+    token_sets: list[set[str]],
+    top_n: int = TOP_SIGNATURE_TOKENS,
+    extra_stopwords: frozenset[str] = frozenset(),
+) -> list[str]:
+    """A cluster's bounded signature: the top ``top_n`` tokens by
+    WITHIN-cluster document frequency (how many member chunks contain the
+    token -- each ``ts`` is a per-chunk SET, so ``Counter.update(ts)``
+    counts exactly one per member that has the token, never raw occurrence
+    count). Same quantity ``_extract_topic`` computes for its own DF-IDF
+    ranking; kept as a separate small pass here rather than threading a
+    second return value through that function's existing call sites.
+
+    ``extra_stopwords`` is filtered here TOO, not only at ``_chunk_tokens``:
+    if ``token_sets`` ever arrives from a path that does not route through
+    ``_chunk_tokens`` (a call site added later, say), the signature is still
+    protected from data-derived boilerplate rather than silently trusting
+    an upstream filter that may not apply.
+    """
+    document_frequency: Counter[str] = Counter()
+    for ts in token_sets:
+        document_frequency.update(t for t in ts if t not in extra_stopwords)
+    return [tok for tok, _ in document_frequency.most_common(top_n)]
+
+
+def compute_boilerplate_stoplist(
+    token_sets: dict[str, set[str]], min_fraction: float = 0.20,
+) -> list[tuple[str, float]]:
+    """A DATA-DERIVED stoplist: tokens present in more than ``min_fraction``
+    of the given token sets, sorted by fraction descending.
+
+    Population-agnostic -- ``token_sets`` can be cluster signatures OR a
+    batch of chunks, keyed by whatever id the caller has. The POPULATION
+    it is computed over matters more than the mechanism: measured on the
+    real store, a skill-preamble token was under 2% of persisted cluster
+    signatures (which skew toward older, already-clustered content) but
+    23.9% of one actual stale-chunk batch (recently-fired activity), so a
+    stoplist derived from signatures did not see the batch's problem at
+    all. ``recluster_stale_chunks`` calls this on the CURRENT batch, never
+    on cluster signatures -- a signature-derived stoplist was tried and
+    rejected: on this corpus its top tokens are the team's own real
+    process vocabulary (agent names, "gate", "ratify", "merge"), and
+    stripping those would remove real topical signal, not just noise.
+
+    Unlike ``_STOP_TOKENS`` (hand-curated, general-English function words),
+    this catches vocabulary that is common for reasons that have nothing to
+    do with topical similarity -- concretely, whatever a structural strip
+    (see ``_HARNESS_PREAMBLE_TAGS``, ``_CONTEXT_ECHO_PREFIX``) does not have
+    an exact shape for. Returns empty on no token sets (division by zero
+    avoided, not silently wrong).
+
+    A batch-derived drop list naming this team's OWN process words (e.g.
+    "dev", "review", "channel" -- measured on a real batch) is expected and
+    is not the signature-rejection problem repeating: it is recomputed from
+    THIS batch alone, discarded when the run ends, and never written to a
+    persisted signature, so it cannot permanently erase a topic's real
+    vocabulary the way stripping it from a signature would.
+    """
+    total = len(token_sets)
+    if total == 0:
+        return []
+    document_frequency: Counter[str] = Counter()
+    for tokens in token_sets.values():
+        document_frequency.update(tokens)
+    return sorted(
+        (
+            (tok, count / total)
+            for tok, count in document_frequency.items()
+            if count / total > min_fraction
+        ),
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+
+
+def _match_existing_cluster(
+    chunk_tokens: set[str],
+    cluster_signatures: dict[str, set[str]],
+    *,
+    min_containment: float = CONTAINMENT_THRESHOLD,
+    min_shared_tokens: int = MIN_SHARED_SIGNATURE_TOKENS,
+) -> str | None:
+    """Best-matching existing cluster id for one chunk's tokens, or None.
+
+    Asymmetric CONTAINMENT of the cluster's signature in the chunk's
+    tokens -- ``|signature ∩ chunk| / |signature|`` -- not symmetric
+    Jaccard: a signature is capped at ``TOP_SIGNATURE_TOKENS`` while a
+    chunk commonly carries far more tokens, so Jaccard's union-sized
+    denominator dilutes real overlap toward zero regardless of how
+    thematically similar the chunk actually is.
+
+    Containment alone is the false-merge shape for a SMALL signature: a
+    10-token signature needs only 3 shared tokens to read 0.30 contained,
+    which is coincidence, not similarity. ``min_shared_tokens`` is an
+    absolute floor independent of the ratio, so a signature this small
+    cannot match without substantial real overlap.
+
+    A signature is also ineligible outright when it holds fewer than
+    ``min_shared_tokens`` LETTER-BEARING tokens (see ``_has_letter``),
+    checked directly against the signature rather than inferred from
+    ``_chunk_tokens`` already excluding non-letter tokens on the chunk
+    side: a signature persisted BEFORE that filter existed can still be
+    sitting on disk full of coincidental line-number tokens (measured:
+    one real signature was 64/64 bare numbers) until its
+    next backfill, and this check keeps it from acting as a magnet for
+    numbered-code chunks in the meantime, rather than relying only on the
+    fact that a freshly-tokenized chunk can no longer contribute matching
+    digits to ``shared``.
+    """
+    best_score = 0.0
+    best_id: str | None = None
+    for cluster_id, signature in cluster_signatures.items():
+        if not signature:
+            continue
+        if sum(1 for t in signature if _has_letter(t)) < min_shared_tokens:
+            continue
+        shared = len(signature & chunk_tokens)
+        if shared < min_shared_tokens:
+            continue
+        containment = shared / len(signature)
+        if containment >= min_containment and containment > best_score:
+            best_score = containment
+            best_id = cluster_id
+    return best_id
 
 
 def _cluster_id(chunk_ids: list[str]) -> str:
@@ -135,6 +356,7 @@ def _extract_topic(
 def cluster_chunks(
     chunks: list[TranscriptChunk],
     threshold: float = JACCARD_THRESHOLD,
+    boilerplate_stopwords: frozenset[str] = frozenset(),
 ) -> list[dict]:
     """Group chunks by token overlap using greedy Jaccard clustering.
 
@@ -146,6 +368,12 @@ def cluster_chunks(
     enters a cluster's signature, it stays. Combined with the raised
     threshold (0.20 vs 0.15), this prevents over-absorption while
     maintaining 85% cluster ID stability across rebuilds.
+
+    ``boilerplate_stopwords`` (see ``compute_boilerplate_stoplist``) is
+    filtered out of every chunk's tokens before Jaccard runs: two chunks
+    sharing nothing but an identical injected system/skill preamble would
+    otherwise read as topically similar on that shared boilerplate alone.
+    Default empty -- existing callers are unaffected.
 
     Returns a list of cluster dicts ready for storage, each containing:
         - cluster_id: deterministic ID from member chunk IDs
@@ -162,7 +390,7 @@ def cluster_chunks(
     # Compute token sets for all chunks
     chunk_token_map: dict[int, set[str]] = {}
     for i, chunk in enumerate(chunks):
-        tokens = _chunk_tokens(chunk)
+        tokens = _chunk_tokens(chunk, boilerplate_stopwords)
         if len(tokens) >= MIN_TOKENS:
             chunk_token_map[i] = tokens
 
@@ -252,6 +480,9 @@ def cluster_chunks(
         timestamps = [c.timestamp for c in member_chunks if c.timestamp]
 
         topic = _extract_topic(member_token_sets, global_df, n_docs)
+        signature_tokens = _cluster_signature_tokens(
+            member_token_sets, extra_stopwords=boilerplate_stopwords,
+        )
 
         result.append({
             "cluster_id": _cluster_id(chunk_ids),
@@ -266,6 +497,7 @@ def cluster_chunks(
             "status": "active",
             "created_at": now,
             "updated_at": now,
+            "signature_tokens": signature_tokens,
         })
 
     # Sort by date_end descending (most recent cluster first)
@@ -664,6 +896,88 @@ def upgrade_large_cluster_summaries(
 # default.
 DEFAULT_RECLUSTER_BATCH = 2000
 DEFAULT_RECLUSTER_REFUSE_ABOVE = 50_000
+DEFAULT_SIGNATURE_BACKFILL_BATCH = 500
+
+# Below this many chunks, "present in >20% of the batch" is not
+# a meaningful pervasiveness signal -- at 2 chunks, ONE occurrence is
+# already 50%, so the guard would strip the entire batch's vocabulary on
+# any shared token at all (caught by the e2e test's small fixture batch).
+# The real-store batch this guard was built for is thousands of chunks;
+# this floor only matters for small batches, tests included.
+MIN_BATCH_FOR_BOILERPLATE_GUARD = 20
+
+# Three rounds of "read the actual merged pairs before trusting
+# the aggregate count" each needed an ad-hoc script to reconstruct which
+# chunk merged into which cluster, because the receipt only ever carried a
+# count. Capping a small sample IN the receipt itself is what makes a
+# dry run's hand-read (and any real run's) not require touching the DB
+# again after the fact.
+MERGE_SAMPLE_SIZE = 10
+
+
+def backfill_cluster_signatures(
+    db: "RecallDB",
+    batch_size: int = DEFAULT_SIGNATURE_BACKFILL_BATCH,
+    boilerplate_stopwords: frozenset[str] = frozenset(),
+) -> dict:
+    """Compute and persist a token signature for a bounded batch of clusters
+    that do not have one yet -- clusters that predate ``cluster_token_signatures``,
+    or one a recent merge invalidated (``merge_chunks_into_cluster`` deletes
+    the old signature outright).
+
+    Memory bound: this loads member chunks for at most ``batch_size``
+    clusters at a time (each capped at ``MAX_CLUSTER_SIZE``), never every
+    cluster's members at once -- the same batching discipline
+    ``recluster_stale_chunks`` uses for chunks, applied here to clusters.
+
+    ``boilerplate_stopwords`` (see ``compute_boilerplate_stoplist``) is
+    filtered before the signature is computed, same reasoning as
+    ``cluster_chunks``. Default empty -- existing callers are unaffected.
+    """
+    missing = db.active_topic_clusters_missing_signature()
+    total_missing = len(missing)
+    batch_cluster_ids = missing[:batch_size]
+    if not batch_cluster_ids:
+        return {"clusters_signed": 0, "clusters_skipped": 0, "clusters_remaining": 0}
+
+    members_by_cluster = db.load_cluster_member_chunk_ids(batch_cluster_ids)
+    all_chunk_ids = sorted({cid for ids in members_by_cluster.values() for cid in ids})
+    id_rowid_map = db.get_chunk_id_rowid_map()
+    rowids = [id_rowid_map[cid] for cid in all_chunk_ids if cid in id_rowid_map]
+    chunk_map_by_rowid = db.load_chunks_by_rowids(rowids)
+    chunk_by_id = {
+        c.id: c
+        for r in rowids
+        if r in chunk_map_by_rowid
+        for c in [chunk_map_by_rowid[r]]
+    }
+
+    now = datetime.now(timezone.utc).isoformat()
+    signed = 0
+    skipped = 0
+    for cluster_id in batch_cluster_ids:
+        member_ids = members_by_cluster.get(cluster_id, [])
+        token_sets = [
+            _chunk_tokens(chunk_by_id[cid], boilerplate_stopwords)
+            for cid in member_ids
+            if cid in chunk_by_id
+        ]
+        # A cluster with no resolvable member (its rows were deleted out
+        # from under it, or member_ids was empty) has nothing to sign from.
+        if not token_sets:
+            skipped += 1
+            continue
+        signature = _cluster_signature_tokens(
+            token_sets, extra_stopwords=boilerplate_stopwords,
+        )
+        db.save_cluster_token_signature(cluster_id, signature, now)
+        signed += 1
+
+    return {
+        "clusters_signed": signed,
+        "clusters_skipped": skipped,
+        "clusters_remaining": total_missing - signed - skipped,
+    }
 
 
 def stale_transcript_chunk_ids(db: "RecallDB") -> list[str]:
@@ -719,19 +1033,38 @@ def recluster_stale_chunks(
     db: "RecallDB",
     batch_size: int = DEFAULT_RECLUSTER_BATCH,
     refuse_above: int = DEFAULT_RECLUSTER_REFUSE_ABOVE,
+    merge_into_existing: bool = False,
+    boilerplate_stopwords: frozenset[str] = frozenset(),
+    dry_run: bool = False,
 ) -> dict:
     """Cluster a bounded batch of stale chunks, preferring never-tried ones
     first; report the backlog.
 
     The memory bound that actually prevents a repeat of recall#435's OOM:
     this NEVER reloads the already-clustered corpus. It clusters only the
-    selected batch among itself and calls ``append_clusters`` (additive), so
-    a stale chunk that is Jaccard-similar to an EXISTING cluster still gets
-    its own NEW cluster rather than being merged into the old one's
-    token-union. Named tradeoff, not a silent gap -- merging into existing
-    clusters is a later, separate lane: the real store clears only ~1-4%
-    of a batch per run, so most of the backlog cannot cluster with itself
-    at all and needs the merge lane, not a bigger batch or a smarter skip.
+    selected batch among itself and calls ``append_clusters`` (additive).
+
+    When ``merge_into_existing`` is set, a stale chunk gets a first chance
+    to join an EXISTING cluster before self-batch clustering ever runs:
+    ``load_cluster_token_signatures`` is a cheap read (cluster count, not
+    chunk count) of every cluster's PERSISTED bounded signature -- the top
+    ``TOP_SIGNATURE_TOKENS`` tokens by within-cluster document frequency,
+    not the raw ``search_text`` sample (measured: symmetric Jaccard against
+    search_text-derived tokens dilutes to ~0.05-0.10 regardless of real
+    thematic overlap, because a chunk's own token set runs far larger than
+    a short search_text sample). Each batch chunk is matched by asymmetric
+    CONTAINMENT of the signature in its own tokens, with an absolute
+    shared-token floor (see ``_match_existing_cluster``). A match grows
+    that cluster in place (``merge_chunks_into_cluster`` -- membership
+    added, chunk_count and search_text updated, cluster_id UNCHANGED since
+    the id may already be referenced elsewhere; the cluster's now-stale
+    signature is deleted so it re-enters the backfill queue). Chunks with
+    no match fall through to self-batch clustering exactly as before.
+    Default False: this changes which chunks a batch clusters, so it stays
+    opt-in until the real-store numbers say otherwise. A cluster with no
+    persisted signature yet (predates this table, or one that had a signature
+    deleted by a recent merge) is simply absent from the comparison --
+    ``backfill_cluster_signatures`` is the bounded op that fills it in.
 
     Batch SELECTION prefers chunks ``recluster_attempts`` has never seen:
     a chunk that fails to cluster is marked attempted and routed around on
@@ -745,6 +1078,18 @@ def recluster_stale_chunks(
     that many stale chunks means something is wrong (``skip_clustering``
     left on for a long stretch, most likely), not that a bigger single
     batch is safe.
+
+    ``dry_run=True`` runs every comparison and computes the SAME receipt
+    (``merged_into_existing``, ``chunks_clustered``, ``still_stale`` derived
+    from the in-memory decisions rather than a post-write re-query) but
+    skips every write (``merge_chunks_into_cluster``, ``append_clusters``,
+    ``mark_recluster_attempted``) -- three rounds of hand-
+    reading real merges each needed writing to the live store first (or a
+    full copy of it) because no dry mode existed; this is that mode. The
+    receipt also carries ``merge_samples`` (bounded by ``MERGE_SAMPLE_SIZE``,
+    chunk id / target cluster id / target topic) regardless of ``dry_run``,
+    so a hand-read never has to reconstruct which chunk went where from a
+    before/after diff of the database again.
     """
     stale_ids = stale_transcript_chunk_ids(db)
     total_stale = len(stale_ids)
@@ -775,6 +1120,11 @@ def recluster_stale_chunks(
             "still_stale": total_stale,
             "fresh_in_batch": 0,
             "fallback_in_batch": 0,
+            "merged_into_existing": 0,
+            "batch_boilerplate_dropped": [],
+            "merge_samples": [],
+            "merge_run_id": None,
+            "dry_run": dry_run,
             "drain_command": _drain_command(total_stale),
         }
 
@@ -788,6 +1138,11 @@ def recluster_stale_chunks(
             "still_stale": 0,
             "fresh_in_batch": 0,
             "fallback_in_batch": 0,
+            "merged_into_existing": 0,
+            "batch_boilerplate_dropped": [],
+            "merge_samples": [],
+            "merge_run_id": None,
+            "dry_run": dry_run,
             "drain_command": "",
         }
 
@@ -796,8 +1151,83 @@ def recluster_stale_chunks(
     chunk_map = db.load_chunks_by_rowids(rowids)
     batch_chunks = [chunk_map[r] for r in rowids if r in chunk_map]
 
-    clusters = cluster_chunks(batch_chunks)
-    if clusters:
+    merged_count = 0
+    batch_boilerplate_dropped: list[tuple[str, float]] = []
+    merge_samples: list[dict] = []
+    effective_stopwords = boilerplate_stopwords
+    # One run_id per call, stamped on every membership row this
+    # run's merges write (see cluster_chunks' schema comment) -- an undo of
+    # THIS run's merges is then a query by run_id, never the "shared
+    # timestamp" fallback a live-store incident needed before this column
+    # existed. Self-batch clustering rows are unaffected (append_clusters
+    # does not take a run_id; a full rebuild replaces them wholesale).
+    merge_run_id = uuid.uuid4().hex[:12] if merge_into_existing else None
+    if merge_into_existing and batch_chunks:
+        # Data-derived guard computed from THIS BATCH, not cluster
+        # signatures: a stoplist built from signatures (older, already-
+        # clustered content) measured under 2% for the exact tokens that
+        # were 23.9% of a real stale batch -- signatures and the incoming
+        # stale queue are different populations with different composition,
+        # so the guard has to look at the population actually being
+        # compared. Structural stripping already ran inside _chunk_tokens
+        # (see _HARNESS_PREAMBLE_TAGS); this catches whatever that does not
+        # have an exact tag for. With the structural strip in place this
+        # should be short -- a long list here is itself a finding.
+        raw_batch_tokens = {
+            c.id: _chunk_tokens(c, boilerplate_stopwords) for c in batch_chunks
+        }
+        if len(batch_chunks) >= MIN_BATCH_FOR_BOILERPLATE_GUARD:
+            batch_boilerplate_dropped = compute_boilerplate_stoplist(
+                raw_batch_tokens, min_fraction=0.20,
+            )
+            effective_stopwords = boilerplate_stopwords | frozenset(
+                tok for tok, _frac in batch_boilerplate_dropped
+            )
+
+        cluster_token_sets = db.load_cluster_token_signatures()
+        now = datetime.now(timezone.utc).isoformat()
+        merges_by_cluster: dict[str, list[TranscriptChunk]] = {}
+        remaining_chunks: list[TranscriptChunk] = []
+        for chunk in batch_chunks:
+            tokens = raw_batch_tokens[chunk.id] - effective_stopwords
+            # Same noise filter self-batch clustering applies -- a chunk too
+            # short to ever form its own cluster is too short to match an
+            # existing one meaningfully either.
+            target = (
+                _match_existing_cluster(tokens, cluster_token_sets)
+                if len(tokens) >= MIN_TOKENS
+                else None
+            )
+            if target is not None:
+                merges_by_cluster.setdefault(target, []).append(chunk)
+            else:
+                remaining_chunks.append(chunk)
+        # Signatures are a snapshot from the top of this batch: two batch
+        # members that both match the SAME existing cluster both merge into
+        # it correctly (chunk_count is recomputed, not incremented), but a
+        # chunk merged earlier in this loop does not grow the signature a
+        # LATER chunk in the same batch is compared against. Named
+        # tradeoff for the first working version, not a silent gap.
+        for cluster_id, chunks_to_merge in merges_by_cluster.items():
+            appended_text = " ".join(
+                part
+                for c in chunks_to_merge
+                for part in (c.user_text, c.assistant_text)
+                if part
+            )
+            if not dry_run:
+                db.merge_chunks_into_cluster(
+                    cluster_id, [c.id for c in chunks_to_merge], appended_text, now,
+                    run_id=merge_run_id,
+                )
+            merged_count += len(chunks_to_merge)
+            for c in chunks_to_merge:
+                if len(merge_samples) < MERGE_SAMPLE_SIZE:
+                    merge_samples.append({"chunk_id": c.id, "cluster_id": cluster_id})
+        batch_chunks = remaining_chunks
+
+    clusters = cluster_chunks(batch_chunks, boilerplate_stopwords=effective_stopwords)
+    if clusters and not dry_run:
         memberships = [
             (cl["cluster_id"], cid, cl["created_at"])
             for cl in clusters
@@ -805,22 +1235,44 @@ def recluster_stale_chunks(
         ]
         db.append_clusters(clusters, memberships)
 
-    still_stale_ids = set(stale_transcript_chunk_ids(db))
-    # Mark only batch members that FAILED to cluster this run -- a chunk
-    # that succeeded is no longer stale and will never be reselected, so it
-    # needs no attempt row (see the table's own comment in storage.py).
-    failed_this_run = [cid for cid in batch_ids if cid in still_stale_ids]
-    if failed_this_run:
-        db.mark_recluster_attempted(failed_this_run, run_id=uuid.uuid4().hex[:12])
+    if merge_samples:
+        topics = db.load_cluster_topics(list({s["cluster_id"] for s in merge_samples}))
+        for sample in merge_samples:
+            sample["cluster_topic"] = topics.get(sample["cluster_id"], "")
 
-    still_stale = len(still_stale_ids)
+    if dry_run:
+        # No write happened, so "still stale" cannot be re-queried from the
+        # DB -- it is derived from the SAME in-memory decisions that would
+        # have driven the writes: every chunk that matched an existing
+        # cluster (merged_count) plus every chunk cluster_chunks() actually
+        # placed in a NEW self-batch cluster (a candidate list is not
+        # itself a guarantee -- MIN_CLUSTER_SIZE can leave chunks out of it).
+        newly_self_batch = sum(len(cl["chunk_ids"]) for cl in clusters) if clusters else 0
+        chunks_clustered_this_run = merged_count + newly_self_batch
+        still_stale = total_stale - chunks_clustered_this_run
+    else:
+        still_stale_ids = set(stale_transcript_chunk_ids(db))
+        # Mark only batch members that FAILED to cluster this run -- a chunk
+        # that succeeded is no longer stale and will never be reselected, so
+        # it needs no attempt row (see the table's own comment in storage.py).
+        failed_this_run = [cid for cid in batch_ids if cid in still_stale_ids]
+        if failed_this_run:
+            db.mark_recluster_attempted(failed_this_run, run_id=uuid.uuid4().hex[:12])
+        still_stale = len(still_stale_ids)
+        chunks_clustered_this_run = total_stale - still_stale
+
     return {
         "refused": False,
         "total_stale_at_start": total_stale,
         "batches_run": 1,
-        "chunks_clustered": total_stale - still_stale,
+        "chunks_clustered": chunks_clustered_this_run,
         "still_stale": still_stale,
         "fresh_in_batch": fresh_count,
         "fallback_in_batch": fallback_count,
+        "merged_into_existing": merged_count,
+        "batch_boilerplate_dropped": batch_boilerplate_dropped,
+        "merge_samples": merge_samples,
+        "merge_run_id": merge_run_id if (merged_count and not dry_run) else None,
+        "dry_run": dry_run,
         "drain_command": _drain_command(still_stale),
     }
