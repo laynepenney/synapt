@@ -1057,7 +1057,15 @@ class TestCodexCwdCacheWiredIntoCommands(unittest.TestCase):
                 cli.cmd_resume(args)
 
     def test_all_six_wired_commands_arm_the_cache_at_the_projects_index_dir(self):
+        """Atlas's R1 on v2 (#dev m_4db995f2): the arming spy only checked
+        configure_cwd_cache, so removing _configure_codex_cwd_cache's
+        atexit.register(flush_cwd_cache) call left every subtest green — a
+        cache that arms but never flushes defeats the cross-process half of
+        recall#1125 while this test stayed silent. Spy atexit.register the
+        same way, in the same subTest, so one command failing either half
+        of the pairing fails that command's row and no other."""
         from synapt.recall import cli
+        from synapt.recall.codex import flush_cwd_cache
 
         project = Path.cwd().resolve()
         expected_index_dir = cli.project_index_dir(project)
@@ -1071,6 +1079,8 @@ class TestCodexCwdCacheWiredIntoCommands(unittest.TestCase):
         }
         for name, invoke in invocations.items():
             with self.subTest(command=name):
-                with mock.patch("synapt.recall.codex.configure_cwd_cache") as spy:
+                with mock.patch("synapt.recall.codex.configure_cwd_cache") as configure_spy, \
+                     mock.patch("atexit.register") as atexit_spy:
                     invoke(project)
-                spy.assert_called_once_with(expected_index_dir)
+                configure_spy.assert_called_once_with(expected_index_dir)
+                atexit_spy.assert_any_call(flush_cwd_cache)
