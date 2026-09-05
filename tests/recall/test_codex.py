@@ -583,9 +583,21 @@ class TestTheBuildPreCheckReadsTheCodexArm(unittest.TestCase):
         # shared helper — this was a hand-rolled two-variable save/restore
         # until now, which is exactly the duplication owned_store exists to
         # remove. Consolidated: one restore path, not a per-class copy.
+        #
+        # recall#1125's cache configuration calls project_index_dir(project)
+        # with an EXPLICIT project_dir (cmd_build's own project = Path.cwd()),
+        # and an explicit project_dir suppresses every env override by design
+        # — owned_store()'s SYNAPT_RECALL_ROOT never reaches it. Per
+        # owned_store's own docstring ("a test genuinely asserting inference
+        # should chdir to an owned directory so the inference still runs,
+        # just from a starting point it owns"), chdir into the owned root so
+        # even an explicit-project_dir resolution lands under it.
         self._store = owned_store()
+        self._orig_cwd = os.getcwd()
+        os.chdir(self._store.root)
 
     def tearDown(self):
+        os.chdir(self._orig_cwd)
         self._store.restore()
 
     def _run_precheck(self, has_codex: bool):
@@ -802,6 +814,40 @@ class TestSessionCwdCache(unittest.TestCase):
         configure_cwd_cache(index_dir)  # must not raise
         self.assertEqual(self._codex_module._cwd_cache, {})
 
+    def test_failed_flush_never_corrupts_the_existing_cache_file(self):
+        """Stromus's R2 (recall-codex-cwd-cache-followon-v1, #dev m_c7c9f9a5):
+        an in-place write (revert atomic-flush) passes every other test in
+        this class, because none of them fail mid-write. This is the actual
+        crash shape atomicity exists for: os.replace fails partway through
+        flush, and the ORIGINAL file must be exactly as it was, with no
+        leftover tmp file — an in-place write would have already truncated
+        or partially overwritten the original by the time the failure could
+        even be detected."""
+        tmpdir = tempfile.mkdtemp()
+        index_dir = Path(tempfile.mkdtemp())
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+        )
+        from synapt.recall.codex import _session_cwd, configure_cwd_cache, flush_cwd_cache
+
+        cache_path = index_dir / "codex_cwd_cache.json"
+        original_bytes = b'{"sentinel-original-content": true}'
+        cache_path.write_bytes(original_bytes)
+
+        configure_cwd_cache(index_dir)  # a corrupt-looking seed degrades to {} in memory
+        _session_cwd(path)  # a real miss: marks the in-memory cache dirty
+
+        with mock.patch("os.replace", side_effect=OSError("simulated crash mid-flush")):
+            flush_cwd_cache()
+
+        self.assertEqual(
+            cache_path.read_bytes(), original_bytes,
+            "a failed flush must never corrupt the existing cache file",
+        )
+        leftover_tmp = list(index_dir.glob("codex_cwd_cache.json.tmp-*"))
+        self.assertEqual(leftover_tmp, [], "a failed flush must not leave a tmp file behind")
+
     def test_flush_is_a_noop_when_nothing_changed(self):
         """No cache miss occurred (or the cache was never configured with a
         real index_dir) -> flush must not write a file at all."""
@@ -811,6 +857,30 @@ class TestSessionCwdCache(unittest.TestCase):
         configure_cwd_cache(index_dir)
         flush_cwd_cache()
         self.assertFalse((index_dir / "codex_cwd_cache.json").exists())
+
+    def test_deleted_file_is_never_served_its_stale_cached_cwd(self):
+        """Atlas's R1 note on recall-codex-cwd-cache-1125-v2: a cache entry
+        for a since-deleted rollout must never be served on a later read.
+        _session_cwd already stats the path FIRST and returns None on
+        OSError before ever consulting the cache dict, so this is a
+        regression witness for existing read-path behavior, not a new fix —
+        it protects the read side from ever regressing to check the cache
+        before the filesystem."""
+        tmpdir = tempfile.mkdtemp()
+        index_dir = Path(tempfile.mkdtemp())
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+        )
+        from synapt.recall.codex import _session_cwd, configure_cwd_cache
+
+        configure_cwd_cache(index_dir)
+        first = _session_cwd(path)
+        self.assertEqual(first, Path(tmpdir).resolve())
+
+        path.unlink()
+        second = _session_cwd(path)
+        self.assertIsNone(second, "a deleted file must never be served its stale cached cwd")
 
     def test_flush_prunes_entries_for_removed_files(self):
         """A cache entry for a since-deleted rollout must not accumulate
@@ -881,3 +951,57 @@ class TestSessionCwdCache(unittest.TestCase):
         from synapt.recall.codex import _session_cwd_uncached
 
         self.assertEqual(_session_cwd_uncached(path), Path(tmpdir).resolve())
+
+
+class TestCodexCwdCacheWiredIntoCommands(unittest.TestCase):
+    """Stromus's R2 (recall-codex-cwd-cache-followon-v1, #dev m_c7c9f9a5):
+    removing cmd_build's arming call passed every other test in the file —
+    the cache existing is not the fix, the fix is that the commands which
+    reach the Codex scan actually arm it. Same "predicate exists but nothing
+    consumes it" shape as TestTheBuildPreCheckReadsTheCodexArm above, one
+    call site over.
+    """
+
+    def setUp(self):
+        self._store = owned_store()
+        self._orig_cwd = os.getcwd()
+        os.chdir(self._store.root)
+
+    def tearDown(self):
+        os.chdir(self._orig_cwd)
+        self._store.restore()
+
+    def test_cmd_build_arms_the_cache_at_the_projects_index_dir(self):
+        import argparse
+        from synapt.recall import cli
+
+        args = argparse.Namespace(
+            source=None, hf=None, chatgpt_archive=None,
+            no_embeddings=True, incremental=False,
+        )
+        fake_index = mock.Mock()
+        fake_index.stats.return_value = {"chunk_count": 1, "session_count": 1}
+        expected_index_dir = cli.project_index_dir(Path.cwd().resolve())
+        with mock.patch.object(cli, "project_transcript_dirs", return_value=["dummy"]), \
+             mock.patch.object(cli, "_check_legacy_index", return_value=None), \
+             mock.patch.object(cli, "_archive_and_build", return_value=fake_index), \
+             mock.patch("synapt.recall.codex.configure_cwd_cache") as spy:
+            cli.cmd_build(args)
+        spy.assert_called_once_with(expected_index_dir)
+
+    def test_cmd_hook_precompact_arms_the_cache_at_the_projects_index_dir(self):
+        import argparse
+        import io
+        import sys
+        from synapt.recall import cli
+
+        with mock.patch.object(sys, "stdin", io.StringIO("{}")), \
+             mock.patch.object(cli, "project_transcript_dirs", return_value=["dummy"]), \
+             mock.patch.object(cli, "_archive_and_build", return_value=None), \
+             mock.patch.object(cli, "_sync_after_rebuild"), \
+             mock.patch.object(cli, "_precompact_journal_write"), \
+             mock.patch("synapt.recall.channel.channel_heartbeat"), \
+             mock.patch("synapt.recall.codex.configure_cwd_cache") as spy:
+            expected_index_dir = cli.project_index_dir(Path.cwd().resolve())
+            cli.cmd_hook(argparse.Namespace(event="precompact"))
+        spy.assert_called_once_with(expected_index_dir)
