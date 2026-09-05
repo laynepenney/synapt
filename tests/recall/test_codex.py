@@ -1,8 +1,10 @@
 """Tests for synapt.recall.codex — Codex CLI transcript parsing."""
 
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 
 from _isolation_helpers import owned_store
 from pathlib import Path
@@ -620,3 +622,221 @@ class TestTheBuildPreCheckReadsTheCodexArm(unittest.TestCase):
         # The control. Without it, deleting the guard entirely would satisfy the
         # test above while letting an empty project proceed to a no-op build.
         self.assertEqual(self._run_precheck(has_codex=False), 1)
+
+
+class TestSessionCwdCache(unittest.TestCase):
+    """recall#1125: _session_cwd's opt-in, disk-backed (path,size,mtime) cache.
+
+    Every test resets the module-global cache state directly (not through
+    the public configure_cwd_cache(None), which leaves an active in-memory
+    cache rather than disabling it) so no test's cache state can leak into
+    another test in this file that calls _session_cwd unaware of caching.
+    """
+
+    def setUp(self):
+        import synapt.recall.codex as codex_module
+
+        self._codex_module = codex_module
+        self._reset_cache_state()
+
+    def tearDown(self):
+        self._reset_cache_state()
+
+    def _reset_cache_state(self):
+        self._codex_module._cwd_cache = None
+        self._codex_module._cwd_cache_dirty = False
+        self._codex_module._cwd_cache_index_dir = None
+
+    def test_disabled_by_default_reads_every_call(self):
+        """No configure_cwd_cache call: behavior is unchanged from before
+        the cache existed — every _session_cwd call re-reads the file."""
+        tmpdir = tempfile.mkdtemp()
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+        )
+        from synapt.recall.codex import _session_cwd
+
+        with mock.patch(
+            "synapt.recall.codex._session_cwd_uncached",
+            wraps=self._codex_module._session_cwd_uncached,
+        ) as spy:
+            _session_cwd(path)
+            _session_cwd(path)
+        self.assertEqual(spy.call_count, 2)
+
+    def test_configured_cache_avoids_reopening_unchanged_file(self):
+        """The concrete recall#1125 proof: with the cache configured, a
+        second call on an unchanged file does not re-scan it."""
+        tmpdir = tempfile.mkdtemp()
+        index_dir = Path(tempfile.mkdtemp())
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+        )
+        from synapt.recall.codex import _session_cwd, configure_cwd_cache
+
+        configure_cwd_cache(index_dir)
+        with mock.patch(
+            "synapt.recall.codex._session_cwd_uncached",
+            wraps=self._codex_module._session_cwd_uncached,
+        ) as spy:
+            first = _session_cwd(path)
+            second = _session_cwd(path)
+        self.assertEqual(spy.call_count, 1, "second call re-scanned an unchanged file")
+        self.assertEqual(first, second)
+        self.assertEqual(first, Path(tmpdir).resolve())
+
+    def test_cache_invalidates_when_file_changes(self):
+        """A changed file (new mtime/size) must never be served a stale
+        cwd — this is the control proving the cache isn't just short-circuiting."""
+        tmpdir = tempfile.mkdtemp()
+        other_dir = tempfile.mkdtemp()
+        index_dir = Path(tempfile.mkdtemp())
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+        )
+        from synapt.recall.codex import _session_cwd, configure_cwd_cache
+
+        configure_cwd_cache(index_dir)
+        first = _session_cwd(path)
+        self.assertEqual(first, Path(tmpdir).resolve())
+
+        # Rewrite with a different recorded cwd. Sleep-free: bump mtime
+        # explicitly in case the filesystem's mtime resolution is coarse
+        # enough that a fast rewrite could otherwise collide with the
+        # cached (size, mtime) key.
+        _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": other_dir + "-x"}}],
+            name=path.name,
+        )
+        new_stat = path.stat()
+        os.utime(path, (new_stat.st_atime, new_stat.st_mtime + 5))
+
+        second = _session_cwd(path)
+        self.assertEqual(second, Path(other_dir + "-x").resolve())
+        self.assertNotEqual(first, second)
+
+    def test_cache_persists_across_reconfigure_reads_disk_without_rescanning(self):
+        """Two bare `resume` invocations are two separate Python processes:
+        the cache must survive via the on-disk file, not just in memory."""
+        tmpdir = tempfile.mkdtemp()
+        index_dir = Path(tempfile.mkdtemp())
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+        )
+        from synapt.recall.codex import (
+            _session_cwd,
+            configure_cwd_cache,
+            flush_cwd_cache,
+        )
+
+        # "Process 1": scan once, then flush to disk.
+        configure_cwd_cache(index_dir)
+        _session_cwd(path)
+        flush_cwd_cache()
+        self.assertTrue((index_dir / "codex_cwd_cache.json").exists())
+
+        # "Process 2": fresh module state, reconfigure from the same
+        # index_dir, and the second scan must come from the loaded cache.
+        self._reset_cache_state()
+        configure_cwd_cache(index_dir)
+        with mock.patch(
+            "synapt.recall.codex._session_cwd_uncached",
+            wraps=self._codex_module._session_cwd_uncached,
+        ) as spy:
+            result = _session_cwd(path)
+        self.assertEqual(spy.call_count, 0, "cross-process cache was not loaded from disk")
+        self.assertEqual(result, Path(tmpdir).resolve())
+
+    def test_missing_or_corrupt_cache_file_degrades_to_empty_cache(self):
+        """A cache is a courtesy: a corrupt cache file must not fail resume."""
+        index_dir = Path(tempfile.mkdtemp())
+        (index_dir / "codex_cwd_cache.json").write_text("{not valid json")
+        from synapt.recall.codex import configure_cwd_cache
+
+        configure_cwd_cache(index_dir)  # must not raise
+        self.assertEqual(self._codex_module._cwd_cache, {})
+
+    def test_flush_is_a_noop_when_nothing_changed(self):
+        """No cache miss occurred (or the cache was never configured with a
+        real index_dir) -> flush must not write a file at all."""
+        index_dir = Path(tempfile.mkdtemp())
+        from synapt.recall.codex import configure_cwd_cache, flush_cwd_cache
+
+        configure_cwd_cache(index_dir)
+        flush_cwd_cache()
+        self.assertFalse((index_dir / "codex_cwd_cache.json").exists())
+
+    def test_flush_prunes_entries_for_removed_files(self):
+        """A cache entry for a since-deleted rollout must not accumulate
+        forever — it is dropped the next time something triggers a flush."""
+        tmpdir = tempfile.mkdtemp()
+        index_dir = Path(tempfile.mkdtemp())
+        gone_path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+            name="rollout-will-be-removed.jsonl",
+        )
+        kept_path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "k", "cwd": tmpdir}}],
+            name="rollout-kept.jsonl",
+        )
+        from synapt.recall.codex import _session_cwd, configure_cwd_cache, flush_cwd_cache
+
+        configure_cwd_cache(index_dir)
+        _session_cwd(gone_path)
+        _session_cwd(kept_path)
+        gone_path.unlink()
+
+        # Deleting gone_path alone does not mark the cache dirty; a real
+        # miss (kept_path re-read after being touched) is what triggers the
+        # flush this test is checking prunes the stale entry too. Bump
+        # mtime forward explicitly rather than os.utime(path, None) — "now"
+        # can collide with the mtime already cached on a coarse filesystem.
+        kept_stat = kept_path.stat()
+        os.utime(kept_path, (kept_stat.st_atime, kept_stat.st_mtime + 5))
+        _session_cwd(kept_path)
+        flush_cwd_cache()
+
+        saved = json.loads((index_dir / "codex_cwd_cache.json").read_text())
+        self.assertNotIn(str(gone_path), saved)
+        self.assertIn(str(kept_path), saved)
+
+    def test_uncached_scan_is_bounded_on_a_malformed_file(self):
+        """A file with more leading blank/garbage lines than the scan cap
+        must not force reading an entire multi-thousand-line rollout."""
+        from synapt.recall.codex import (
+            _SESSION_CWD_SCAN_LINE_CAP,
+            _session_cwd_uncached,
+        )
+
+        tmpdir = tempfile.mkdtemp()
+        path = Path(tmpdir) / "rollout-garbage.jsonl"
+        with open(path, "w", encoding="utf-8") as f:
+            for _ in range(_SESSION_CWD_SCAN_LINE_CAP + 10):
+                f.write("not json at all\n")
+            f.write(json.dumps({"type": "session_meta", "payload": {"cwd": tmpdir}}) + "\n")
+
+        # The real session_meta line sits past the cap, so a correctly
+        # bounded scan reports no cwd rather than finding it — the cap
+        # trades a rare late-session_meta miss for a hard ceiling on read
+        # cost, which is the point.
+        self.assertIsNone(_session_cwd_uncached(path))
+
+    def test_uncached_scan_still_finds_session_meta_within_the_cap(self):
+        """The control for the cap test: a well-formed file (session_meta
+        first, as Codex always writes it) is unaffected by the cap."""
+        tmpdir = tempfile.mkdtemp()
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": tmpdir}}],
+            name="rollout-wellformed.jsonl",
+        )
+        from synapt.recall.codex import _session_cwd_uncached
+
+        self.assertEqual(_session_cwd_uncached(path), Path(tmpdir).resolve())

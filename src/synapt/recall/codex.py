@@ -55,6 +55,71 @@ def discover_codex_sessions() -> Path | None:
     return None
 
 
+_CWD_CACHE_FILENAME = "codex_cwd_cache.json"
+
+# Process-wide, opt-in cache for _session_cwd's (path -> cwd) lookups, keyed
+# by (size, mtime) so a changed file is never served a stale answer. None
+# means the cache is not configured: _session_cwd behaves exactly as before,
+# so every existing caller that never opts in sees no behavior change.
+#
+# ~/.codex/sessions is a single machine-wide directory (recall#1125):
+# resume's cold path opens and line-scans every rollout file in it on every
+# invocation, unscoped to gripspace or store size, because _session_cwd has
+# no memory across the many call sites that need a transcript's cwd
+# (caller_transcripts' own loop, and every list_codex_transcripts caller via
+# _matches_project). Caching inside _session_cwd itself, rather than at any
+# one call site, means every caller benefits without its own signature
+# changing — the fix is scoped to the function whose repeated cost is the
+# actual problem.
+_cwd_cache: dict[str, dict] | None = None
+_cwd_cache_dirty = False
+_cwd_cache_index_dir: Path | None = None
+
+
+def configure_cwd_cache(index_dir: Path | None) -> None:
+    """Point the process-wide session-cwd cache at *index_dir*'s cache file,
+    loading it if present. Call once near the start of a command that will
+    scan Codex sessions; pair with ``flush_cwd_cache()`` before exit.
+
+    A missing, unreadable, or corrupt cache file degrades to an empty cache
+    rather than failing the caller — the cache is a courtesy, never a
+    dependency to unlock resume/build.
+    """
+    global _cwd_cache, _cwd_cache_dirty, _cwd_cache_index_dir
+    _cwd_cache_index_dir = index_dir
+    _cwd_cache_dirty = False
+    if index_dir is None:
+        _cwd_cache = {}
+        return
+    try:
+        _cwd_cache = json.loads((index_dir / _CWD_CACHE_FILENAME).read_text())
+    except (OSError, json.JSONDecodeError):
+        _cwd_cache = {}
+
+
+def flush_cwd_cache() -> None:
+    """Persist the process-wide session-cwd cache if it changed. Best-effort:
+    a read-only or vanished index_dir must not turn a cache write failure
+    into a resume/build failure.
+
+    Prunes entries for files that no longer exist before writing: a removed
+    Codex rollout never grows the cache back to the cost it exists to avoid
+    (a stat() failure already refuses to serve a stale entry on read — see
+    _session_cwd — so this is a cleanup at write time, not a correctness fix
+    at read time).
+    """
+    global _cwd_cache_dirty
+    if _cwd_cache_index_dir is None or not _cwd_cache_dirty or _cwd_cache is None:
+        return
+    for key in [k for k in _cwd_cache if not Path(k).exists()]:
+        del _cwd_cache[key]
+    try:
+        (_cwd_cache_index_dir / _CWD_CACHE_FILENAME).write_text(json.dumps(_cwd_cache))
+        _cwd_cache_dirty = False
+    except OSError:
+        pass
+
+
 def _project_roots(project_dir: Path | None = None) -> list[Path]:
     """Return project roots whose Codex sessions should be indexed."""
     from synapt.recall.core import _find_gripspace_root, _git_main_worktree_root
@@ -88,13 +153,73 @@ def _project_roots(project_dir: Path | None = None) -> list[Path]:
 
 
 def _session_cwd(path: Path) -> Path | None:
-    """Return the session cwd recorded in a Codex transcript, if present."""
+    """Return the session cwd recorded in a Codex transcript, if present.
+
+    Consults the process-wide cache configured via ``configure_cwd_cache``
+    when one is active, keyed by (size, mtime) so a file that changed since
+    it was cached is never served a stale answer. With no cache configured
+    (the default), this reads the file every call, exactly as before.
+    """
+    global _cwd_cache_dirty
+
+    cache = _cwd_cache
+    stat_result = None
+    if cache is not None:
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        key = str(path)
+        cached = cache.get(key)
+        if (
+            cached is not None
+            and cached.get("size") == stat_result.st_size
+            and cached.get("mtime") == stat_result.st_mtime
+        ):
+            cwd = cached.get("cwd")
+            return Path(cwd) if cwd else None
+
+    cwd = _session_cwd_uncached(path)
+
+    if cache is not None:
+        if stat_result is None:
+            try:
+                stat_result = path.stat()
+            except OSError:
+                return cwd
+        cache[str(path)] = {
+            "size": stat_result.st_size,
+            "mtime": stat_result.st_mtime,
+            "cwd": str(cwd) if cwd else None,
+        }
+        _cwd_cache_dirty = True
+
+    return cwd
+
+
+_SESSION_CWD_SCAN_LINE_CAP = 50
+
+
+def _session_cwd_uncached(path: Path) -> Path | None:
+    """The real scan _session_cwd caches: open *path* and read its recorded cwd.
+
+    A well-formed Codex rollout records session_meta as its first entry, so
+    the loop normally reads one line. Bounded to
+    _SESSION_CWD_SCAN_LINE_CAP non-empty lines so a malformed or corrupt
+    file (leading blank lines, unparseable garbage) cannot force an
+    unbounded scan of an otherwise-multi-thousand-turn rollout on a cache
+    miss (recall#1125).
+    """
     try:
         with open(path, encoding="utf-8") as f:
+            scanned = 0
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                scanned += 1
+                if scanned > _SESSION_CWD_SCAN_LINE_CAP:
+                    return None
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
