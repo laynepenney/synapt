@@ -4970,7 +4970,46 @@ def _guard_data_root(operation: str, path: Path) -> Path:
 _GRIPSPACE_ROOT_MARKER_RELPATH = Path(".synapt") / "gripspace-root"
 
 
-def _persist_shared_gripspace_root(resolved: Path) -> None:
+def _gripspace_has_registered_repo(root: Path) -> bool:
+    """True when *root* is a POPULATED gripspace: something (``gr spawn``,
+    ``gr repo add``) has actually registered at least one member repo,
+    rather than *root* being a hand-built directory that merely carries a
+    gripspace marker with nothing inside it.
+
+    Read using only the OSS-visible signals ``project_transcript_dirs``
+    already reads for the same purpose (declared griptrees, direct child
+    ``.git`` repos, ``.worktrees/*``) -- this deliberately never parses any
+    gr2 workspace/agent/repo manifest for identity content, which stays
+    premium (see the Identity Test in claude.md).
+    """
+    griptrees_json = root / ".gitgrip" / "griptrees.json"
+    if griptrees_json.is_file():
+        try:
+            data = json.loads(griptrees_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if data.get("griptrees"):
+            return True
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        if not child.is_dir():
+            continue
+        if (child / ".git").exists():
+            return True
+        if child.name == ".worktrees":
+            try:
+                worktrees = list(child.iterdir())
+            except OSError:
+                worktrees = []
+            if any(wt.is_dir() and (wt / ".git").exists() for wt in worktrees):
+                return True
+    return False
+
+
+def _persist_shared_gripspace_root(resolved: Path, env_var: str) -> None:
     """Record *resolved* as the shared coordinate for the CALLER's own
     gripspace, so a later call with no env var in its shell (a bare CLI
     invocation) can converge on the same root an env-bound call (the MCP
@@ -4985,9 +5024,33 @@ def _persist_shared_gripspace_root(resolved: Path) -> None:
     cwd happens to walk up into a REAL gripspace (rather than a tmp_path
     fixture) must not have this side effect plant a real file, the same
     contract project_data_dir already enforces for its own store root.
+
+    Refuses when the caller's own gripspace is not itself POPULATED (no
+    registered repo) -- a real agent worktree is created by ``gr spawn`` /
+    ``gr repo add`` and always has at least one member repo; a hand-built
+    scratch directory that merely carries a bare gripspace marker never
+    does. Without this, an ambient ``GRIPSPACE_ROOT`` still set in a shell
+    poisons the FIRST scratch gripspace it happens to be run from with a
+    marker pointing at the real team root, and every later env-less call
+    from that scratch dir silently converges on the real store too
+    (recall#1124, the marker half of a 2026-09-05 incident; #1123 is the
+    resolver half). An explicit ``project_dir`` argument still bypasses this
+    entire function (named intent, never ambient) -- see the caller.
     """
     self_root = _find_gripspace_root(Path.cwd())
     if self_root is None or self_root == resolved:
+        return
+    if not _gripspace_has_registered_repo(self_root):
+        import sys
+
+        print(
+            f"[recall] refusing to persist a shared-gripspace-root marker: "
+            f"{self_root} is not a populated gripspace (no registered "
+            f"repo) -- not binding it to {resolved} from {env_var}. "
+            f"Register a repo first (gr spawn / gr repo add) if this "
+            f"binding is intentional.",
+            file=sys.stderr,
+        )
         return
     marker = self_root / _GRIPSPACE_ROOT_MARKER_RELPATH
     _guard_data_root("gripspace_root_marker", marker)
@@ -5095,7 +5158,7 @@ def _resolve_root_and_source(project_dir: Path | None = None) -> tuple[Path | No
             # checkout while the store itself is redirected. Only
             # GRIPSPACE_ROOT (gr spawn's uniform per-agent binding) gets
             # persisted for a later env-less call to converge on.
-            _persist_shared_gripspace_root(resolved)
+            _persist_shared_gripspace_root(resolved, var)
         return resolved, f"env:{var}"
     marker_root, stale_target = _read_shared_gripspace_root_marker()
     if marker_root is not None:

@@ -934,10 +934,18 @@ def _make_named_gripspace(tmp_path: Path, name: str) -> Path:
     .gitgrip/griptrees.json), distinct from _make_gripspace's default -- for
     tests that need TWO real gripspaces (the agent's own worktree and the
     shared canonical root) rather than one gripspace plus an unmarked dir.
+
+    POPULATED by default (one registered child repo) -- a real gr-spawned
+    agent worktree always has at least one member repo, and
+    _persist_shared_gripspace_root refuses to persist a marker into a
+    gripspace that isn't (recall#1124). Tests that specifically need the
+    UNPOPULATED, hand-built-scratch-dir shape use _make_gripspace instead,
+    which deliberately has no child repo.
     """
     grip = tmp_path / name
     (grip / ".gitgrip").mkdir(parents=True)
     (grip / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
+    _make_git_repo(grip, "repo")
     return grip
 
 
@@ -1061,6 +1069,112 @@ class TestGripspaceRootMarkerPersistence:
 
         monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
         assert project_data_dir() == shared_ws / ".synapt" / "recall"
+
+    def test_unpopulated_scratch_gripspace_refuses_to_persist_the_marker(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """recall#1124 negative witness, reproducing the 2026-09-05 incident
+        shape exactly: a hand-built scratch dir (real .gitgrip marker, but
+        NO registered repo -- never gr-spawned, never gr repo add'd) with
+        GRIPSPACE_ROOT still live in the shell from an earlier, unrelated
+        session, then a bare `synapt build` run from that scratch dir.
+
+        The env-bound call itself still resolves to the real (populated)
+        shared root for THIS process -- that resolution is correct and is
+        the resolver's own contract (#1123 covers whether the BUILD should
+        have run there at all). What must NOT happen is the scratch dir's
+        marker getting poisoned with the real root, because that poisoning
+        is what made a LATER, entirely env-less call also silently reach
+        the real store.
+        """
+        scratch = _make_gripspace(tmp_path)  # unpopulated: no child repo
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        before = sorted(str(p.relative_to(shared_ws)) for p in shared_ws.rglob("*"))
+
+        monkeypatch.chdir(scratch)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        assert project_data_dir() == shared_ws / ".synapt" / "recall"
+        _gripspace_cache.clear()
+
+        marker = scratch / ".synapt" / "gripspace-root"
+        assert not marker.exists()
+
+        err = capsys.readouterr().err
+        assert str(scratch) in err
+        assert str(shared_ws) in err
+        assert "GRIPSPACE_ROOT" in err
+
+        after = sorted(str(p.relative_to(shared_ws)) for p in shared_ws.rglob("*"))
+        assert after == before  # the real store's own tree got no side effect
+
+        # The incident's actual failure mode: a LATER, env-less call from
+        # the same scratch dir must resolve to the scratch dir's OWN store,
+        # never silently converge on the real one via a marker that was
+        # correctly never written.
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        assert project_data_dir() == scratch / ".synapt" / "recall"
+
+    def test_populated_agent_worktree_control_for_the_refusal(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Control for the refusal above: a populated gripspace (the normal
+        _make_named_gripspace shape) persists exactly as before, with no
+        refusal message on stderr. Without this, a mutation that refuses
+        EVERY persist unconditionally would pass the negative witness
+        trivially."""
+        agent_ws = _make_named_gripspace(tmp_path, "agent-worktree")
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(agent_ws)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        assert project_data_dir() == shared_ws / ".synapt" / "recall"
+        marker = agent_ws / ".synapt" / "gripspace-root"
+        assert marker.is_file()
+        assert Path(marker.read_text().strip()) == shared_ws
+        assert capsys.readouterr().err == ""
+
+    @pytest.mark.parametrize(
+        "signal,expect_registered",
+        [
+            ("declared_griptrees_only", True),
+            ("worktrees_only", True),
+            ("empty", False),
+        ],
+    )
+    def test_each_registered_repo_signal_is_independently_sufficient(
+        self, tmp_path, monkeypatch, signal, expect_registered
+    ):
+        """R2 survivor on v1 (Stromus, m_8b405299): every test in this file
+        registers a repo the SAME way -- _make_named_gripspace's direct
+        child .git dir -- so the declared-griptrees.json branch of
+        _gripspace_has_registered_repo was never exercised by anything;
+        deleting that branch left the whole 79-test file green. Exercise
+        each of the three signals _gripspace_has_registered_repo reads
+        (declared griptrees.json entries, a direct child .git repo --
+        covered elsewhere, and .worktrees/*) in ISOLATION, so a mutation
+        that drops any single one of them is caught by exactly this test.
+        """
+        self_root = tmp_path / "self-root"
+        (self_root / ".gitgrip").mkdir(parents=True)
+        if signal == "declared_griptrees_only":
+            (self_root / ".gitgrip" / "griptrees.json").write_text(
+                json.dumps({"griptrees": {"some-repo": {"path": "/anywhere"}}})
+            )
+        elif signal == "worktrees_only":
+            (self_root / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
+            (self_root / ".worktrees").mkdir()
+            _make_git_repo(self_root / ".worktrees", "wt1")
+        else:
+            (self_root / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
+
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(self_root)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        assert project_data_dir() == shared_ws / ".synapt" / "recall"
+        marker = self_root / ".synapt" / "gripspace-root"
+        assert marker.is_file() == expect_registered
 
 
 class TestGripspaceRootSourceDisclosure:
