@@ -301,6 +301,16 @@ class TestResumeRefusesIndexSourceGripspaceMismatch(unittest.TestCase):
     took the REAL other workspace's build.lock and rebuilt its index using this
     cwd's content. Real GRIPSPACE_ROOT env and two real on-disk workspaces (not
     mocked): cmd_resume must refuse before anything reaches the lock.
+
+    v3 (Stromus's R2 on v2, m_4422aa09): the check below is a DISCRIMINATOR
+    (is source_dir's own gripspace populated?) and not a COMPARISON
+    (does source_root equal index_root?) -- every real agent desk on this
+    host is a filesystem sibling of the shared GRIPSPACE_ROOT team root, so
+    root inequality alone is the normal, correct shape for a legitimate
+    desk, not a defect. test_sibling_desk_with_a_registered_repo_proceeds
+    below is the witness the comparison-shaped v2 lacked; the two tests
+    after it are the unpopulated-scratch and same-root negative/positive
+    controls the discriminator must still get right.
     """
 
     def _cmd_resume_args(self):
@@ -374,6 +384,48 @@ class TestResumeRefusesIndexSourceGripspaceMismatch(unittest.TestCase):
                 (a / ".synapt" / "recall" / "build.lock").exists(),
                 "the real other workspace's build.lock must never be created",
             )
+
+    def test_sibling_desk_with_a_registered_repo_proceeds(self):
+        # v3's new witness: cwd (b) is a POPULATED gripspace -- it has a
+        # registered child repo, the same shape a real `gr spawn`/`gr repo
+        # add` desk always has (recall#1124's own positive control uses the
+        # identical fixture shape). GRIPSPACE_ROOT (a) still names a
+        # DIFFERENT workspace -- root inequality persists exactly as in the
+        # scratch-dir mismatch test above -- but a populated source must
+        # PROCEED, not refuse: this is the sibling-desk binding every real
+        # desk on this host relies on. Real dirs, no mocking of the
+        # discriminator itself, so a mutation that drops the populated
+        # check has nowhere to hide.
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            a = tmp / "canonical"       # GRIPSPACE_ROOT -- a DIFFERENT, real workspace
+            b = tmp / "agent-desk"      # cwd, populated (registered child repo)
+            a.mkdir()
+            b.mkdir()
+            (b / "repo" / ".git").mkdir(parents=True)
+
+            orig_cwd = Path.cwd()
+            os.chdir(b)
+            captured = io.StringIO()
+            try:
+                with mock.patch.dict(os.environ, {"GRIPSPACE_ROOT": str(a)}, clear=False), \
+                     mock.patch("sys.stderr", captured):
+                    os.environ.pop("SYNAPT_RECALL_ROOT", None)
+                    with self.assertRaises(SystemExit) as ctx:
+                        cli.cmd_resume(self._cmd_resume_args())
+            finally:
+                os.chdir(orig_cwd)
+
+            # Reaches the SAME downstream outcome as the agreeing-root case
+            # below ("no index found" against a, since a's real index was
+            # never built) -- proving the refusal did not fire, not merely
+            # that some other error happened to also exit 1.
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("no index found", captured.getvalue())
+            self.assertNotIn("disagree on which workspace", captured.getvalue())
 
     def test_explicit_index_flag_bypasses_the_refusal(self):
         # The fix this refusal points a caller at: passing --index explicitly

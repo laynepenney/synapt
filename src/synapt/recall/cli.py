@@ -72,6 +72,7 @@ from synapt.recall.core import (
     project_transcript_dir,
     project_transcript_dirs,
     all_worktree_archive_dirs,
+    _gripspace_has_registered_repo,
     _is_real_user_message,
     _extract_user_text,
     _extract_assistant_content,
@@ -122,13 +123,32 @@ def _refuse_if_index_disagrees_with_source(
     args: argparse.Namespace, index_dir: Path, source_dir: Path
 ) -> None:
     """recall#1123: an ambient index_dir (no explicit ``--index``) resolved
-    via a stale ``GRIPSPACE_ROOT``/``SYNAPT_RECALL_ROOT`` can point at a
-    DIFFERENT workspace than source_dir (cwd) -- reachable whenever the
-    environment carries a coordinate left over from another desk. Left
-    unchecked, a caller that goes on to rebuild (resume's cold no-caller
-    path is the one that does) takes THAT workspace's real build.lock and
-    rebuilds ITS index using THIS cwd's content: a cross-workspace index
-    corruption, not merely a wrong read.
+    via ``GRIPSPACE_ROOT``/``SYNAPT_RECALL_ROOT`` can point at a DIFFERENT
+    workspace than source_dir (cwd). Left unchecked, a caller that goes on
+    to rebuild (resume's cold no-caller path is the one that does) takes
+    THAT workspace's real build.lock and rebuilds ITS index using THIS
+    cwd's content: a cross-workspace index corruption, not merely a wrong
+    read.
+
+    v3 (Stromus's R2 on v2, m_4422aa09): a bare root-vs-root COMPARISON
+    refuses a shape that is legitimate BY DESIGN -- every real agent desk on
+    this host is a filesystem SIBLING of the team's shared GRIPSPACE_ROOT,
+    so ``source_root != index_root`` is true for every correctly-spawned
+    desk, not just for a poisoned one. The fix is a DISCRIMINATOR, not a
+    comparison: refuse only when source_dir's OWN gripspace is not itself
+    POPULATED (no registered repo), reusing recall#1124's
+    ``_gripspace_has_registered_repo`` -- the same signal that already
+    distinguishes a real ``gr spawn``/``gr repo add`` worktree from a
+    hand-built scratch dir for the marker-persistence half of this same
+    incident. A populated source proves this cwd was deliberately set up as
+    a desk; an unpopulated one is indistinguishable from the scratch dir a
+    stray env var poisoned in the original incident.
+
+    KNOWN LIMITATION, filed privately rather than detailed here: a
+    populated gripspace belonging to a DIFFERENT TEAM than the one
+    GRIPSPACE_ROOT names is not caught by this check -- "populated" only
+    proves SOME repo is registered, not that it is the SAME team's. Closing
+    that gap needs a registry signal this function does not have.
 
     Refuses before anything can touch build.lock, printing both paths and
     the fix. Skipped when ``--index`` was passed explicitly -- an explicit
@@ -143,6 +163,8 @@ def _refuse_if_index_disagrees_with_source(
         return
     source_root = project_data_dir(source_dir).parent.parent
     if index_root.resolve() == source_root.resolve():
+        return
+    if _gripspace_has_registered_repo(source_root):
         return
     print(
         "Error: index and source disagree on which workspace they belong to.",
