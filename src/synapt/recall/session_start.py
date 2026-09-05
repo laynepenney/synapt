@@ -42,6 +42,12 @@ PREVIEW_BYTES = 2048
 
 HOOK_RUN_LOG_MAX_RECORDS = 100
 
+# recall#856: a byte count says something was cut; it does not say HOW MUCH
+# (in items a reader can count) or HOW FAR BACK the visible window still
+# reaches. Carried next-steps carry this date already (journal.strip_carry_stamp
+# writes it); this just reads it back out of whatever survived clipping.
+_CARRY_STAMP_RE = re.compile(r"\[carried since (\d{4}-\d{2}-\d{2})\]")
+
 # Per-source byte caps. They sum to less than WAKE_BUDGET_BYTES by
 # construction, so the budget holds without a second pass; the final guard in
 # render_wake exists for the day someone adds a source and forgets this table.
@@ -556,7 +562,12 @@ def render_wake(
     shown = len(text.encode("utf-8"))
     withheld_bytes = max(0, full_bytes - shown)
     if withheld_lines or withheld_bytes > 0 and shown < full_bytes:
-        footer = f"--- shown {shown:,} of {full_bytes:,} B; {withheld_bytes:,} B withheld → read {pointer}"
+        oldest_shown = min(_CARRY_STAMP_RE.findall(text), default=None)
+        oldest_bit = f"; oldest shown: {oldest_shown}" if oldest_shown else ""
+        footer = (
+            f"--- shown {shown:,} of {full_bytes:,} B "
+            f"({withheld_lines} item(s) withheld, {withheld_bytes:,} B){oldest_bit} → read {pointer}"
+        )
     else:
         footer = f"--- {full_bytes:,} B, complete"
     return text + "\n\n" + footer + "\n"
