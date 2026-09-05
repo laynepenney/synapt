@@ -28,6 +28,39 @@ jobs:
       # every other test's result along with it.
       - run: pytest tests/ -v --continue-on-collection-errors
 
+  # unit-tests above only ever installs [test,dashboard,anthropic,openai] --
+  # every other declared extra (google-adk, crewai, onnx, all, ...) has never
+  # been installed in CI at all, so a customer running
+  # `pip install synapt[all]` was exercising a combination this repo had
+  # never once run its own suite against. Measured 2026-09-05 (recall_channel
+  # #dev, pinned m_e0aa1214): google-adk (19 real failures -- a constructor
+  # signature mismatch), crewai (4, "Memory Save Error"), onnx (1,
+  # JSONDecodeError), and all/all-integrations (23, the union of the crewai +
+  # google-adk failures, no additional breakage from anything else those
+  # extras pull in) all fail their own test paths for real when installed --
+  # not skipped for missing credentials, actually broken.
+  #
+  # continue-on-error: true because these are pre-existing product bugs this
+  # job did not introduce and is not the PR that fixes; the point of this job
+  # is to make an invisible gap visible (a check that can never fail is not a
+  # check), not to turn every future unrelated PR red over bugs it didn't
+  # touch. Once google-adk/crewai/onnx are fixed, drop continue-on-error (or
+  # narrow the matrix as each one goes green) so this becomes a real gate.
+  extras-smoke:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        extra: [google-adk, crewai, onnx, all]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test,${{ matrix.extra }}]"
+      - run: pytest tests/ -v --continue-on-collection-errors
+
   # requirements-mcp.lock is a hand-maintained, scoped lock (see requirements-mcp.in)
   # pinning the mcp SDK across recall's full supported Python range. The unit-tests
   # matrix above never installs it -- it installs directly from pyproject.toml -- so
