@@ -4104,11 +4104,30 @@ def cmd_maintain(args: argparse.Namespace) -> None:
             "  AND cs.cluster_id IS NULL",
             (min_chunks,),
         ).fetchone()[0]
+        recluster_receipt = None
+        if getattr(args, "recluster", False):
+            batch_size = args.recluster_batch or clustering.DEFAULT_RECLUSTER_BATCH
+            recluster_receipt = clustering.recluster_stale_chunks(db, batch_size=batch_size)
     finally:
         db.close()
 
     print(f"maintain: upgraded {upgraded} cluster summar{'y' if upgraded == 1 else 'ies'}")
     print(f"  {remaining} remaining above the {min_chunks}-chunk threshold")
+
+    if recluster_receipt is not None:
+        r = recluster_receipt
+        if r["refused"]:
+            print(
+                f"  Recluster: REFUSED -- {r['total_stale_at_start']} stale chunks "
+                f"exceeds the safety ceiling. {r['drain_command']}"
+            )
+        else:
+            print(
+                f"  Recluster: {r['batches_run']} batch(es), "
+                f"{r['chunks_clustered']} chunk(s) clustered this run, "
+                f"{r['still_stale']} still stale"
+                + (f". {r['drain_command']}" if r["drain_command"] else ".")
+            )
 
 
 def cmd_catchup(args: argparse.Namespace) -> None:
@@ -4472,6 +4491,17 @@ def make_parser() -> argparse.ArgumentParser:
         help="Maximum summaries to generate this run (default: 5). Bounded by "
              "default on purpose: an unbounded grind is what this command exists "
              "to replace.",
+    )
+    maintain_parser.add_argument(
+        "--recluster", action="store_true",
+        help="recall#435 follow-on: cluster the oldest bounded batch of "
+             "transcript chunks a skip_clustering build left stale. Default off.",
+    )
+    maintain_parser.add_argument(
+        "--recluster-batch", type=int, default=None,
+        help="Stale chunks to cluster this run (default: "
+             "clustering.DEFAULT_RECLUSTER_BATCH). Bounded on purpose -- this "
+             "is what keeps --recluster from repeating recall#435's OOM.",
     )
 
     migrate_parser = subparsers.add_parser(

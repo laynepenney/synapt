@@ -654,3 +654,126 @@ def upgrade_large_cluster_summaries(
     db._conn.commit()
 
     return count
+
+
+# recall#435 follow-on: bounded reclustering for chunks a skipped build left
+# stale. Defaults are first estimates, not yet validated against a real
+# per-chunk memory measurement -- see the PR that lands this comment for the
+# measured number and peak memory_pressure before it becomes the shipped
+# default.
+DEFAULT_RECLUSTER_BATCH = 2000
+DEFAULT_RECLUSTER_REFUSE_ABOVE = 50_000
+
+
+def stale_transcript_chunk_ids(db: "RecallDB") -> list[str]:
+    """Transcript chunk ids (turn_index >= 0) with no topic-cluster membership.
+
+    recall#435's ``skip_clustering`` build path saves chunks to FTS5 without
+    clustering them, which makes storage.py's own long-standing assumption
+    ("clustering is fully rebuilt on every recall build") false. This is
+    what makes that assumption checkable again.
+
+    Cluster membership always lives in the metadata/index shard -- both
+    ``save_clusters`` and ``append_clusters`` route there on
+    ``ShardedRecallDB`` -- while chunks may be split across per-shard data
+    DBs. Reads chunk HEADERS only (id + turn_index, no chunk text), across
+    every shard: cheap and O(chunk count), not the full-text O(store size)
+    cost that made full-corpus clustering itself OOM.
+    """
+    clustered_ids = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT DISTINCT cc.chunk_id FROM cluster_chunks cc "
+            "JOIN clusters cl ON cl.cluster_id = cc.cluster_id "
+            "WHERE cl.cluster_type = 'topic'"
+        ).fetchall()
+    }
+    headers = db.load_chunk_headers()
+    return [c.id for c in headers if c.turn_index >= 0 and c.id not in clustered_ids]
+
+
+def recluster_stale_chunks(
+    db: "RecallDB",
+    batch_size: int = DEFAULT_RECLUSTER_BATCH,
+    refuse_above: int = DEFAULT_RECLUSTER_REFUSE_ABOVE,
+) -> dict:
+    """Cluster the oldest bounded batch of stale chunks; report the backlog.
+
+    The memory bound that actually prevents a repeat of recall#435's OOM:
+    this NEVER reloads the already-clustered corpus. It clusters only the
+    stale batch among itself and calls ``append_clusters`` (additive), so a
+    stale chunk that is Jaccard-similar to an EXISTING cluster still gets
+    its own NEW cluster rather than being merged into the old one's
+    token-union. Named tradeoff, not a silent gap -- merging into existing
+    clusters is a later, separate lane.
+
+    Above ``refuse_above`` stale chunks, refuses outright and reports the
+    backlog plus the command that would drain it in batches, rather than
+    attempting one huge batch: that many stale chunks means something is
+    wrong (``skip_clustering`` left on for a long stretch, most likely),
+    not that a bigger single batch is safe.
+    """
+    stale_ids = stale_transcript_chunk_ids(db)
+    total_stale = len(stale_ids)
+
+    def _drain_command(remaining: int) -> str:
+        if remaining <= 0:
+            return ""
+        # Ceil division is a LOWER BOUND on runs needed, not a prediction:
+        # it assumes every chunk in every future batch actually clusters,
+        # which cluster_chunks()'s own MIN_CLUSTER_SIZE filtering does not
+        # guarantee (measured on the real store: 71 of 2000 selected chunks,
+        # 3.6%, actually formed a saved cluster in one run -- the rest stay
+        # stale and get reselected). "At least" is the honest word; a flat
+        # "N more runs" would overpromise convergence this function cannot
+        # itself guarantee.
+        runs = -(-remaining // batch_size)  # ceil division
+        return (
+            f"synapt maintain --recluster --recluster-batch {batch_size} "
+            f"(at least {runs} more run{'s' if runs != 1 else ''} to drain the backlog)"
+        )
+
+    if total_stale > refuse_above:
+        return {
+            "refused": True,
+            "total_stale_at_start": total_stale,
+            "batches_run": 0,
+            "chunks_clustered": 0,
+            "still_stale": total_stale,
+            "drain_command": _drain_command(total_stale),
+        }
+
+    batch_ids = stale_ids[:batch_size]
+    if not batch_ids:
+        return {
+            "refused": False,
+            "total_stale_at_start": 0,
+            "batches_run": 0,
+            "chunks_clustered": 0,
+            "still_stale": 0,
+            "drain_command": "",
+        }
+
+    id_rowid_map = db.get_chunk_id_rowid_map()
+    rowids = [id_rowid_map[cid] for cid in batch_ids if cid in id_rowid_map]
+    chunk_map = db.load_chunks_by_rowids(rowids)
+    batch_chunks = [chunk_map[r] for r in rowids if r in chunk_map]
+
+    clusters = cluster_chunks(batch_chunks)
+    if clusters:
+        memberships = [
+            (cl["cluster_id"], cid, cl["created_at"])
+            for cl in clusters
+            for cid in cl["chunk_ids"]
+        ]
+        db.append_clusters(clusters, memberships)
+
+    still_stale = len(stale_transcript_chunk_ids(db))
+    return {
+        "refused": False,
+        "total_stale_at_start": total_stale,
+        "batches_run": 1,
+        "chunks_clustered": total_stale - still_stale,
+        "still_stale": still_stale,
+        "drain_command": _drain_command(still_stale),
+    }
