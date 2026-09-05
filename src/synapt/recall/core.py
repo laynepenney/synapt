@@ -1454,8 +1454,24 @@ class TranscriptIndex:
         """
         if not self._lazy_chunks or self._db is None:
             return self.chunks
+        # idx -> position within self.sessions[chunk.session_id]. self.sessions
+        # was built in __init__ by walking self.chunks in order and appending
+        # each chunk to its session's list, so replaying that same walk here
+        # (over the CURRENT, not-yet-mutated self.chunks) reconstructs the
+        # exact position each index lands at in its session list -- letting a
+        # hydrated chunk be written back in O(1) instead of the O(session
+        # length) linear id-scan this used to do per chunk (measured as the
+        # new dominant frame, 22.3s tottime, once the batch-hydration fix
+        # above resolved the DB N+1: a session_length^2 blowup for any one
+        # large session, witnessed at 80,200 comparisons for a 400-chunk
+        # session in this function's own test).
         to_load: dict[int, int] = {}
+        session_position: dict[int, int] = {}
+        session_counts: dict[str, int] = {}
         for i, chunk in enumerate(self.chunks):
+            sid = chunk.session_id
+            session_position[i] = session_counts.get(sid, 0)
+            session_counts[sid] = session_position[i] + 1
             if chunk.user_text or chunk.assistant_text or chunk.tool_content or chunk.transcript_path:
                 continue
             rowid = self._idx_to_rowid.get(i)
@@ -1469,11 +1485,21 @@ class TranscriptIndex:
             if loaded is None:
                 continue
             self.chunks[idx] = loaded
-            session_chunks = self.sessions.get(loaded.session_id, [])
-            for pos, existing in enumerate(session_chunks):
-                if existing.id == loaded.id:
+            session_chunks = self.sessions.get(loaded.session_id)
+            if session_chunks is not None:
+                pos = session_position.get(idx, -1)
+                if 0 <= pos < len(session_chunks) and session_chunks[pos].id == loaded.id:
                     session_chunks[pos] = loaded
-                    break
+                else:
+                    # Defensive fallback only: the precomputed position should
+                    # always be correct (self.chunks's order and every chunk's
+                    # session_id are stable across this call), so this branch
+                    # is not expected to run. If some future change breaks
+                    # that invariant, correctness still wins over speed here.
+                    for scan_pos, existing in enumerate(session_chunks):
+                        if existing.id == loaded.id:
+                            session_chunks[scan_pos] = loaded
+                            break
             if loaded.turn_index >= 0:
                 self._turn_lookup[(loaded.session_id, loaded.turn_index)] = loaded
         return self.chunks
