@@ -719,6 +719,47 @@ class TestSessionCwdCache(unittest.TestCase):
         self.assertEqual(second, Path(other_dir + "-x").resolve())
         self.assertNotEqual(first, second)
 
+    def test_cache_invalidates_on_mtime_alone_when_size_is_unchanged(self):
+        """The size-only-key control: the test above rewrites to a LONGER
+        cwd string, so a mutant comparing size alone (dropping mtime from
+        the cache key) would still pass it — the rewrite changes both. This
+        keeps the byte length of the recorded cwd identical (one character
+        swapped) so only mtime distinguishes the two versions, and would
+        fail against a size-only key even though it passes against the
+        real (size, mtime) key.
+        """
+        tmpdir = tempfile.mkdtemp()
+        index_dir = Path(tempfile.mkdtemp())
+        first_cwd = str(tmpdir)
+        last_char = first_cwd[-1]
+        swapped_char = "9" if last_char != "9" else "8"
+        second_cwd = first_cwd[:-1] + swapped_char
+        self.assertEqual(len(first_cwd), len(second_cwd), "test setup must keep size identical")
+
+        path = _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": first_cwd}}],
+        )
+        from synapt.recall.codex import _session_cwd, configure_cwd_cache
+
+        configure_cwd_cache(index_dir)
+        first = _session_cwd(path)
+        self.assertEqual(first, Path(first_cwd).resolve())
+
+        pre_size = path.stat().st_size
+        _write_codex_transcript(
+            tmpdir,
+            [{"type": "session_meta", "payload": {"id": "s", "cwd": second_cwd}}],
+            name=path.name,
+        )
+        post_stat = path.stat()
+        self.assertEqual(pre_size, post_stat.st_size, "test setup must keep size identical")
+        os.utime(path, (post_stat.st_atime, post_stat.st_mtime + 5))
+
+        second = _session_cwd(path)
+        self.assertEqual(second, Path(second_cwd).resolve())
+        self.assertNotEqual(first, second)
+
     def test_cache_persists_across_reconfigure_reads_disk_without_rescanning(self):
         """Two bare `resume` invocations are two separate Python processes:
         the cache must survive via the on-disk file, not just in memory."""
