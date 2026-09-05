@@ -1700,6 +1700,9 @@ def cmd_resume(args: argparse.Namespace) -> None:
     nothing to resume), and a session id that does not resolve (exit 1 — the
     request was wrong). Collapsing them would send the reader down the wrong path.
     """
+    import atexit
+
+    from synapt.recall.codex import configure_cwd_cache, flush_cwd_cache
     from synapt.recall.journal import _journal_path
     from synapt.recall.resume import (
         ResumeError,
@@ -1719,6 +1722,16 @@ def cmd_resume(args: argparse.Namespace) -> None:
         print(f"Error: no index found at {index_dir}", file=sys.stderr)
         print("Run 'synapt recall build' or 'synapt init' first.", file=sys.stderr)
         sys.exit(1)
+
+    # recall#1125: every caller of _session_cwd (this function's own loop
+    # below, plus every list_codex_transcripts caller reached through the
+    # freshness check and the cold-path archive) shares one process-wide
+    # cache keyed off this index_dir, so a resume that opens a Codex rollout
+    # file once does not reopen it on the next call as long as it is
+    # unchanged. atexit guarantees the flush runs on every exit path in this
+    # function, including the early sys.exit(1) paths below.
+    configure_cwd_cache(index_dir)
+    atexit.register(flush_cwd_cache)
 
     project = getattr(args, "project", None) or Path.cwd()
     caller_sources = caller_transcripts(project)
