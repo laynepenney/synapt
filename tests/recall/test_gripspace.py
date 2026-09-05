@@ -1255,6 +1255,60 @@ class TestNearestExistingStoreRoot:
         assert project_data_dir(other) == other / ".synapt" / "recall"
 
 
+class TestIsInitializedStoreEvidenceBranches:
+    """_is_initialized_store() claims THREE independent OR-branches of
+    evidence: knowledge.jsonl, an index database (recall.db or index.db),
+    or a per-worktree journal (worktrees/*/journal.jsonl). Only the
+    knowledge.jsonl branch was exercised above (indirectly, through
+    _nearest_existing_store_root). Found in R1 review (Sentinel,
+    2026-09-05): disabling ONLY the index-db branch left the full suite
+    green -- neither the index-db nor the worktree-journal branch had a
+    test that would fail if either were silently dropped in a future
+    refactor. These call _is_initialized_store() directly, one witness
+    per branch, so each branch has its own failure mode."""
+
+    def test_index_database_alone_is_an_initialized_store(self, tmp_path):
+        """recall_build writes index/recall.db (or the sharded index.db)
+        without ever writing knowledge.jsonl for a build-only store -- that
+        alone must be sufficient evidence."""
+        from synapt.recall.core import _is_initialized_store
+
+        recall_db_dir = tmp_path / "build-only-recall-db" / ".synapt" / "recall"
+        (recall_db_dir / "index").mkdir(parents=True)
+        (recall_db_dir / "index" / "recall.db").write_text("")
+        assert _is_initialized_store(recall_db_dir) is True
+
+        index_db_dir = tmp_path / "build-only-index-db" / ".synapt" / "recall"
+        (index_db_dir / "index").mkdir(parents=True)
+        (index_db_dir / "index" / "index.db").write_text("")
+        assert _is_initialized_store(index_db_dir) is True
+
+        # Negative control: an index/ directory that holds neither db file
+        # must not itself count as evidence.
+        empty_index_dir = tmp_path / "empty-index-dir" / ".synapt" / "recall"
+        (empty_index_dir / "index").mkdir(parents=True)
+        assert _is_initialized_store(empty_index_dir) is False
+
+    def test_per_worktree_journal_alone_is_an_initialized_store(self, tmp_path):
+        """recall_journal's first write lands at worktrees/<name>/journal.jsonl
+        without ever touching knowledge.jsonl or the index -- that alone
+        must be sufficient evidence."""
+        from synapt.recall.core import _is_initialized_store
+
+        journal_dir = tmp_path / "journal-only" / ".synapt" / "recall"
+        (journal_dir / "worktrees" / "main").mkdir(parents=True)
+        (journal_dir / "worktrees" / "main" / "journal.jsonl").write_text("")
+        assert _is_initialized_store(journal_dir) is True
+
+        # Negative control: a worktrees/ directory that exists but holds no
+        # journal.jsonl anywhere under it (e.g. only a side-file from other
+        # tooling) must not count as evidence.
+        no_journal_dir = tmp_path / "worktrees-no-journal" / ".synapt" / "recall"
+        (no_journal_dir / "worktrees" / "main").mkdir(parents=True)
+        (no_journal_dir / "worktrees" / "main" / "spawn_state.json").write_text("{}")
+        assert _is_initialized_store(no_journal_dir) is False
+
+
 class TestRecallSaveHonorsGripspaceRootOverCwd:
     """Direct call-site witness for recall_save, not just project_data_dir in
     isolation. A mutation test (Stromus, 2026-09-05) reverting recall_save's
