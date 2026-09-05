@@ -1135,3 +1135,81 @@ class TestGripspaceRootSourceDisclosure:
         assert source.startswith("walk-up")
         assert str(shared_ws) in source
         assert "stale" in source.lower()
+
+
+class TestNearestExistingStoreRoot:
+    """A store deliberately initialized at a root NESTED under an agent
+    desk is not itself a git worktree or a gripspace boundary, so the
+    git/gripspace walk-up used to skip straight past it to the ENCLOSING
+    desk's root -- a root nested under a desk is never isolated. These
+    tests exercise the ambient (no env override, no
+    explicit project_dir) resolution path only; the env-override case is
+    covered by test_env_root_wins_over_gripspace_inference et al. above and
+    unaffected by this change (env override still runs before this check
+    even applies)."""
+
+    def test_nested_store_wins_over_enclosing_gripspace(self, tmp_path, monkeypatch):
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        desk = _make_gr2_workspace(fake_home)
+        nested = desk / "nested-store"
+        (nested / ".synapt" / "recall").mkdir(parents=True)
+        monkeypatch.chdir(nested)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        with patch("synapt.recall.core.Path.home", return_value=fake_home):
+            assert project_data_dir(None) == nested / ".synapt" / "recall"
+
+    def test_control_no_nested_store_still_walks_up_to_gripspace(self, tmp_path, monkeypatch):
+        """Unaffected case: no store nested below cwd, the enclosing
+        gripspace still wins exactly as before this change."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        desk = _make_gr2_workspace(fake_home)
+        sub = desk / "plain-subdir"
+        sub.mkdir()
+        monkeypatch.chdir(sub)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
+        with patch("synapt.recall.core.Path.home", return_value=fake_home):
+            assert project_data_dir(None) == desk / ".synapt" / "recall"
+
+    def test_nearest_existing_store_root_helper_returns_none_when_absent(self, tmp_path):
+        from synapt.recall.core import _nearest_existing_store_root
+
+        fake_home = tmp_path / "home"
+        bare = fake_home / "bare"
+        bare.mkdir(parents=True)
+        with patch("synapt.recall.core.Path.home", return_value=fake_home):
+            assert _nearest_existing_store_root(bare) is None
+
+    def test_nearest_existing_store_root_stops_at_the_first_one_found(self, tmp_path):
+        """Two nested stores: the walk must stop at the NEARER one, never
+        continue past it to an ancestor's."""
+        from synapt.recall.core import _nearest_existing_store_root
+
+        fake_home = tmp_path / "home"
+        outer = fake_home / "outer"
+        (outer / ".synapt" / "recall").mkdir(parents=True)
+        inner = outer / "inner"
+        (inner / ".synapt" / "recall").mkdir(parents=True)
+        deepest = inner / "deepest"
+        deepest.mkdir()
+        with patch("synapt.recall.core.Path.home", return_value=fake_home):
+            assert _nearest_existing_store_root(deepest) == inner
+            assert _nearest_existing_store_root(inner) == inner
+            assert _nearest_existing_store_root(outer) == outer
+
+    def test_explicit_project_dir_bypasses_the_nested_store_check(self, tmp_path, monkeypatch):
+        """An explicitly-passed project_dir is a deliberate root (matching
+        the env-override suppression rule) -- it must not be redirected by
+        a nested store the caller did not ask about."""
+        fake_home = tmp_path / "home"
+        fake_home.mkdir()
+        desk = _make_gr2_workspace(fake_home)
+        nested = desk / "nested-store"
+        (nested / ".synapt" / "recall").mkdir(parents=True)
+        other = tmp_path / "other-explicit-root"
+        other.mkdir()
+        monkeypatch.chdir(nested)
+        assert project_data_dir(other) == other / ".synapt" / "recall"

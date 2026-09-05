@@ -4706,6 +4706,49 @@ def _find_gripspace_root(path: Path) -> Path | None:
     return None
 
 
+def _nearest_existing_store_root(path: Path, stop_at: Path | None = None) -> Path | None:
+    """Walk up from *path* and return the NEAREST ancestor (including
+    *path* itself) that already has an initialized ``.synapt/recall``
+    store, stopping at *stop_at* (inclusive) if given, else at ``$HOME``
+    or the filesystem root. Returns ``None`` if none exists in that range.
+
+    A store deliberately initialized at a root NESTED under an agent desk
+    (e.g. a test-isolation directory a level below the desk's own
+    gripspace) is not itself a git worktree or a gripspace boundary, so the
+    walk-up in ``project_data_dir`` used to skip straight past it to the
+    ENCLOSING desk's root -- a root nested under a desk is never isolated.
+    This check runs BEFORE the boundary is
+    accepted in the ambient (no env override, no explicit project_dir)
+    branch: an already-initialized store at or below the git/gripspace
+    boundary wins over that boundary, because it is the more specific,
+    already-established coordinate.
+
+    ``stop_at`` is load-bearing, not cosmetic: an unbounded walk toward
+    ``$HOME`` treats ANY existing store between the caller's boundary and
+    home as if it were nested under the caller's own project, which is not
+    the claim this check is allowed to make. Measured directly (2026-09-05):
+    a stray ``.synapt/recall`` leaked at the shared macOS ``$TMPDIR`` root
+    by an unrelated earlier run silently hijacked five pre-existing
+    ambient-resolution tests the moment this function's walk was allowed to
+    pass their fixture's own gripspace boundary looking for something
+    nearer -- the exact "walked past the wrong thing" failure this function
+    exists to fix, one boundary further out. Bounding the walk at the
+    caller-supplied boundary means a store outside that boundary can never
+    be mistaken for one nested inside it, leaked debris included. It never
+    walks PAST an existing store to find an ancestor's -- only the nearest
+    one, starting from *path*.
+    """
+    home = Path.home().resolve()
+    limit = stop_at.resolve() if stop_at is not None else home
+    current = path.resolve()
+    while True:
+        if (current / ".synapt" / "recall").is_dir():
+            return current
+        if current == limit or current == home or current == current.parent:
+            return None
+        current = current.parent
+
+
 def _resolve_griptree_parent(griptree_path: Path) -> Path | None:
     """Resolve a linked griptree back to its parent gripspace root.
 
@@ -5045,15 +5088,38 @@ def project_data_dir(project_dir: Path | None = None) -> Path:
 
         # Priority 1: git worktree → resolve to main worktree root
         main_root = _git_main_worktree_root(root)
-        if main_root is not None:
-            root = main_root
+        boundary = main_root
 
         # Priority 2: GitGrip gripspace → resolve to gripspace root
         # If CWD (or resolved root) is inside a gripspace, prefer the
         # gripspace root so all constituent repos share one recall index.
-        grip_root = _find_gripspace_root(root)
+        grip_root = _find_gripspace_root(boundary if boundary is not None else root)
         if grip_root is not None:
-            root = grip_root
+            boundary = grip_root
+
+        # Priority 0c (ambient only): an already-initialized store nested
+        # strictly between `root` and `boundary` (inclusive of both ends)
+        # wins over the boundary -- it is the more specific, already-
+        # established coordinate, and the walk-up must not skip past it to
+        # an enclosing desk's root. Bounded at `boundary` on purpose: a
+        # store existing further out, between the boundary and $HOME, is
+        # not nested under this project and must never hijack resolution --
+        # see _nearest_existing_store_root's docstring for the leaked-store
+        # incident that made this bound load-bearing rather than cosmetic.
+        # Skipped when project_dir was explicitly passed: a deliberate root
+        # is the caller's own choice, same as the env-override suppression
+        # above.
+        nearest_store_root = (
+            _nearest_existing_store_root(
+                root, stop_at=boundary if boundary is not None else root
+            )
+            if project_dir is None
+            else None
+        )
+        if nearest_store_root is not None:
+            root = nearest_store_root
+        elif boundary is not None:
+            root = boundary
         elif project_dir is None and root == Path.home().resolve():
             # AMBIENT inference (no project_dir passed) that falls all the way to
             # $HOME — a store sitting above every project on the machine — is

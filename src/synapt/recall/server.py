@@ -1179,7 +1179,11 @@ def recall_build(incremental: bool = True) -> str:
     """
     from synapt.recall.cli import _acquire_build_lock, _release_build_lock
 
-    project = Path.cwd().resolve()
+    # None => resolve via SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT + inference
+    # (project_data_dir, _archive_and_build, and every downstream helper
+    # below already handle None; only this cwd-forcing forwarding
+    # suppressed the override).
+    project = None
     with _BUILD_RECEIPT_LOCK:
         receipt_lock = _acquire_build_lock(
             project_data_dir(project), timeout=5, name="build-receipt.lock",
@@ -1245,7 +1249,9 @@ def recall_build_status(build_id: str = "") -> str:
 
     Omit build_id to read the newest receipt for the current project.
     """
-    project = Path.cwd().resolve()
+    # Same None-forwarding as recall_build: let SYNAPT_RECALL_ROOT /
+    # GRIPSPACE_ROOT take effect instead of a pre-resolved cwd.
+    project = None
     if build_id:
         if not _BUILD_ID_RE.fullmatch(build_id):
             return "Invalid build id. Expected build_<12 lowercase hex characters>."
@@ -1283,12 +1289,17 @@ def recall_setup(no_hook: bool = False) -> str:
     """
     from synapt.recall.cli import _archive_and_build, _ensure_gitignore, _install_global_hooks
 
-    project = Path.cwd().resolve()
+    # Two different concerns, two different roots. .gitignore (step 3) must
+    # stay tied to the ACTUAL cwd -- it belongs to the git repo standing
+    # here, regardless of where the store lives. The index build (step 1)
+    # is store resolution and must honor an env override the same way
+    # recall_build does: forward None, never a pre-resolved cwd.
+    cwd = Path.cwd().resolve()
     steps: list[str] = []
 
     # 1. Archive transcripts + build index
     try:
-        final_index = _archive_and_build(project, use_embeddings=True)
+        final_index = _archive_and_build(None, use_embeddings=True)
     except Exception as e:
         return f"Setup failed during index build: {e}"
     finally:
@@ -1316,11 +1327,11 @@ def recall_setup(no_hook: bool = False) -> str:
         steps.append("Hook installation skipped (no_hook=True)")
 
     # 3. Add .synapt/ to .gitignore
-    _ensure_gitignore(project)
+    _ensure_gitignore(cwd)
     steps.append(".synapt/ ensured in .gitignore")
 
-    # Summary
-    index_dir = project_index_dir(project)
+    # Summary: same root as step 1's build -- forward None, never cwd.
+    index_dir = project_index_dir(None)
     if index_dir.exists() and any(index_dir.iterdir()):
         total_size = sum(fp.stat().st_size for fp in index_dir.iterdir() if fp.is_file())
         steps.append(f"Index size: {format_size(total_size)}")
@@ -2472,7 +2483,10 @@ def recall_save(
                 f"Valid categories: {', '.join(sorted(VALID_CATEGORIES))}."
             )
 
-        project = Path.cwd().resolve()
+        # None => resolve via SYNAPT_RECALL_ROOT / GRIPSPACE_ROOT + inference.
+        # Forwarding Path.cwd() would suppress the override, same pattern as
+        # recall_export's existing fix for the same class of bug.
+        project = None
         db = RecallDB(live_store_path(project_index_dir(project)))
         try:
             # --- Retract path ---

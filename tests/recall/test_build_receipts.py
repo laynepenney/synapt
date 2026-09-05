@@ -190,7 +190,18 @@ def test_receipt_status_uses_query_only_windows_pid_primitive(monkeypatch, tmp_p
     observed = json.loads(server.recall_build_status(receipt["build_id"]))
     assert observed["state"] == "running"
     assert pid_calls == [424242]
-    assert marker_calls == [(tmp_path.resolve(), receipt["server_marker"])]
+    # recall_build_status now forwards None (not a pre-resolved cwd) so
+    # project_data_dir's own env-var-first resolution applies; the
+    # call argument recorded here is therefore None, not tmp_path.resolve().
+    # What must still hold -- and is the actual invariant this test checks
+    # -- is that it resolves to the SAME store the receipt was written
+    # under, whichever raw argument reached it.
+    assert len(marker_calls) == 1
+    called_project, called_marker = marker_calls[0]
+    assert called_marker == receipt["server_marker"]
+    assert server.project_data_dir(called_project) == server.project_data_dir(
+        tmp_path.resolve()
+    )
 
 
 def test_status_cannot_overwrite_a_terminal_receipt_with_interrupted(monkeypatch, tmp_path):
