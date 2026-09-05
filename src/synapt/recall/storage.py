@@ -168,6 +168,20 @@ CREATE TABLE IF NOT EXISTS cluster_chunks (
 CREATE INDEX IF NOT EXISTS idx_cluster_chunks_chunk ON cluster_chunks(chunk_id);
 CREATE INDEX IF NOT EXISTS idx_clusters_status ON clusters(status);
 
+-- recall#435's recluster maintenance op reselects the same
+-- stale chunks every run when they fail to reach MIN_CLUSTER_SIZE (measured
+-- on the real store: 98.9% batch overlap between consecutive runs). This
+-- table records which chunks a recluster run has already tried, so batch
+-- selection can prefer never-tried chunks first. One row per chunk_id --
+-- INSERT OR REPLACE on a repeat attempt, never deleted: a chunk that later
+-- clusters is excluded from the stale query entirely and will never be
+-- selected again, so its (now-inert) attempt row needs no cleanup.
+CREATE TABLE IF NOT EXISTS recluster_attempts (
+    chunk_id     TEXT PRIMARY KEY,
+    attempted_at TEXT NOT NULL,
+    run_id       TEXT NOT NULL
+);
+
 -- Access tracking tables for adaptive memory (Phase 2).
 -- access_log is append-only: every returned search result or drill-down is
 -- recorded.  access_stats is a materialized aggregate rebuilt from the log
@@ -2457,6 +2471,30 @@ class RecallDB:
             )
         cur.execute("INSERT INTO clusters_fts(clusters_fts) VALUES ('rebuild')")
         self._conn.commit()
+
+    def mark_recluster_attempted(self, chunk_ids: list[str], run_id: str) -> None:
+        """Record that a recluster run tried these chunk ids.
+
+        ``INSERT OR REPLACE`` -- a chunk attempted again on a later run just
+        updates its timestamp/run_id, it does not accumulate history rows.
+        """
+        if not chunk_ids:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        cur = self._conn.cursor()
+        cur.executemany(
+            "INSERT OR REPLACE INTO recluster_attempts (chunk_id, attempted_at, run_id) "
+            "VALUES (?, ?, ?)",
+            [(cid, now, run_id) for cid in chunk_ids],
+        )
+        self._conn.commit()
+
+    def get_recluster_attempted_ids(self) -> set[str]:
+        """Chunk ids a recluster run has already tried and failed on."""
+        return {
+            row[0]
+            for row in self._conn.execute("SELECT chunk_id FROM recluster_attempts").fetchall()
+        }
 
     def load_clusters(self, status: str = "active") -> list[dict]:
         """Load clusters filtered by status."""

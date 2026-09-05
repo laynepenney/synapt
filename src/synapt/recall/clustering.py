@@ -15,6 +15,7 @@ import hashlib
 import logging
 import math
 import re as _re
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -692,26 +693,58 @@ def stale_transcript_chunk_ids(db: "RecallDB") -> list[str]:
     return [c.id for c in headers if c.turn_index >= 0 and c.id not in clustered_ids]
 
 
+def _select_recluster_batch(
+    db: "RecallDB", stale_ids: list[str], batch_size: int
+) -> tuple[list[str], int, int]:
+    """never-attempted stale chunks first, oldest first; fall back
+    to already-attempted ones only once the fresh queue is exhausted.
+
+    Measured on the real store: without this preference, 98.9%
+    of a batch overlaps the previous run's batch when most of it fails to
+    cluster, so the op makes almost no forward progress. Returns
+    ``(batch_ids, fresh_count, fallback_count)``.
+    """
+    attempted = db.get_recluster_attempted_ids()
+    fresh = [cid for cid in stale_ids if cid not in attempted]
+    fallback_pool = [cid for cid in stale_ids if cid in attempted]
+
+    batch = fresh[:batch_size]
+    fresh_count = len(batch)
+    if fresh_count < batch_size:
+        batch = batch + fallback_pool[: batch_size - fresh_count]
+    return batch, fresh_count, len(batch) - fresh_count
+
+
 def recluster_stale_chunks(
     db: "RecallDB",
     batch_size: int = DEFAULT_RECLUSTER_BATCH,
     refuse_above: int = DEFAULT_RECLUSTER_REFUSE_ABOVE,
 ) -> dict:
-    """Cluster the oldest bounded batch of stale chunks; report the backlog.
+    """Cluster a bounded batch of stale chunks, preferring never-tried ones
+    first; report the backlog.
 
     The memory bound that actually prevents a repeat of recall#435's OOM:
     this NEVER reloads the already-clustered corpus. It clusters only the
-    stale batch among itself and calls ``append_clusters`` (additive), so a
-    stale chunk that is Jaccard-similar to an EXISTING cluster still gets
+    selected batch among itself and calls ``append_clusters`` (additive), so
+    a stale chunk that is Jaccard-similar to an EXISTING cluster still gets
     its own NEW cluster rather than being merged into the old one's
     token-union. Named tradeoff, not a silent gap -- merging into existing
-    clusters is a later, separate lane.
+    clusters is a later, separate lane: the real store clears only ~1-4%
+    of a batch per run, so most of the backlog cannot cluster with itself
+    at all and needs the merge lane, not a bigger batch or a smarter skip.
 
-    Above ``refuse_above`` stale chunks, refuses outright and reports the
-    backlog plus the command that would drain it in batches, rather than
-    attempting one huge batch: that many stale chunks means something is
-    wrong (``skip_clustering`` left on for a long stretch, most likely),
-    not that a bigger single batch is safe.
+    Batch SELECTION prefers chunks ``recluster_attempts`` has never seen:
+    a chunk that fails to cluster is marked attempted and routed around on
+    future runs until every never-tried chunk is exhausted, which is what
+    keeps the op making forward progress instead of reselecting the same
+    stuck chunks every time.
+
+    Above ``refuse_above`` stale chunks (total backlog, not batch
+    composition), refuses outright and reports the backlog plus the command
+    that would drain it in batches, rather than attempting one huge batch:
+    that many stale chunks means something is wrong (``skip_clustering``
+    left on for a long stretch, most likely), not that a bigger single
+    batch is safe.
     """
     stale_ids = stale_transcript_chunk_ids(db)
     total_stale = len(stale_ids)
@@ -740,10 +773,12 @@ def recluster_stale_chunks(
             "batches_run": 0,
             "chunks_clustered": 0,
             "still_stale": total_stale,
+            "fresh_in_batch": 0,
+            "fallback_in_batch": 0,
             "drain_command": _drain_command(total_stale),
         }
 
-    batch_ids = stale_ids[:batch_size]
+    batch_ids, fresh_count, fallback_count = _select_recluster_batch(db, stale_ids, batch_size)
     if not batch_ids:
         return {
             "refused": False,
@@ -751,6 +786,8 @@ def recluster_stale_chunks(
             "batches_run": 0,
             "chunks_clustered": 0,
             "still_stale": 0,
+            "fresh_in_batch": 0,
+            "fallback_in_batch": 0,
             "drain_command": "",
         }
 
@@ -768,12 +805,22 @@ def recluster_stale_chunks(
         ]
         db.append_clusters(clusters, memberships)
 
-    still_stale = len(stale_transcript_chunk_ids(db))
+    still_stale_ids = set(stale_transcript_chunk_ids(db))
+    # Mark only batch members that FAILED to cluster this run -- a chunk
+    # that succeeded is no longer stale and will never be reselected, so it
+    # needs no attempt row (see the table's own comment in storage.py).
+    failed_this_run = [cid for cid in batch_ids if cid in still_stale_ids]
+    if failed_this_run:
+        db.mark_recluster_attempted(failed_this_run, run_id=uuid.uuid4().hex[:12])
+
+    still_stale = len(still_stale_ids)
     return {
         "refused": False,
         "total_stale_at_start": total_stale,
         "batches_run": 1,
         "chunks_clustered": total_stale - still_stale,
         "still_stale": still_stale,
+        "fresh_in_batch": fresh_count,
+        "fallback_in_batch": fallback_count,
         "drain_command": _drain_command(still_stale),
     }

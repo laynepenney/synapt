@@ -211,6 +211,12 @@ class ShardedRecallDB:
     def append_clusters(self, clusters: list[dict], memberships: list[tuple]) -> None:
         self._index.append_clusters(clusters, memberships)
 
+    def mark_recluster_attempted(self, chunk_ids: list[str], run_id: str) -> None:
+        self._index.mark_recluster_attempted(chunk_ids, run_id)
+
+    def get_recluster_attempted_ids(self) -> set[str]:
+        return self._index.get_recluster_attempted_ids()
+
     def save_cluster_summary(self, cluster_id: str, summary: str, **kwargs) -> None:
         self._index.save_cluster_summary(cluster_id, summary, **kwargs)
 

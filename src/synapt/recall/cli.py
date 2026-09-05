@@ -4124,7 +4124,8 @@ def cmd_maintain(args: argparse.Namespace) -> None:
         else:
             print(
                 f"  Recluster: {r['batches_run']} batch(es), "
-                f"{r['chunks_clustered']} chunk(s) clustered this run, "
+                f"{r['fresh_in_batch']} fresh + {r['fallback_in_batch']} fallback "
+                f"in the batch, {r['chunks_clustered']} chunk(s) clustered this run, "
                 f"{r['still_stale']} still stale"
                 + (f". {r['drain_command']}" if r["drain_command"] else ".")
             )
