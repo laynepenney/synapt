@@ -26,6 +26,8 @@ from unittest import mock
 
 from synapt.recall import cli
 from synapt.recall.cli import ColdRefreshOutcome, cold_no_caller_refresh
+from synapt.recall.core import TranscriptChunk, TranscriptIndex
+from synapt.recall.freshness import IndexFreshness
 from synapt.recall.resume import ResumeView, ResumeTurn, format_resume
 
 from _isolation_helpers import owned_store
@@ -75,6 +77,57 @@ class TestColdNoCallerRefresh(unittest.TestCase):
         self.assertEqual(out.cursor_before, "2026-06-01T00:00:00")
         self.assertEqual(out.cursor_after, "2026-09-01T00:00:00")
         self.assertEqual(len(build_calls), 1)  # the build ran
+
+    def test_a_real_build_names_both_store_and_source_distinctly_on_stderr(self):
+        # recall#1123 hardening: even the agreeing case (the only one that
+        # reaches the build today, cmd_resume's own refusal having ruled out
+        # the disagreeing one) leaves a legible trail of which store was
+        # rebuilt from which source. store_root and source_dir can differ in
+        # cold_no_caller_refresh's own signature (see TestColdRefreshStoreSplit
+        # above), so this fixture uses genuinely different paths to prove the
+        # line names BOTH, not one value printed twice.
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            store = tmp / "canonical"
+            source = tmp / "agent-desk"
+            (store / ".synapt" / "recall" / "index").mkdir(parents=True)
+            source.mkdir()
+            index_dir = store / ".synapt" / "recall" / "index"
+
+            fresh = iter([mock.Mock(build_timestamp="old"), mock.Mock(build_timestamp="new")])
+            with mock.patch.object(cli, "_newest_source_file",
+                                   return_value=source / ".codex" / "rollout.jsonl"), \
+                 mock.patch.object(cli, "_acquire_build_lock", return_value=7), \
+                 mock.patch.object(cli, "_release_build_lock"), \
+                 mock.patch.object(cli, "_archive_and_build_locked"), \
+                 mock.patch.object(cli, "project_data_dir", return_value=store), \
+                 mock.patch("synapt.recall.freshness.check_index_freshness",
+                            side_effect=lambda *a, **k: next(fresh)):
+                captured = io.StringIO()
+                with mock.patch("sys.stderr", captured):
+                    cold_no_caller_refresh(source, index_dir)
+
+        self.assertIn("refreshing store", captured.getvalue())
+        self.assertIn(str(store.resolve()), captured.getvalue())
+        self.assertIn(str(source), captured.getvalue())
+
+    def test_ghost_lock_and_no_source_print_nothing(self):
+        # Negative control: the print sits AFTER lock acquisition succeeds,
+        # so paths that never get that far (held lock, nothing to refresh)
+        # must stay silent -- proves the positive test above is reading the
+        # NEW line, not some unrelated print elsewhere in the function.
+        import io
+
+        for lock_fd, newest in ((None, Path("/w/rollout.jsonl")), (7, None)):
+            with self.subTest(lock_fd=lock_fd, newest=newest):
+                cms, _ = _patches(lock_fd=lock_fd, newest=newest)
+                captured = io.StringIO()
+                with mock.patch("sys.stderr", captured):
+                    self._run(cms)
+                self.assertEqual(captured.getvalue(), "")
 
     def test_ghost_lock_control_builds_nothing_and_waits_for_nothing(self):
         # recall#1018: lock held (possibly by a dead holder). The read must not
@@ -235,6 +288,161 @@ class TestColdRefreshStoreSplit(unittest.TestCase):
             self.assertEqual(captured["source"], b)             # SOURCE == cwd (B), threaded as-is
             self.assertFalse((b / ".synapt").exists())          # no cwd-derived secondary store
             self.assertTrue((a / ".synapt" / "recall").is_dir())  # the real lock touched A
+
+
+class TestResumeRefusesIndexSourceGripspaceMismatch(unittest.TestCase):
+    """recall#1123: TestColdRefreshStoreSplit above proves cold_no_caller_refresh
+    correctly targets whichever store it is TOLD to target -- that is right for
+    a function that trusts its caller. The incident this closes is one layer up:
+    a bare `synapt resume` with a stale GRIPSPACE_ROOT (left over from another
+    desk) resolves index_dir from THAT env var while source stays cwd, so
+    cmd_resume handed cold_no_caller_refresh two paths naming DIFFERENT
+    workspaces -- and cold_no_caller_refresh, trusting its caller as designed,
+    took the REAL other workspace's build.lock and rebuilt its index using this
+    cwd's content. Real GRIPSPACE_ROOT env and two real on-disk workspaces (not
+    mocked): cmd_resume must refuse before anything reaches the lock.
+    """
+
+    def _cmd_resume_args(self):
+        import argparse
+        return argparse.Namespace(session=None, index=None, turns=10)
+
+    def _build_real_loadable_index(self, index_dir: Path) -> None:
+        """A genuinely loadable index (SQLite-backed, per test_resume.py's own
+        _save_sqlite_index pattern) -- not an empty stub. Without this, resume
+        would crash on schema errors before ever reaching caller_transcripts /
+        the freshness check / cold_no_caller_refresh, and the RED-before-fix
+        run below would prove nothing about the actual incident path."""
+        from synapt.recall.storage import RecallDB
+
+        index_dir.mkdir(parents=True, exist_ok=True)
+        chunk = TranscriptChunk(
+            id="fake0000:t0", session_id="fake0000", timestamp="2026-01-01T00:00:00Z",
+            turn_index=0, user_text="hi", assistant_text="hello",
+        )
+        db = RecallDB(index_dir / "recall.db")
+        try:
+            TranscriptIndex([chunk], use_embeddings=False, db=db).save(index_dir)
+        finally:
+            db.close()
+
+    def test_ambient_mismatch_refuses_before_any_lock_is_taken(self):
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            a = tmp / "canonical"       # GRIPSPACE_ROOT store -- the REAL other workspace
+            b = tmp / "agent-desk"      # cwd, a filesystem SIBLING of A
+            index_dir = a / ".synapt" / "recall" / "index"
+            self._build_real_loadable_index(index_dir)
+            b.mkdir()
+
+            orig_cwd = Path.cwd()
+            os.chdir(b)
+            captured = io.StringIO()
+            try:
+                stale_verdict = IndexFreshness(
+                    stale=True, build_timestamp="old", scanned="archive+sources"
+                )
+                with mock.patch.dict(os.environ, {"GRIPSPACE_ROOT": str(a)}, clear=False), \
+                     mock.patch("synapt.recall.resume.caller_transcripts", return_value=[]), \
+                     mock.patch(
+                        "synapt.recall.freshness.check_index_freshness",
+                        return_value=stale_verdict,
+                     ), \
+                     mock.patch.object(
+                        cli, "_newest_source_file", return_value=b / "fake-rollout.jsonl"
+                     ), \
+                     mock.patch.object(cli, "_archive_and_build_locked") as build, \
+                     mock.patch.object(cli, "_acquire_build_lock", return_value=999) as lock, \
+                     mock.patch.object(cli, "_release_build_lock") as release, \
+                     mock.patch("sys.stderr", captured):
+                    os.environ.pop("SYNAPT_RECALL_ROOT", None)
+                    with self.assertRaises(SystemExit) as ctx:
+                        cli.cmd_resume(self._cmd_resume_args())
+            finally:
+                os.chdir(orig_cwd)
+
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("disagree on which workspace", captured.getvalue())
+            self.assertIn(str(b), captured.getvalue())         # names the source path
+            self.assertIn(str(a), captured.getvalue())         # names the index path
+            lock.assert_not_called()   # never reached the lock
+            build.assert_not_called()  # never built
+            self.assertFalse(
+                (a / ".synapt" / "recall" / "build.lock").exists(),
+                "the real other workspace's build.lock must never be created",
+            )
+
+    def test_explicit_index_flag_bypasses_the_refusal(self):
+        # The fix this refusal points a caller at: passing --index explicitly
+        # is a deliberate choice recall already treats as suppressing ambient
+        # resolution elsewhere (project_data_dir's own env-override rule).
+        # Both this test and the mismatch test above end in the SAME exit
+        # code (1), from two DIFFERENT checks -- so the message on stderr,
+        # not the exit code, is what proves which one fired.
+        import argparse
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            a = tmp / "canonical"
+            b = tmp / "agent-desk"
+            (a / ".synapt" / "recall" / "index").mkdir(parents=True)
+            b.mkdir()
+
+            orig_cwd = Path.cwd()
+            os.chdir(b)
+            captured = io.StringIO()
+            try:
+                args = argparse.Namespace(
+                    session=None, index=str(a / ".synapt" / "recall" / "index"), turns=10
+                )
+                with mock.patch("sys.stderr", captured):
+                    # Real function, no mocking: an explicit --index skips the
+                    # mismatch check entirely and falls through to "no index
+                    # found" (a real .db was never written under it) -- that
+                    # SystemExit(1) is expected; it is the OTHER check.
+                    with self.assertRaises(SystemExit) as ctx:
+                        cli.cmd_resume(args)
+            finally:
+                os.chdir(orig_cwd)
+
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("no index found", captured.getvalue())
+            self.assertNotIn("disagree on which workspace", captured.getvalue())
+
+    def test_agreeing_ambient_index_and_source_do_not_refuse(self):
+        # Negative control for the mismatch test above: SAME GRIPSPACE_ROOT env
+        # mechanism, but cwd IS the GRIPSPACE_ROOT workspace, so index and
+        # source name the SAME root. Must proceed past the refusal to the
+        # "no index found" branch -- same exit code as the mismatch test,
+        # disambiguated here by the stderr message, not the code.
+        import io
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            a = tmp / "canonical"
+            a.mkdir()
+
+            orig_cwd = Path.cwd()
+            os.chdir(a)
+            captured = io.StringIO()
+            try:
+                with mock.patch.dict(os.environ, {"GRIPSPACE_ROOT": str(a)}, clear=False), \
+                     mock.patch("sys.stderr", captured):
+                    os.environ.pop("SYNAPT_RECALL_ROOT", None)
+                    with self.assertRaises(SystemExit) as ctx:
+                        cli.cmd_resume(self._cmd_resume_args())
+            finally:
+                os.chdir(orig_cwd)
+
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertIn("no index found", captured.getvalue())
+            self.assertNotIn("disagree on which workspace", captured.getvalue())
 
 
 class TestNewestSourceProjectScope(unittest.TestCase):
