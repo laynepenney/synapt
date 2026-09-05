@@ -1134,6 +1134,48 @@ class TestGripspaceRootMarkerPersistence:
         assert Path(marker.read_text().strip()) == shared_ws
         assert capsys.readouterr().err == ""
 
+    @pytest.mark.parametrize(
+        "signal,expect_registered",
+        [
+            ("declared_griptrees_only", True),
+            ("worktrees_only", True),
+            ("empty", False),
+        ],
+    )
+    def test_each_registered_repo_signal_is_independently_sufficient(
+        self, tmp_path, monkeypatch, signal, expect_registered
+    ):
+        """R2 survivor on v1 (Stromus, m_8b405299): every test in this file
+        registers a repo the SAME way -- _make_named_gripspace's direct
+        child .git dir -- so the declared-griptrees.json branch of
+        _gripspace_has_registered_repo was never exercised by anything;
+        deleting that branch left the whole 79-test file green. Exercise
+        each of the three signals _gripspace_has_registered_repo reads
+        (declared griptrees.json entries, a direct child .git repo --
+        covered elsewhere, and .worktrees/*) in ISOLATION, so a mutation
+        that drops any single one of them is caught by exactly this test.
+        """
+        self_root = tmp_path / "self-root"
+        (self_root / ".gitgrip").mkdir(parents=True)
+        if signal == "declared_griptrees_only":
+            (self_root / ".gitgrip" / "griptrees.json").write_text(
+                json.dumps({"griptrees": {"some-repo": {"path": "/anywhere"}}})
+            )
+        elif signal == "worktrees_only":
+            (self_root / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
+            (self_root / ".worktrees").mkdir()
+            _make_git_repo(self_root / ".worktrees", "wt1")
+        else:
+            (self_root / ".gitgrip" / "griptrees.json").write_text('{"griptrees": {}}')
+
+        shared_ws = _make_named_gripspace(tmp_path, "shared-canonical")
+        monkeypatch.chdir(self_root)
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(shared_ws))
+        assert project_data_dir() == shared_ws / ".synapt" / "recall"
+        marker = self_root / ".synapt" / "gripspace-root"
+        assert marker.is_file() == expect_registered
+
 
 class TestGripspaceRootSourceDisclosure:
     """One word naming which of env:GRIPSPACE_ROOT / env:SYNAPT_RECALL_ROOT /
