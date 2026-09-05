@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from synapt.recall.knowledge import (
     KnowledgeNode,
@@ -13,6 +14,7 @@ from synapt.recall.knowledge import (
     format_knowledge_for_display,
     format_knowledge_for_session_start,
     read_nodes,
+    save_knowledge_node,
     update_node,
 )
 
@@ -158,6 +160,59 @@ class TestKnowledgeCRUD(unittest.TestCase):
     def test_read_empty_file(self):
         nodes = read_nodes(Path(self.tmpdir) / "no-such-file.jsonl")
         self.assertEqual(nodes, [])
+
+
+class TestSaveKnowledgeNode(unittest.TestCase):
+    """recall#1122: the shared write helper recall_save and
+    SynaptMemoryService._save_to_recall both call, so the same append_node +
+    upsert_knowledge_node pair only exists in one place."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.knowledge_path = Path(self.tmpdir) / "knowledge.jsonl"
+        self.index_dir = Path(self.tmpdir) / "index"
+
+    def test_writes_both_the_jsonl_record_and_the_db_row(self):
+        from synapt.recall.sharding import live_store_path
+        from synapt.recall.storage import RecallDB
+
+        node = KnowledgeNode.create(content="shared helper fact", category="workflow")
+        returned_path = save_knowledge_node(node, self.knowledge_path, self.index_dir)
+
+        self.assertEqual(returned_path, self.knowledge_path)
+        jsonl_nodes = read_nodes(self.knowledge_path)
+        self.assertEqual(len(jsonl_nodes), 1)
+        self.assertEqual(jsonl_nodes[0].content, "shared helper fact")
+
+        db = RecallDB(live_store_path(self.index_dir))
+        try:
+            db_node = db.get_knowledge_node(node.id)
+        finally:
+            db.close()
+        self.assertIsNotNone(db_node)
+        self.assertEqual(db_node["content"], "shared helper fact")
+
+    def test_appends_the_jsonl_record_before_the_db_upsert_can_fail(self):
+        """recall#1122, Stromus's R2 (#dev m_c85b0104): a helper that upserts
+        before appending passes every other test in this file, because none
+        of them observe an upsert failure -- and the docstring's own
+        ordering claim ("the JSONL is what a rebuild reads") is exactly the
+        guarantee a reordered write would silently drop. Force the DB half
+        to raise and assert the durable JSONL record still landed and the
+        exception still propagates (the caller must see the failure, not a
+        half-written state that looks like success)."""
+        node = KnowledgeNode.create(content="db half fails", category="workflow")
+
+        with mock.patch(
+            "synapt.recall.storage.RecallDB.upsert_knowledge_node",
+            side_effect=RuntimeError("db half fails"),
+        ):
+            with self.assertRaises(RuntimeError):
+                save_knowledge_node(node, self.knowledge_path, self.index_dir)
+
+        jsonl_nodes = read_nodes(self.knowledge_path)
+        self.assertEqual(len(jsonl_nodes), 1, "JSONL append must happen before the DB half")
+        self.assertEqual(jsonl_nodes[0].content, "db half fails")
 
 
 class TestCompactKnowledge(unittest.TestCase):

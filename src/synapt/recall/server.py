@@ -2473,7 +2473,7 @@ def recall_save(
         import hashlib
         from datetime import datetime, timezone
 
-        from synapt.recall.knowledge import VALID_CATEGORIES, KnowledgeNode, append_node
+        from synapt.recall.knowledge import VALID_CATEGORIES, KnowledgeNode, save_knowledge_node
         from synapt.recall.sharding import live_store_path
         from synapt.recall.storage import RecallDB
 
@@ -2527,8 +2527,9 @@ def recall_save(
                 node.created_at = existing.get("created_at", node.created_at)
                 node.version = existing.get("version", 1) + 1
                 node.lineage_id = existing.get("lineage_id", "") or existing["id"]
-            append_node(node, project_data_dir(project) / "knowledge.jsonl")
-            db.upsert_knowledge_node(node.to_dict())
+            save_knowledge_node(
+                node, project_data_dir(project) / "knowledge.jsonl", project_index_dir(project)
+            )
 
             embedded = False
             provider = get_embedding_provider()

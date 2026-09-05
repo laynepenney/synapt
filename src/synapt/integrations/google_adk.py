@@ -224,13 +224,14 @@ if BaseMemoryService is not None:
                 # process-wide env vars around this call (unsafe: this class
                 # is used from concurrent async callers sharing one process,
                 # per the threading.Lock above) or reaching past the wrapper
-                # to the same primitives it uses. This calls those primitives
-                # directly, parameterized on self._project_root, mirroring
-                # recall_save's create path (append the durable JSONL record,
-                # upsert the queryable SQLite row _search_scoped_recall
-                # reads) minus the parts this integration doesn't need yet
-                # (retract, existing-version bump, embeddings).
-                from synapt.recall.knowledge import KnowledgeNode, append_node
+                # to the same primitives it uses. recall#1122: those
+                # primitives are save_knowledge_node (append the durable
+                # JSONL record, upsert the queryable SQLite row
+                # _search_scoped_recall reads), the shared write path
+                # recall_save's own create/update branch also calls -- this
+                # mirrors that path minus the parts this integration doesn't
+                # need yet (retract, existing-version bump, embeddings).
+                from synapt.recall.knowledge import KnowledgeNode, save_knowledge_node
 
                 content_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8]
                 node = KnowledgeNode.create(
@@ -249,14 +250,11 @@ if BaseMemoryService is not None:
                     ],
                     node_id=_node_id(app_name, user_id, content_hash),
                 )
-                append_node(
-                    node, project_data_dir(self._project_root) / "knowledge.jsonl"
+                save_knowledge_node(
+                    node,
+                    project_data_dir(self._project_root) / "knowledge.jsonl",
+                    project_index_dir(self._project_root),
                 )
-                db = RecallDB(live_store_path(project_index_dir(self._project_root)))
-                try:
-                    db.upsert_knowledge_node(node.to_dict())
-                finally:
-                    db.close()
             except Exception as e:
                 log.warning("Recall save failed: %s", e)
 

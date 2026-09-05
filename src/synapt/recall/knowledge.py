@@ -142,6 +142,54 @@ def append_node(node: KnowledgeNode, path: Path | None = None) -> Path:
     return path
 
 
+def save_knowledge_node(
+    node: KnowledgeNode,
+    knowledge_path: Path,
+    index_dir: Path,
+) -> Path:
+    """Write a node to both halves of the store: append to the durable JSONL
+    record at knowledge_path, then upsert into the queryable SQLite index at
+    index_dir.
+
+    recall#1122: recall_save (server.py) and SynaptMemoryService._save_to_recall
+    (google_adk.py) each independently reimplemented this same pair of writes
+    because recall_save's own project scope is hard-coded to None (ambient
+    resolution) with no override, so the ADK integration (which needs a
+    non-ambient, per-instance scope for test/sandbox isolation) couldn't call
+    it directly and had to duplicate its body instead. That duplication is
+    exactly the risk this helper closes: the two write calls drifting apart
+    the next time either one changes.
+
+    Takes ALREADY-RESOLVED paths rather than a project_root to resolve itself:
+    each caller keeps doing its own project_data_dir(...)/project_index_dir(...)
+    resolution (recall_save's via server.py's own imports, the ADK integration's
+    via self._project_root) and passes the result in. A version of this helper
+    that re-resolved project_root internally was tried and reverted -- it
+    silently diverged from recall_save's own read-side resolution under any
+    caller that patches or overrides resolution (e.g. a sharded-store test
+    patching server.py's own project_index_dir reference), since a second,
+    independent resolution call in a different module isn't reached by a
+    patch on the first one. Passing resolved paths in makes that divergence
+    structurally impossible: there is only one resolution, by the caller.
+
+    Deliberately narrower than recall_save's own create/update branch: no
+    retract, no version-bump-on-existing, no embeddings. Those stay
+    caller-specific, wrapped around a call to this helper.
+
+    Returns the JSONL path written to.
+    """
+    from synapt.recall.sharding import live_store_path
+    from synapt.recall.storage import RecallDB
+
+    jsonl_path = append_node(node, knowledge_path)
+    db = RecallDB(live_store_path(index_dir))
+    try:
+        db.upsert_knowledge_node(node.to_dict())
+    finally:
+        db.close()
+    return jsonl_path
+
+
 def _read_all_nodes(path: Path) -> list[KnowledgeNode]:
     """Read every node from a knowledge JSONL file."""
     nodes = []
