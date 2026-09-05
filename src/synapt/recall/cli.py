@@ -533,7 +533,7 @@ def cold_no_caller_refresh(project_dir: Path, index_dir: Path) -> ColdRefreshOut
     try:
         _archive_and_build_locked(
             store_root, None, use_embeddings=False, incremental=True, chatgpt_archive=None,
-            source_dir=project_dir,
+            source_dir=project_dir, skip_clustering=True,
         )
     except Exception:
         return ColdRefreshOutcome(True, False, source.name, before, before, "error")
@@ -585,6 +585,7 @@ def _archive_and_build(
     incremental: bool = False,
     chatgpt_archive: str | None = None,
     progress: Callable[[str], None] | None = None,
+    skip_clustering: bool = False,
 ) -> TranscriptIndex | None:
     """Archive transcripts and build the index. Shared by build/rebuild/setup.
 
@@ -593,6 +594,20 @@ def _archive_and_build(
 
     1. Archive transcripts from Claude Code source dir -> .synapt/recall/transcripts/
     2. Build index from archive (not directly from ~/.claude/)
+
+    *skip_clustering*: recall#435. Full-corpus topic clustering (cluster_chunks
+    over every transcript-only chunk, not just what this build added) is O(total
+    store size), not O(what changed) -- on a ~168k-chunk store it is the single
+    most expensive phase of a build and has OOM-killed two independent processes
+    doing it (2026-09-05, this store). Defaults to False so every existing
+    explicit build/rebuild/setup caller is unchanged; the one caller that sets it
+    True is cold_no_caller_refresh's silent, automatic rebuild during a bare
+    resume, which per Layne's 2026-08-25 ruling on recall#435 must return in
+    seconds, not race a background clustering pass to an OOM. Clustering moves to
+    a separate maintenance operation (follow-on; the nightly runner is the named
+    home), not gone -- a build made with this set simply leaves new chunks
+    unclustered until that maintenance op next runs, same tradeoff `maintain`'s
+    own LLM-upgrade summaries already accept for the same reason.
 
     Returns the final TranscriptIndex, or None if no chunks found.
     """
@@ -609,7 +624,7 @@ def _archive_and_build(
     try:
         return _archive_and_build_locked(
             project_dir, source_dirs, use_embeddings, incremental, chatgpt_archive,
-            progress,
+            progress, skip_clustering=skip_clustering,
         )
     finally:
         _release_build_lock(lock_fd)
@@ -623,6 +638,7 @@ def _archive_and_build_locked(
     chatgpt_archive: str | None,
     progress: Callable[[str], None] | None = None,
     source_dir: Path | None = None,
+    skip_clustering: bool = False,
 ) -> TranscriptIndex | None:
     """Inner build logic — caller must hold the build lock.
 
@@ -634,6 +650,8 @@ def _archive_and_build_locked(
     a cold no-caller resume, where the source is cwd but the store must be the
     GRIPSPACE_ROOT one the load reads, never a cwd-derived secondary store
     (this change's R2 (Atlas)).
+
+    *skip_clustering*: see _archive_and_build's docstring (recall#435).
     """
     import time as _time
 
@@ -977,13 +995,33 @@ def _archive_and_build_locked(
     final_index.save(index_dir)
     logger.info("build: FTS5 save complete in %.1fs", _time.monotonic() - save_t0)
 
-    # Cluster chunks by topic similarity
-    if progress:
-        progress("clustering")
-    logger.info("build: clustering %d transcript chunks...", sum(1 for c in deduped if c.turn_index >= 0))
-    from synapt.recall.clustering import cluster_chunks as _cluster_chunks, generate_concat_summary
+    # Cluster chunks by topic similarity. recall#435: full-corpus, O(store
+    # size) not O(what changed) -- skipped for the automatic, silent rebuild
+    # a bare resume triggers (cold_no_caller_refresh), which must return in
+    # seconds. New chunks stay unclustered until the next build that does not
+    # skip this (an explicit `synapt build`/`rebuild`, or the follow-on
+    # maintenance operation) -- named tradeoff, not a silent gap: transcript_only
+    # is still computed below (Phase 10 auto-tagging reads it), just not passed
+    # through cluster_chunks.
     transcript_only = [c for c in deduped if c.turn_index >= 0]
-    if transcript_only:
+    if skip_clustering:
+        if progress:
+            progress("clustering_skipped")
+        logger.info(
+            "build: skipping full-corpus clustering (recall#435) -- %d transcript "
+            "chunks stay unclustered until the next non-skipping build",
+            sum(1 for c in transcript_only),
+        )
+        print(
+            f"  Clusters: skipped ({len(transcript_only)} chunks unclustered until "
+            "the next full build/maintenance pass, recall#435)"
+        )
+    if progress and not skip_clustering:
+        progress("clustering")
+    if not skip_clustering:
+        logger.info("build: clustering %d transcript chunks...", sum(1 for c in transcript_only))
+    from synapt.recall.clustering import cluster_chunks as _cluster_chunks, generate_concat_summary
+    if not skip_clustering and transcript_only:
         clusters = _cluster_chunks(transcript_only)
         if clusters:
             # Build chunk ID → TranscriptChunk lookup for summary generation

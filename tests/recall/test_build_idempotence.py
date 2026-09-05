@@ -540,6 +540,139 @@ def test_build_never_calls_the_summary_grinder(tmp_path, monkeypatch):
 
 
 # ===========================================================================
+# F. recall#435 — skip_clustering keeps a bare resume's silent rebuild fast
+# ===========================================================================
+#
+# cluster_chunks() re-clusters the FULL corpus (every transcript-only chunk in
+# the store, not just what this build added) -- O(store size), not O(what
+# changed). On the real ~168k-chunk team store, 2026-09-05, this phase alone
+# OOM-killed two independent build processes (Sentinel's, then Atlas's) after
+# the FTS5 save/publish phase had already completed cleanly in ~100s. Layne's
+# ruling: move full-corpus clustering OUT of the incremental build path first;
+# incremental clustering into a maintenance operation is the follow-on, not
+# this step.
+
+def test_skip_clustering_keeps_existing_callers_unchanged(tmp_path, monkeypatch):
+    """The default (no skip_clustering argument) must still cluster -- every
+    existing build/rebuild/setup call site is unaffected by this change."""
+    import synapt.recall.clustering as clustering
+    from synapt.recall.cli import _archive_and_build
+
+    calls: list[int] = []
+    real_cluster_chunks = clustering.cluster_chunks
+
+    def _spy(chunks):
+        calls.append(len(chunks))
+        return real_cluster_chunks(chunks)
+
+    monkeypatch.setattr(clustering, "cluster_chunks", _spy)
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    assert calls == [8], f"default build must still cluster all transcript chunks: {calls}"
+
+
+def test_skip_clustering_true_never_calls_cluster_chunks(tmp_path, monkeypatch):
+    """cold_no_caller_refresh's own automatic rebuild passes skip_clustering=True
+    (see its call to _archive_and_build_locked) -- this is the direct witness on
+    _archive_and_build itself, independent of that wiring, so a regression in
+    either place is caught by its own test."""
+    import synapt.recall.clustering as clustering
+    from synapt.recall.cli import _archive_and_build
+
+    calls: list[int] = []
+    monkeypatch.setattr(clustering, "cluster_chunks", lambda chunks: calls.append(len(chunks)) or [])
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False,
+                        incremental=True, skip_clustering=True)
+
+    assert calls == [], f"skip_clustering=True must never call cluster_chunks: {calls}"
+
+
+def test_skip_clustering_true_still_saves_chunks_to_fts5(tmp_path):
+    """Skipping clustering must not skip the actual indexing -- the chunks are
+    still searchable, only unclustered. Real (unmocked) build + real search."""
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.core import project_index_dir
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8, prefix="banana")
+
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False,
+                        incremental=True, skip_clustering=True)
+
+    from synapt.recall.storage import RecallDB
+    db = RecallDB(project_index_dir(project) / "recall.db")
+    try:
+        results = db.fts_search("banana", limit=5)
+        assert results, "chunks must still be indexed and searchable when clustering is skipped"
+        # cluster_type scoped: build_timeline_clusters (Phase 10, unaffected by
+        # skip_clustering) writes its own rows to the same table under a
+        # different cluster_type, so an unscoped count is not a witness on
+        # topic clustering specifically.
+        assert db.cluster_count(cluster_type="topic") == 0, (
+            "no TOPIC clusters should exist -- topic clustering was skipped"
+        )
+    finally:
+        db.close()
+
+
+def test_cold_no_caller_refresh_passes_skip_clustering_true(monkeypatch):
+    """The one caller recall#435 targets: a bare resume's silent, automatic
+    rebuild must set skip_clustering=True. Direct assertion on the call site's
+    own kwargs, not an inference from behavior -- a future refactor that moves
+    this call must carry the flag with it or this test names exactly where."""
+    from synapt.recall import cli
+
+    captured: dict = {}
+
+    def _spy(*args, **kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(cli, "_archive_and_build_locked", _spy)
+    monkeypatch.setattr(cli, "_newest_source_file", lambda project_dir: Path("/w/rollout.jsonl"))
+    # project_data_dir mocked out entirely (same pattern as
+    # TestColdNoCallerRefresh in test_cold_no_caller_refresh.py) so no real
+    # implicit recall data path is ever resolved -- the store-isolation guard
+    # only has something to check when the real implementation runs.
+    monkeypatch.setattr(cli, "project_data_dir", lambda project_dir=None: Path("/tmp/x"))
+    monkeypatch.setattr(cli, "_acquire_build_lock", lambda data_dir, timeout=None: 7)
+    monkeypatch.setattr(cli, "_release_build_lock", lambda fd: None)
+    monkeypatch.setattr(
+        "synapt.recall.freshness.check_index_freshness",
+        lambda *a, **k: mock_freshness(),
+    )
+
+    cli.cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+
+    assert captured.get("skip_clustering") is True, (
+        f"cold_no_caller_refresh must call _archive_and_build_locked with "
+        f"skip_clustering=True, got kwargs: {captured}"
+    )
+
+
+def mock_freshness():
+    from synapt.recall.freshness import IndexFreshness
+    return IndexFreshness(stale=True, build_timestamp="old", scanned="archive+sources")
+
+
+# ===========================================================================
 # E. `synapt maintain` — the grinder's new, explicit home
 # ===========================================================================
 
