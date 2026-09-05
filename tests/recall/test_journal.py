@@ -833,6 +833,29 @@ class TestCarryForwardAgingAndBound(unittest.TestCase):
         self.assertEqual(merged, [])
         self.assertEqual(report.retired_by_done, 2)
 
+    def test_done_retires_the_response_renderers_own_bulleted_display_text(self):
+        """recall#984, today's data point (Stromus, #dev m_6fb60a1c): a carried
+        step retired NOTHING even when done listed the step's "exact text" --
+        because the exact text the agent had in hand was copied from the
+        tool's own carry-forward response, which renders each carried step
+        as ``f"- {step}"`` (format_carry_forward_response). The renderer's
+        leading "- " is display formatting, not part of the stored step, so
+        a literal copy-paste of the displayed line carried an extra token
+        that pre-fix exact-equality never accounted for. Following the
+        tool's own instruction ("list its exact text under done") must not
+        silently fail to retire."""
+        from synapt.recall.journal import merge_carried_forward_with_report
+        prev = self._entry(
+            "2026-08-20T09:00:00+00:00",
+            ["work out why the index rebuild stalls on cold start [carried since 2026-08-10]"],
+        )
+        rendered_display_line = (
+            "- work out why the index rebuild stalls on cold start [carried since 2026-08-10]"
+        )
+        merged, report = merge_carried_forward_with_report([], [rendered_display_line], prev)
+        self.assertEqual(merged, [])
+        self.assertEqual(report.retired_by_done, 1)
+
     def test_near_miss_does_not_retire(self):
         """The issue's explicit ask: rewording must NOT retire; only exact text does."""
         from synapt.recall.journal import merge_carried_forward_with_report

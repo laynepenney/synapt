@@ -605,8 +605,16 @@ def is_withheld_marker(step: str) -> bool:
 
 def _step_key(step: str) -> str:
     """Normalize a next-step string for exact matching (the age stamp is ignored,
-    so ``done`` can name a carried step with or without its stamp)."""
+    so ``done`` can name a carried step with or without its stamp; a leading
+    ``"- "`` bullet is also ignored, since the tool's own carry-forward
+    response renders each carried step as ``f"- {step}"`` -- recall#984:
+    copying that displayed line verbatim, exactly as the tool's own
+    instruction says to, must not silently fail to retire because of a
+    formatting artifact the tool itself introduced)."""
     bare, _ = strip_carry_stamp(step)
+    bare = bare.strip()
+    if bare.startswith("- "):
+        bare = bare[2:]
     return " ".join(bare.split()).casefold()
 
 
