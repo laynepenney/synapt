@@ -4706,6 +4706,38 @@ def _find_gripspace_root(path: Path) -> Path | None:
     return None
 
 
+def _is_initialized_store(recall_dir: Path) -> bool:
+    """Return True only if *recall_dir* (a ``.synapt/recall`` path) is a
+    genuinely initialized recall store, not merely a directory that exists.
+
+    ``is_dir()`` is not sufficient: other tools can create ``.synapt/recall/``
+    for reasons that have nothing to do with recall ever having been used
+    there. Measured directly (Stromus, 2026-09-05): ``gr spawn`` writes
+    ``.synapt/recall/spawn_state.json`` as a side-file under the clone it
+    runs from, so a bare ``gitgrip/.synapt/recall`` directory existed on a
+    real desk holding nothing but that one unrelated file -- and the
+    nearest-existing-store check below, keyed on ``is_dir()`` alone, treated
+    it as an initialized store and routed resolution away from the real
+    gripspace store to reach it.
+
+    A store is genuinely initialized once recall itself has written to it:
+    ``knowledge.jsonl`` (the first thing ``recall_save`` writes), an index
+    database (``recall.db`` or the sharded ``index.db``, written by
+    ``recall_build``), or a per-worktree journal (``recall_journal``'s first
+    write). Any one of these is sufficient; a directory holding only
+    side-files from other tools is not.
+    """
+    if (recall_dir / "knowledge.jsonl").exists():
+        return True
+    index_dir = recall_dir / "index"
+    if (index_dir / "recall.db").exists() or (index_dir / "index.db").exists():
+        return True
+    worktrees_dir = recall_dir / "worktrees"
+    if worktrees_dir.is_dir():
+        return any(worktrees_dir.glob("*/journal.jsonl"))
+    return False
+
+
 def _nearest_existing_store_root(path: Path, stop_at: Path | None = None) -> Path | None:
     """Walk up from *path* and return the NEAREST ancestor (including
     *path* itself) that already has an initialized ``.synapt/recall``
@@ -4742,7 +4774,7 @@ def _nearest_existing_store_root(path: Path, stop_at: Path | None = None) -> Pat
     limit = stop_at.resolve() if stop_at is not None else home
     current = path.resolve()
     while True:
-        if (current / ".synapt" / "recall").is_dir():
+        if _is_initialized_store(current / ".synapt" / "recall"):
             return current
         if current == limit or current == home or current == current.parent:
             return None

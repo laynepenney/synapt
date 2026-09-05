@@ -1153,7 +1153,9 @@ class TestNearestExistingStoreRoot:
         fake_home.mkdir()
         desk = _make_gr2_workspace(fake_home)
         nested = desk / "nested-store"
-        (nested / ".synapt" / "recall").mkdir(parents=True)
+        nested_recall = nested / ".synapt" / "recall"
+        nested_recall.mkdir(parents=True)
+        (nested_recall / "knowledge.jsonl").write_text("")
         monkeypatch.chdir(nested)
         monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
         monkeypatch.delenv("GRIPSPACE_ROOT", raising=False)
@@ -1183,6 +1185,40 @@ class TestNearestExistingStoreRoot:
         with patch("synapt.recall.core.Path.home", return_value=fake_home):
             assert _nearest_existing_store_root(bare) is None
 
+    def test_debris_directory_is_not_mistaken_for_an_initialized_store(
+        self, tmp_path
+    ):
+        """The discriminating pair: a bare .synapt/recall directory holding
+        only a side-file from an unrelated tool must NOT be treated as an
+        initialized store, while the same shape with real store content
+        one level further out IS. Measured (Stromus, 2026-09-05): gr spawn
+        writes .synapt/recall/spawn_state.json as a side-file under the
+        clone it runs from, leaving a directory that exists but was never
+        actually used as a recall store; is_dir() alone mistook it for one
+        and routed resolution away from the real store to reach it."""
+        from synapt.recall.core import _nearest_existing_store_root
+
+        fake_home = tmp_path / "home"
+        real_store_root = fake_home / "real-store-root"
+        real_recall = real_store_root / ".synapt" / "recall"
+        real_recall.mkdir(parents=True)
+        (real_recall / "knowledge.jsonl").write_text("")
+
+        debris_root = real_store_root / "debris-clone"
+        debris_recall = debris_root / ".synapt" / "recall"
+        debris_recall.mkdir(parents=True)
+        (debris_recall / "spawn_state.json").write_text("{}")
+
+        deepest = debris_root / "deepest"
+        deepest.mkdir()
+        with patch("synapt.recall.core.Path.home", return_value=fake_home):
+            # The debris directory is skipped entirely -- resolution finds
+            # the real store one level further out, not the nearer debris.
+            assert _nearest_existing_store_root(deepest) == real_store_root
+            # And the debris directory alone, with nothing further out,
+            # correctly finds nothing.
+            assert _nearest_existing_store_root(debris_root, stop_at=debris_root) is None
+
     def test_nearest_existing_store_root_stops_at_the_first_one_found(self, tmp_path):
         """Two nested stores: the walk must stop at the NEARER one, never
         continue past it to an ancestor's."""
@@ -1191,8 +1227,10 @@ class TestNearestExistingStoreRoot:
         fake_home = tmp_path / "home"
         outer = fake_home / "outer"
         (outer / ".synapt" / "recall").mkdir(parents=True)
+        (outer / ".synapt" / "recall" / "knowledge.jsonl").write_text("")
         inner = outer / "inner"
         (inner / ".synapt" / "recall").mkdir(parents=True)
+        (inner / ".synapt" / "recall" / "knowledge.jsonl").write_text("")
         deepest = inner / "deepest"
         deepest.mkdir()
         with patch("synapt.recall.core.Path.home", return_value=fake_home):
@@ -1208,8 +1246,51 @@ class TestNearestExistingStoreRoot:
         fake_home.mkdir()
         desk = _make_gr2_workspace(fake_home)
         nested = desk / "nested-store"
-        (nested / ".synapt" / "recall").mkdir(parents=True)
+        nested_recall = nested / ".synapt" / "recall"
+        nested_recall.mkdir(parents=True)
+        (nested_recall / "knowledge.jsonl").write_text("")
         other = tmp_path / "other-explicit-root"
         other.mkdir()
         monkeypatch.chdir(nested)
         assert project_data_dir(other) == other / ".synapt" / "recall"
+
+
+class TestRecallSaveHonorsGripspaceRootOverCwd:
+    """Direct call-site witness for recall_save, not just project_data_dir in
+    isolation. A mutation test (Stromus, 2026-09-05) reverting recall_save's
+    ``project = None`` back to ``project = Path.cwd().resolve()`` left 108
+    tests passing -- the core bug report (a save from a desk whose cwd holds
+    its own store landed there instead of at an explicitly-pinned
+    GRIPSPACE_ROOT) was verified only by hand, never by an automated
+    regression test bound to recall_save itself. This closes that gap."""
+
+    def test_recall_save_lands_in_gripspace_root_not_cwd_store(
+        self, tmp_path, monkeypatch
+    ):
+        from synapt.recall import server as server_mod
+
+        gripspace_root = tmp_path / "gripspace-root"
+        gripspace_root.mkdir()
+
+        desk = tmp_path / "desk"
+        desk_recall = desk / ".synapt" / "recall"
+        desk_recall.mkdir(parents=True)
+        (desk_recall / "knowledge.jsonl").write_text("")
+
+        monkeypatch.chdir(desk)
+        monkeypatch.setenv("GRIPSPACE_ROOT", str(gripspace_root))
+        monkeypatch.delenv("SYNAPT_RECALL_ROOT", raising=False)
+
+        with patch.object(server_mod, "get_embedding_provider", return_value=None):
+            result = server_mod.recall_save(
+                content="gripspace-root call-site witness", category="workflow"
+            )
+
+        assert "saved" in result.lower(), result
+        gripspace_knowledge = gripspace_root / ".synapt" / "recall" / "knowledge.jsonl"
+        desk_knowledge = desk_recall / "knowledge.jsonl"
+        assert gripspace_knowledge.exists()
+        assert "gripspace-root call-site witness" in gripspace_knowledge.read_text()
+        # The desk's own store must be untouched -- still the empty file
+        # this test created it with, not a second copy of the save.
+        assert desk_knowledge.read_text() == ""
