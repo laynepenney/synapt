@@ -162,6 +162,7 @@ x = "synapt.x.server"
 
 [tool.pytest.ini_options]
 addopts = "--benchmark-disable"
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
