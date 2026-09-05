@@ -634,7 +634,7 @@ def test_cli_build_forwards_phase_callback_without_changing_sync_result(monkeypa
     monkeypatch.setattr(cli, "_acquire_build_lock", lambda data_dir: 42)
     monkeypatch.setattr(cli, "_release_build_lock", lambda fd: None)
 
-    def inner(*args):
+    def inner(*args, **kwargs):
         args[-1]("parsing")
         return expected
 
