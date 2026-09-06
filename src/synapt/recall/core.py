@@ -4918,6 +4918,15 @@ def _worktree_name(project_dir: Path | None = None) -> str:
 
     current = (project_dir or Path.cwd()).resolve()
     grip_root = _find_gripspace_root(current)
+    # A gr2 workspace (`.grip` marker) is ONE per-worktree bucket: a constituent
+    # repo's own `.git` must NOT mint a per-repo slice, or a session standing in
+    # the repo and a session standing at the workspace root write to different
+    # buckets keyed on the cwd basename (recall#974 — measured live as a
+    # `synapt` bucket beside a `synapt-dev` bucket for one agent). The workspace
+    # boundary wins over any constituent `.git` below it. gr1 gripspaces (no
+    # `.grip`) keep their per-constituent-repo buckets via the walk below.
+    if grip_root is not None and (grip_root / ".grip").is_dir():
+        return grip_root.name
     candidate = current
     while candidate != candidate.parent:
         # A .git marker identifies the root of either a main checkout or a
