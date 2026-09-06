@@ -72,6 +72,11 @@ def main():
         # machine, or an unclean stop. Routing through the recall dispatcher
         # means `synapt recall resume` is the same entry point, not a second one.
         _dispatch_recall("resume", *sys.argv[2:])
+    elif subcmd == "code":
+        # Front-door verb for the code-plus-memory search (R3.2): where is
+        # this defined, and what did the team say about it. Same entry point
+        # as `synapt recall code`, not a second implementation.
+        _dispatch_recall("code", *sys.argv[2:])
     elif subcmd == "server":
         # Remove the subcommand from argv so the sub-CLI sees correct args.
         sys.argv = [f"synapt {subcmd}"] + sys.argv[2:]
@@ -109,6 +114,7 @@ def _print_help(extra_commands: dict | None = None):
         "Commands:",
         "  init      One-command project setup",
         "  resume    Pick up where the last session stopped",
+        "  code      Where is this defined, and what did the team say about it",
         "  recall    Search and manage past session transcripts",
         "  dashboard Launch mission control UI",
         "  server    Start the unified MCP server (--dev for auto-reload)",
