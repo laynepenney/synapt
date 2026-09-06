@@ -257,11 +257,30 @@ def _cluster_signature_tokens(
     ``_chunk_tokens`` (a call site added later, say), the signature is still
     protected from data-derived boilerplate rather than silently trusting
     an upstream filter that may not apply.
+
+    The cut at ``top_n`` MUST be a pure function of the token multiset, not
+    of iteration order: ``token_sets`` entries are ``set[str]``, and Python
+    randomizes ``str`` hashing per process (``PYTHONHASHSEED``), so a plain
+    ``Counter.most_common(top_n)`` breaks ties at the cutoff by insertion
+    order inherited from that randomized set iteration -- deterministic
+    WITHIN one process (one hash seed for the run), silently different
+    ACROSS process invocations. Measured on a real cluster
+    (``clust-fd0963dd7faa``): 108 distinct tokens, 74 of them tied at the
+    document-frequency value sitting exactly at the ``top_n=64`` rank
+    boundary. ``redrive_cluster_signatures`` recomputing-and-comparing an
+    already-persisted signature was the first caller ever positioned to
+    expose this (``backfill_cluster_signatures`` only ever compares against
+    absence). Witness:
+    ``test_cluster_signature_tiebreak_is_stable_across_process_hash_seeds``
+    runs this function in two subprocesses under
+    ``PYTHONHASHSEED=0``/``PYTHONHASHSEED=1`` and asserts equality -- a
+    same-process mutation test cannot see this class of bug at all.
     """
     document_frequency: Counter[str] = Counter()
     for ts in token_sets:
         document_frequency.update(t for t in ts if t not in extra_stopwords)
-    return [tok for tok, _ in document_frequency.most_common(top_n)]
+    ranked = sorted(document_frequency.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [tok for tok, _ in ranked[:top_n]]
 
 
 def compute_boilerplate_stoplist(
