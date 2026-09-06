@@ -634,18 +634,19 @@ def test_skip_clustering_true_still_saves_chunks_to_fts5(tmp_path):
 
 def test_cold_no_caller_refresh_passes_skip_clustering_true(monkeypatch):
     """The one caller recall#435 targets: a bare resume's silent, automatic
-    rebuild must set skip_clustering=True. Direct assertion on the call site's
-    own kwargs, not an inference from behavior -- a future refactor that moves
-    this call must carry the flag with it or this test names exactly where."""
+    rebuild must set skip_clustering=True. R3.1 (recall#435) moved this call
+    out of the caller's own process into a detached background script
+    (_BACKGROUND_COLD_REFRESH_SCRIPT, spawned via subprocess.Popen) so a bare
+    resume never blocks on it -- there is no longer a kwargs dict to capture
+    in THIS process, since the real _archive_and_build_locked call now runs
+    inside the spawned child. The direct witness moves to the exact source
+    text that child will run: assert the spawned argv carries the module's
+    own script constant (not an ad-hoc string), and that the constant's own
+    _archive_and_build_locked call carries skip_clustering=True -- a future
+    refactor that drops the flag from that call site fails this test by
+    inspection, same as the retired kwargs assertion did before R3.1."""
     from synapt.recall import cli
 
-    captured: dict = {}
-
-    def _spy(*args, **kwargs):
-        captured.update(kwargs)
-        return None
-
-    monkeypatch.setattr(cli, "_archive_and_build_locked", _spy)
     monkeypatch.setattr(cli, "_newest_source_file", lambda project_dir: Path("/w/rollout.jsonl"))
     # project_data_dir mocked out entirely (same pattern as
     # TestColdNoCallerRefresh in test_cold_no_caller_refresh.py) so no real
@@ -659,11 +660,27 @@ def test_cold_no_caller_refresh_passes_skip_clustering_true(monkeypatch):
         lambda *a, **k: mock_freshness(),
     )
 
-    cli.cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+    captured: dict = {}
 
-    assert captured.get("skip_clustering") is True, (
-        f"cold_no_caller_refresh must call _archive_and_build_locked with "
-        f"skip_clustering=True, got kwargs: {captured}"
+    def _spy_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return None
+
+    monkeypatch.setattr(cli.subprocess, "Popen", _spy_popen)
+
+    outcome = cli.cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+
+    assert outcome.reason == "queued_background", (
+        f"a free lock must queue the background script, not run inline: {outcome}"
+    )
+    argv = captured.get("argv")
+    assert argv is not None, "cold_no_caller_refresh must spawn the background script via Popen"
+    assert argv[2] is cli._BACKGROUND_COLD_REFRESH_SCRIPT, (
+        "must spawn the exact module-level script constant, not an ad-hoc string"
+    )
+    assert "skip_clustering=True" in cli._BACKGROUND_COLD_REFRESH_SCRIPT, (
+        "the spawned script's own _archive_and_build_locked call must carry "
+        f"skip_clustering=True; script text: {cli._BACKGROUND_COLD_REFRESH_SCRIPT}"
     )
 
 

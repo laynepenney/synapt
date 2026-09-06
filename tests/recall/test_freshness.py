@@ -722,18 +722,24 @@ def test_cmd_resume_cold_pristine_lock_error_still_renders_stale(owned_recall_ro
 def test_cmd_resume_cold_ab_store_split_builds_into_A_and_renders_the_new_turn(owned_recall_root, tmp_path, monkeypatch):
     """The happy path across a store split. GRIPSPACE_ROOT store A owns the index
     the render loads; cwd B is a filesystem SIBLING owning a live source newer than
-    A's archive. The source-aware trigger (source=B, archive=A) detects it, the
-    refresh targets A (store=A, source=B, no B/.synapt), and the reloaded A renders
-    the NEW turn.
+    A's archive. The source-aware trigger (source=B, archive=A) detects it, and the
+    QUEUED background refresh (R3.1, recall#435) targets A (store=A, source=B, no
+    B/.synapt).
 
-    The heavy archive+build is replaced by a side-effect that writes the turn the
-    build would produce into A's index, so the RELOAD+RENDER path is exercised for
-    real (archiver/builder are covered by their own suites). Real fs, real lock.
+    R3.1 retired the synchronous free-lock build this test originally exercised: a
+    bare resume now never blocks on the incremental rebuild, so THIS render still
+    shows the OLD turn plus an honest "catching up in background" label, and the
+    store/source targeting is witnessed on the spawned subprocess.Popen argv
+    instead of on a synchronously-applied side-effect. Real fs, real lock (the
+    probe-then-release around the spawn); Popen itself is mocked so the test does
+    not actually fork a background rebuild.
 
     MUTATION deep->cheap: a cheap trigger reads A cheap-fresh, skips the refresh,
-    the side-effect never runs, and only the OLD turn renders -> this test reds.
+    Popen is never called, and no catchup label renders -> this test reds.
     """
     from argparse import Namespace
+
+    from synapt.recall import cli
 
     a = tmp_path / "canonical"
     b = tmp_path / "agent-desk"
@@ -768,23 +774,30 @@ def test_cmd_resume_cold_ab_store_split_builds_into_A_and_renders_the_new_turn(o
 
     captured: dict[str, object] = {}
 
-    def spy_build(project_dir, source_dirs, **kw):
-        captured["store"] = Path(project_dir)
-        captured["source"] = kw.get("source_dir")
-        # write the turn the real incremental build would produce, INTO A.
-        _write_turn(_index_dir(Path(project_dir)) / "recall.db",
-                    "aaaaaaaa:t1", 1, "the FRESH question", "fresh answer")
+    def spy_popen(argv, **kw):
+        captured["argv"] = argv
         return None
 
-    monkeypatch.setattr("synapt.recall.cli._archive_and_build_locked", spy_build)
+    monkeypatch.setattr(cli.subprocess, "Popen", spy_popen)
 
     args = Namespace(index=str(a_index), session=None, turns=10, project=b)
     out = _io_run_resume(args)
 
-    assert captured.get("store") == a.resolve(), "the build must target store A (GRIPSPACE_ROOT), resolved"
-    assert captured.get("source") == b, "the SOURCE scope stays cwd B"
+    argv = captured.get("argv")
+    assert argv is not None, "a source-aware deep-stale trigger must queue the background script"
+    assert argv[2] is cli._BACKGROUND_COLD_REFRESH_SCRIPT, (
+        "must spawn the module's own script constant, not an ad-hoc string"
+    )
+    assert argv[3] == str(a.resolve()), "the queued refresh must target store A (GRIPSPACE_ROOT), resolved"
+    assert argv[4] == str(b), "the SOURCE scope stays cwd B"
     assert not (b / ".synapt").exists(), "no cwd-derived secondary store"
-    assert "the FRESH question" in out, "the reloaded A must render the newly-built turn"
+    assert "the OLD question" in out, (
+        "R3.1: a bare resume never blocks on the rebuild, so this render is still "
+        "the pre-catchup index -- the OLD turn, not a synchronously-built new one"
+    )
+    assert "CATCHING UP IN BACKGROUND" in out, (
+        "the queued refresh must render an honest catchup label, not a silent stale answer"
+    )
 
 
 def _io_run_resume(args) -> str:
