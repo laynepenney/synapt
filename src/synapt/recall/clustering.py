@@ -394,6 +394,35 @@ def _cluster_id(chunk_ids: list[str]) -> str:
     return f"clust-{sha}"
 
 
+# Session ids (m_<hex>) and Anthropic tool_use ids (toolu_<alnum>) are
+# genuinely, permanently rare across a corpus -- a fresh one is minted per
+# session/tool-call and essentially never repeats -- so DF-IDF's rarity
+# bonus is maximal for them despite zero topical content. _tokenize()'s
+# charset ([a-zA-Z0-9_.]) keeps them intact as single tokens (by design,
+# to protect code identifiers like bm25.py), so nothing upstream strips
+# them; _chunk_tokens()'s filters (echo/preamble/boilerplate/has-letter)
+# have no shape for "looks like a unique id" either. Measured on the real
+# store: identifier-shaped tokens dominate a meaningful fraction of junk
+# topic labels sampled from recall_quick/dashboard output.
+_EPHEMERAL_ID_TOKEN_RE = _re.compile(r"^(m_[0-9a-f]{6,}|toolu_[0-9a-zA-Z]{6,})$")
+
+
+def _normalize_topic_token(token: str) -> str:
+    """Strip trailing '.' so a word's sentence-final form isn't scored as a
+    token distinct from its mid-sentence form.
+
+    _tokenize()'s charset keeps '.' inside a token (same reason as above --
+    protecting file-path-shaped identifiers), so "seen." (sentence-final)
+    and "seen" (mid-sentence) land as two different dict keys. The
+    punctuated form is then spuriously rare -- most other occurrences of
+    the word aren't sentence-final -- which inflates its IDF and lets a
+    semantically empty word (measured examples: "world assembled. seen.",
+    "change. activity. report") win the top-3 ranking purely because it
+    fell at a sentence boundary in this cluster's members.
+    """
+    return token.rstrip(".")
+
+
 def _extract_topic(
     token_sets: list[set[str]],
     global_df: Counter[str],
@@ -403,16 +432,19 @@ def _extract_topic(
 
     Args:
         token_sets: Token sets for chunks in this cluster.
-        global_df: Precomputed document frequency across ALL chunks.
+        global_df: Precomputed document frequency across ALL chunks, keyed
+            by ``_normalize_topic_token`` (see ``cluster_chunks``) so a
+            word's punctuated and unpunctuated forms share one count.
         n_docs: Total number of chunks (for IDF denominator).
     """
     if n_docs == 0:
         return "unknown"
 
-    # Cluster document frequency: how many cluster members contain each token
+    # Cluster document frequency: how many cluster members contain each
+    # NORMALIZED token (see _normalize_topic_token).
     cluster_df: Counter[str] = Counter()
     for ts in token_sets:
-        cluster_df.update(ts)
+        cluster_df.update({_normalize_topic_token(t) for t in ts} - {""})
 
     # DF-IDF score: tokens frequent in this cluster but rare globally
     # Allow code identifiers (with underscores/dots) alongside pure words
@@ -422,6 +454,8 @@ def _extract_topic(
             continue
         # Accept pure words and code identifiers (e.g., recall_build, bm25.py)
         if not (token.isalpha() or "_" in token or "." in token):
+            continue
+        if _EPHEMERAL_ID_TOKEN_RE.match(token):
             continue
         doc_freq = global_df.get(token, 1)
         idf = math.log(n_docs / doc_freq) if doc_freq < n_docs else 0.1
@@ -540,11 +574,14 @@ def cluster_chunks(
             for token in chunk_tokens:
                 token_to_clusters.setdefault(token, []).append(new_ci)
 
-    # Precompute global document frequency ONCE for topic extraction
+    # Precompute global document frequency ONCE for topic extraction.
+    # Normalized (see _normalize_topic_token) so a word's sentence-final
+    # and mid-sentence forms share one count instead of two spuriously
+    # separate ones (measured on the real store).
     n_docs = len(chunk_token_map)
     global_df: Counter[str] = Counter()
     for ts in chunk_token_map.values():
-        global_df.update(ts)
+        global_df.update({_normalize_topic_token(t) for t in ts} - {""})
 
     # Convert to output format, filtering singletons and empties
     now = datetime.now(timezone.utc).isoformat()
