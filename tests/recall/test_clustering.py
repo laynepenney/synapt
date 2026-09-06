@@ -152,6 +152,73 @@ class TestExtractTopic:
         topic = _extract_topic(cluster_tokens, global_df, len(cluster_tokens))
         assert "abc" not in topic
 
+    def test_session_id_tokens_excluded(self):
+        """A session id (m_<hex>) recurring across a cluster's
+        own members is genuinely rare corpus-wide, so DF-IDF's rarity bonus
+        is maximal for it despite carrying zero topical signal. Measured on
+        the real store: "m_be61448... fathom m_6d67ca24" as a topic label."""
+        from collections import Counter
+        cluster_tokens = [
+            {"m_be61448ec3d91a2", "antagonist", "frozen"},
+            {"m_be61448ec3d91a2", "antagonist", "review"},
+        ]
+        all_tokens = cluster_tokens + [
+            {"harness", "swift", "test", "eval"},
+            {"swift", "adapter", "training", "loss"},
+        ]
+        global_df: Counter[str] = Counter()
+        for ts in all_tokens:
+            global_df.update(ts)
+        topic = _extract_topic(cluster_tokens, global_df, len(all_tokens))
+        assert "m_be61448ec3d91a2" not in topic
+        assert "antagonist" in topic
+
+    def test_tool_use_id_tokens_excluded(self):
+        """toolu_<alnum> ids are the same shape of defect as
+        session ids -- unique per tool call, so IDF treats them as maximally
+        rare. Measured: "toolu_01eum13sxeaunhmdiljvdlmx u... notification"."""
+        from collections import Counter
+        cluster_tokens = [
+            {"toolu_01eum13sxeaunhmdiljvdlmx", "notification", "queue"},
+            {"toolu_01eum13sxeaunhmdiljvdlmx", "notification", "delivery"},
+        ]
+        global_df: Counter[str] = Counter()
+        for ts in cluster_tokens:
+            global_df.update(ts)
+        topic = _extract_topic(cluster_tokens, global_df, len(cluster_tokens))
+        assert "toolu_01eum13sxeaunhmdiljvdlmx" not in topic
+
+    def test_sentence_final_punctuation_does_not_inflate_rarity(self):
+        """_tokenize() keeps '.' inside a token, so "seen."
+        (sentence-final) and "seen" (mid-sentence) land as separate dict
+        keys. Before the fix, the punctuated form looked spuriously rare
+        globally (most other occurrences of the word aren't sentence-final)
+        and won the ranking on that artifact alone. Measured real examples:
+        "world assembled. seen." and "change. activity. report" -- vacuous
+        words that happened to fall at a sentence boundary in the cluster.
+        Here "seen" is actually the MORE common word globally once its two
+        forms are merged, so it must not lose to the genuinely rare
+        "antagonist" purely because of how it's punctuated in this cluster.
+        """
+        from collections import Counter
+        cluster_tokens = [
+            {"seen.", "antagonist", "review"},
+            {"seen.", "antagonist", "gate"},
+        ]
+        # "seen" (unpunctuated) is common corpus-wide; "antagonist" is rare.
+        all_tokens = cluster_tokens + [
+            {"seen", "harness", "test"},
+            {"seen", "swift", "adapter"},
+            {"seen", "training", "loss"},
+            {"seen", "eval", "gate"},
+        ]
+        global_df: Counter[str] = Counter()
+        for ts in all_tokens:
+            global_df.update(ts)
+        topic = _extract_topic(cluster_tokens, global_df, len(all_tokens))
+        assert "antagonist" in topic
+        assert "seen." not in topic.split()
+
 
 # ---------------------------------------------------------------------------
 # Clustering algorithm
