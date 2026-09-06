@@ -793,6 +793,24 @@ def test_compute_boilerplate_stoplist_empty_signatures_is_empty_not_a_crash():
     assert compute_boilerplate_stoplist({}) == []
 
 
+def _decoy_signatures(n: int, *, size: int = 64) -> dict[str, frozenset[str]]:
+    """N cluster signatures with mutually disjoint, synthetic vocabulary --
+    background population for tests that are NOT about distinctiveness
+    weighting, so every token in the signature actually under test still
+    gets document frequency 1 (present in only that one signature) and
+    therefore a UNIFORM per-token IDF. Under uniform IDF, the weighted
+    containment ratio in ``_match_existing_cluster`` reduces exactly to the
+    old ``|shared| / |signature|`` count ratio (every token contributes the
+    same weight), so these decoys let existing count/ratio-focused tests
+    keep testing exactly what they tested before the distinctiveness
+    weighting existed, just against a realistically-sized cluster
+    population instead of a population of one or two."""
+    return {
+        f"decoy-{i}": frozenset(f"decoytok{i}_{j}" for j in range(size))
+        for i in range(n)
+    }
+
+
 # Hand-read finding: recall's own context-echo user_text
 # ("(context: User previously asked: X)", core.py's synthetic restatement
 # for every sub-chunk past the first of a long assistant reply) is the
@@ -826,6 +844,7 @@ def test_context_echo_alone_does_not_match_but_real_body_overlap_still_does():
         MIN_SHARED_SIGNATURE_TOKENS,
         _chunk_tokens,
         _match_existing_cluster,
+        _signature_cross_cluster_df,
     )
 
     signature = frozenset(_TOPIC_WORDS)
@@ -844,7 +863,11 @@ def test_context_echo_alone_does_not_match_but_real_body_overlap_still_does():
         _DISJOINT_SINGLETON_TEXT[0][1],  # giraffes/savanna, shares nothing
     )
 
-    cluster_signatures = {"clust-topic": signature}
+    # Decoys give the topic words a uniform, non-degenerate IDF (see
+    # _decoy_signatures) so this test still isolates the echo-stripping
+    # behavior it's named for, not the distinctiveness weighting.
+    cluster_signatures = {"clust-topic": signature, **_decoy_signatures(50)}
+    signature_df = _signature_cross_cluster_df(cluster_signatures)
 
     on_topic_tokens = _chunk_tokens(on_topic)
     off_topic_tokens = _chunk_tokens(off_topic)
@@ -855,10 +878,14 @@ def test_context_echo_alone_does_not_match_but_real_body_overlap_still_does():
     unstripped_off_topic = set(rich_echo.lower().split()) | off_topic_tokens
     assert len(signature & unstripped_off_topic) >= MIN_SHARED_SIGNATURE_TOKENS
 
-    assert _match_existing_cluster(on_topic_tokens, cluster_signatures) == "clust-topic", (
+    assert _match_existing_cluster(
+        on_topic_tokens, cluster_signatures, signature_df,
+    ) == "clust-topic", (
         "a chunk whose own assistant text shares the topic must still match"
     )
-    assert _match_existing_cluster(off_topic_tokens, cluster_signatures) is None, (
+    assert _match_existing_cluster(
+        off_topic_tokens, cluster_signatures, signature_df,
+    ) is None, (
         "a chunk that shares ONLY the echoed context, not its own content, "
         "must not match -- the echo must be stripped before comparison"
     )
@@ -909,15 +936,20 @@ def test_signature_of_bare_numbers_is_never_a_merge_target():
     _chunk_tokens, because _chunk_tokens' own fix already keeps a FRESH
     chunk from ever producing such tokens again -- going through the real
     pipeline would prove only the tokenizer fix, not this separate guard."""
-    from synapt.recall.clustering import MIN_SHARED_SIGNATURE_TOKENS, _match_existing_cluster
+    from synapt.recall.clustering import (
+        MIN_SHARED_SIGNATURE_TOKENS,
+        _match_existing_cluster,
+        _signature_cross_cluster_df,
+    )
 
     numeric_signature = frozenset(str(n) for n in range(100, 100 + MIN_SHARED_SIGNATURE_TOKENS + 20))
     # Shares EVERY signature token plus real, unrelated words -- old floor
     # (>= 8 shared) and old ratio (shared/len(signature) == 1.0) both pass.
     chunk_tokens = numeric_signature | {"giraffe", "savanna", "acacia"}
 
+    cluster_signatures = {"clust-numeric": numeric_signature}
     assert _match_existing_cluster(
-        chunk_tokens, {"clust-numeric": numeric_signature},
+        chunk_tokens, cluster_signatures, _signature_cross_cluster_df(cluster_signatures),
     ) is None, "a signature with no letter-bearing tokens must never be a merge target"
 
 
@@ -934,10 +966,18 @@ def test_containment_ratio_is_enforced_independently_of_the_absolute_floor():
         CONTAINMENT_THRESHOLD,
         MIN_SHARED_SIGNATURE_TOKENS,
         _match_existing_cluster,
+        _signature_cross_cluster_df,
     )
 
     signature = frozenset(f"topicword{i}" for i in range(64))
     assert len(signature) == 64
+
+    # Decoys give every "topicword*" token document frequency 1 (present
+    # only in the signature under test) and therefore a uniform per-token
+    # IDF -- under uniform IDF the weighted containment ratio reduces
+    # exactly to the plain count ratio this test is named for.
+    cluster_signatures = {"clust-x": signature, **_decoy_signatures(50)}
+    signature_df = _signature_cross_cluster_df(cluster_signatures)
 
     shared_at_floor = sorted(signature)[:MIN_SHARED_SIGNATURE_TOKENS]
     low_ratio_tokens = frozenset(shared_at_floor) | {"unrelated1", "unrelated2"}
@@ -953,11 +993,94 @@ def test_containment_ratio_is_enforced_independently_of_the_absolute_floor():
         "fixture assumption: 16/64 must sit AT OR ABOVE the ratio threshold"
     )
 
-    assert _match_existing_cluster(low_ratio_tokens, {"clust-x": signature}) is None, (
+    assert _match_existing_cluster(
+        low_ratio_tokens, cluster_signatures, signature_df,
+    ) is None, (
         "8/64 clears the absolute floor but not the containment ratio -- must not match"
     )
-    assert _match_existing_cluster(high_ratio_tokens, {"clust-x": signature}) == "clust-x", (
+    assert _match_existing_cluster(
+        high_ratio_tokens, cluster_signatures, signature_df,
+    ) == "clust-x", (
         "16/64 clears both the floor and the ratio -- must match"
+    )
+
+
+# 10-sample hand read of live merge_into_existing candidates (recall#435
+# follow-on, tracked privately; candidate-side lane, unblocked once the
+# signature tiebreak fix converged): 5 of 10 shared mostly vocabulary
+# common across MANY other clusters'
+# signatures -- a recurring harness/status prompt's own words -- and clear
+# BOTH the count floor and the containment ratio on that shared vocabulary
+# alone, despite having no real topical relationship to the cluster they'd
+# join. The other 5 share genuinely rare, cluster-specific vocabulary. The
+# two tests below reproduce each shape directly against _match_existing_cluster.
+
+def test_common_cross_cluster_tokens_do_not_merge_despite_clearing_count_and_ratio():
+    """A candidate that shares an ENTIRE signature made of tokens recurring
+    across many OTHER clusters' signatures too (the shape of a harness/
+    status-update prompt's own vocabulary) must not merge, even though the
+    raw count (20 shared, well above the floor) and containment ratio
+    (1.0, well above the threshold) both clear comfortably on their own --
+    exactly the false-merge shape a count/ratio-only check cannot see."""
+    from synapt.recall.clustering import (
+        MIN_SHARED_SIGNATURE_TOKENS,
+        _match_existing_cluster,
+        _signature_cross_cluster_df,
+    )
+
+    boilerplate = frozenset(f"ritualword{i}" for i in range(20))
+    assert len(boilerplate) >= MIN_SHARED_SIGNATURE_TOKENS
+    target_signature = boilerplate
+
+    # 30 OTHER clusters share the SAME boilerplate vocabulary -- a
+    # recurring prompt appearing across many unrelated real-topic clusters
+    # -- plus their own disjoint filler, so they aren't literal duplicate
+    # signatures, just clusters that also happen to carry this vocabulary.
+    other_clusters = {
+        f"clust-other-{i}": boilerplate | frozenset(f"filler{i}_{j}" for j in range(10))
+        for i in range(30)
+    }
+    cluster_signatures = {"clust-target": target_signature, **other_clusters}
+    signature_df = _signature_cross_cluster_df(cluster_signatures)
+
+    candidate_tokens = boilerplate | {"unrelated_word_a", "unrelated_word_b"}
+    assert len(candidate_tokens & target_signature) == len(boilerplate), (
+        "fixture assumption: the candidate shares the WHOLE target signature"
+    )
+
+    assert _match_existing_cluster(
+        candidate_tokens, cluster_signatures, signature_df,
+    ) is None, (
+        "shared tokens that recur across many OTHER clusters' signatures "
+        "carry no topical signal, however many are shared or how high the "
+        "raw containment ratio reads"
+    )
+
+
+def test_genuinely_rare_shared_tokens_still_merge():
+    """The other half of the same fixture shape: a candidate sharing
+    vocabulary specific to ONLY the target cluster's signature (present in
+    no other cluster) must still merge -- the distinctiveness check
+    preserves exactly the matches it exists to keep, not just the ones it
+    exists to block."""
+    from synapt.recall.clustering import (
+        _match_existing_cluster,
+        _signature_cross_cluster_df,
+    )
+
+    distinctive = frozenset(f"specificterm{i}" for i in range(10))
+    target_signature = distinctive
+    decoys = _decoy_signatures(30)
+    cluster_signatures = {"clust-target": target_signature, **decoys}
+    signature_df = _signature_cross_cluster_df(cluster_signatures)
+
+    candidate_tokens = distinctive | {"chunk_only_word"}
+
+    assert _match_existing_cluster(
+        candidate_tokens, cluster_signatures, signature_df,
+    ) == "clust-target", (
+        "tokens specific to a single cluster's signature are exactly the "
+        "distinctiveness signal this check exists to preserve a match on"
     )
 
 
