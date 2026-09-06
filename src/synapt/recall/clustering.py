@@ -18,6 +18,7 @@ import math
 import re as _re
 import uuid
 from collections import Counter
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -60,6 +61,23 @@ _STOP_TOKENS = frozenset({
     "current", "already", "still", "actually", "instead",
 })
 
+# Agent/founder display names used purely as SPEAKER-ATTRIBUTION markers
+# ("@stromus", "s_xxx: Atlas:") -- never themselves a chunk's own topic --
+# in both their stemmed mid-sentence form and their unstemmed
+# sentence-final form (``_tokenize``'s stemmer skips any token containing
+# punctuation, so "Atlas." never reaches the stemmer at all and survives
+# as literal "atlas." until ``_normalize_topic_token`` strips the dot).
+# Both forms verified directly against ``synapt.recall.bm25._tokenize``
+# (recall#435 follow-on, tracked privately). Applied only at SIGNATURE build/compare time
+# (see ``_normalize_signature_token`` below), never inside
+# ``_chunk_tokens`` itself: that function also feeds INITIAL Jaccard
+# clustering, and a chunk genuinely ABOUT one of these people (not just
+# addressed to them) still deserves that word in its own token set there.
+_ROSTER_NAME_STOPWORDS = frozenset({
+    "atla", "atlas", "sentinel", "apollo", "stromu", "stromus",
+    "opu", "opus", "fathom", "dev", "layne",
+})
+
 # Clustering parameters
 JACCARD_THRESHOLD = 0.20  # Raised from 0.15 for tighter clusters
 MIN_CLUSTER_SIZE = 2      # Singleton clusters are not useful
@@ -91,12 +109,36 @@ MIN_SHARED_SIGNATURE_TOKENS = 8  # absolute floor: ratio alone lets a tiny
 # recall#435's whole reason for existing (never reload the
 # already-clustered corpus).
 #
-# The floor is an AVERAGE over the shared tokens, not a SUM: a sum grows
-# with the shared-token COUNT, which is exactly the quantity
-# min_shared_tokens already governs separately, so a sum-floor would just
-# be a second, differently-scaled count floor wearing an IDF costume. An
-# average is scale-invariant with respect to count.
-MIN_AVERAGE_DISTINCTIVE_IDF = 1.0  # avg IDF of the shared tokens
+# First shipped as an AVERAGE-IDF floor over the shared tokens (an
+# average, not a sum, to stay scale-invariant with respect to the
+# shared-token COUNT min_shared_tokens already governs separately).
+# Measured wrong on the real store one batch later (recall#435 follow-on, tracked privately,
+# Stromus's independent cross-check plus
+# a read-only probe against the live signature table): at the real N=479 signed
+# clusters -- not the far larger population the floor of 1.0 was
+# informally validated against -- log(N/df) already clears 1.0 for any
+# token present in under ~37% of ALL signatures (df <= N/e), and the
+# team's own roster display names sit at 32%-62% (measured: dev 295/479,
+# stromu 222/479, fathom 206/479, atla 182/479, apollo 163/479). A handful
+# of those, averaged in with a few genuinely rare tokens, clears the floor
+# easily -- averaging lets a common token ride along with rare ones
+# instead of being screened out on its own.
+#
+# Replaced with a COUNT of shared tokens that each individually clear a
+# per-token rarity ceiling, not an average blended across all of them: a
+# token counts as distinctiveness EVIDENCE only if its signature
+# cross-cluster document frequency sits at or below
+# ``total_clusters // RARE_TOKEN_DF_DIVISOR``, and enough of THOSE tokens
+# (not just enough shared tokens overall) must be present. A common token
+# can no longer offset a rare one's contribution -- it simply never
+# counts, however many rare ones sit beside it.
+RARE_TOKEN_DF_DIVISOR = 10  # a token counts as distinctive only inside
+                            # this fraction of all signed clusters
+MIN_DISTINCTIVE_SHARED_TOKENS = 8  # same floor VALUE as
+                                    # MIN_SHARED_SIGNATURE_TOKENS, but a
+                                    # DIFFERENT, narrower population:
+                                    # shared tokens that ALSO clear the
+                                    # rarity ceiling above
 
 # Below this many total clusters, cross-signature document frequency
 # cannot tell "rare" from "common" at all -- with, say, one cluster in
@@ -294,6 +336,11 @@ def _cluster_signature_tokens(
     protected from data-derived boilerplate rather than silently trusting
     an upstream filter that may not apply.
 
+    ``_normalize_signature_tokens`` is applied here too, for the same
+    reason: a sentence-final punctuated form or a roster display name (see
+    ``_normalize_signature_token``) must never earn a signature slot
+    regardless of which path produced the raw per-chunk token sets.
+
     The cut at ``top_n`` MUST be a pure function of the token multiset, not
     of iteration order: ``token_sets`` entries are ``set[str]``, and Python
     randomizes ``str`` hashing per process (``PYTHONHASHSEED``), so a plain
@@ -314,7 +361,9 @@ def _cluster_signature_tokens(
     """
     document_frequency: Counter[str] = Counter()
     for ts in token_sets:
-        document_frequency.update(t for t in ts if t not in extra_stopwords)
+        document_frequency.update(
+            _normalize_signature_tokens(t for t in ts if t not in extra_stopwords)
+        )
     ranked = sorted(document_frequency.items(), key=lambda kv: (-kv[1], kv[0]))
     return [tok for tok, _ in ranked[:top_n]]
 
@@ -394,7 +443,8 @@ def _match_existing_cluster(
     *,
     min_containment: float = CONTAINMENT_THRESHOLD,
     min_shared_tokens: int = MIN_SHARED_SIGNATURE_TOKENS,
-    min_average_distinctive_idf: float = MIN_AVERAGE_DISTINCTIVE_IDF,
+    rare_token_df_divisor: int = RARE_TOKEN_DF_DIVISOR,
+    min_distinctive_shared_tokens: int = MIN_DISTINCTIVE_SHARED_TOKENS,
     min_clusters_for_distinctiveness: int = MIN_CLUSTERS_FOR_DISTINCTIVENESS,
 ) -> str | None:
     """Best-matching existing cluster id for one chunk's tokens, or None.
@@ -416,16 +466,20 @@ def _match_existing_cluster(
     common, recurring vocabulary shared with the signature (a harness
     prompt's own words, a status update's "quiet"/"standing by") -- shared
     tokens that recur across MANY clusters' signatures carry no real
-    topical signal, however many of them there are. ``min_average_distinctive_idf``
-    is a separate, INDEPENDENT floor on the AVERAGE per-token rarity of the
-    shared set (see ``_signature_cross_cluster_df`` -- how many DIFFERENT
+    topical signal, however many of them there are.
+    ``min_distinctive_shared_tokens`` is a separate, INDEPENDENT floor on
+    HOW MANY of the shared tokens individually clear a per-token rarity
+    ceiling (see ``_signature_cross_cluster_df`` -- how many DIFFERENT
     clusters' signatures contain each token, the cheap proxy for
-    distinctiveness already loaded at the call site; same ``log(N/df)``
-    shape ``_extract_topic`` uses for topic-label ranking, applied to
-    signatures rather than chunks because that is the population in memory
-    here). An AVERAGE, not a sum: a sum grows with shared-token count,
-    which ``min_shared_tokens`` already governs, so a sum-floor would just
-    be a second, differently-scaled count floor. Below
+    distinctiveness already loaded at the call site -- a token counts only
+    if its df sits at or below ``total_clusters // rare_token_df_divisor``),
+    not an average blended across the whole shared set. Shipped first as
+    an average; measured wrong on the real store one batch
+    later -- at the real cluster count an average lets a handful of
+    genuinely rare tokens drag several common ones over the line with
+    them, so a match dominated by boilerplate still cleared it. A
+    per-token count cannot be dragged that way: a common token simply
+    never counts, however many rare ones sit beside it. Below
     ``min_clusters_for_distinctiveness`` total clusters this check is
     skipped outright -- with too few clusters to compare against, every
     token trivially looks "common" (it IS the only, or one of a handful
@@ -451,10 +505,7 @@ def _match_existing_cluster(
     """
     total_clusters = len(cluster_signatures)
     check_distinctiveness = total_clusters >= min_clusters_for_distinctiveness
-
-    def _idf(token: str) -> float:
-        df = signature_df.get(token, 1)
-        return math.log(total_clusters / df) if df < total_clusters else 0.1
+    rare_df_ceiling = max(1, total_clusters // rare_token_df_divisor)
 
     best_score = 0.0
     best_id: str | None = None
@@ -467,8 +518,10 @@ def _match_existing_cluster(
         if len(shared) < min_shared_tokens:
             continue
         if check_distinctiveness:
-            avg_shared_idf = sum(_idf(t) for t in shared) / len(shared)
-            if avg_shared_idf < min_average_distinctive_idf:
+            distinctive_shared = sum(
+                1 for t in shared if signature_df.get(t, 1) <= rare_df_ceiling
+            )
+            if distinctive_shared < min_distinctive_shared_tokens:
                 continue
         containment = len(shared) / len(signature)
         if containment >= min_containment and containment > best_score:
@@ -514,6 +567,38 @@ def _normalize_topic_token(token: str) -> str:
     fell at a sentence boundary in this cluster's members.
     """
     return token.rstrip(".")
+
+
+def _normalize_signature_token(token: str) -> str:
+    """Signature-space normalization: apply the same trailing-'.' strip
+    ``_normalize_topic_token`` already applies for topic-label ranking (a
+    sentence-final punctuated form is not a distinct token from its
+    mid-sentence form), THEN drop the token entirely if it is a roster
+    display name (see ``_ROSTER_NAME_STOPWORDS``). Order matters: a
+    sentence-final "Atlas." only reaches the stoplist's dot-stripped
+    "atlas" entry after the dot is stripped -- the stemmer skips any token
+    containing punctuation, so the raw sentence-final form is never
+    already the stemmed "atla" a stoplist entry might otherwise assume.
+
+    Returns "" when the token should be dropped entirely; callers filter
+    empties out (mirrors ``_extract_topic``'s own ``- {""}`` after
+    applying ``_normalize_topic_token``).
+    """
+    normalized = _normalize_topic_token(token)
+    return "" if normalized in _ROSTER_NAME_STOPWORDS else normalized
+
+
+def _normalize_signature_tokens(tokens: Iterable[str]) -> set[str]:
+    """Set-level wrapper for ``_normalize_signature_token``, applied
+    identically on BOTH sides of a signature comparison -- the persisted
+    signature (``_cluster_signature_tokens``) and the incoming candidate
+    (``recluster_stale_chunks``'s ``merge_into_existing`` lane) -- so a
+    sentence-final "now." on one side and a mid-sentence "now" on the
+    other still land on the same token and can actually be counted as
+    shared."""
+    normalized = {_normalize_signature_token(t) for t in tokens}
+    normalized.discard("")
+    return normalized
 
 
 def _extract_topic(
@@ -1504,7 +1589,15 @@ def recluster_stale_chunks(
         merges_by_cluster: dict[str, list[TranscriptChunk]] = {}
         remaining_chunks: list[TranscriptChunk] = []
         for chunk in batch_chunks:
-            tokens = raw_batch_tokens[chunk.id] - effective_stopwords
+            # Normalized the SAME way the persisted signature is (see
+            # _normalize_signature_tokens): the candidate side of this
+            # comparison must collapse the same sentence-final/roster-name
+            # noise the signature side does, or a real shared token with a
+            # punctuated or attributed form on one side and not the other
+            # silently never intersects.
+            tokens = _normalize_signature_tokens(
+                raw_batch_tokens[chunk.id] - effective_stopwords
+            )
             # Same noise filter self-batch clustering applies -- a chunk too
             # short to ever form its own cluster is too short to match an
             # existing one meaningfully either.

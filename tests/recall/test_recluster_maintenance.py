@@ -848,6 +848,80 @@ def test_recluster_merge_into_existing_distinctiveness_through_the_real_call_sit
         db.close()
 
 
+def test_recluster_merge_into_existing_normalizes_candidate_side_symmetrically(tmp_path):
+    """Mutation witness for the CANDIDATE side of the normalization fix,
+    isolated from the signature side: the real cluster is built from
+    ordinary (undecorated) topic-word text, so its persisted signature
+    already carries the bare forms without needing any fix on that side.
+    The candidate's own text renders every shared topic word dot-suffixed
+    (period-joined, so the tokenizer keeps each word's own trailing dot as
+    part of that one token) -- if ``recluster_stale_chunks`` stopped
+    normalizing the candidate's own tokens before the match (see the
+    ``_normalize_signature_tokens`` call at the real call site), every one
+    of those tokens would arrive as "kubernetes." rather than "kubernetes"
+    and share nothing at all with the signature's bare forms."""
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.clustering import recluster_stale_chunks, stale_transcript_chunk_ids
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _topic_transcript(source / "topic.jsonl", turns=8)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    db = _open_db(project)
+    try:
+        existing_cluster_id, = db._conn.execute(
+            "SELECT cluster_id FROM clusters WHERE cluster_type = 'topic'"
+        ).fetchone()
+
+        real_signature = db.load_cluster_token_signatures()[existing_cluster_id]
+        assert any(w in real_signature for w in _TOPIC_WORDS), (
+            f"fixture assumption: bare topic words must be in the real "
+            f"signature: {sorted(real_signature)}"
+        )
+        assert not any(f"{w}." in real_signature for w in _TOPIC_WORDS), (
+            f"fixture assumption: the corpus never uses a dot-suffixed "
+            f"form, so none should be persisted either: {sorted(real_signature)}"
+        )
+
+        dotted = ". ".join(_TOPIC_WORDS) + "."
+        write_jsonl(source / "dotted_candidate.jsonl", [
+            user_text_entry(f"question about {dotted}", uuid="dotted-u",
+                             ts="2026-03-01T11:00:00Z"),
+            assistant_entry(text=f"answer about {dotted}", uuid="dotted-a",
+                             ts="2026-03-01T11:00:30Z"),
+        ])
+        _archive_and_build(project, source_dirs=[source], use_embeddings=False,
+                            incremental=True, skip_clustering=True)
+    finally:
+        db.close()
+
+    db = _open_db(project)
+    try:
+        stale_before = set(stale_transcript_chunk_ids(db))
+        assert len(stale_before) == 1, f"exactly the one new candidate should be stale: {stale_before}"
+
+        receipt = recluster_stale_chunks(db, batch_size=100, merge_into_existing=True)
+        assert receipt["merged_into_existing"] == 1, (
+            f"the dot-suffixed candidate must still merge once its own "
+            f"tokens are normalized the same way the signature's are: {receipt}"
+        )
+
+        member_ids = {
+            r[0] for r in db._conn.execute(
+                "SELECT chunk_id FROM cluster_chunks WHERE cluster_id = ?",
+                (existing_cluster_id,),
+            ).fetchall()
+        }
+        assert any("dotted" in cid for cid in member_ids), (
+            f"the dotted candidate must be a real member of the real cluster: {member_ids}"
+        )
+    finally:
+        db.close()
+
+
 def test_backfill_cluster_signatures_fills_in_clusters_that_predate_the_table(tmp_path):
     """A cluster with no persisted signature yet (predates this table, or
     had one invalidated by ``merge_chunks_into_cluster``) gets one from
@@ -1212,6 +1286,70 @@ def test_genuinely_rare_shared_tokens_still_merge():
     )
 
 
+# Real-store measurement (recall#435 follow-on, tracked privately, Stromus's independent
+# cross-check + a read-only probe against the live signature table): the
+# AVERAGE-IDF floor this replaces cleared 1.0 on a real fresh-batch sample
+# where 15 of 20 shared tokens recurred across 49 OTHER clusters'
+# signatures too -- a handful of genuinely rare tokens dragged the average
+# over the line. This fixture reproduces that arithmetic directly: 5
+# tokens unique to the target cluster (idf = ln(50/1) = 3.91) plus 15
+# tokens shared with 49 other clusters (idf floors at 0.1, since their df
+# equals total_clusters exactly) average to (5*3.91 + 15*0.1) / 20 = 1.05
+# -- comfortably OVER the old 1.0 floor despite 75% of the shared
+# vocabulary being boilerplate common to the majority of the population.
+
+def test_few_rare_tokens_no_longer_drag_many_common_ones_over_the_line():
+    """The exact miscalibration the average-IDF floor shipped with:
+    averaging let a small rare-token minority pull a boilerplate-dominated
+    match over the line. The count-based floor cannot be dragged this
+    way -- a common token simply never counts as evidence, however many
+    rare ones sit beside it in the same shared set."""
+    from synapt.recall.clustering import (
+        MIN_SHARED_SIGNATURE_TOKENS,
+        _match_existing_cluster,
+        _signature_cross_cluster_df,
+    )
+
+    rare = frozenset(f"raretoken{i}" for i in range(5))
+    semi_common = frozenset(f"semicommon{i}" for i in range(15))
+    target_signature = rare | semi_common
+    assert len(target_signature) == 20
+
+    # 49 OTHER clusters carry the SAME 15 semi-common tokens (their own
+    # disjoint filler besides) -- df(semi_common) = 50 (target + 49
+    # others), df(rare) = 1 (only the target). 1 target + 49 others = 50
+    # total clusters, matching the real-store arithmetic above exactly.
+    other_clusters = {
+        f"clust-other-{i}": semi_common | frozenset(f"filler{i}_{j}" for j in range(45))
+        for i in range(49)
+    }
+    cluster_signatures = {"clust-target": target_signature, **other_clusters}
+    assert len(cluster_signatures) == 50, "fixture assumption: N=50 exactly"
+    signature_df = _signature_cross_cluster_df(cluster_signatures)
+    assert signature_df["semicommon0"] == 50, (
+        f"fixture assumption: semi-common tokens sit in ALL 50 signatures: "
+        f"{signature_df['semicommon0']}"
+    )
+    assert signature_df["raretoken0"] == 1, (
+        f"fixture assumption: rare tokens sit in only the target: "
+        f"{signature_df['raretoken0']}"
+    )
+
+    candidate_tokens = target_signature | {"unrelated_a", "unrelated_b"}
+    assert len(candidate_tokens & target_signature) == 20, (
+        "fixture assumption: the candidate shares the WHOLE target signature"
+    )
+    assert len(candidate_tokens & target_signature) >= MIN_SHARED_SIGNATURE_TOKENS
+
+    assert _match_existing_cluster(
+        candidate_tokens, cluster_signatures, signature_df,
+    ) is None, (
+        "only 5 of the 20 shared tokens individually clear the rarity "
+        "ceiling -- below the 8-token floor -- so this must not merge "
+        "even though it shares the entire signature at containment 1.0"
+    )
+
+
 # Real-store hand-read finding: a cluster
 # whose members are mostly one recurring HARNESS/CRON/RITUAL prompt (e.g. a
 # nightly close-shop checklist, or a wake-loop's "check #dev channel"
@@ -1338,6 +1476,63 @@ def test_tokenize_cluster_members_signature_drops_ritual_prompt_vocabulary():
             f"{real_word!r} is the cluster's real, varying content and must "
             f"survive into the signature: {signature}"
         )
+
+
+# Real-store hand-read finding (recall#435 follow-on, tracked privately): a persisted
+# signature carries a word's sentence-final punctuated form and its
+# mid-sentence form as two SEPARATE tokens ("now." / "now",
+# "story." / "story"), each with its own, spuriously-lower document
+# frequency -- and separately carries agent/founder display names used
+# purely as speaker-attribution markers ("apollo.", "atla", "stromu"),
+# present in 32%-62% of ALL 479 real persisted signatures with no topical
+# content at all. _normalize_topic_token already fixed the first shape for
+# TOPIC LABELS; neither fix had ever reached SIGNATURE building.
+
+def test_cluster_signature_tokens_collapses_trailing_dot_variants():
+    """A word's sentence-final punctuated form and its mid-sentence form
+    must count as the SAME token for signature purposes, mirroring
+    _normalize_topic_token's existing topic-label behavior -- otherwise
+    the punctuated form is spuriously rare within this cluster's own
+    document-frequency count and can independently claim a signature slot
+    the bare form should have owned outright."""
+    from synapt.recall.clustering import _cluster_signature_tokens
+
+    token_sets = [
+        {"giraffe", "savanna"},
+        {"giraffe.", "savanna"},
+        {"giraffe", "acacia"},
+        {"giraffe.", "acacia"},
+        {"giraffe", "unrelated"},
+    ]
+    signature = _cluster_signature_tokens(token_sets, top_n=64)
+    assert "giraffe." not in signature, (
+        f"the punctuated form must not survive as its own token: {signature}"
+    )
+    assert "giraffe" in signature
+
+
+def test_cluster_signature_tokens_drops_roster_display_names():
+    """An agent/founder display name used purely as a speaker-attribution
+    marker (measured on the real store: dev/stromu/fathom/atla/apollo sit
+    at 32%-62% cross-cluster document frequency, none of it topical) must
+    never reach a persisted signature, however often it recurs within this
+    one cluster's own members -- both its stemmed mid-sentence form and
+    its unstemmed, dot-suffixed sentence-final form."""
+    from synapt.recall.clustering import _cluster_signature_tokens
+
+    token_sets = [
+        {"atla", "giraffe"},
+        {"stromu", "savanna"},
+        {"apollo.", "acacia"},
+        {"fathom", "giraffe"},
+        {"dev", "savanna"},
+    ]
+    signature = _cluster_signature_tokens(token_sets, top_n=64)
+    for roster_token in ("atla", "stromu", "apollo", "apollo.", "fathom", "dev"):
+        assert roster_token not in signature, (
+            f"{roster_token!r} must never reach a persisted signature: {signature}"
+        )
+    assert {"giraffe", "savanna", "acacia"} <= set(signature)
 
 
 # Second real-store finding from the same morning follow-on: a cluster's
