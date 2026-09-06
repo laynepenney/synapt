@@ -53,7 +53,23 @@ _MATCH_KIND_RANK = {"exact": 0, "prefix": 1, "substring": 2}
 # alone can return several substring hits) still crowds out a later token's
 # exact hit within its own per-token slice before the global sort ever sees
 # it.
-_CANDIDATE_POOL_PER_TOKEN = 20
+_CANDIDATE_POOL_PER_TOKEN = 100
+# 20 was measured too small on the first real query through the MCP tool
+# (2026-09-06): "build" alone substring-matches well over 20 symbols in this
+# repo, so ``_acquire_build_lock`` never entered the pool for either of the
+# two words it contains and coverage ranking had nothing to rank. 100 costs
+# one indexed SQLite query per token and is still bounded.
+
+
+def _stem(word: str) -> str:
+    """Fold the plainest English inflections so a question's "acquired" can
+    meet a symbol's "acquire" and "indexes" can meet "index". Deliberately
+    tiny: strip one of ed / es / s / ing when at least four letters remain.
+    Not a stemmer; a coverage aid that never widens below four characters."""
+    for suffix in ("ing", "ed", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 4:
+            return word[: -len(suffix)]
+    return word
 
 # --- Optional per-hit annotator seam ---
 # A downstream layer may register a per-hit annotation callable via the
@@ -98,10 +114,23 @@ def _identifier_tokens(query: str) -> list[str]:
     don't crowd out real symbol names in the fixed-size result budget."""
     raw = re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query)
     raw = [t for t in raw if t.lower() not in _STOPWORDS]
+    raw = list(dict.fromkeys(raw + [_stem(t.lower()) for t in raw]))
     joined_underscore = "_".join(re.findall(r"[A-Za-z]+", query))
     joined_none = "".join(re.findall(r"[A-Za-z]+", query)).lower()
     candidates = list(dict.fromkeys(raw + [joined_underscore, joined_none, query]))
     return [c for c in candidates if len(c) >= 3]
+
+
+def _is_test_path(path: str) -> bool:
+    """A test file is a legitimate hit but never the definition a reader is
+    looking for first; it ranks after production paths at equal coverage."""
+    parts = path.replace("\\", "/").split("/")
+    base = parts[-1]
+    return (
+        any(part in ("test", "tests") for part in parts[:-1])
+        or base.startswith("test_")
+        or base.endswith(("_test.py", ".test.ts", ".test.js", "_test.go", "_test.rs"))
+    )
 
 
 def _match_kind(symbol_name: str, token: str) -> str:
@@ -141,8 +170,8 @@ def recall_code(
         {
             "query": str,
             "symbols": [{name, kind, path, line_start, line_end, signature,
-                         matched_token, match_kind, annotation?,
-                         annotation_error?}],
+                         matched_token, match_kind, token_coverage, is_test,
+                         annotation?, annotation_error?}],
             "has_code_hit": bool,
             "has_memory_hit": bool,
             "memories": str,
@@ -154,18 +183,48 @@ def recall_code(
     "annotation_error" instead of raising, since annotation is enrichment,
     not the answer.
     """
-    seen: set[tuple[str, str, int]] = set()
-    candidates: list[dict] = []
+    # Dogfood finding (2026-09-06, first real query through the MCP tool):
+    # "where is the build lock acquired" returned four test fixtures named
+    # ``build`` as "exact" hits and never the real ``_acquire_build_lock``,
+    # because (a) a symbol was kept under the FIRST token that found it, so a
+    # later, better match kind on the same symbol was dropped, and (b) one
+    # exact hit on a generic word outranked a symbol containing TWO of the
+    # query's words. So: a duplicate upgrades its match kind, coverage
+    # (how many distinct query words the name contains) ranks first, then
+    # match kind, then non-test paths over test paths, then name.
+    query_words = list(
+        dict.fromkeys(
+            _stem(t.lower())
+            for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", query)
+            if t.lower() not in _STOPWORDS
+        )
+    )
+    by_key: dict[tuple[str, str, int], dict] = {}
     for token in _identifier_tokens(query):
         for hit in find_symbols(db_path, token, repo=repo, limit=_CANDIDATE_POOL_PER_TOKEN):
             key = (hit["path"], hit["name"], hit["line_start"])
-            if key in seen:
-                continue
-            seen.add(key)
-            hit["matched_token"] = token
-            hit["match_kind"] = _match_kind(hit["name"], token)
-            candidates.append(hit)
-    candidates.sort(key=lambda h: (_MATCH_KIND_RANK[h["match_kind"]], h["name"]))
+            kind = _match_kind(hit["name"], token)
+            kept = by_key.get(key)
+            if kept is None:
+                hit["matched_token"] = token
+                hit["match_kind"] = kind
+                by_key[key] = hit
+            elif _MATCH_KIND_RANK[kind] < _MATCH_KIND_RANK[kept["match_kind"]]:
+                kept["matched_token"] = token
+                kept["match_kind"] = kind
+    candidates = list(by_key.values())
+    for hit in candidates:
+        lowered = hit["name"].lower()
+        hit["token_coverage"] = sum(1 for w in query_words if w in lowered)
+        hit["is_test"] = _is_test_path(hit["path"])
+    candidates.sort(
+        key=lambda h: (
+            -h["token_coverage"],
+            _MATCH_KIND_RANK[h["match_kind"]],
+            h["is_test"],
+            h["name"],
+        )
+    )
     symbol_hits = candidates[:max_symbols]
 
     annotator = _load_annotator()

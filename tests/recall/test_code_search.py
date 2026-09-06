@@ -184,7 +184,7 @@ def test_annotation_present_when_an_annotator_is_registered(
     assert "annotation_error" not in hit
 
 
-def test_annotation_absent_without_error_when_no_annotator_registered(
+def test_annotation_absent_without_error_when_reset_annotator_cache_registered(
     tmp_path: Path, db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No entry point registered under synapt.annotators -- the default
@@ -323,3 +323,84 @@ def test_no_hit_anywhere_is_honest_not_silent(
     assert result["has_code_hit"] is False
     assert result["symbols"] == []
     assert result["has_memory_hit"] is False
+
+
+def test_coverage_outranks_a_single_exact_hit_on_a_generic_word(tmp_path, monkeypatch, _reset_annotator_cache) -> None:
+    """Dogfood 2026-09-06: "where is the build lock acquired" returned four
+    fixtures named ``build`` as exact hits and never ``_acquire_build_lock``.
+    A symbol containing more of the question's words ranks first, the
+    duplicate-key upgrade keeps the best match kind, and a test path never
+    outranks a production path at equal coverage."""
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "src" / "lock.py").write_text(
+        "def _acquire_build_lock(root):\n    return root\n\n"
+        "def build_lock_has_waiter(root):\n    return False\n"
+    )
+    (repo / "tests" / "test_build.py").write_text(
+        "def build():\n    return 1\n\n"
+        "def blocked_build():\n    return 2\n"
+    )
+    db = tmp_path / "code.db"
+    index_repo(repo, db, repo="repo")
+    monkeypatch.setattr(
+        "synapt.recall.code_search.recall_server.recall_search",
+        lambda q, **k: "No results found.",
+    )
+    result = recall_code(
+        "where is the build lock acquired",
+        db_path=str(db), repo="repo", repo_root=str(repo), max_symbols=4,
+    )
+    names = [s["name"] for s in result["symbols"]]
+    assert names[0] == "_acquire_build_lock", names
+    top = result["symbols"][0]
+    assert top["token_coverage"] == 3, top   # build, lock, acquire(d)
+    assert top["is_test"] is False
+    # the generic exact hit is still returned, just not first
+    assert "build" in names
+    assert names.index("build_lock_has_waiter") < names.index("build")
+
+
+def test_duplicate_key_keeps_the_best_match_kind(tmp_path, monkeypatch, _reset_annotator_cache) -> None:
+    """"cold no-caller refresh" reaches ``cold_no_caller_refresh`` first by
+    the raw token "cold" (prefix) and then by the underscore-joined form
+    (exact); the kept hit must carry the exact kind, not the first arrival."""
+    repo = tmp_path / "repo"
+    (repo / "pkg").mkdir(parents=True)
+    (repo / "pkg" / "r.py").write_text("def cold_no_caller_refresh(d):\n    return d\n")
+    db = tmp_path / "code.db"
+    index_repo(repo, db, repo="repo")
+    monkeypatch.setattr(
+        "synapt.recall.code_search.recall_server.recall_search",
+        lambda q, **k: "No results found.",
+    )
+    result = recall_code(
+        "cold no-caller refresh", db_path=str(db), repo="repo", repo_root=str(repo)
+    )
+    assert [s["name"] for s in result["symbols"]] == ["cold_no_caller_refresh"]
+    assert result["symbols"][0]["match_kind"] == "exact"
+    assert result["symbols"][0]["matched_token"] == "cold_no_caller_refresh"
+
+
+def test_production_path_outranks_test_path_on_a_genuine_tie(tmp_path, monkeypatch, _reset_annotator_cache) -> None:
+    """Sentinel's R1 mutant (2026-09-06): forcing _is_test_path to False left
+    every test green, so "production before test" was a claim with no
+    witness. Two symbols with the SAME name, same match kind, same coverage,
+    one under tests/: the production one must come first, and flipping the
+    demotion off must red this test."""
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_widget.py").write_text("def widget_factory():\n    return 1\n")
+    (repo / "src" / "widget.py").write_text("def widget_factory():\n    return 2\n")
+    db = tmp_path / "code.db"
+    index_repo(repo, db, repo="repo")
+    monkeypatch.setattr(
+        "synapt.recall.code_search.recall_server.recall_search",
+        lambda q, **k: "No results found.",
+    )
+    result = recall_code("widget_factory", db_path=str(db), repo="repo", repo_root=str(repo), max_symbols=2)
+    paths = [s["path"] for s in result["symbols"]]
+    assert paths == ["src/widget.py", "tests/test_widget.py"], paths
+    assert [s["is_test"] for s in result["symbols"]] == [False, True]
