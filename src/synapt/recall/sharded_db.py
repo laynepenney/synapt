@@ -228,6 +228,9 @@ class ShardedRecallDB:
     def active_topic_clusters_missing_signature(self) -> list[str]:
         return self._index.active_topic_clusters_missing_signature()
 
+    def cluster_ids_with_signature_oldest_first(self) -> list[str]:
+        return self._index.cluster_ids_with_signature_oldest_first()
+
     def load_cluster_member_chunk_ids(self, cluster_ids: list[str]) -> dict[str, list[str]]:
         return self._index.load_cluster_member_chunk_ids(cluster_ids)
 

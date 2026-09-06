@@ -11,6 +11,7 @@ Threshold raised from 0.15 to 0.20 for 85% cluster stability.
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 import math
@@ -74,6 +75,17 @@ TOP_SIGNATURE_TOKENS = 64        # signature size cap
 CONTAINMENT_THRESHOLD = 0.20     # fraction of the signature that must be present
 MIN_SHARED_SIGNATURE_TOKENS = 8  # absolute floor: ratio alone lets a tiny
                                   # signature "match" on a handful of coincidental tokens
+
+# A cluster whose members are mostly one recurring HARNESS/CRON/RITUAL
+# prompt (measured: 42.7% of 300 sampled signed real-store clusters had
+# >=80% of members share byte-identical user_text) gets that prompt's own
+# generic vocabulary baked into its persisted signature -- present in
+# nearly every member purely because the prompt repeats verbatim. Below
+# MIN_CLUSTER_SIZE_FOR_DUPLICATE_GUARD members, two sharing identical text
+# is as likely to be real topical overlap as a recurring prompt, so the
+# guard withholds judgment rather than strip on thin evidence.
+MIN_CLUSTER_SIZE_FOR_DUPLICATE_GUARD = 3
+MIN_DUPLICATE_USER_TEXT_FRACTION = 0.5
 
 # Harness-injected wrapper blocks, verified with matching
 # open/close counts on a real 2000-chunk stale batch (skill 162/162,
@@ -175,6 +187,56 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     intersection = len(a & b)
     union = len(a | b)
     return intersection / union if union > 0 else 0.0
+
+
+def _strip_cluster_duplicate_user_text(
+    chunks: list[TranscriptChunk],
+    *,
+    min_members: int = MIN_CLUSTER_SIZE_FOR_DUPLICATE_GUARD,
+    min_fraction: float = MIN_DUPLICATE_USER_TEXT_FRACTION,
+) -> list[TranscriptChunk]:
+    """Blank the ``user_text`` of any member whose user_text is shared,
+    byte-identical, by at least ``min_fraction`` of this cluster's own
+    members -- a recurring harness/cron/ritual prompt, not this member's
+    distinguishing content. ``assistant_text`` (the part that actually
+    varies turn to turn) is always left untouched.
+
+    Different from the echo-wrapper and skill-preamble strips in
+    ``_chunk_tokens``: those detect a KNOWN FIXED SHAPE from one chunk
+    alone. This detects duplication WITHIN A CLUSTER's own membership, so
+    it needs the whole member list, not one chunk -- same reasoning
+    (structural, non-content, known-bounds text should not drive a
+    signature), different detector because the shape here is "recurs
+    verbatim across this specific cluster," not a fixed prefix or tag.
+
+    Below ``min_members``, returns the input unchanged: two chunks sharing
+    identical text is as often real topical coincidence as it is a
+    recurring prompt, and there is no "majority" to measure against yet.
+    """
+    if len(chunks) < min_members:
+        return chunks
+    counts = Counter(c.user_text for c in chunks if c.user_text)
+    n = len(chunks)
+    boilerplate_texts = {
+        text for text, count in counts.items() if count / n >= min_fraction
+    }
+    if not boilerplate_texts:
+        return chunks
+    return [
+        dataclasses.replace(c, user_text="") if c.user_text in boilerplate_texts else c
+        for c in chunks
+    ]
+
+
+def _tokenize_cluster_members(
+    chunks: list[TranscriptChunk], extra_stopwords: frozenset[str] = frozenset(),
+) -> list[set[str]]:
+    """Token sets for one cluster's members, with the recurring-prompt
+    strip applied first. The one place ``backfill_cluster_signatures`` and
+    ``redrive_cluster_signatures`` both route through, so the fix lives in
+    exactly one place."""
+    stripped = _strip_cluster_duplicate_user_text(chunks)
+    return [_chunk_tokens(c, extra_stopwords) for c in stripped]
 
 
 def _cluster_signature_tokens(
@@ -957,16 +1019,13 @@ def backfill_cluster_signatures(
     skipped = 0
     for cluster_id in batch_cluster_ids:
         member_ids = members_by_cluster.get(cluster_id, [])
-        token_sets = [
-            _chunk_tokens(chunk_by_id[cid], boilerplate_stopwords)
-            for cid in member_ids
-            if cid in chunk_by_id
-        ]
+        member_chunks = [chunk_by_id[cid] for cid in member_ids if cid in chunk_by_id]
         # A cluster with no resolvable member (its rows were deleted out
         # from under it, or member_ids was empty) has nothing to sign from.
-        if not token_sets:
+        if not member_chunks:
             skipped += 1
             continue
+        token_sets = _tokenize_cluster_members(member_chunks, boilerplate_stopwords)
         signature = _cluster_signature_tokens(
             token_sets, extra_stopwords=boilerplate_stopwords,
         )
@@ -977,6 +1036,110 @@ def backfill_cluster_signatures(
         "clusters_signed": signed,
         "clusters_skipped": skipped,
         "clusters_remaining": total_missing - signed - skipped,
+    }
+
+
+DEFAULT_SIGNATURE_REDRIVE_REFUSE_ABOVE = 50_000
+
+
+def redrive_cluster_signatures(
+    db: "RecallDB",
+    batch_size: int = DEFAULT_SIGNATURE_BACKFILL_BATCH,
+    refuse_above: int = DEFAULT_SIGNATURE_REDRIVE_REFUSE_ABOVE,
+    boilerplate_stopwords: frozenset[str] = frozenset(),
+    dry_run: bool = False,
+) -> dict:
+    """Recompute a bounded batch of ALREADY-SIGNED clusters' persisted
+    signatures from their CURRENT members with the CURRENT tokenizer, and
+    write only where the recomputed value actually differs from what is
+    stored.
+
+    ``backfill_cluster_signatures`` only fills in ABSENT signatures --
+    correct for its own job, but it means a signature computed before a
+    tokenization fix landed (the context-echo strip, the ritual-prompt
+    strip in ``_strip_cluster_duplicate_user_text``) is never revisited
+    once it exists, however polluted. This is the companion op that
+    revisits it: same batching discipline as ``backfill_cluster_signatures``
+    and ``recluster_stale_chunks`` (bounded per call, drains a backlog over
+    repeated runs), same ``dry_run`` contract as ``recluster_stale_chunks``
+    (computes the same receipt, writes nothing) -- re-deriving a persisted
+    signature is itself a WRITE to the store, so it gets the same
+    dry-run-with-a-count discipline the merge lane does.
+
+    Selection is simply "every cluster with a row in
+    ``cluster_token_signatures``, oldest ``updated_at`` first" -- there is
+    no cheap way to know in advance which ones are polluted without
+    recomputing, and recomputing is exactly what this does; the batching
+    is what keeps one call bounded, not the selection.
+    """
+    signed_cluster_ids = db.cluster_ids_with_signature_oldest_first()
+    total_signed = len(signed_cluster_ids)
+
+    if total_signed > refuse_above:
+        return {
+            "refused": True,
+            "dry_run": dry_run,
+            "clusters_checked": 0,
+            "clusters_changed": 0,
+            "clusters_unchanged": 0,
+            "clusters_skipped": 0,
+            "changed_cluster_ids": [],
+        }
+
+    batch_cluster_ids = signed_cluster_ids[:batch_size]
+    if not batch_cluster_ids:
+        return {
+            "refused": False,
+            "dry_run": dry_run,
+            "clusters_checked": 0,
+            "clusters_changed": 0,
+            "clusters_unchanged": 0,
+            "clusters_skipped": 0,
+            "changed_cluster_ids": [],
+        }
+
+    old_signatures = db.load_cluster_token_signatures()
+    members_by_cluster = db.load_cluster_member_chunk_ids(batch_cluster_ids)
+    all_chunk_ids = sorted({cid for ids in members_by_cluster.values() for cid in ids})
+    id_rowid_map = db.get_chunk_id_rowid_map()
+    rowids = [id_rowid_map[cid] for cid in all_chunk_ids if cid in id_rowid_map]
+    chunk_map_by_rowid = db.load_chunks_by_rowids(rowids)
+    chunk_by_id = {
+        c.id: c
+        for r in rowids
+        if r in chunk_map_by_rowid
+        for c in [chunk_map_by_rowid[r]]
+    }
+
+    now = datetime.now(timezone.utc).isoformat()
+    changed_cluster_ids: list[str] = []
+    unchanged = 0
+    skipped = 0
+    for cluster_id in batch_cluster_ids:
+        member_ids = members_by_cluster.get(cluster_id, [])
+        member_chunks = [chunk_by_id[cid] for cid in member_ids if cid in chunk_by_id]
+        if not member_chunks:
+            skipped += 1
+            continue
+        token_sets = _tokenize_cluster_members(member_chunks, boilerplate_stopwords)
+        new_signature = _cluster_signature_tokens(
+            token_sets, extra_stopwords=boilerplate_stopwords,
+        )
+        if set(new_signature) == old_signatures.get(cluster_id, set()):
+            unchanged += 1
+            continue
+        changed_cluster_ids.append(cluster_id)
+        if not dry_run:
+            db.save_cluster_token_signature(cluster_id, new_signature, now)
+
+    return {
+        "refused": False,
+        "dry_run": dry_run,
+        "clusters_checked": len(batch_cluster_ids),
+        "clusters_changed": len(changed_cluster_ids),
+        "clusters_unchanged": unchanged,
+        "clusters_skipped": skipped,
+        "changed_cluster_ids": changed_cluster_ids,
     }
 
 
