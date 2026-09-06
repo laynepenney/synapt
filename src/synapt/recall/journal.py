@@ -230,7 +230,9 @@ class JournalEntry:
     auto: bool = False       # True if synthesized at build time
     enriched: bool = False   # True if LLM-enriched
     griptree: str = ""       # Agent's griptree identity (e.g., "synapt/synapt")
-    agent_id: str = ""       # Agent's session-scoped ID (e.g., "s_a1b2c3d4")
+    agent_id: str = ""       # Agent's stable identity (e.g., "apollo-001"); empty
+                             # when only a session-scoped fallback is available —
+                             # the session id lives in session_id, never here.
     repair: bool = False     # True if written by repair_journal
 
     def to_dict(self) -> dict:
@@ -1098,7 +1100,15 @@ def auto_extract_entry(
     try:
         from synapt.recall.channel import _resolve_griptree, _agent_id
         griptree = _resolve_griptree()
-        agent_id = _agent_id()
+        resolved = _agent_id()
+        # A session-scoped fallback (s_xxxxxxxx) is what _agent_id() returns for
+        # an unregistered session; it is NOT an agent identity. Storing it in
+        # agent_id makes the row unattributable-by-agent while looking attributed.
+        # The session is already captured in session_id, so record a real agent
+        # identity or nothing. Same s_-is-session-shaped convention
+        # the channel path uses for from_display (channel.py). _agent_id() itself
+        # is untouched — channel presence legitimately uses the s_ ephemeral form.
+        agent_id = "" if resolved.startswith("s_") else resolved
     except Exception:
         pass  # Channel module may not be available
 

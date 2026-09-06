@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 from synapt.recall.core import TranscriptChunk, TranscriptIndex, parse_journal_entries
 from synapt.recall.journal import (
     JournalEntry, append_entry, synthesize_journal_stubs, _filter_project_files,
+    auto_extract_entry,
 )
 from synapt.recall.enrich import _parse_llm_response, iter_enrichable_entries
 
@@ -554,3 +555,44 @@ class TestBuildTranscriptSummary:
             summary = _build_transcript_summary("nonexistent-id", tmp_path)
 
         assert summary == ""
+
+
+# ===========================================================================
+# agent_id attribution on write
+# ===========================================================================
+
+
+class TestJournalAgentIdAttribution:
+    """The journal agent_id field must carry a real agent identity or nothing —
+    never the session-scoped fallback (s_xxxxxxxx) that channel._agent_id()
+    returns for an unregistered session. A session id in agent_id is
+    unattributable-by-agent while looking attributed. The session is already
+    captured in session_id."""
+
+    def test_session_scoped_fallback_is_not_stored_in_agent_id(
+        self, tmp_path, monkeypatch
+    ):
+        # Pin the identity seam to the session-scoped fallback shape that
+        # channel._agent_id() returns for an unregistered session. Doing it at
+        # the seam (rather than via env) makes the witness deterministic: it
+        # does not depend on the ambient gripspace/GRIPSPACE_ROOT the test runs
+        # in, and it reds if the write site ever stores the raw fallback again.
+        monkeypatch.setattr("synapt.recall.channel._resolve_griptree", lambda *a, **k: "gt")
+        monkeypatch.setattr("synapt.recall.channel._agent_id", lambda *a, **k: "s_deadbeef")
+        entry = auto_extract_entry(transcript_path=None, cwd=str(tmp_path))
+        assert not entry.agent_id.startswith("s_"), (
+            f"session-scoped fallback leaked into agent_id: {entry.agent_id!r}"
+        )
+        assert entry.agent_id == "", (
+            f"expected empty agent_id when only a session fallback is available, "
+            f"got {entry.agent_id!r}"
+        )
+
+    def test_registered_agent_id_is_preserved(self, tmp_path, monkeypatch):
+        # Control: a real registered identity must NOT be dropped by the fix.
+        monkeypatch.setattr("synapt.recall.channel._resolve_griptree", lambda *a, **k: "gt")
+        monkeypatch.setattr("synapt.recall.channel._agent_id", lambda *a, **k: "apollo-001")
+        entry = auto_extract_entry(transcript_path=None, cwd=str(tmp_path))
+        assert entry.agent_id == "apollo-001", (
+            f"registered agent id was not preserved: {entry.agent_id!r}"
+        )
