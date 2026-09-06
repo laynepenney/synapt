@@ -77,6 +77,7 @@ MCP_INSTRUCTIONS = (
     "\n"
     "WHEN TO SEARCH (do this automatically, without being asked):\n"
     "- When you need file history or design rationale for a specific path -> recall_files\n"
+    "- When you need to know where something is defined in the code AND why it is that way -> recall_code\n"
     "- Before making a design decision -> recall_search for prior discussion\n"
     "- When debugging an error -> recall_search for past fixes\n"
     "- When user references past work -> recall_search immediately\n"
@@ -88,6 +89,7 @@ MCP_INSTRUCTIONS = (
     "- recall_quick: Fast, cheap knowledge check. Use speculatively when unsure.\n"
     "- recall_search: Full search with transcript chunks. Use when you need detail.\n"
     "- recall_files: Use for file history questions like 'who changed this and why?'\n"
+    "- recall_code: Code symbols (where defined, file:line) plus the team's memory of them, one result. Ask it in plain words.\n"
     "- recall_journal: Read/write session notes. Check at session start.\n"
     "- recall_remind: Set/check cross-session reminders.\n"
     "\n"
@@ -748,6 +750,92 @@ def recall_files(
         return result if result else f"No sessions found that touched files matching '{pattern}'."
     except Exception as exc:
         return f"File search failed: {exc}"
+
+
+def _format_recall_code(result: dict, root: Path, db: Path, stats) -> str:
+    """Render a code_search.recall_code() result as one readable block."""
+    lines: list[str] = []
+    fresh = (
+        f"{stats.files_indexed} files re-parsed, {stats.files_skipped} unchanged, "
+        f"{stats.files_pruned} pruned"
+    )
+    lines.append(f"Code hits for \"{result['query']}\" in {root.name} ({fresh}; index {db}):")
+    if result["symbols"]:
+        for hit in result["symbols"]:
+            span = f"{hit['path']}:{hit['line_start']}-{hit['line_end']}"
+            lines.append(
+                f"  {hit['kind']} {hit['name']}  {span}  "
+                f"[{hit['match_kind']} on \"{hit['matched_token']}\"]"
+            )
+            sig = (hit.get("signature") or "").strip()
+            if sig:
+                lines.append(f"      {sig}")
+            for note in hit.get("annotation") or []:
+                text = note.get("excerpt") if isinstance(note, dict) else str(note)
+                if text:
+                    lines.append(f"      why: {text}")
+            if hit.get("annotation_error"):
+                lines.append(f"      (annotation failed: {hit['annotation_error']})")
+    else:
+        lines.append("  No code symbol matched; memories only.")
+    if getattr(stats, "parser_stack_missing", False):
+        lines.append(
+            "  (tree-sitter-language-pack is not installed, so the code index is empty: "
+            "pip install 'synapt[code-index]')"
+        )
+    lines.append("")
+    lines.append("What the team said:")
+    lines.append(result["memories"])
+    return "\n".join(lines)
+
+
+def recall_code(
+    query: str,
+    repo_root: str | None = None,
+    max_symbols: int = 5,
+    max_chunks: int = 3,
+) -> str:
+    """Find where something is defined in this repo's code AND what the team
+    has said about it, in one result.
+
+    Ask in plain words ("cold no-caller refresh", "where is the build lock
+    acquired"). Returns matching symbols (kind, name, file:line span, how the
+    match was made) followed by recall_search memories for the same query.
+    A query with no code hit says so and returns memories only. The symbol
+    index is refreshed first by content hash, so an edited file is re-parsed
+    and an unchanged one costs nothing.
+
+    Args:
+        query: Plain-language question or a symbol name.
+        repo_root: Repository to index and search. Defaults to the current
+            working directory.
+        max_symbols: Maximum code symbols to return.
+        max_chunks: Maximum memory chunks to return.
+    """
+    from synapt.recall.code_index import index_repo
+    from synapt.recall.code_search import recall_code as _recall_code
+
+    root = Path(repo_root).resolve() if repo_root else Path.cwd().resolve()
+    if not root.is_dir():
+        return f"Repo root not found: {root}"
+    db = project_data_dir(root) / "code_index.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        stats = index_repo(root, db, repo=root.name)
+    except Exception as exc:
+        return f"Code index failed at {db}: {exc}"
+    try:
+        result = _recall_code(
+            query,
+            db_path=str(db),
+            repo=root.name,
+            repo_root=str(root),
+            max_symbols=max_symbols,
+            max_chunks=max_chunks,
+        )
+    except Exception as exc:
+        return f"Code search failed: {exc}"
+    return _format_recall_code(result, root, db, stats)
 
 
 def recall_sessions(
@@ -3337,6 +3425,7 @@ def register_tools(mcp) -> None:
     mcp.tool()(_with_directive_check(recall_search))
     mcp.tool()(_with_directive_check(recall_quick))
     mcp.tool()(_with_directive_check(recall_files))
+    mcp.tool()(_with_directive_check(recall_code))
     mcp.tool()(_with_directive_check(recall_sessions))
     mcp.tool()(_with_directive_check(recall_resume))
     mcp.tool()(recall_build)

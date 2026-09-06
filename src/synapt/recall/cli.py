@@ -1532,6 +1532,20 @@ def cmd_build(args: argparse.Namespace) -> None:
     print(f"  Saved to: {project_index_dir()}")
 
 
+def cmd_code(args: argparse.Namespace) -> None:
+    """Code symbols plus team memory for one plain-language query."""
+    from synapt.recall.server import recall_code
+
+    print(
+        recall_code(
+            args.query,
+            repo_root=args.repo_root,
+            max_symbols=args.max_symbols,
+            max_chunks=args.max_chunks,
+        )
+    )
+
+
 def cmd_search(args: argparse.Namespace) -> None:
     """Search the transcript index."""
     import time
@@ -4290,6 +4304,14 @@ def make_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--profile", action="store_true", help="Show per-phase timing breakdown")
 
     # Benchmark
+    code_parser = subparsers.add_parser(
+        "code", help="Where is this defined, and what did the team say about it (code index + memory)"
+    )
+    code_parser.add_argument("query", help="Plain-language question or a symbol name")
+    code_parser.add_argument("--repo-root", default=None, help="Repository to index and search (default: cwd)")
+    code_parser.add_argument("--max-symbols", type=int, default=5)
+    code_parser.add_argument("--max-chunks", type=int, default=3)
+
     benchmark_parser = subparsers.add_parser("benchmark", help="Run search pipeline benchmarks")
     benchmark_parser.add_argument("--index", default=None, help="Index directory (default: per-project)")
     benchmark_parser.add_argument("--json", dest="json_output", action="store_true", help="Output results as JSON")
@@ -4569,6 +4591,8 @@ def main():
         cmd_build(args)
     elif args.command == "split":
         cmd_split(args)
+    elif args.command == "code":
+        cmd_code(args)
     elif args.command == "search":
         cmd_search(args)
     elif args.command == "benchmark":
