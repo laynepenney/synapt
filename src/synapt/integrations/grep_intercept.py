@@ -165,10 +165,38 @@ def count_related_conversations(recall_output: str) -> int:
     return len(_RECALL_BLOCK.findall(recall_output))
 
 
-def _default_recall_quick(query: str) -> str:
+def _load_recall_quick_impl() -> RecallQuick:
+    """Resolve the real recall_quick implementation.
+
+    Broken out as its own function so it is a monkeypatchable seam: a test can
+    replace this attribute to simulate a slow or fake import without touching
+    ``sys.modules``. Importing ``synapt.recall.server`` pulls in the full
+    server stack; measured in isolation at 0.08-0.29s (disk-cache-state
+    dependent), a cost that must never compete with the query itself for the
+    hook's small per-call timeout. ``_resolve_recall_quick`` below calls this
+    in the calling thread, before ``_bounded_recall`` starts its clock -- not
+    inside the timed worker.
+    """
     from synapt.recall.server import recall_quick
 
-    return recall_quick(query)
+    return recall_quick
+
+
+def _default_recall_quick(query: str) -> str:
+    return _load_recall_quick_impl()(query)
+
+
+def _resolve_recall_quick(recall_quick: RecallQuick) -> RecallQuick:
+    """Pay any lazy-import cost in the module's own default before timing.
+
+    Only the module's own default (``_default_recall_quick``) carries the
+    lazy import; a caller-injected ``recall_quick`` (real callers never pass
+    one, tests do) is trusted to already be ready to call and is returned
+    unchanged.
+    """
+    if recall_quick is _default_recall_quick:
+        return _load_recall_quick_impl()
+    return recall_quick
 
 
 def _bounded_recall(
@@ -209,10 +237,13 @@ def build_pretooluse_context(
     pattern = extract_grep_pattern(tool_call)
     if pattern is None:
         return None
+    # Resolve BEFORE the timed budget starts: any lazy import in the default
+    # recall_quick must not compete with the query for the timeout below.
+    resolved_recall_quick = _resolve_recall_quick(recall_quick)
     recall_output = _bounded_recall(
         pattern,
         timeout_ms=config.timeout_ms,
-        recall_quick=recall_quick,
+        recall_quick=resolved_recall_quick,
     )
     if recall_output is None:
         return None
