@@ -1,20 +1,27 @@
-"""Cold no-caller resume refresh (durable-checkpoint follow-on).
+"""Cold no-caller resume refresh (durable-checkpoint follow-on; R3.1 recall#435).
 
 On a cold cross-runtime launch there is no caller transcript, so the caller-tail
-refresh has nothing to act on and the shared index can be months stale. This
-feature does an incremental refresh of the newest source before render, and
-labels what it refreshed. The load-bearing guarantees, each with a witness here:
+refresh has nothing to act on and the shared index can be months stale. The
+load-bearing guarantees, each with a witness here:
 
   * the read NEVER WAITS on a held build lock: a held lock (recall#1018 ghost
-    lock included) builds NOTHING and returns immediately (control). The
-    free-lock build is synchronous and delays the render by its own duration --
-    it never waits on ANOTHER holder, but is not free on the success path;
-  * it NEVER RAISES: every refresh failure (discovery, data-dir, lock acquire,
-    build, lock release) degrades to the stale render;
-  * the refresh builds into the SAME store the load reads, not a cwd-derived
-    secondary one (this change's R2 store split);
-  * a freshened render is legible as freshened: the label names the source and
-    the index cursor before -> after.
+    lock included) queues NOTHING and returns immediately (control);
+  * R3.1: the free-lock leg no longer builds INLINE -- a real refire on the
+    167,762-chunk store cost ~14 minutes of foreground wall (Stromus,
+    2026-09-05), which is not an acceptable interactive cost. It releases the
+    probe lock and spawns a DETACHED background process that does the exact
+    same build, and returns "queued_background" the instant the process is
+    spawned -- never waiting on it;
+  * it NEVER RAISES: every failure in the check itself (discovery, data-dir,
+    lock acquire/release, or spawning the background process) degrades to the
+    stale render;
+  * the queued background process builds into the SAME store the load reads,
+    not a cwd-derived secondary one (this change's R2 store split; still true
+    here since the store/source split is baked into the spawned script's argv);
+  * a queued-but-not-yet-fresher render is legible as such: the label names the
+    source and how many files are behind, distinct from an actual completed
+    refresh's "REFRESHED before render" phrasing (which no code path emits
+    anymore, since nothing completes inline).
 """
 
 from __future__ import annotations
@@ -33,24 +40,28 @@ from synapt.recall.resume import ResumeView, ResumeTurn, format_resume
 from _isolation_helpers import owned_store
 
 
-def _patches(*, lock_fd, build_side_effect=None, ts_before="2026-06-01T00:00:00", ts_after="2026-09-01T00:00:00",
+def _patches(*, lock_fd, popen_side_effect=None, ts_before="2026-06-01T00:00:00", ts_after="2026-09-01T00:00:00",
              newest=Path("/w/.codex/sessions/2026/09/01/rollout-a.jsonl")):
-    """Patch the three seams cold_no_caller_refresh touches. build_calls records
-    whether the real build ran, so the ghost-lock control can assert it did not."""
-    build_calls = []
+    """Patch the seams cold_no_caller_refresh touches. spawn_calls records every
+    subprocess.Popen invocation, so the ghost-lock control can assert none happened
+    and the free-lock leg can assert exactly one did, with the right argv."""
+    spawn_calls = []
 
-    def fake_build(*a, **k):
-        build_calls.append((a, k))
-        if build_side_effect:
-            raise build_side_effect
-        return None
+    class _FakeProc:
+        pid = 4242
+
+    def fake_popen(argv, **kw):
+        spawn_calls.append((argv, kw))
+        if popen_side_effect:
+            raise popen_side_effect
+        return _FakeProc()
 
     fresh = iter([mock.Mock(build_timestamp=ts_before), mock.Mock(build_timestamp=ts_after)])
     cms = [
         mock.patch.object(cli, "_newest_source_file", return_value=newest),
         mock.patch.object(cli, "_acquire_build_lock", return_value=lock_fd),
         mock.patch.object(cli, "_release_build_lock"),
-        mock.patch.object(cli, "_archive_and_build_locked", side_effect=fake_build),
+        mock.patch.object(cli.subprocess, "Popen", side_effect=fake_popen),
         # The STORE is derived from index_dir (the load target) and its data dir
         # mocked to a pytest-owned path so no real store is touched (this change's R2
         # store split); the cwd SOURCE is threaded separately.
@@ -58,7 +69,7 @@ def _patches(*, lock_fd, build_side_effect=None, ts_before="2026-06-01T00:00:00"
         mock.patch("synapt.recall.freshness.check_index_freshness",
                    side_effect=lambda *a, **k: next(fresh)),
     ]
-    return cms, build_calls
+    return cms, spawn_calls
 
 
 class TestColdNoCallerRefresh(unittest.TestCase):
@@ -68,24 +79,31 @@ class TestColdNoCallerRefresh(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         return cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
 
-    def test_refreshed_advances_and_reports_cursor(self):
-        cms, build_calls = _patches(lock_fd=7)
+    def test_free_lock_queues_background_refresh_without_blocking(self):
+        cms, spawn_calls = _patches(lock_fd=7)
         out = self._run(cms)
-        self.assertTrue(out.refreshed)
-        self.assertEqual(out.reason, "refreshed")
+        self.assertFalse(out.refreshed)  # R3.1: nothing built IN THIS CALL
+        self.assertEqual(out.reason, "queued_background")
         self.assertEqual(out.source, "rollout-a.jsonl")
-        self.assertEqual(out.cursor_before, "2026-06-01T00:00:00")
-        self.assertEqual(out.cursor_after, "2026-09-01T00:00:00")
-        self.assertEqual(len(build_calls), 1)  # the build ran
+        self.assertEqual(out.cursor_before, out.cursor_after)  # unchanged -- this call built nothing
+        self.assertEqual(len(spawn_calls), 1)  # exactly one background process spawned
+        argv, kw = spawn_calls[0]
+        self.assertEqual(argv[0], cli.sys.executable)
+        self.assertEqual(argv[1], "-c")
+        self.assertEqual(argv[2], cli._BACKGROUND_COLD_REFRESH_SCRIPT)
+        self.assertEqual(argv[3], str(Path("/proj").resolve()))  # store_root, derived from index_dir
+        self.assertEqual(argv[4], str(Path("/proj")))  # source (project_dir), threaded as-is
+        self.assertTrue(kw.get("start_new_session"))  # survives the parent (resume) process exiting
 
-    def test_a_real_build_names_both_store_and_source_distinctly_on_stderr(self):
-        # recall#1123 hardening: even the agreeing case (the only one that
-        # reaches the build today, cmd_resume's own refusal having ruled out
-        # the disagreeing one) leaves a legible trail of which store was
-        # rebuilt from which source. store_root and source_dir can differ in
-        # cold_no_caller_refresh's own signature (see TestColdRefreshStoreSplit
-        # above), so this fixture uses genuinely different paths to prove the
-        # line names BOTH, not one value printed twice.
+    def test_a_queued_background_refresh_names_both_store_and_source_distinctly_on_stderr(self):
+        # recall#1123 hardening, preserved across the R3.1 rewrite: even the
+        # agreeing case (the only one that reaches this line today, cmd_resume's
+        # own refusal having ruled out the disagreeing one) leaves a legible
+        # trail of which store was QUEUED to rebuild from which source.
+        # store_root and source_dir can differ in cold_no_caller_refresh's own
+        # signature (see TestColdRefreshStoreSplit below), so this fixture uses
+        # genuinely different paths to prove the line names BOTH, not one
+        # value printed twice.
         import io
         import tempfile
 
@@ -102,7 +120,7 @@ class TestColdNoCallerRefresh(unittest.TestCase):
                                    return_value=source / ".codex" / "rollout.jsonl"), \
                  mock.patch.object(cli, "_acquire_build_lock", return_value=7), \
                  mock.patch.object(cli, "_release_build_lock"), \
-                 mock.patch.object(cli, "_archive_and_build_locked"), \
+                 mock.patch.object(cli.subprocess, "Popen", return_value=mock.Mock(pid=1)), \
                  mock.patch.object(cli, "project_data_dir", return_value=store), \
                  mock.patch("synapt.recall.freshness.check_index_freshness",
                             side_effect=lambda *a, **k: next(fresh)):
@@ -110,7 +128,7 @@ class TestColdNoCallerRefresh(unittest.TestCase):
                 with mock.patch("sys.stderr", captured):
                     cold_no_caller_refresh(source, index_dir)
 
-        self.assertIn("refreshing store", captured.getvalue())
+        self.assertIn("queuing background refresh", captured.getvalue())
         self.assertIn(str(store.resolve()), captured.getvalue())
         self.assertIn(str(source), captured.getvalue())
 
@@ -129,33 +147,51 @@ class TestColdNoCallerRefresh(unittest.TestCase):
                     self._run(cms)
                 self.assertEqual(captured.getvalue(), "")
 
-    def test_ghost_lock_control_builds_nothing_and_waits_for_nothing(self):
-        # recall#1018: lock held (possibly by a dead holder). The read must not
-        # build and must not wait. This is THE control.
-        cms, build_calls = _patches(lock_fd=None)
+    def test_ghost_lock_control_queues_nothing_and_waits_for_nothing(self):
+        # recall#1018: lock held (possibly by a dead holder, or a background
+        # catchup this function itself already queued a moment ago). The read
+        # must not queue another one and must not wait. This is THE control.
+        cms, spawn_calls = _patches(lock_fd=None)
         out = self._run(cms)
         self.assertFalse(out.refreshed)
         self.assertEqual(out.reason, "lock_held")
-        self.assertEqual(build_calls, [])  # nothing built under a held lock
+        self.assertEqual(spawn_calls, [])  # nothing spawned under a held lock
         self.assertEqual(out.cursor_before, out.cursor_after)  # index untouched
 
-    def test_up_to_date_when_build_ran_but_cursor_unchanged(self):
-        cms, build_calls = _patches(lock_fd=7, ts_before="2026-09-01T00:00:00",
-                                    ts_after="2026-09-01T00:00:00")
-        out = self._run(cms)
-        self.assertFalse(out.refreshed)
-        self.assertEqual(out.reason, "up_to_date")
-        self.assertEqual(len(build_calls), 1)
+    def test_lock_is_released_before_the_spawn_not_held_across_it(self):
+        # R3.1: the lock is only a PROBE now (is anyone already rebuilding?).
+        # Holding it across the spawn would make the child's own acquire race
+        # pointlessly against its own parent -- assert release happens BEFORE
+        # Popen, via one shared call-order manager.
+        manager = mock.Mock()
+        release_mock = mock.Mock()
+        popen_mock = mock.Mock(side_effect=lambda *a, **k: mock.Mock(pid=1))
+        manager.attach_mock(release_mock, "release")
+        manager.attach_mock(popen_mock, "popen")
+        with mock.patch.object(cli, "_newest_source_file",
+                               return_value=Path("/w/.codex/sessions/rollout-a.jsonl")), \
+             mock.patch.object(cli, "_acquire_build_lock", return_value=7), \
+             mock.patch.object(cli, "_release_build_lock", release_mock), \
+             mock.patch.object(cli.subprocess, "Popen", popen_mock), \
+             mock.patch.object(cli, "project_data_dir", return_value=Path("/tmp/x")), \
+             mock.patch("synapt.recall.freshness.check_index_freshness",
+                        return_value=mock.Mock(build_timestamp="old")):
+            out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
+        self.assertEqual(out.reason, "queued_background")
+        self.assertEqual([c[0] for c in manager.mock_calls], ["release", "popen"])
 
-    def test_no_source_skips_lock_and_build(self):
-        cms, build_calls = _patches(lock_fd=7, newest=None)
+    def test_no_source_skips_lock_and_spawn(self):
+        cms, spawn_calls = _patches(lock_fd=7, newest=None)
         out = self._run(cms)
         self.assertEqual(out.reason, "no_source")
         self.assertFalse(out.refreshed)
-        self.assertEqual(build_calls, [])
+        self.assertEqual(spawn_calls, [])
 
-    def test_build_error_degrades_without_raising_and_releases_lock(self):
-        cms, build_calls = _patches(lock_fd=7, build_side_effect=RuntimeError("boom"))
+    def test_popen_oserror_degrades_to_error_without_raising(self):
+        # The only way this function can fail on the free-lock leg now: the
+        # spawn itself (e.g. resource exhaustion) raises OSError. Must degrade,
+        # never escape, and the probe lock must already be released by then.
+        cms, spawn_calls = _patches(lock_fd=7, popen_side_effect=OSError("out of resources"))
         with mock.patch.object(cli, "_release_build_lock") as rel:
             for c in cms:
                 if getattr(c, "attribute", None) == "_release_build_lock":
@@ -165,7 +201,7 @@ class TestColdNoCallerRefresh(unittest.TestCase):
             out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
             self.assertEqual(out.reason, "error")
             self.assertFalse(out.refreshed)
-            rel.assert_called_once()  # lock released even on build failure
+            rel.assert_called_once()  # the probe lock was released before the spawn attempt
 
     def test_discovery_oserror_degrades_to_error_before_lock(self):
         # this change's R2 (Atlas): source discovery walks the filesystem and can
@@ -209,13 +245,14 @@ class TestColdNoCallerRefresh(unittest.TestCase):
         self.assertEqual(out.source, "rollout-a.jsonl")  # got PAST discovery
         build.assert_not_called()  # never reached the build
 
-    def test_release_oserror_does_not_override_a_successful_read(self):
-        # this change's R2 (Atlas): _release_build_lock runs in a finally and can
-        # raise OSError (a closed/invalid fd, an unlink on a vanished lock file).
-        # In a finally that would OVERRIDE the outcome: a release failure after a
-        # SUCCESSFUL build must still be a successful refresh, not an escaped
-        # exception. Swallow it; keep the read's outcome.
-        cms, build_calls = _patches(lock_fd=7)  # build succeeds, cursor advances
+    def test_release_oserror_does_not_prevent_queuing_the_background_refresh(self):
+        # this change's R2 (Atlas), preserved shape: _release_build_lock can
+        # raise OSError (a closed/invalid fd, an unlink on a vanished lock
+        # file). It is swallowed (try/except, not a finally now that the lock
+        # is released as a standalone probe-cleanup step, before the spawn) --
+        # a release failure must not stop the background refresh from being
+        # queued, and must not escape as an exception.
+        cms, spawn_calls = _patches(lock_fd=7)
         for c in cms:
             if getattr(c, "attribute", None) == "_release_build_lock":
                 continue  # replace the no-op release with a raising one
@@ -223,25 +260,9 @@ class TestColdNoCallerRefresh(unittest.TestCase):
         self.addCleanup(mock.patch.stopall)
         with mock.patch.object(cli, "_release_build_lock", side_effect=OSError("bad fd")):
             out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
-        self.assertTrue(out.refreshed)          # success survived the release error
-        self.assertEqual(out.reason, "refreshed")
-        self.assertEqual(len(build_calls), 1)   # the build ran
-
-    def test_release_oserror_does_not_override_a_build_error(self):
-        # The other half of the finally-override hazard: when the build itself
-        # failed, a release OSError must not replace that build-error outcome with
-        # an escaped exception. reason stays "error", nothing raises.
-        cms, build_calls = _patches(lock_fd=7, build_side_effect=RuntimeError("boom"))
-        for c in cms:
-            if getattr(c, "attribute", None) == "_release_build_lock":
-                continue
-            c.start()
-        self.addCleanup(mock.patch.stopall)
-        with mock.patch.object(cli, "_release_build_lock", side_effect=OSError("bad fd")):
-            out = cold_no_caller_refresh(Path("/proj"), Path("/proj/.synapt/recall/index"))
-        self.assertEqual(out.reason, "error")   # build error survived, did not escape
+        self.assertEqual(out.reason, "queued_background")  # spawn still happened
         self.assertFalse(out.refreshed)
-        self.assertEqual(len(build_calls), 1)   # the build was attempted
+        self.assertEqual(len(spawn_calls), 1)   # the background process was still spawned
 
 
 class TestColdRefreshStoreSplit(unittest.TestCase):
@@ -266,28 +287,30 @@ class TestColdRefreshStoreSplit(unittest.TestCase):
             b.mkdir()
             index_dir = a / ".synapt" / "recall" / "index"
 
-            captured: dict[str, Path | None] = {}
+            spawn_calls = []
 
-            def spy_build(project_dir, source_dirs, **kw):
-                captured["store"] = Path(project_dir)
-                captured["source"] = kw.get("source_dir")
-                return None
+            def spy_popen(argv, **kw):
+                spawn_calls.append(argv)
+                return mock.Mock(pid=1)
 
             with mock.patch.dict(os.environ, {"GRIPSPACE_ROOT": str(a)}, clear=False), \
                  mock.patch.object(cli, "_newest_source_file",
                                    return_value=b / ".codex" / "rollout-x.jsonl"), \
-                 mock.patch.object(cli, "_archive_and_build_locked", side_effect=spy_build), \
+                 mock.patch.object(cli.subprocess, "Popen", side_effect=spy_popen), \
                  mock.patch("synapt.recall.freshness.check_index_freshness",
                             return_value=mock.Mock(build_timestamp="old")):
                 os.environ.pop("SYNAPT_RECALL_ROOT", None)
                 out = cold_no_caller_refresh(b, index_dir)  # real lock + real release
 
             self.assertNotEqual(out.reason, "error")            # did not degrade/escape
+            self.assertEqual(out.reason, "queued_background")
+            self.assertEqual(len(spawn_calls), 1)
+            argv = spawn_calls[0]
             # project_root/project_data_dir resolve() the path (macOS /var -> /private/var)
-            self.assertEqual(captured["store"], a.resolve())    # BUILD store == A (GRIPSPACE_ROOT)
-            self.assertEqual(captured["source"], b)             # SOURCE == cwd (B), threaded as-is
+            self.assertEqual(argv[3], str(a.resolve()))         # BUILD store == A (GRIPSPACE_ROOT)
+            self.assertEqual(argv[4], str(b))                   # SOURCE == cwd (B), threaded as-is
             self.assertFalse((b / ".synapt").exists())          # no cwd-derived secondary store
-            self.assertTrue((a / ".synapt" / "recall").is_dir())  # the real lock touched A
+            self.assertTrue((a / ".synapt" / "recall").is_dir())  # the real (now-released) lock touched A
 
 
 class TestResumeRefusesIndexSourceGripspaceMismatch(unittest.TestCase):
@@ -754,6 +777,97 @@ class TestRefreshLabelRender(unittest.TestCase):
     def test_no_label_when_not_refreshed(self):
         out = format_resume(self._view(None))
         self.assertNotIn("REFRESHED before render", out)
+
+
+class TestBackgroundCatchupLabelRender(unittest.TestCase):
+    """R3.1: the queued-but-not-yet-fresher case gets its OWN honest phrasing,
+    distinct from _format_refresh_label's "REFRESHED before render" -- nothing
+    refreshed THIS render, only a background process was queued."""
+
+    def _view(self, background_catchup_label):
+        v = ResumeView(
+            session_id="0af31c22", selection_scope="store",
+            turns=[ResumeTurn(chunk_id="c0", turn_index=0, timestamp="2026-09-01T00:00:00Z",
+                              user_text="q", assistant_text="a", tools_used=[])],
+            total_turns=1,
+        )
+        v.background_catchup_label = background_catchup_label
+        return v
+
+    def test_label_names_the_stale_count_and_does_not_claim_refreshed(self):
+        out = format_resume(self._view("3 source file(s) behind (source rollout-a.jsonl) -- "
+                                        "incremental rebuild queued in the background"))
+        self.assertIn("CATCHING UP IN BACKGROUND — 3 source file(s) behind", out)
+        self.assertNotIn("REFRESHED before render", out)
+
+    def test_no_label_when_nothing_queued(self):
+        out = format_resume(self._view(None))
+        self.assertNotIn("CATCHING UP IN BACKGROUND", out)
+
+
+class TestBackgroundScriptRunsForReal(unittest.TestCase):
+    """R3.1 working-first proof: the OTHER tests in this file mock subprocess.Popen
+    entirely, so none of them prove _BACKGROUND_COLD_REFRESH_SCRIPT is valid,
+    importable, runnable Python that does what cold_no_caller_refresh used to do
+    inline. This one spawns it for REAL (no mocks) against a tiny real store and
+    waits for it -- the interactive-budget concern this whole change exists to fix
+    is about resume's OWN process not waiting, not about tests being unable to."""
+
+    def test_real_subprocess_archives_and_builds_the_real_store(self):
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as td:
+            store = Path(td) / "store"
+            source = Path(td) / "source"
+            claude_dir = source / ".claude" / "projects" / "-tmp-fake"
+            claude_dir.mkdir(parents=True)
+            transcript = claude_dir / "session.jsonl"
+            transcript.write_text(
+                '{"type":"user","message":{"role":"user","content":"hi"},'
+                '"sessionId":"realbg0001","timestamp":"2026-09-06T00:00:00Z"}\n'
+                '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},'
+                '"sessionId":"realbg0001","timestamp":"2026-09-06T00:00:01Z"}\n',
+                encoding="utf-8",
+            )
+            index_dir = store / ".synapt" / "recall" / "index"
+            (store / ".synapt" / "recall").mkdir(parents=True)
+
+            env = dict(os.environ)
+            env["HOME"] = str(source)  # so project_transcript_dirs() finds it via ~/.claude
+            env.pop("GRIPSPACE_ROOT", None)
+            env.pop("SYNAPT_RECALL_ROOT", None)
+
+            result = subprocess.run(
+                [cli.sys.executable, "-c", cli._BACKGROUND_COLD_REFRESH_SCRIPT, str(store), str(source)],
+                env=env, capture_output=True, text=True, timeout=60,
+            )
+
+            self.assertEqual(result.returncode, 0, msg=f"stderr: {result.stderr}\nstdout: {result.stdout}")
+            self.assertTrue((index_dir / "recall.db").exists() or (index_dir / "chunks.jsonl").exists(),
+                             "the real build must have produced a loadable index")
+            self.assertFalse((store / ".synapt" / "recall" / "build.lock").exists()
+                              and self._lock_is_held(store / ".synapt" / "recall" / "build.lock"),
+                              "the script must release its own lock on exit")
+
+    @staticmethod
+    def _lock_is_held(lock_path: Path) -> bool:
+        # Cross-platform (windows-latest CI included): raw fcntl does not exist
+        # on Windows, so this uses the same lock_exclusive_nb/unlock wrappers
+        # _acquire_build_lock/_release_build_lock use, not fcntl directly.
+        from synapt.recall._filelock import lock_exclusive_nb, unlock
+
+        if not lock_path.exists():
+            return False
+        fd = os.open(lock_path, os.O_RDWR)
+        try:
+            lock_exclusive_nb(fd)
+            unlock(fd)
+            return False
+        except OSError:
+            return True
+        finally:
+            os.close(fd)
 
 
 if __name__ == "__main__":
