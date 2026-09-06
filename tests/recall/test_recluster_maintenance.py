@@ -1237,3 +1237,67 @@ def test_recluster_merge_help_text_describes_the_shipped_mechanism():
     assert "containment of the cluster's persisted top-64" in cli_source, (
         "the help text must describe the actual shipped matching mechanism"
     )
+
+
+# Real-store finding: a live redrive's second dry_run pass, in a fresh
+# process, reported hundreds of clusters as "changed" with nothing between
+# the two passes but a process restart. Root cause: _cluster_signature_tokens
+# used Counter.most_common(top_n), whose tie-break at the cutoff falls back
+# to Counter's insertion order -- which comes from iterating the input
+# set[str] objects, and Python randomizes string-hash-derived set iteration
+# order per process. A pytest run (one process, one hash seed) can never see
+# this: the same input always produces the same output WITHIN a process.
+# The only witness that can see it is two SEPARATE processes with two
+# DIFFERENT hash seeds computing the same signature and comparing.
+
+_SIGNATURE_TIEBREAK_SUBPROCESS_SCRIPT = """
+import json
+from synapt.recall.clustering import _cluster_signature_tokens
+
+# Reproduces the real shape measured on the store: 34 tokens with count=2
+# (unambiguous top ranks), 74 tokens with count=1 all tied at the count
+# sitting exactly at the top_n=64 cutoff -- 30 of those 74 must be chosen
+# arbitrarily unless the tie-break is deterministic.
+hi = [f"hi{i}" for i in range(34)]
+lo = [f"lo{i}" for i in range(74)]
+set_a = set(hi) | set(lo[:37])
+set_b = set(hi) | set(lo[37:])
+signature = _cluster_signature_tokens([set_a, set_b], top_n=64)
+print(json.dumps(signature))
+"""
+
+
+def _run_signature_tiebreak_subprocess(hashseed: str) -> list[str]:
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = hashseed
+    result = subprocess.run(
+        [sys.executable, "-c", _SIGNATURE_TIEBREAK_SUBPROCESS_SCRIPT],
+        env=env, capture_output=True, text=True, check=True, timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+def test_cluster_signature_tiebreak_is_stable_across_process_hash_seeds():
+    """The witness that a same-process mutation test cannot provide: compute
+    the SAME tied-boundary signature in two separate subprocesses with two
+    DIFFERENT PYTHONHASHSEED values and require byte-identical output. This
+    is the actual property _cluster_signature_tokens must have (a pure
+    function of the token multiset, not of that process's hash seed) --
+    reverting the (-count, token) sort back to Counter.most_common(top_n)
+    makes this test fail (verified by hand: seed 0 and seed 1 disagree on
+    which lo-tokens fill the last several slots)."""
+    sig_seed0 = _run_signature_tiebreak_subprocess("0")
+    sig_seed1 = _run_signature_tiebreak_subprocess("1")
+
+    assert sig_seed0 == sig_seed1, (
+        "the signature must not depend on the process's hash seed -- "
+        f"seed 0 gave {sig_seed0}, seed 1 gave {sig_seed1}"
+    )
+    assert len(sig_seed0) == 64, sig_seed0
+    # The 34 unambiguous high-count tokens must always be present.
+    assert all(f"hi{i}" in sig_seed0 for i in range(34)), sig_seed0
