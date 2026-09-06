@@ -158,10 +158,22 @@ CREATE TABLE IF NOT EXISTS cluster_summaries (
 -- Join table for cluster membership. No REFERENCES constraints because
 -- PRAGMA foreign_keys is OFF (SQLite default) and clustering is fully
 -- rebuilt on every recall build — orphans are impossible in practice.
+--
+-- run_id is NULL for ordinary self-batch clustering (the
+-- table's original rows -- a full rebuild replaces them wholesale, so
+-- there is nothing to undo by run) and set ONLY for rows written by
+-- merge_chunks_into_cluster(). A live-store incident recovered a bad
+-- merge's rows by their shared added_at TIMESTAMP because no run_id
+-- existed to key on -- correct that time only because one write call
+-- produces one timestamp for every row, which is not guaranteed in
+-- general (clock resolution, or a future caller batching differently).
+-- run_id is deliberate identity for exactly this recovery, not a
+-- coincidence of implementation.
 CREATE TABLE IF NOT EXISTS cluster_chunks (
     cluster_id  TEXT NOT NULL,
     chunk_id    TEXT NOT NULL,
     added_at    TEXT NOT NULL,
+    run_id      TEXT,
     PRIMARY KEY (cluster_id, chunk_id)
 );
 
@@ -180,6 +192,21 @@ CREATE TABLE IF NOT EXISTS recluster_attempts (
     chunk_id     TEXT PRIMARY KEY,
     attempted_at TEXT NOT NULL,
     run_id       TEXT NOT NULL
+);
+
+-- recall#435 follow-on: a bounded, persisted per-cluster token signature
+-- (top N tokens by WITHIN-cluster document frequency), so a stale chunk can
+-- be compared against what a cluster is ACTUALLY about instead of a
+-- truncated raw-text search_text sample (measured: search_text averages
+-- 121 chars, ~10-35 content tokens, versus a chunk's own 100-200 -- Jaccard
+-- against that size mismatch dilutes real overlap below any sane
+-- threshold). One row per cluster_id, INSERT OR REPLACE -- a cluster whose
+-- membership changes gets a fresh signature computed from its current
+-- members, never an incremental patch.
+CREATE TABLE IF NOT EXISTS cluster_token_signatures (
+    cluster_id  TEXT PRIMARY KEY,
+    tokens      TEXT NOT NULL,  -- JSON list, top N by document frequency
+    updated_at  TEXT NOT NULL
 );
 
 -- Access tracking tables for adaptive memory (Phase 2).
@@ -589,6 +616,7 @@ class RecallDB:
         self._migrate_access_stats_table()
         self._migrate_contradictions_table()
         self._migrate_chunk_links_table()
+        self._migrate_cluster_chunks_table()
         # Check if FTS table exists (FTS5 virtual tables don't support
         # IF NOT EXISTS, so we check manually before creating)
         row = self._conn.execute(
@@ -815,6 +843,23 @@ class RecallDB:
                     "ALTER TABLE cluster_summaries ADD COLUMN content_hash TEXT"
                 )
                 self._conn.commit()
+
+    def _migrate_cluster_chunks_table(self) -> None:
+        """Add ``run_id`` to a ``cluster_chunks`` table created before it
+        existed. NULL default: pre-existing rows were not written by any
+        merge run and have nothing to be keyed by."""
+        row = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='cluster_chunks'"
+        ).fetchone()
+        if row is None:
+            return
+        cols = {
+            r[1]
+            for r in self._conn.execute("PRAGMA table_info(cluster_chunks)").fetchall()
+        }
+        if "run_id" not in cols:
+            self._conn.execute("ALTER TABLE cluster_chunks ADD COLUMN run_id TEXT")
+            self._conn.commit()
 
     def _migrate_access_stats_table(self) -> None:
         """Add promotion columns that may be missing from an older access_stats table."""
@@ -2365,6 +2410,10 @@ class RecallDB:
             "(SELECT cluster_id FROM clusters WHERE cluster_type = 'topic') "
             "AND method != 'llm'"
         )
+        cur.execute(
+            "DELETE FROM cluster_token_signatures WHERE cluster_id IN "
+            "(SELECT cluster_id FROM clusters WHERE cluster_type = 'topic')"
+        )
         # Disable FTS trigger during bulk delete, then rebuild
         cur.execute("DROP TRIGGER IF EXISTS clusters_ad")
         cur.execute(
@@ -2409,6 +2458,15 @@ class RecallDB:
                 "(cluster_id, chunk_id, added_at) VALUES (?, ?, ?)",
                 (cluster_id, chunk_id, added_at),
             )
+
+        for c in clusters:
+            sig = c.get("signature_tokens")
+            if sig is not None:
+                cur.execute(
+                    "INSERT OR REPLACE INTO cluster_token_signatures "
+                    "(cluster_id, tokens, updated_at) VALUES (?, ?, ?)",
+                    (c["cluster_id"], json.dumps(sig), c["updated_at"]),
+                )
 
         # Keep orphaned LLM summaries temporarily — they carry content_hash
         # values that upgrade_large_cluster_summaries() can match against
@@ -2469,6 +2527,14 @@ class RecallDB:
                 "(cluster_id, chunk_id, added_at) VALUES (?, ?, ?)",
                 (cluster_id, chunk_id, added_at),
             )
+        for c in clusters:
+            sig = c.get("signature_tokens")
+            if sig is not None:
+                cur.execute(
+                    "INSERT OR REPLACE INTO cluster_token_signatures "
+                    "(cluster_id, tokens, updated_at) VALUES (?, ?, ?)",
+                    (c["cluster_id"], json.dumps(sig), c["updated_at"]),
+                )
         cur.execute("INSERT INTO clusters_fts(clusters_fts) VALUES ('rebuild')")
         self._conn.commit()
 
@@ -2495,6 +2561,133 @@ class RecallDB:
             row[0]
             for row in self._conn.execute("SELECT chunk_id FROM recluster_attempts").fetchall()
         }
+
+    def save_cluster_token_signature(
+        self, cluster_id: str, tokens: list[str], updated_at: str,
+    ) -> None:
+        """Persist a cluster's bounded token signature, replacing any prior
+        one -- a cluster's membership changing invalidates its old signature
+        outright, there is no incremental patch that stays correct."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO cluster_token_signatures "
+            "(cluster_id, tokens, updated_at) VALUES (?, ?, ?)",
+            (cluster_id, json.dumps(tokens), updated_at),
+        )
+        self._conn.commit()
+
+    def load_cluster_token_signatures(self) -> dict[str, set[str]]:
+        """Every persisted cluster signature, keyed by ``cluster_id``.
+
+        Cheap by construction: each signature is capped at a small fixed
+        token count (see ``clustering.TOP_SIGNATURE_TOKENS``), so this is
+        cluster-count * a constant, never chunk-count or corpus size.
+        """
+        return {
+            row[0]: set(json.loads(row[1]))
+            for row in self._conn.execute(
+                "SELECT cluster_id, tokens FROM cluster_token_signatures"
+            ).fetchall()
+        }
+
+    def active_topic_clusters_missing_signature(self) -> list[str]:
+        """Active topic cluster ids with no row in ``cluster_token_signatures``
+        yet -- the backfill queue for clusters that predate this table."""
+        return [
+            row[0]
+            for row in self._conn.execute(
+                "SELECT cl.cluster_id FROM clusters cl "
+                "LEFT JOIN cluster_token_signatures sig "
+                "  ON sig.cluster_id = cl.cluster_id "
+                "WHERE cl.cluster_type = 'topic' AND cl.status = 'active' "
+                "  AND sig.cluster_id IS NULL"
+            ).fetchall()
+        ]
+
+    def load_cluster_member_chunk_ids(self, cluster_ids: list[str]) -> dict[str, list[str]]:
+        """Member chunk ids for each of the given clusters, keyed by
+        ``cluster_id``. Bounded by the caller's own cluster batch, not the
+        corpus -- used to compute a signature from ACTUAL current members."""
+        if not cluster_ids:
+            return {}
+        placeholders = ",".join("?" * len(cluster_ids))
+        result: dict[str, list[str]] = {cid: [] for cid in cluster_ids}
+        for cluster_id, chunk_id in self._conn.execute(
+            f"SELECT cluster_id, chunk_id FROM cluster_chunks "
+            f"WHERE cluster_id IN ({placeholders})",
+            cluster_ids,
+        ).fetchall():
+            result[cluster_id].append(chunk_id)
+        return result
+
+    def load_cluster_topics(self, cluster_ids: list[str]) -> dict[str, str]:
+        """Topic label for each of the given clusters, keyed by
+        ``cluster_id``. Bounded by the caller's own set -- used to label a
+        merge sample for hand-reading without a caller having to query
+        ``clusters`` directly."""
+        if not cluster_ids:
+            return {}
+        placeholders = ",".join("?" * len(cluster_ids))
+        return dict(
+            self._conn.execute(
+                f"SELECT cluster_id, topic FROM clusters WHERE cluster_id IN ({placeholders})",
+                cluster_ids,
+            ).fetchall()
+        )
+
+    def merge_chunks_into_cluster(
+        self,
+        cluster_id: str,
+        chunk_ids: list[str],
+        appended_text: str,
+        added_at: str,
+        run_id: str | None = None,
+    ) -> None:
+        """Add chunk(s) to an EXISTING cluster without changing its identity.
+
+        Unlike ``append_clusters`` (new clusters formed from a self-batch),
+        this grows a cluster that already exists and may already be
+        referenced by its ``cluster_id`` elsewhere -- so the id, unlike a
+        full rebuild's, does not get recomputed from the new membership set.
+        ``chunk_count`` is recomputed from ``cluster_chunks`` itself rather
+        than incremented, so a rerun over an already-merged chunk (``INSERT
+        OR IGNORE``) cannot inflate the count.
+
+        ``run_id``, if given, is stamped on every membership row this call
+        writes (see ``cluster_chunks``'s schema comment) so a bad run can be
+        undone by exactly its own rows, not by a shared ``added_at``
+        timestamp -- which a live-store incident had to fall back to
+        because this column did not exist yet, and a shared timestamp is
+        only unambiguous by accident of one write call producing one clock
+        reading for every row.
+
+        Also deletes any persisted token signature for this cluster: a
+        signature is a snapshot of a specific membership set, and this call
+        just changed that set, so the old signature is now describing
+        members the cluster no longer has in the shape it was signed. The
+        delete re-enters the cluster into the backfill queue (a cluster with
+        no signature row) rather than leaving a stale one silently drifting.
+        """
+        if not chunk_ids:
+            return
+        cur = self._conn.cursor()
+        cur.executemany(
+            "INSERT OR IGNORE INTO cluster_chunks (cluster_id, chunk_id, added_at, run_id) "
+            "VALUES (?, ?, ?, ?)",
+            [(cluster_id, cid, added_at, run_id) for cid in chunk_ids],
+        )
+        cur.execute(
+            "UPDATE clusters SET "
+            "  chunk_count = (SELECT COUNT(*) FROM cluster_chunks "
+            "                 WHERE cluster_chunks.cluster_id = clusters.cluster_id), "
+            "  search_text = substr(search_text || ' ' || ?, 1, 4000), "
+            "  updated_at = ? "
+            "WHERE cluster_id = ?",
+            (appended_text, added_at, cluster_id),
+        )
+        cur.execute(
+            "DELETE FROM cluster_token_signatures WHERE cluster_id = ?", (cluster_id,),
+        )
+        self._conn.commit()
 
     def load_clusters(self, status: str = "active") -> list[dict]:
         """Load clusters filtered by status."""
