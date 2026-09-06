@@ -174,19 +174,32 @@ class TestExtractTopic:
         assert "antagonist" in topic
 
     def test_tool_use_id_tokens_excluded(self):
-        """toolu_<alnum> ids are the same shape of defect as
-        session ids -- unique per tool call, so IDF treats them as maximally
-        rare. Measured: "toolu_01eum13sxeaunhmdiljvdlmx u... notification"."""
+        """toolu_<alnum> ids are the same shape of defect as session ids --
+        unique per tool call, so IDF treats them as maximally rare. Measured:
+        "toolu_01eum13sxeaunhmdiljvdlmx u... notification".
+
+        Corpus widened to match test_session_id_tokens_excluded: with only
+        the cluster's own two members as the whole corpus, the id's global
+        doc-freq equals n_docs regardless of the regex guard, so it falls
+        into the `idf = 0.1` branch and loses on score alone -- the regex
+        is never exercised. Here the id is genuinely rare against a wider
+        corpus, so without the guard it would win on rarity alone.
+        """
         from collections import Counter
         cluster_tokens = [
             {"toolu_01eum13sxeaunhmdiljvdlmx", "notification", "queue"},
             {"toolu_01eum13sxeaunhmdiljvdlmx", "notification", "delivery"},
         ]
+        all_tokens = cluster_tokens + [
+            {"harness", "swift", "test", "eval"},
+            {"swift", "adapter", "training", "loss"},
+        ]
         global_df: Counter[str] = Counter()
-        for ts in cluster_tokens:
+        for ts in all_tokens:
             global_df.update(ts)
-        topic = _extract_topic(cluster_tokens, global_df, len(cluster_tokens))
+        topic = _extract_topic(cluster_tokens, global_df, len(all_tokens))
         assert "toolu_01eum13sxeaunhmdiljvdlmx" not in topic
+        assert "notification" in topic
 
     def test_sentence_final_punctuation_does_not_inflate_rarity(self):
         """_tokenize() keeps '.' inside a token, so "seen."
@@ -218,6 +231,40 @@ class TestExtractTopic:
         topic = _extract_topic(cluster_tokens, global_df, len(all_tokens))
         assert "antagonist" in topic
         assert "seen." not in topic.split()
+
+    def test_cluster_chunks_normalizes_global_df_before_extracting_topic(self):
+        """End-to-end witness for cluster_chunks()'s OWN global_df-building
+        line (a mutant reverting just that line, leaving _extract_topic's
+        internal normalization intact, survived with no test going red --
+        every prior test built global_df by hand, already normalized,
+        bypassing this call site entirely).
+
+        Every chunk in the corpus -- target and filler alike -- writes
+        "seen." (sentence-final) literally; NO chunk anywhere contains the
+        bare "seen". If cluster_chunks's own global_df is built WITHOUT
+        normalizing, no "seen" key ever exists in it. _extract_topic (fixed
+        internally) still normalizes the target cluster's OWN tokens to
+        "seen" before scoring, then looks up doc_freq via
+        ``global_df.get("seen", 1)`` -- which falls through to the default
+        of 1 (spuriously, maximally rare) instead of the true count, and
+        "seen" wrongly wins the ranking over three genuinely rare real
+        words. With the line intact, "seen" merges into the correctly
+        common count and is correctly excluded from the topic.
+        """
+        target = [
+            _chunk("t0", assistant="antagonist gate harbor seen.", session="s-target", ts="2026-03-05T10:00:00Z"),
+            _chunk("t1", assistant="antagonist gate harbor seen.", session="s-target", ts="2026-03-05T10:05:00Z"),
+        ]
+        fillers = [
+            _chunk(f"f{i}", assistant=f"alpha{i} bravo{i} seen.", session=f"s-filler-{i}",
+                   ts="2026-03-05T11:00:00Z")
+            for i in range(10)
+        ]
+        clusters = cluster_chunks(target + fillers)
+        target_cluster = next(cl for cl in clusters if "t0" in cl["chunk_ids"])
+        topic_tokens = target_cluster["topic"].split()
+        assert "seen" not in topic_tokens
+        assert {"antagonist", "gate", "harbor"} <= set(topic_tokens)
 
 
 # ---------------------------------------------------------------------------
