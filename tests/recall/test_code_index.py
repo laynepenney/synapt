@@ -669,3 +669,50 @@ def test_missing_parser_stack_does_not_poison_the_index_for_a_later_run(
             sys.modules["tree_sitter_language_pack"] = prior_value
         else:
             sys.modules.pop("tree_sitter_language_pack", None)
+
+
+def test_a_missing_grammar_for_one_file_does_not_poison_it_once_the_grammar_arrives(
+    tmp_path: Path,
+):
+    """Per-file analog of the whole-stack poison above (recall#943). The stack
+    can be present while THIS file's grammar is unavailable — an unbundled
+    language, or a partial extra — in which case _get_parser() returns None for
+    it even though parser_stack_missing is False. Before the fix, index_repo
+    still wrote the file's REAL content_hash with empty symbols, so a later run
+    (grammar now available, same unchanged bytes) saw "unchanged" and skipped
+    it forever. Two runs, same db, same file on disk: grammar absent, then
+    present, must actually index on the second run.
+    """
+    from synapt.recall import code_index
+
+    src = tmp_path / "repo"
+    src.mkdir()
+    (src / "m.py").write_text("def alpha():\n    return 1\n")
+    db = tmp_path / "code.db"
+
+    real_get_parser = code_index._get_parser
+    # Run 1: this file's grammar unavailable (stack itself is present).
+    code_index._get_parser = lambda lang: None
+    try:
+        stats1 = index_repo(src, db, repo="demo")
+    finally:
+        code_index._get_parser = real_get_parser
+
+    assert stats1.parser_stack_missing is False, (
+        "this is the per-grammar case, not the whole-stack case — the stack is present"
+    )
+    assert stats1.files_indexed == 0, (
+        "a file whose grammar is unavailable must not be counted as indexed"
+    )
+
+    # Run 2: grammar available again, same db, same unchanged file on disk.
+    stats2 = index_repo(src, db, repo="demo")
+    assert stats2.symbols > 0, (
+        "run 2 must index the file run 1 couldn't parse — a content_hash "
+        "written in run 1 would read as unchanged and skip it forever"
+    )
+    import sqlite3
+    n = sqlite3.connect(str(db)).execute(
+        "SELECT COUNT(*) FROM code_symbols"
+    ).fetchone()[0]
+    assert n > 0, "symbols permanently empty: the missing-grammar row poisoned the file"

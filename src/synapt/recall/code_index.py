@@ -528,6 +528,19 @@ def index_repo(
                 stats.files_skipped += 1
                 continue
 
+            if _get_parser(grammar) is None:
+                # Per-file analog of the whole-stack guard above: the stack is
+                # present but THIS file's grammar is unavailable (an unbundled
+                # language, or a partial extra). Writing its real content_hash
+                # with empty symbols would make a later run — once the grammar
+                # arrives, same bytes — see "unchanged" and skip it forever.
+                # No write at all, and not counted as indexed; the next run
+                # re-attempts it. (recall#943)
+                stats.errors.append(
+                    f"{rel}: no grammar available for {grammar!r} — not indexed"
+                )
+                continue
+
             parsed = _parse_file(source_path, grammar)
             if parsed is None:
                 stats.errors.append(f"{rel}: could not be parsed")
