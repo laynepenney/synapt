@@ -720,6 +720,134 @@ def test_merge_run_id_is_stamped_and_distinct_across_separate_runs(tmp_path):
         db.close()
 
 
+def test_recluster_merge_into_existing_distinctiveness_through_the_real_call_site(tmp_path):
+    """R2 finding: both distinctiveness unit tests call ``_match_existing_cluster``
+    directly with a HAND-BUILT ``signature_df``, so neither ever exercises
+    ``recluster_stale_chunks``'s own ``signature_df = _signature_cross_cluster_df(...)``
+    call site -- a mutant replacing that line with an empty ``Counter()``
+    survives every existing test, because every real end-to-end
+    ``merge_into_existing`` fixture sits under the 20-cluster population
+    guard (one real cluster). This builds ONE real cluster (via
+    ``_topic_transcript``, its signature carrying BOTH a group of tokens
+    unique to it and a group shared with 19 additional PURELY SYNTHETIC
+    decoy signatures, injected directly via ``save_cluster_token_signature``
+    -- 20 total clusters, at the activation boundary) and runs TWO stale
+    candidates through the real ``recluster_stale_chunks(merge_into_existing=True)``
+    call: one sharing only the cluster-specific group (must merge), one
+    sharing only the group common across the 19 decoys too (must not)."""
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.clustering import recluster_stale_chunks, stale_transcript_chunk_ids
+
+    common_group = [f"commonword{i}" for i in range(10)]
+
+    def _topic_transcript_with_common_group(path: Path, *, turns: int = 8) -> Path:
+        entries = []
+        common = " ".join(common_group)
+        for i in range(turns):
+            rare = " ".join(w for j, w in enumerate(_TOPIC_WORDS) if (j + i) % 3 != 0)
+            entries.append(
+                user_text_entry(f"question about {rare} {common}", uuid=f"ctopic-u{i}",
+                                 ts=f"2026-03-01T10:{i:02d}:00Z")
+            )
+            entries.append(
+                assistant_entry(text=f"answer about {rare} {common}", uuid=f"ctopic-a{i}",
+                                 ts=f"2026-03-01T10:{i:02d}:30Z")
+            )
+        write_jsonl(path, entries)
+        return path
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _topic_transcript_with_common_group(source / "topic.jsonl", turns=8)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    db = _open_db(project)
+    try:
+        existing_cluster_id, = db._conn.execute(
+            "SELECT cluster_id FROM clusters WHERE cluster_type = 'topic'"
+        ).fetchone()
+
+        # Verify by fruit, not assumption: both groups must actually have
+        # landed in the persisted signature before the test means anything.
+        real_signature = db.load_cluster_token_signatures()[existing_cluster_id]
+        assert set(_TOPIC_WORDS) & real_signature, (
+            f"fixture assumption: the rare/topic group must be in the real "
+            f"signature: {sorted(real_signature)}"
+        )
+        assert set(common_group) & real_signature, (
+            f"fixture assumption: the common group must be in the real "
+            f"signature too: {sorted(real_signature)}"
+        )
+
+        # 19 purely synthetic decoys, no backing `clusters` row needed --
+        # they exist only to make common_group's tokens document-frequency
+        # 20 (real + 19 decoys) instead of 1, and to reach the 20-cluster
+        # population floor. common_group is the ONLY overlap with the real
+        # signature; _TOPIC_WORDS appears in no decoy.
+        now = "2026-03-01T12:00:00Z"
+        for i in range(19):
+            decoy_signature = list(common_group) + [f"decoyfiller{i}_{j}" for j in range(50)]
+            db.save_cluster_token_signature(f"decoy-{i}", decoy_signature, now)
+
+        total_clusters = len(db.load_cluster_token_signatures())
+        assert total_clusters == 20, (
+            f"fixture assumption: exactly 20 total signatures (1 real + 19 "
+            f"decoys), the activation boundary: {total_clusters}"
+        )
+
+        write_jsonl(source / "rare_candidate.jsonl", [
+            user_text_entry("question about " + " ".join(_TOPIC_WORDS), uuid="rare-u",
+                             ts="2026-03-01T11:00:00Z"),
+            assistant_entry(text="answer about " + " ".join(_TOPIC_WORDS), uuid="rare-a",
+                             ts="2026-03-01T11:00:30Z"),
+        ])
+        write_jsonl(source / "common_candidate.jsonl", [
+            user_text_entry("question about " + " ".join(common_group), uuid="common-u",
+                             ts="2026-03-01T11:01:00Z"),
+            assistant_entry(text="answer about " + " ".join(common_group), uuid="common-a",
+                             ts="2026-03-01T11:01:30Z"),
+        ])
+        _archive_and_build(project, source_dirs=[source], use_embeddings=False,
+                            incremental=True, skip_clustering=True)
+    finally:
+        db.close()
+
+    db = _open_db(project)
+    try:
+        stale_before = set(stale_transcript_chunk_ids(db))
+        assert len(stale_before) == 2, f"exactly the two new candidates should be stale: {stale_before}"
+
+        receipt = recluster_stale_chunks(db, batch_size=100, merge_into_existing=True)
+
+        assert receipt["merged_into_existing"] == 1, (
+            f"exactly the rare candidate must merge, not the common one: {receipt}"
+        )
+
+        stale_after = set(stale_transcript_chunk_ids(db))
+        merged_chunk_id = (stale_before - stale_after).pop()
+        assert "rare" in merged_chunk_id, (
+            f"the RARE candidate must be the one that merged, not the common "
+            f"one: {merged_chunk_id}"
+        )
+
+        member_ids = {
+            r[0] for r in db._conn.execute(
+                "SELECT chunk_id FROM cluster_chunks WHERE cluster_id = ?",
+                (existing_cluster_id,),
+            ).fetchall()
+        }
+        assert merged_chunk_id in member_ids, (
+            f"the merged chunk must be a real member of the real cluster: {member_ids}"
+        )
+        assert not any("common" in cid for cid in member_ids), (
+            f"the common candidate must never have joined the real cluster: {member_ids}"
+        )
+    finally:
+        db.close()
+
+
 def test_backfill_cluster_signatures_fills_in_clusters_that_predate_the_table(tmp_path):
     """A cluster with no persisted signature yet (predates this table, or
     had one invalidated by ``merge_chunks_into_cluster``) gets one from
