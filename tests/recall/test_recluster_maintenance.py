@@ -959,3 +959,281 @@ def test_containment_ratio_is_enforced_independently_of_the_absolute_floor():
     assert _match_existing_cluster(high_ratio_tokens, {"clust-x": signature}) == "clust-x", (
         "16/64 clears both the floor and the ratio -- must match"
     )
+
+
+# Real-store hand-read finding: a cluster
+# whose members are mostly one recurring HARNESS/CRON/RITUAL prompt (e.g. a
+# nightly close-shop checklist, or a wake-loop's "check #dev channel"
+# instruction) gets a persisted signature dominated by that prompt's own
+# generic process vocabulary (branch, merge, PRs, ready...) -- present in
+# nearly every member purely because the prompt repeats verbatim, not
+# because it is this cluster's real topic. Measured on the real store: of
+# 300 sampled signed clusters, 128 (42.7%) had at least 80% of their members
+# share byte-identical user_text. The batch-derived boilerplate stoplist in
+# ``recluster_stale_chunks`` cannot see this -- it is computed from the
+# INCOMING BATCH, and this pollution lives in the PERSISTED CLUSTER side.
+
+def _cluster_member_chunk(chunk_id: str, user_text: str, assistant_text: str):
+    from synapt.recall.core import TranscriptChunk
+
+    return TranscriptChunk(
+        id=chunk_id,
+        session_id="dup-session",
+        timestamp="2026-03-01T12:00:00Z",
+        turn_index=1,
+        user_text=user_text,
+        assistant_text=assistant_text,
+    )
+
+
+def test_strip_cluster_duplicate_user_text_drops_a_recurring_ritual_prompt():
+    """Four members, three sharing one byte-identical ritual prompt as their
+    user_text (75% >= the 50% majority floor) and one with its own distinct
+    user_text. The three ritual-prompt members lose their user_text for
+    signature purposes; the odd one out keeps its own."""
+    from synapt.recall.clustering import _strip_cluster_duplicate_user_text
+
+    ritual = "10PM CLOSE SHOP -- Stromus. Zero Agent-tool calls. DANGLING-WORK SWEEP."
+    chunks = [
+        _cluster_member_chunk("c1", ritual, "Close-shop routine starting. First the sweep."),
+        _cluster_member_chunk("c2", ritual, "Executing the routine, token-preservation mode."),
+        _cluster_member_chunk("c3", ritual, "Sweep clean, syncing the .msg now."),
+        _cluster_member_chunk("c4", "what's the status on the release?", "Everything shipped."),
+    ]
+
+    stripped = _strip_cluster_duplicate_user_text(chunks)
+    by_id = {c.id: c for c in stripped}
+
+    for cid in ("c1", "c2", "c3"):
+        assert by_id[cid].user_text == "", (
+            f"{cid}'s user_text is the 75%-majority ritual prompt and must be dropped"
+        )
+        assert by_id[cid].assistant_text == chunks[["c1", "c2", "c3"].index(cid)].assistant_text, (
+            "assistant_text (the actual varying content) must be untouched"
+        )
+    assert by_id["c4"].user_text == "what's the status on the release?", (
+        "the one member with its OWN distinct user_text must be untouched"
+    )
+
+
+def test_strip_cluster_duplicate_user_text_leaves_small_clusters_alone():
+    """Two members sharing an identical, genuinely topical user_text (not a
+    generic ritual prompt) must NOT be stripped: below
+    MIN_CLUSTER_SIZE_FOR_DUPLICATE_GUARD, two members sharing text is as
+    likely to be real coincidental topical overlap as it is to be a
+    recurring harness prompt, and this guard only has evidence once there
+    are enough members to call something a majority."""
+    from synapt.recall.clustering import (
+        MIN_CLUSTER_SIZE_FOR_DUPLICATE_GUARD,
+        _strip_cluster_duplicate_user_text,
+    )
+
+    shared = "please review PR #400"
+    chunks = [
+        _cluster_member_chunk("c1", shared, "LGTM, merged."),
+        _cluster_member_chunk("c2", shared, "One nit, otherwise fine."),
+    ]
+    assert len(chunks) < MIN_CLUSTER_SIZE_FOR_DUPLICATE_GUARD, (
+        "fixture assumption: below the minimum cluster size for this guard"
+    )
+
+    stripped = _strip_cluster_duplicate_user_text(chunks)
+    by_id = {c.id: c for c in stripped}
+    assert by_id["c1"].user_text == shared
+    assert by_id["c2"].user_text == shared
+
+
+def test_strip_cluster_duplicate_user_text_below_majority_floor_is_untouched():
+    """Three members, no single user_text shared by a majority (each
+    distinct) -- the ordinary, non-polluted case. Nothing is stripped."""
+    from synapt.recall.clustering import _strip_cluster_duplicate_user_text
+
+    chunks = [
+        _cluster_member_chunk("c1", "question one", "answer one"),
+        _cluster_member_chunk("c2", "question two", "answer two"),
+        _cluster_member_chunk("c3", "question three", "answer three"),
+    ]
+    stripped = _strip_cluster_duplicate_user_text(chunks)
+    for original, result in zip(chunks, stripped):
+        assert result.user_text == original.user_text
+
+
+def test_tokenize_cluster_members_signature_drops_ritual_prompt_vocabulary():
+    """End-to-end through the tokenizer + signature builder: with the
+    ritual-prompt user_text stripped, the resulting signature's top tokens
+    come from the varying assistant_text (the real content), not from the
+    prompt's own generic process vocabulary."""
+    from synapt.recall.clustering import _cluster_signature_tokens, _tokenize_cluster_members
+
+    ritual = ("10PM CLOSE SHOP -- Stromus rhythm. Zero Agent-tool calls. "
+              "DANGLING-WORK SWEEP verified branch merge prs ready.")
+    chunks = [
+        _cluster_member_chunk("c1", ritual, "baseline running giraffe savanna experiment"),
+        _cluster_member_chunk("c2", ritual, "giraffe savanna experiment baseline nearly done"),
+        _cluster_member_chunk("c3", ritual, "savanna baseline experiment giraffe results in"),
+        _cluster_member_chunk("c4", ritual, "giraffe experiment baseline savanna concluded"),
+    ]
+
+    token_sets = _tokenize_cluster_members(chunks)
+    signature = _cluster_signature_tokens(token_sets)
+
+    for ritual_only_word in ("sweep", "dangling", "prs", "branch", "merge"):
+        assert ritual_only_word not in signature, (
+            f"{ritual_only_word!r} comes only from the stripped ritual prompt "
+            f"and must not reach the signature: {signature}"
+        )
+    for real_word in ("giraffe", "savanna", "baseline", "experi"):  # "experiment" stems to "experi"
+        assert real_word in signature, (
+            f"{real_word!r} is the cluster's real, varying content and must "
+            f"survive into the signature: {signature}"
+        )
+
+
+# Second real-store finding from the same morning follow-on: a cluster's
+# persisted signature computed BEFORE a tokenization fix landed (the
+# context-echo strip, the ritual-prompt strip above) keeps carrying that
+# pollution forever -- ``backfill_cluster_signatures`` only fills in
+# ABSENT signatures, so an already-signed-but-polluted cluster is never
+# revisited. ``redrive_cluster_signatures`` recomputes EVERY currently
+# signed cluster from its actual current members with the CURRENT
+# tokenizer, and only writes where the recomputed value actually differs
+# -- itself a WRITE to the store, so it gets the same dry-run-with-a-count
+# discipline as the merge lane.
+
+def test_redrive_cluster_signatures_dry_run_reports_without_writing(tmp_path):
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.clustering import redrive_cluster_signatures
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _topic_transcript(source / "topic.jsonl", turns=8)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    db = _open_db(project)
+    try:
+        cluster_id = db._conn.execute(
+            "SELECT cluster_id FROM clusters WHERE cluster_type = 'topic'"
+        ).fetchone()[0]
+
+        # Simulate a signature computed by a since-fixed, buggy mechanism:
+        # inject a marker token that a fresh recomputation could not produce.
+        polluted = ["polluted_marker_token", "another_stale_token"]
+        db.save_cluster_token_signature(cluster_id, polluted, "2026-01-01T00:00:00Z")
+        assert db.load_cluster_token_signatures()[cluster_id] == set(polluted)
+
+        receipt = redrive_cluster_signatures(db, dry_run=True)
+        assert receipt["dry_run"] is True
+        assert receipt["clusters_checked"] >= 1, receipt
+        assert receipt["clusters_changed"] >= 1, receipt
+        assert cluster_id in receipt["changed_cluster_ids"], receipt
+
+        # No write happened: the polluted signature is still exactly what
+        # was stored, byte for byte -- verify by fruit, not by the flag.
+        assert db.load_cluster_token_signatures()[cluster_id] == set(polluted), (
+            "dry_run must not have written anything"
+        )
+    finally:
+        db.close()
+
+
+def test_redrive_cluster_signatures_writes_the_recomputed_signature(tmp_path):
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.clustering import redrive_cluster_signatures
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _topic_transcript(source / "topic.jsonl", turns=8)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    db = _open_db(project)
+    try:
+        cluster_id = db._conn.execute(
+            "SELECT cluster_id FROM clusters WHERE cluster_type = 'topic'"
+        ).fetchone()[0]
+        polluted = ["polluted_marker_token"]
+        db.save_cluster_token_signature(cluster_id, polluted, "2026-01-01T00:00:00Z")
+
+        receipt = redrive_cluster_signatures(db, dry_run=False)
+        assert receipt["dry_run"] is False
+        assert cluster_id in receipt["changed_cluster_ids"], receipt
+
+        rewritten = db.load_cluster_token_signatures()[cluster_id]
+        assert "polluted_marker_token" not in rewritten, (
+            "the stale marker must be gone after a real (non-dry) redrive"
+        )
+        assert len(rewritten) >= 8, rewritten
+    finally:
+        db.close()
+
+
+def test_redrive_cluster_signatures_leaves_unchanged_signatures_alone(tmp_path):
+    """A cluster whose stored signature already matches a fresh
+    recomputation is reported as unchanged, not as changed -- the receipt
+    must distinguish real drift from a no-op re-derivation."""
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.clustering import redrive_cluster_signatures
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _topic_transcript(source / "topic.jsonl", turns=8)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    db = _open_db(project)
+    try:
+        cluster_id = db._conn.execute(
+            "SELECT cluster_id FROM clusters WHERE cluster_type = 'topic'"
+        ).fetchone()[0]
+        # Freshly built by the current tokenizer already -- redrive should
+        # find nothing to change.
+        before = db.load_cluster_token_signatures()[cluster_id]
+
+        receipt = redrive_cluster_signatures(db, dry_run=False)
+        assert cluster_id not in receipt["changed_cluster_ids"], receipt
+        assert receipt["clusters_unchanged"] >= 1, receipt
+
+        after = db.load_cluster_token_signatures()[cluster_id]
+        assert after == before
+    finally:
+        db.close()
+
+
+def test_redrive_cluster_signatures_refuses_above_ceiling(tmp_path):
+    from synapt.recall.cli import _archive_and_build
+    from synapt.recall.clustering import redrive_cluster_signatures
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    source = tmp_path / "source"
+    source.mkdir()
+    _topic_transcript(source / "topic.jsonl", turns=8)
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=True)
+
+    db = _open_db(project)
+    try:
+        receipt = redrive_cluster_signatures(db, refuse_above=0, dry_run=True)
+        assert receipt["refused"] is True, receipt
+        assert receipt["clusters_checked"] == 0, receipt
+    finally:
+        db.close()
+
+
+def test_recluster_merge_help_text_describes_the_shipped_mechanism():
+    """Sentinel's carried finding (m_8a65239d): --recluster-merge's help
+    text described the abandoned Jaccard-against-search_text mechanism
+    (measured and rejected -- see recluster_stale_chunks' own docstring),
+    not the containment-of-a-persisted-signature mechanism that actually
+    shipped. Source-string regression, not a behavior test: this is
+    documentation drift, not logic."""
+    cli_source = (Path(__file__).parents[2] / "src" / "synapt" / "recall" / "cli.py").read_text()
+    assert "Jaccard-matched against cluster search_text" not in cli_source, (
+        "the abandoned mechanism's wording must not still be in the help text"
+    )
+    assert "containment of the cluster's persisted top-64" in cli_source, (
+        "the help text must describe the actual shipped matching mechanism"
+    )

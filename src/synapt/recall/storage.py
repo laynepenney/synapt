@@ -2589,6 +2589,20 @@ class RecallDB:
             ).fetchall()
         }
 
+    def cluster_ids_with_signature_oldest_first(self) -> list[str]:
+        """Every cluster_id with a row in ``cluster_token_signatures``,
+        oldest ``updated_at`` first -- selection order for
+        ``clustering.redrive_cluster_signatures``'s bounded batches, so a
+        drain across repeated calls makes forward progress rather than
+        re-checking the same freshly-redriven clusters first."""
+        return [
+            row[0]
+            for row in self._conn.execute(
+                "SELECT cluster_id FROM cluster_token_signatures "
+                "ORDER BY updated_at ASC"
+            ).fetchall()
+        ]
+
     def active_topic_clusters_missing_signature(self) -> list[str]:
         """Active topic cluster ids with no row in ``cluster_token_signatures``
         yet -- the backfill queue for clusters that predate this table."""

@@ -4519,7 +4519,8 @@ def make_parser() -> argparse.ArgumentParser:
     maintain_parser.add_argument(
         "--recluster-merge", action="store_true",
         help="With --recluster, let a stale chunk join an EXISTING cluster "
-             "(Jaccard-matched against cluster search_text, cheap) before "
+             "(asymmetric containment of the cluster's persisted top-64 "
+             "token signature in the chunk's own tokens, cheap) before "
              "self-batch clustering runs, instead of only ever forming new "
              "clusters from same-batch matches. Default off.",
     )
