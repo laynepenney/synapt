@@ -208,6 +208,43 @@ def test_timeout_never_blocks_the_original_grep_result() -> None:
     assert elapsed < 0.150
 
 
+def test_a_slow_import_of_the_default_recall_quick_does_not_consume_the_query_budget(
+    monkeypatch,
+) -> None:
+    """recall#... : the default recall_quick's lazy `import synapt.recall.server`
+    is a genuinely variable, host-load-dependent cost (measured 0.08-0.29s in
+    isolation) that must not compete with the actual query for the hook's small
+    per-call timeout. Simulate a slow import through the monkeypatchable seam
+    (`_load_recall_quick_impl`) while the resolved query itself is fast: the
+    advisory must still arrive, because only the query is timed, not the import.
+    """
+    mod = _grep_intercept()
+    # Tight 30ms budget for the QUERY -- the fast lambda below finishes well
+    # inside it. The import, simulated at 300ms, must not be charged against
+    # this budget at all.
+    config = mod.GrepInterceptConfig(enabled=True, timeout_ms=30)
+
+    def slow_import() -> "mod.RecallQuick":
+        time.sleep(0.30)
+        return lambda _query: (
+            "Past session context:\n"
+            "--- [cluster: slow-import witness] 2026-09-06, 1 chunks (clust-a) ---\n"
+            "The import was slow; the query was not."
+        )
+
+    monkeypatch.setattr(mod, "_load_recall_quick_impl", slow_import)
+
+    context = mod.build_pretooluse_context(
+        _bash('rg "slow-import witness" src'),
+        config=config,
+    )
+
+    assert context == (
+        'recall: 1 related conversations '
+        '(recall_search "slow-import witness" for detail)'
+    ), "the advisory must arrive: the slow IMPORT must not be charged to the query budget"
+
+
 def test_pretooluse_context_is_advisory_and_does_not_require_tool_result() -> None:
     mod = _grep_intercept()
     config = mod.GrepInterceptConfig(enabled=True, timeout_ms=150)
