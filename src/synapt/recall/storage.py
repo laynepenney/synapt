@@ -611,6 +611,37 @@ class RecallDB:
                 "ADD COLUMN observed_prefix_sha256 TEXT NOT NULL DEFAULT ''"
             )
         self._migrate_chunks_table()
+        # session_overview's GROUP BY session_id aggregates timestamp,
+        # turn_index, transcript_path, and agent_id per row. idx_chunks_session
+        # alone covers the GROUP BY key, but referencing any of those four
+        # columns forces SQLite off the index and into a per-row table lookup
+        # (measured: on an isolated shard copy, adding ANY one of them to the
+        # SELECT list -- independent of which aggregate function touches it --
+        # was the entire cost; julianday() and GROUP_CONCAT specifically were
+        # not).
+        #
+        # This index covers session_id/timestamp/turn_index/agent_id -- NOT
+        # transcript_path. That is deliberate, not an oversight: a 5-column
+        # index covering all five was measured to cost ~22% more per INSERT
+        # than no covering index at all, entirely from having one more
+        # composite index on the table, not from the aggregate itself
+        # (recall#1147 follow-on, tracked privately -- an interleaved,
+        # two-batch-size write-cost measurement). transcript_path IS a
+        # per-session constant (one source transcript file per session_id),
+        # unlike agent_id (see session_overview()'s docstring) -- so instead
+        # of covering it too, session_overview() fetches it via one lookup
+        # PER SESSION rather than folding it into the per-CHUNK aggregate.
+        # That drops the insert cost to ~18% while keeping the same read
+        # benefit as the 5-column shape (measured, same follow-on).
+        #
+        # Created here, AFTER _migrate_chunks_table(), not in _SCHEMA_SQL's
+        # executescript above: an older chunks table may not have
+        # transcript_path/agent_id yet, and creating an index that
+        # references them before the migration adds them fails outright.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunks_overview_covering "
+            "ON chunks(session_id, timestamp, turn_index, agent_id)"
+        )
         self._migrate_knowledge_table()
         self._migrate_clusters_table()
         self._migrate_access_stats_table()
@@ -1572,7 +1603,27 @@ class RecallDB:
         return loaded
 
     def session_overview(self) -> dict[str, dict]:
-        """Return routing and listing metadata without materializing chunks."""
+        """Return routing and listing metadata without materializing chunks.
+
+        Split into two queries rather than one, deliberately: agent_id is
+        NOT a per-session constant (a session can genuinely have multiple
+        contributing agents -- resume.py and sharded_db.py both treat
+        session_overview's ``agent_ids`` as a real multi-value set, unioned
+        across chunks/shards, and resolve scope with ``agent_id in
+        agent_ids``), so it stays a real ``GROUP_CONCAT(DISTINCT ...)``
+        aggregate over every chunk. transcript_path IS a per-session
+        constant (one source transcript file per session_id), so instead
+        of folding it into the same per-chunk aggregate -- which would
+        require covering it in the same index as the other four columns,
+        at a measured ~22% insert-cost premium (recall#1147 follow-on,
+        tracked privately) -- it is fetched via one lookup PER SESSION
+        (a MIN(rowid) per session_id, restricted to rows that actually
+        HAVE a transcript_path, matching the tolerance the old single-query
+        MIN(NULLIF(transcript_path, '')) had for some rows being empty).
+        Measured: this keeps the same read benefit as covering all five
+        columns, at a lower per-insert cost (~18% vs ~22%), because the
+        second query does N_SESSIONS lookups, not N_CHUNKS.
+        """
         rows = self._conn.execute(
             "SELECT session_id, "
             "MIN(NULLIF(timestamp, '')) AS earliest_ts, "
@@ -1585,11 +1636,21 @@ class RecallDB:
             "         THEN timestamp END) AS activity_raw, "
             "MAX(julianday(timestamp)) AS fallback_jd, "
             "MAX(CASE WHEN julianday(timestamp) IS NULL THEN timestamp END) AS fallback_raw "
-            ", MIN(NULLIF(transcript_path, '')) AS transcript_path "
             ", GROUP_CONCAT(DISTINCT CASE WHEN turn_index != -1 "
             "THEN NULLIF(agent_id, '') END) AS agent_ids "
             "FROM chunks GROUP BY session_id"
         ).fetchall()
+
+        transcript_paths: dict[str, str] = {
+            row["session_id"]: row["transcript_path"]
+            for row in self._conn.execute(
+                "SELECT session_id, transcript_path FROM chunks "
+                "WHERE rowid IN ("
+                "  SELECT MIN(rowid) FROM chunks "
+                "  WHERE transcript_path != '' GROUP BY session_id"
+                ")"
+            ).fetchall()
+        }
 
         result: dict[str, dict] = {}
         for row in rows:
@@ -1609,7 +1670,7 @@ class RecallDB:
                 "latest_ts": row["latest_ts"] or "",
                 "turn_count": int(row["turn_count"] or 0),
                 "has_real_activity": bool(row["activity_count"]),
-                "transcript_path": row["transcript_path"] or "",
+                "transcript_path": transcript_paths.get(row["session_id"], ""),
                 "agent_ids": frozenset(
                     part for part in (row["agent_ids"] or "").split(",") if part
                 ),

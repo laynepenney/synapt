@@ -142,6 +142,148 @@ class TestDBCreation:
         assert len(new_results) > 0
 
 
+class TestSessionOverviewCoveringIndex:
+    """session_overview's GROUP BY session_id query touches timestamp,
+    turn_index, transcript_path, and agent_id per row -- idx_chunks_session
+    alone covers the grouping key but not those four columns, so without a
+    covering index SQLite falls off the index into a per-row table lookup.
+
+    Measured on the real production store (17 shards, cProfile, two
+    back-to-back bare `resume` runs): session_overview accounted for
+    74-84% of total wall time. Isolated on copied shards: session_id-only
+    (fully index-covered) ran in ~0.01s; adding just `timestamp` to the
+    SELECT, with no function applied to it, jumped to the same order of
+    magnitude as the full query -- the cost is the table lookup any
+    uncovered column forces, not julianday() or GROUP_CONCAT specifically.
+
+    The index covers session_id/timestamp/turn_index/agent_id, NOT
+    transcript_path. A 5-column shape covering all five was measured to
+    cost ~22% more per INSERT than no covering index, purely from having
+    one more composite index on the table (recall#1147 follow-on, tracked
+    privately -- interleaved, two-batch-size write-cost measurement).
+    transcript_path is a per-session constant (one source file per
+    session_id) unlike agent_id (a real multi-value set, see
+    test_session_overview_returns_every_distinct_agent_id_in_one_session
+    below), so session_overview() fetches it via one lookup PER SESSION
+    instead of covering it in the same per-chunk index -- same read
+    benefit, ~18% insert cost instead of ~22%.
+    """
+
+    def test_covering_index_created(self, db):
+        row = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_chunks_overview_covering'"
+        ).fetchone()
+        assert row is not None
+
+    def test_session_overview_hot_query_uses_covering_index(self, db, sample_chunks):
+        """The exact HOT query session_overview runs (everything except
+        transcript_path) must show a COVERING INDEX scan -- not a plain
+        index scan requiring a per-row table lookup. This is the actual
+        acceptance criterion: an index merely existing proves nothing about
+        which plan SQLite picks."""
+        db.save_chunks(sample_chunks)
+        query = (
+            "SELECT session_id, "
+            "MIN(NULLIF(timestamp, '')) AS earliest_ts, "
+            "MAX(NULLIF(timestamp, '')) AS latest_ts, "
+            "SUM(CASE WHEN turn_index >= 0 THEN 1 ELSE 0 END) AS turn_count, "
+            "SUM(CASE WHEN turn_index != -1 AND timestamp IS NOT NULL "
+            "          AND timestamp != '' THEN 1 ELSE 0 END) AS activity_count, "
+            "MAX(CASE WHEN turn_index != -1 THEN julianday(timestamp) END) AS activity_jd, "
+            "MAX(CASE WHEN turn_index != -1 AND julianday(timestamp) IS NULL "
+            "         THEN timestamp END) AS activity_raw, "
+            "MAX(julianday(timestamp)) AS fallback_jd, "
+            "MAX(CASE WHEN julianday(timestamp) IS NULL THEN timestamp END) AS fallback_raw "
+            ", GROUP_CONCAT(DISTINCT CASE WHEN turn_index != -1 "
+            "THEN NULLIF(agent_id, '') END) AS agent_ids "
+            "FROM chunks GROUP BY session_id"
+        )
+        plan = db._conn.execute("EXPLAIN QUERY PLAN " + query).fetchall()
+        plan_text = " ".join(row[3] for row in plan)
+        assert "COVERING INDEX" in plan_text, (
+            f"expected a covering-index scan, got: {plan_text}"
+        )
+        assert "idx_chunks_overview_covering" in plan_text
+
+    def test_covering_index_survives_recreation(self, db_path, sample_chunks):
+        """Same idempotent-schema guarantee the other chunks indexes already
+        have (test_idempotent_schema): reopening must not error or drop it."""
+        d1 = RecallDB(db_path)
+        d1.save_chunks(sample_chunks)
+        d1.close()
+        d2 = RecallDB(db_path)
+        row = d2._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' "
+            "AND name='idx_chunks_overview_covering'"
+        ).fetchone()
+        assert row is not None
+        d2.close()
+
+    def test_session_overview_returns_every_distinct_agent_id_in_one_session(self, db):
+        """agent_id is NOT a per-session constant: a session can genuinely
+        have multiple contributing agents, and resume.py/sharded_db.py both
+        treat session_overview's agent_ids as a real multi-value set
+        (`agent_id in agent_ids` for scope resolution). This is the
+        regression witness for that: if agent_id were ever narrowed to a
+        single per-session lookup (the same shape transcript_path uses
+        below), this must fail -- it would silently drop every agent but
+        the one row the lookup happened to pick."""
+        db.save_chunks([
+            TranscriptChunk(
+                id="multi:t0", session_id="session-multi", timestamp="2026-03-01T10:00:00Z",
+                turn_index=0, user_text="hello", assistant_text="hi",
+                agent_id="agent-a",
+            ),
+            TranscriptChunk(
+                id="multi:t1", session_id="session-multi", timestamp="2026-03-01T10:05:00Z",
+                turn_index=1, user_text="hello again", assistant_text="hi again",
+                agent_id="agent-b",
+            ),
+        ])
+        overview = db.session_overview()["session-multi"]
+        assert overview["agent_ids"] == frozenset({"agent-a", "agent-b"}), (
+            f"both contributing agents must survive: {overview['agent_ids']}"
+        )
+
+    def test_session_overview_transcript_path_tolerates_some_empty_rows(self, db):
+        """The old single-query MIN(NULLIF(transcript_path, '')) tolerated
+        SOME rows in a session having an empty transcript_path (e.g. a
+        synthesized/auto-journal entry) as long as at least one row had a
+        real value. The per-session lookup query must tolerate the same
+        shape: it restricts to rows WHERE transcript_path != '' before
+        picking one, so an empty-transcript_path row must never win."""
+        db.save_chunks([
+            TranscriptChunk(
+                id="mixed:t0", session_id="session-mixed", timestamp="2026-03-01T10:00:00Z",
+                turn_index=0, user_text="stub", assistant_text="stub",
+                transcript_path="",
+            ),
+            TranscriptChunk(
+                id="mixed:t1", session_id="session-mixed", timestamp="2026-03-01T10:05:00Z",
+                turn_index=1, user_text="real", assistant_text="real",
+                transcript_path="/real/transcripts/session-mixed.jsonl",
+            ),
+        ])
+        overview = db.session_overview()["session-mixed"]
+        assert overview["transcript_path"] == "/real/transcripts/session-mixed.jsonl"
+
+    def test_session_overview_transcript_path_empty_when_every_row_is(self, db):
+        """A session where every row's transcript_path is empty must report
+        "" (matching the old query's `row["transcript_path"] or ""`
+        fallback), not KeyError or None -- the per-session lookup query
+        finds no matching row for this session_id at all in that case."""
+        db.save_chunks([
+            TranscriptChunk(
+                id="empty:t0", session_id="session-empty", timestamp="2026-03-01T10:00:00Z",
+                turn_index=0, user_text="stub", assistant_text="stub",
+                transcript_path="",
+            ),
+        ])
+        overview = db.session_overview()["session-empty"]
+        assert overview["transcript_path"] == ""
+
+
 # -- Chunks CRUD ---------------------------------------------------------
 
 class TestChunksCRUD:
