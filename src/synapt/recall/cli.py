@@ -371,15 +371,23 @@ def _release_build_lock(fd: int) -> None:
 class ColdRefreshOutcome:
     """Result of a cold no-caller resume refresh, for the render label and tests.
 
-    ``reason`` is one of: ``refreshed`` (the incremental build advanced the
-    index), ``up_to_date`` (build ran, nothing to commit), ``lock_held`` (the
-    build lock was busy -- including a recall#1018 ghost lock -- so NOTHING was
-    built and the read never waited), ``no_source`` (no source to refresh from),
-    ``custom_store`` (a non-canonical ``--index`` this refresh cannot map to a
-    build root), ``error`` (ANY refresh failure -- source discovery, data-dir
-    resolution, lock acquisition, the build, or lock release; the read proceeds
-    on the stale index). The two cursor fields are the index build timestamps
-    before and after, so a reader can tell a freshened tail from a stale one.
+    ``reason`` is one of: ``queued_background`` (R3.1: the lock was free, so a
+    detached background process was spawned to do the incremental build; THIS
+    call never blocked on it and the render proceeds on the current, still-
+    possibly-stale index -- see ``cold_no_caller_refresh``'s docstring for why
+    the free-lock leg no longer builds inline), ``lock_held`` (the build lock
+    was busy -- including a recall#1018 ghost lock, or another background
+    catchup already spawned -- so no new one was queued and the read never
+    waited), ``no_source`` (no source to refresh from), ``custom_store`` (a
+    non-canonical ``--index`` this refresh cannot map to a build root),
+    ``error`` (ANY refresh failure -- source discovery, data-dir resolution,
+    lock acquisition, or lock release; the read proceeds on the stale index).
+    ``refreshed``/``up_to_date`` are retired reason values (pre-R3.1: the
+    free-lock leg built inline and could report them) kept only so old test
+    fixtures reading this docstring have somewhere to look; no code path
+    returns them anymore. The two cursor fields are the index build
+    timestamps before and after THIS call only -- for ``queued_background``
+    they are always equal, since nothing was built in this process.
     """
 
     attempted: bool
@@ -455,26 +463,66 @@ def _newest_source_file(project_dir: Path) -> Path | None:
     return newest
 
 
+# R3.1 (recall#435): the detached background build cold_no_caller_refresh spawns.
+# Mirrors the acquire/build/release sequence that USED to run inline in the
+# free-lock leg, byte-for-byte the same args to _archive_and_build_locked, just
+# moved into a process whose lifetime is independent of the resume call that
+# spawned it. sys.argv[1]/[2] are store_root/project_dir; a lock that is busy
+# by the time this actually runs (a race against another queued refresh) exits
+# quietly -- the caller who wins does the work, exactly like the old inline
+# non-blocking acquire behaved.
+_BACKGROUND_COLD_REFRESH_SCRIPT = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "from synapt.recall.cli import (\n"
+    "    _acquire_build_lock, _release_build_lock, _archive_and_build_locked, project_data_dir,\n"
+    ")\n"
+    "store_root = Path(sys.argv[1])\n"
+    "project_dir = Path(sys.argv[2])\n"
+    "data_dir = project_data_dir(store_root)\n"
+    "fd = _acquire_build_lock(data_dir, timeout=0.0)\n"
+    "if fd is not None:\n"
+    "    try:\n"
+    "        _archive_and_build_locked(\n"
+    "            store_root, None, use_embeddings=False, incremental=True,\n"
+    "            chatgpt_archive=None, source_dir=project_dir, skip_clustering=True,\n"
+    "        )\n"
+    "    finally:\n"
+    "        _release_build_lock(fd)\n"
+)
+
+
 def cold_no_caller_refresh(project_dir: Path, index_dir: Path) -> ColdRefreshOutcome:
-    """Incrementally refresh the newest source before a cold, stale resume.
+    """Check whether the newest source can be refreshed, and QUEUE it -- never block.
 
     Contract (durable-checkpoint follow-on): the caller is resume, which has already
-    established there is NO caller session and the index is STALE. This tries to
-    make the tail fresher. It NEVER WAITS ON A HELD BUILD LOCK:
+    established there is NO caller session and the index is STALE. This NEVER WAITS
+    ON A HELD BUILD LOCK, and (R3.1, recall#435) never runs the build itself either:
 
       * try-acquire the build lock NON-BLOCKING (timeout 0). If it is held --
-        the recall#1018 ghost-lock case included -- return immediately having
-        built NOTHING, so resume falls back to the durable-checkpoint block.
-      * otherwise run the OSS incremental build (no embeddings) under that lock.
-        This build is SYNCHRONOUS: when the lock is free it runs inline and
-        delays the render by the incremental build's own duration. It never
-        waits on ANOTHER holder, but it is not free on the success path. It
-        reports the index build timestamp before and after so the render can
-        say what it refreshed.
+        the recall#1018 ghost-lock case included, or a background catchup this
+        function already queued a moment ago -- return immediately having
+        queued NOTHING new, so resume falls back to the durable-checkpoint block.
+      * otherwise release the lock immediately (it was only a probe: is anyone
+        already rebuilding?) and spawn a DETACHED background process that
+        re-acquires the lock itself and runs the exact same OSS incremental
+        build (no embeddings) this function used to run inline. This call
+        returns the instant the process is spawned -- it does not wait for it,
+        so it cannot cost the caller the build's own duration.
 
-    Never raises: EVERY failure in the refresh -- source discovery, data-dir
-    resolution, lock acquisition, the build, and lock release -- degrades to the
-    stale render, which is strictly what resume did before this existed.
+    Measured why this exists (Stromus, 2026-09-05, real 167,762-chunk store):
+    the OLD synchronous free-lock leg cost ~14 minutes of foreground wall time
+    on a real refire. An interactive `resume` blocking for 14 minutes on a
+    background maintenance operation is a correctness bug wearing a
+    freshness feature's clothes; the render must answer from the CURRENT
+    index within the interactive budget and let the rebuild catch up
+    independently of this process's lifetime. ``queued_background`` is
+    honest about this: the render is not fresher than it was before the
+    call, only headed there.
+
+    Never raises: EVERY failure in this check -- source discovery, data-dir
+    resolution, lock acquisition, or lock release -- degrades to the stale
+    render, which is strictly what resume did before this existed.
     """
     from synapt.recall.freshness import check_index_freshness
 
@@ -528,40 +576,34 @@ def cold_no_caller_refresh(project_dir: Path, index_dir: Path) -> ColdRefreshOut
         return ColdRefreshOutcome(True, False, source.name, before, before, "error")
     if lock_fd is None:
         # Ghost-lock control: the lock is held (possibly by a dead holder,
-        # recall#1018). Build nothing, wait for nothing; the caller renders the
-        # durable-checkpoint block and only that.
+        # recall#1018, or a background catchup this function itself already
+        # queued a moment ago). Queue nothing new, wait for nothing; the
+        # caller renders the durable-checkpoint block and only that.
         return ColdRefreshOutcome(True, False, source.name, before, before, "lock_held")
-    # recall#1123 hardening: name both paths on every cold rebuild, even the
-    # (only) case that reaches here today -- store and source already agree.
-    # cmd_resume's own refusal only guards ITS ambient resolution; a future
-    # caller of cold_no_caller_refresh that skips that guard, or a bug that
-    # narrows the guard's scope, still leaves a legible trail of which store
-    # was rebuilt from which source, rather than silence either way.
-    print(f"[resume] refreshing store {store_root} from source {project_dir}", file=sys.stderr)
+    # The lock was free at this instant -- that is all this probe establishes.
+    # Release it immediately rather than holding it across a spawn (a lock
+    # held by THIS process while a background process starts under it would
+    # make the child's own acquire race pointlessly against its own parent).
     try:
-        _archive_and_build_locked(
-            store_root, None, use_embeddings=False, incremental=True, chatgpt_archive=None,
-            source_dir=project_dir, skip_clustering=True,
+        _release_build_lock(lock_fd)
+    except OSError:
+        pass
+    # recall#1123 hardening, preserved: name both paths on every cold rebuild,
+    # even the (only) case that reaches here today -- store and source already
+    # agree. cmd_resume's own refusal only guards ITS ambient resolution; a
+    # future caller of cold_no_caller_refresh that skips that guard, or a bug
+    # that narrows the guard's scope, still leaves a legible trail of which
+    # store was queued to rebuild from which source, rather than silence
+    # either way.
+    print(f"[resume] queuing background refresh of store {store_root} from source {project_dir}", file=sys.stderr)
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", _BACKGROUND_COLD_REFRESH_SCRIPT, str(store_root), str(project_dir)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
-    except Exception:
+    except OSError:
         return ColdRefreshOutcome(True, False, source.name, before, before, "error")
-    finally:
-        # Releasing the lock can itself raise OSError (a closed/invalid fd, an
-        # unlink on a vanished lock file). In a finally it would OVERRIDE the
-        # outcome above: a release failure after a successful build is still a
-        # successful refresh, and after a build error is still that build error.
-        # Swallow it to the same non-raising contract this function promises.
-        try:
-            _release_build_lock(lock_fd)
-        except OSError:
-            pass
-
-    after = _build_ts()
-    refreshed = bool(after) and after != before
-    return ColdRefreshOutcome(
-        True, refreshed, source.name, before, after,
-        "refreshed" if refreshed else "up_to_date",
-    )
+    return ColdRefreshOutcome(True, False, source.name, before, before, "queued_background")
 
 
 def _build_journal_files(project_dir: Path) -> list[Path]:
@@ -1913,6 +1955,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
     # stale render plus the durable-checkpoint block. A free-lock build
     # runs synchronously and delays the render by its own (no-embeddings) duration.
     refresh_label = None
+    background_catchup_label = None
     cold_freshness = None  # source-aware verdict carried into _attach_freshness
     if not caller_sources:
         from synapt.recall.freshness import check_index_freshness
@@ -1939,6 +1982,18 @@ def cmd_resume(args: argparse.Namespace) -> None:
                 refresh_label = (
                     f"source {outcome.source}, index "
                     f"{outcome.cursor_before or '(unrecorded)'} → {outcome.cursor_after}"
+                )
+            elif outcome.reason == "queued_background":
+                # R3.1: a bare resume never blocks on the incremental rebuild
+                # anymore (recall#435 -- 14 minutes of foreground wall on the
+                # real 167,762-chunk store). Say honestly that THIS render is
+                # still the pre-catchup index, and how far behind it is, so a
+                # stale answer is a labeled one, not a silent one.
+                stale_count = len(cold_freshness.new_files) + len(cold_freshness.changed_files)
+                background_catchup_label = (
+                    f"{stale_count} source file(s) behind "
+                    f"(source {outcome.source}) -- incremental rebuild queued in the "
+                    "background, not waited on; this render is the pre-catchup index"
                 )
             # Carry the verdict so the later cheap _attach_freshness cannot erase a
             # known-stale state. After a build ran (refreshed / up_to_date)
@@ -2003,6 +2058,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
     view = attach_durable_checkpoint(view, _journal_path())
     view.refresh_label = refresh_label
+    view.background_catchup_label = background_catchup_label
 
     # The MCP recall_resume tool wraps its output with the
     # query-time freshness line (server.py:_query_freshness_line /

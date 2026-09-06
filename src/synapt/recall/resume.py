@@ -134,6 +134,14 @@ class ResumeView:
     # stale one. None means no refresh happened (fresh index, a caller present,
     # lock held, or nothing to refresh).
     refresh_label: str | None = None
+    # R3.1 (recall#435): set by the CLI when a cold no-caller resume found the
+    # index stale, the build lock free, and QUEUED a detached background
+    # rebuild rather than blocking on it (a real refire costs ~14 minutes on
+    # the shared store). None means no background catchup was queued (fresh
+    # index, a caller present, lock already held, or nothing to refresh).
+    # Distinct from refresh_label: that one only ever fires AFTER a build
+    # completed in-process, which the free-lock leg no longer does.
+    background_catchup_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1101,6 +1109,18 @@ def _format_refresh_label(view: ResumeView) -> list[str]:
     return ["", f"REFRESHED before render — {view.refresh_label}"]
 
 
+def _format_background_catchup_label(view: ResumeView) -> list[str]:
+    """Say a background catchup was queued rather than staying silent about it.
+
+    Deliberately NOT phrased as "REFRESHED" (_format_refresh_label's word) --
+    nothing refreshed THIS render; a stale answer is honestly a stale one,
+    just no longer a silent one.
+    """
+    if not view.background_catchup_label:
+        return []
+    return ["", f"CATCHING UP IN BACKGROUND — {view.background_catchup_label}"]
+
+
 def _format_durable_checkpoint(view: ResumeView) -> list[str]:
     entry = view.durable_checkpoint
     if entry is None:
@@ -1240,6 +1260,7 @@ def format_resume(view: ResumeView, max_chars: int = 600) -> str:
 
     lines = [header]
     lines.extend(_format_refresh_label(view))
+    lines.extend(_format_background_catchup_label(view))
     lines.extend(_format_freshness(view))
     lines.extend(_format_durable_checkpoint(view))
     lines.extend(_format_journal(view))
