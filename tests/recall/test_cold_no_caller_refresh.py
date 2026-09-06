@@ -376,8 +376,14 @@ class TestResumeRefusesIndexSourceGripspaceMismatch(unittest.TestCase):
 
             self.assertEqual(ctx.exception.code, 1)
             self.assertIn("disagree on which workspace", captured.getvalue())
-            self.assertIn(str(b), captured.getvalue())         # names the source path
-            self.assertIn(str(a), captured.getvalue())         # names the index path
+            # RESOLVED, not raw: the message now prints source_dir.resolve() /
+            # index_dir.resolve() consistently (recall#1136's fix), so on
+            # Windows the raw str(b)/str(a) can be a SHORT (8.3) form no
+            # longer present anywhere in a message that is now consistently
+            # LONG-form -- checking the raw form here is exactly the bug this
+            # follow-up corrects.
+            self.assertIn(str(b.resolve()), captured.getvalue())  # names the source path
+            self.assertIn(str(a.resolve()), captured.getvalue())  # names the index path
             lock.assert_not_called()   # never reached the lock
             build.assert_not_called()  # never built
             self.assertFalse(
