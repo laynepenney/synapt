@@ -76,6 +76,42 @@ CONTAINMENT_THRESHOLD = 0.20     # fraction of the signature that must be presen
 MIN_SHARED_SIGNATURE_TOKENS = 8  # absolute floor: ratio alone lets a tiny
                                   # signature "match" on a handful of coincidental tokens
 
+# A raw shared-token COUNT rewards a match dominated by common, recurring
+# vocabulary (a harness prompt's own words, a status update's "quiet",
+# "standing by") exactly as readily as one dominated by rare, topical
+# vocabulary. Measured on a 10-sample hand read of live merge_into_existing
+# candidates: 5 of 10 shared mostly common cross-cluster words and should
+# NOT have matched -- including a candidate whose recurring-prompt
+# vocabulary also shows up in many OTHER clusters' signatures, so raw
+# containment treated a coincidence of shared BOILERPLATE as a signal of
+# shared TOPIC. Distinctiveness is approximated cheaply from data already
+# loaded at the call site (no new corpus read): SIGNATURE cross-cluster
+# document frequency -- how many DIFFERENT clusters' signatures contain a
+# token -- rather than a chunk-corpus-wide DF, which would defeat
+# recall#435's whole reason for existing (never reload the
+# already-clustered corpus).
+#
+# The floor is an AVERAGE over the shared tokens, not a SUM: a sum grows
+# with the shared-token COUNT, which is exactly the quantity
+# min_shared_tokens already governs separately, so a sum-floor would just
+# be a second, differently-scaled count floor wearing an IDF costume. An
+# average is scale-invariant with respect to count.
+MIN_AVERAGE_DISTINCTIVE_IDF = 1.0  # avg IDF of the shared tokens
+
+# Below this many total clusters, cross-signature document frequency
+# cannot tell "rare" from "common" at all -- with, say, one cluster in
+# existence, every token in its signature trivially has df == total
+# clusters (it IS the only cluster), which is an artifact of the
+# population size, not evidence the token is unimportant. Skip the
+# distinctiveness check entirely below this floor rather than let it
+# silently block every match against a reference population too small to
+# judge distinctiveness from; count and containment-ratio matching (the
+# prior behavior) still applies on its own. Comfortably below any real
+# store's cluster count and comfortably above the handful of clusters a
+# hand-built test fixture uses when it is not specifically testing
+# distinctiveness.
+MIN_CLUSTERS_FOR_DISTINCTIVENESS = 20
+
 # A cluster whose members are mostly one recurring HARNESS/CRON/RITUAL
 # prompt (measured: 42.7% of 300 sampled signed real-store clusters had
 # >=80% of members share byte-identical user_text) gets that prompt's own
@@ -333,12 +369,33 @@ def compute_boilerplate_stoplist(
     )
 
 
+def _signature_cross_cluster_df(cluster_signatures: dict[str, set[str]]) -> Counter[str]:
+    """How many DIFFERENT clusters' persisted signatures contain each
+    token -- the cheap, already-in-memory proxy for token distinctiveness
+    used by ``_match_existing_cluster``.
+
+    ``cluster_signatures`` is already loaded in full at the one call site
+    (``recluster_stale_chunks``), so this costs one more pass over data
+    already in memory (bounded by cluster COUNT times ``TOP_SIGNATURE_TOKENS``,
+    not chunk count), never a new corpus read. Computed ONCE per
+    ``recluster_stale_chunks`` call and passed to every ``_match_existing_cluster``
+    call in that batch's loop, not recomputed per chunk.
+    """
+    df: Counter[str] = Counter()
+    for signature in cluster_signatures.values():
+        df.update(set(signature))
+    return df
+
+
 def _match_existing_cluster(
     chunk_tokens: set[str],
     cluster_signatures: dict[str, set[str]],
+    signature_df: Counter[str],
     *,
     min_containment: float = CONTAINMENT_THRESHOLD,
     min_shared_tokens: int = MIN_SHARED_SIGNATURE_TOKENS,
+    min_average_distinctive_idf: float = MIN_AVERAGE_DISTINCTIVE_IDF,
+    min_clusters_for_distinctiveness: int = MIN_CLUSTERS_FOR_DISTINCTIVENESS,
 ) -> str | None:
     """Best-matching existing cluster id for one chunk's tokens, or None.
 
@@ -355,6 +412,31 @@ def _match_existing_cluster(
     absolute floor independent of the ratio, so a signature this small
     cannot match without substantial real overlap.
 
+    A raw COUNT floor still lets a match through built entirely from
+    common, recurring vocabulary shared with the signature (a harness
+    prompt's own words, a status update's "quiet"/"standing by") -- shared
+    tokens that recur across MANY clusters' signatures carry no real
+    topical signal, however many of them there are. ``min_average_distinctive_idf``
+    is a separate, INDEPENDENT floor on the AVERAGE per-token rarity of the
+    shared set (see ``_signature_cross_cluster_df`` -- how many DIFFERENT
+    clusters' signatures contain each token, the cheap proxy for
+    distinctiveness already loaded at the call site; same ``log(N/df)``
+    shape ``_extract_topic`` uses for topic-label ranking, applied to
+    signatures rather than chunks because that is the population in memory
+    here). An AVERAGE, not a sum: a sum grows with shared-token count,
+    which ``min_shared_tokens`` already governs, so a sum-floor would just
+    be a second, differently-scaled count floor. Below
+    ``min_clusters_for_distinctiveness`` total clusters this check is
+    skipped outright -- with too few clusters to compare against, every
+    token trivially looks "common" (it IS the only, or one of a handful
+    of, known signatures), which is an artifact of the population size,
+    not evidence about the token, so the prior count/ratio-only behavior
+    applies unchanged.
+
+    Both floors are required independently: a small-but-rare match and a
+    large-but-common match must both fail if either check alone is
+    applied.
+
     A signature is also ineligible outright when it holds fewer than
     ``min_shared_tokens`` LETTER-BEARING tokens (see ``_has_letter``),
     checked directly against the signature rather than inferred from
@@ -367,6 +449,13 @@ def _match_existing_cluster(
     fact that a freshly-tokenized chunk can no longer contribute matching
     digits to ``shared``.
     """
+    total_clusters = len(cluster_signatures)
+    check_distinctiveness = total_clusters >= min_clusters_for_distinctiveness
+
+    def _idf(token: str) -> float:
+        df = signature_df.get(token, 1)
+        return math.log(total_clusters / df) if df < total_clusters else 0.1
+
     best_score = 0.0
     best_id: str | None = None
     for cluster_id, signature in cluster_signatures.items():
@@ -374,10 +463,14 @@ def _match_existing_cluster(
             continue
         if sum(1 for t in signature if _has_letter(t)) < min_shared_tokens:
             continue
-        shared = len(signature & chunk_tokens)
-        if shared < min_shared_tokens:
+        shared = signature & chunk_tokens
+        if len(shared) < min_shared_tokens:
             continue
-        containment = shared / len(signature)
+        if check_distinctiveness:
+            avg_shared_idf = sum(_idf(t) for t in shared) / len(shared)
+            if avg_shared_idf < min_average_distinctive_idf:
+                continue
+        containment = len(shared) / len(signature)
         if containment >= min_containment and containment > best_score:
             best_score = containment
             best_id = cluster_id
@@ -1404,6 +1497,9 @@ def recluster_stale_chunks(
             )
 
         cluster_token_sets = db.load_cluster_token_signatures()
+        # Computed ONCE per batch from data already loaded above, not per
+        # chunk in the loop below (see _signature_cross_cluster_df).
+        signature_df = _signature_cross_cluster_df(cluster_token_sets)
         now = datetime.now(timezone.utc).isoformat()
         merges_by_cluster: dict[str, list[TranscriptChunk]] = {}
         remaining_chunks: list[TranscriptChunk] = []
@@ -1413,7 +1509,7 @@ def recluster_stale_chunks(
             # short to ever form its own cluster is too short to match an
             # existing one meaningfully either.
             target = (
-                _match_existing_cluster(tokens, cluster_token_sets)
+                _match_existing_cluster(tokens, cluster_token_sets, signature_df)
                 if len(tokens) >= MIN_TOKENS
                 else None
             )
