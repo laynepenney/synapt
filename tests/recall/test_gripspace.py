@@ -472,6 +472,60 @@ def test_gr2_workspace_boundary_beats_an_enclosing_git_root(tmp_path):
     )
 
 
+def test_constituent_git_repo_inside_a_gr2_workspace_uses_the_workspace_bucket(tmp_path):
+    """recall#974 witness: a constituent git repo (with its own .git) inside a
+    gr2 (.grip) workspace must resolve to the WORKSPACE bucket, not the repo
+    name, so a session standing in the repo and a session standing at the
+    workspace root write to the SAME bucket.
+
+    This is the live split-brain: a gr2 workspace ``synapt-dev`` holds a
+    constituent repo ``synapt`` (recall's own clone) with a real ``.git``. From
+    the workspace root the coordinate derives to ``synapt-dev``; from inside the
+    constituent repo it derives to ``synapt`` (the repo basename); with
+    SYNAPT_RECALL_WORKTREE set by pane bookkeeping it is a third value. The
+    ``.grip`` workspace marker must win over a constituent ``.git`` so the bucket
+    is one coordinate regardless of cwd. RED before the fix (the constituent repo
+    mints its own ``synapt``-named bucket).
+
+    Distinct from the gr1 contract in
+    ``test_worktree_bucket_uses_the_repo_root_beneath_a_gripspace`` below, which
+    stays per-repo: that gripspace has no ``.grip`` marker.
+    """
+    workspace = _make_gr2_workspace(tmp_path)
+    repo = _make_git_repo(workspace, "synapt")  # constituent repo WITH .git
+    nested = repo / "src" / "synapt"
+    nested.mkdir(parents=True)
+
+    expected = workspace / ".synapt" / "recall" / "worktrees" / "gr2-workspace"
+    assert project_worktree_dir(workspace) == expected
+    assert project_worktree_dir(repo) == expected  # RED on dev: mints .../synapt
+    assert project_worktree_dir(nested) == expected
+
+
+def test_env_coordinate_still_wins_over_gr2_workspace_derivation(tmp_path, monkeypatch):
+    """Control for the recall#974 fix: SYNAPT_RECALL_WORKTREE set must STILL win
+    over the .grip-workspace derivation, so this fix can never be read later as
+    having changed env precedence. The fix only decides what the derivation
+    yields when no explicit coordinate is given; the env override is untouched.
+
+    (The env is consulted only when no explicit project_dir is passed — that is
+    the resolver's contract — so the env half calls _worktree_name() with no dir,
+    and the derivation half passes the workspace explicitly.)
+    """
+    from synapt.recall.core import _worktree_name
+
+    workspace = _make_gr2_workspace(tmp_path)
+    _make_git_repo(workspace, "synapt")
+
+    # Env set, no explicit dir → env wins (unchanged by the fix).
+    monkeypatch.setenv("SYNAPT_RECALL_WORKTREE", "explicit-coord")
+    assert _worktree_name() == "explicit-coord"
+
+    # Same workspace, env cleared → the fix's derivation yields the workspace.
+    monkeypatch.delenv("SYNAPT_RECALL_WORKTREE", raising=False)
+    assert _worktree_name(workspace) == "gr2-workspace"
+
+
 def test_worktree_bucket_uses_the_repo_root_beneath_a_gripspace(tmp_path):
     """Constituent repos share the store but retain distinct stable buckets."""
     grip = _make_gripspace(tmp_path)
