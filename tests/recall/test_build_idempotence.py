@@ -737,6 +737,131 @@ def test_maintain_passes_the_limit_through_and_reports_backlog(tmp_path, monkeyp
     assert "remaining" in out, "maintain must report the remaining backlog, not drain it silently"
 
 
+def test_maintain_recluster_refuse_above_flag_reaches_the_function(tmp_path, monkeypatch, capsys):
+    """--recluster-refuse-above must thread to recluster_stale_chunks's
+    refuse_above kwarg. The ceiling (clustering.py:1189-1194) is a first
+    estimate against an unmeasured per-chunk memory cost, not a validated
+    safety property -- a legitimate one-time event (a fleet-wide catchup
+    after an outage) can push a real backlog above it, and there must be a
+    sanctioned way to raise it per run rather than only a programmatic
+    bypass of the guard."""
+    import synapt.recall.clustering as clustering
+    from synapt.recall.cli import cmd_maintain, make_parser
+
+    seen: list[int] = []
+
+    def _spy(db, batch_size=2000, merge_into_existing=False, refuse_above=50_000):
+        seen.append(refuse_above)
+        return {
+            "refused": False, "total_stale_at_start": 0, "batches_run": 0,
+            "chunks_clustered": 0, "still_stale": 0, "fresh_in_batch": 0,
+            "fallback_in_batch": 0, "merged_into_existing": 0,
+            "batch_boilerplate_dropped": [], "merge_samples": [],
+            "merge_run_id": None, "dry_run": False, "drain_command": "",
+        }
+
+    monkeypatch.setattr(clustering, "recluster_stale_chunks", _spy)
+    monkeypatch.chdir(tmp_path)
+
+    project = tmp_path
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    from synapt.recall.cli import _archive_and_build
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=False)
+
+    args = make_parser().parse_args(
+        ["maintain", "--recluster", "--recluster-refuse-above", "100000"]
+    )
+    cmd_maintain(args)
+
+    assert seen == [100000], f"--recluster-refuse-above did not reach the function: {seen}"
+
+
+def test_maintain_recluster_refuse_above_explicit_zero_is_not_treated_as_unset(
+    tmp_path, monkeypatch, capsys
+):
+    """--recluster-refuse-above 0 is a legitimate (if extreme) explicit value
+    and must reach the function as 0, not fall through to the default via a
+    truthiness check -- ``x or DEFAULT`` treats 0 the same as omitted; the
+    exact test is ``is None``."""
+    import synapt.recall.clustering as clustering
+    from synapt.recall.cli import cmd_maintain, make_parser
+
+    seen: list[int] = []
+
+    def _spy(db, batch_size=2000, merge_into_existing=False, refuse_above=50_000):
+        seen.append(refuse_above)
+        return {
+            "refused": False, "total_stale_at_start": 0, "batches_run": 0,
+            "chunks_clustered": 0, "still_stale": 0, "fresh_in_batch": 0,
+            "fallback_in_batch": 0, "merged_into_existing": 0,
+            "batch_boilerplate_dropped": [], "merge_samples": [],
+            "merge_run_id": None, "dry_run": False, "drain_command": "",
+        }
+
+    monkeypatch.setattr(clustering, "recluster_stale_chunks", _spy)
+    monkeypatch.chdir(tmp_path)
+
+    project = tmp_path
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    from synapt.recall.cli import _archive_and_build
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=False)
+
+    args = make_parser().parse_args(
+        ["maintain", "--recluster", "--recluster-refuse-above", "0"]
+    )
+    cmd_maintain(args)
+
+    assert seen == [0], (
+        f"--recluster-refuse-above 0 was treated as unset, fell through to "
+        f"the default: {seen}"
+    )
+
+
+def test_maintain_recluster_default_refuse_above_still_refuses_at_50001(
+    tmp_path, monkeypatch, capsys
+):
+    """Omitting --recluster-refuse-above must leave the default ceiling
+    (clustering.DEFAULT_RECLUSTER_REFUSE_ABOVE = 50_000) unchanged for every
+    other caller: one chunk over it must still refuse. Runs the REAL
+    recluster_stale_chunks (only its stale-id source is faked, real backlogs
+    this size are not built in a test) so this exercises the actual refusal
+    branch the flag threads into, not a mock of it."""
+    import synapt.recall.clustering as clustering
+    from synapt.recall.cli import cmd_maintain, make_parser
+
+    fake_stale_ids = [f"chunk-{i}" for i in range(50_001)]
+    monkeypatch.setattr(
+        clustering, "stale_transcript_chunk_ids", lambda db: fake_stale_ids
+    )
+    monkeypatch.chdir(tmp_path)
+
+    project = tmp_path
+    source = tmp_path / "source"
+    source.mkdir()
+    _transcript(source / "s1.jsonl", turns=8)
+
+    from synapt.recall.cli import _archive_and_build
+    _archive_and_build(project, source_dirs=[source], use_embeddings=False, incremental=False)
+
+    args = make_parser().parse_args(["maintain", "--recluster"])
+    cmd_maintain(args)
+
+    out = capsys.readouterr().out
+    assert "REFUSED" in out, f"default ceiling did not refuse at 50,001: {out}"
+    assert "50000" in out or "50,000" in out, (
+        f"refusal message must name the ceiling actually used: {out}"
+    )
+    assert "--recluster-refuse-above" in out, (
+        f"refusal message must name the flag that raises it: {out}"
+    )
+
+
 # ===========================================================================
 # F. A no-op run must SAY it is a no-op
 # ===========================================================================

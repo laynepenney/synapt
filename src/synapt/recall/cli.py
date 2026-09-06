@@ -4183,11 +4183,18 @@ def cmd_maintain(args: argparse.Namespace) -> None:
             (min_chunks,),
         ).fetchone()[0]
         recluster_receipt = None
+        recluster_refuse_above = None
         if getattr(args, "recluster", False):
             batch_size = args.recluster_batch or clustering.DEFAULT_RECLUSTER_BATCH
+            recluster_refuse_above = (
+                args.recluster_refuse_above
+                if args.recluster_refuse_above is not None
+                else clustering.DEFAULT_RECLUSTER_REFUSE_ABOVE
+            )
             recluster_receipt = clustering.recluster_stale_chunks(
                 db, batch_size=batch_size,
                 merge_into_existing=getattr(args, "recluster_merge", False),
+                refuse_above=recluster_refuse_above,
             )
     finally:
         db.close()
@@ -4200,7 +4207,8 @@ def cmd_maintain(args: argparse.Namespace) -> None:
         if r["refused"]:
             print(
                 f"  Recluster: REFUSED -- {r['total_stale_at_start']} stale chunks "
-                f"exceeds the safety ceiling. {r['drain_command']}"
+                f"exceeds the safety ceiling ({recluster_refuse_above}; raise it with "
+                f"--recluster-refuse-above N). {r['drain_command']}"
             )
         else:
             print(
@@ -4601,6 +4609,17 @@ def make_parser() -> argparse.ArgumentParser:
              "token signature in the chunk's own tokens, cheap) before "
              "self-batch clustering runs, instead of only ever forming new "
              "clusters from same-batch matches. Default off.",
+    )
+    maintain_parser.add_argument(
+        "--recluster-refuse-above", type=int, default=None,
+        help="Raise the runaway-backlog ceiling (default: "
+             "clustering.DEFAULT_RECLUSTER_REFUSE_ABOVE). The ceiling is a "
+             "first-estimate guard against an unbounded grind, not a measured "
+             "memory-safety property -- a total-stale backlog above the "
+             "default can be a legitimate one-time event (e.g. a fleet-wide "
+             "catchup after an outage) rather than something wrong. Raise it "
+             "deliberately per run; the default is unchanged for every other "
+             "caller.",
     )
 
     migrate_parser = subparsers.add_parser(
